@@ -1,0 +1,15 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  ci-status:
+    name: CI status
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "OK"
