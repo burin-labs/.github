@@ -1,0 +1,143 @@
+name: runner-availability (reusable)
+
+# Reusable detection of idle self-hosted runners, by OS, with safe fall-through
+# to GitHub-hosted runners. Callers gate each job's `runs-on` on these boolean
+# outputs via a ternary, for example:
+#
+#   jobs:
+#     runner-availability:
+#       uses: burin-labs/.github/.github/workflows/runner-availability.yml@main
+#       secrets:
+#         RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+#         RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+#     build:
+#       needs: runner-availability
+#       runs-on: ${{ needs.runner-availability.outputs.linux == 'true'
+#         && fromJSON('["self-hosted", "Linux", "harn-ci-stable"]') || 'ubuntu-latest' }}
+#
+# The `.busy | not` filter means a busy/absent self-hosted pool reports that OS
+# as unavailable, so callers route to hosted runners instead of queueing behind
+# active local work.
+on:
+  workflow_call:
+    inputs:
+      runner_tag:
+        description: "Default label required on self-hosted runners"
+        type: string
+        default: harn-ci
+        required: false
+      linux_runner_tag:
+        description: "Linux-specific self-hosted runner label"
+        type: string
+        default: harn-ci-stable
+        required: false
+      macos_runner_tag:
+        description: "macOS-specific self-hosted runner label"
+        type: string
+        default: harn-ci
+        required: false
+      windows_runner_tag:
+        description: "Windows-specific self-hosted runner label"
+        type: string
+        default: harn-ci
+        required: false
+    # Declared explicitly so callers can avoid `secrets: inherit` and pass only
+    # the GitHub App credentials this detector needs. Both are optional:
+    # fork/dependabot runs without them and fall through to hosted runners.
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        required: false
+    outputs:
+      linux:
+        description: "true when an idle matching self-hosted Linux runner exists"
+        value: ${{ jobs.detect.outputs.linux }}
+      windows:
+        description: "true when an idle matching self-hosted Windows runner exists"
+        value: ${{ jobs.detect.outputs.windows }}
+      macos:
+        description: "true when an idle matching self-hosted macOS runner exists"
+        value: ${{ jobs.detect.outputs.macos }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect self-hosted runner availability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Promote to job env so step-level `if:` can gate on secret presence; the
+      # `secrets` context is unavailable directly in step `if:` expressions.
+      HAS_RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+    outputs:
+      linux: ${{ steps.detect.outputs.linux }}
+      windows: ${{ steps.detect.outputs.windows }}
+      macos: ${{ steps.detect.outputs.macos }}
+    steps:
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ env.HAS_RELEASE_APP_CLIENT_ID == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          # Required for /orgs/{org}/actions/runners; without it the app token
+          # returns 403 and the detector falls back to hosted runners.
+          permission-actions: read
+          permission-organization-self-hosted-runners: read
+      - id: detect
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+          DEFAULT_TAG: ${{ inputs.runner_tag }}
+          LINUX_TAG: ${{ inputs.linux_runner_tag }}
+          MACOS_TAG: ${{ inputs.macos_runner_tag }}
+          WINDOWS_TAG: ${{ inputs.windows_runner_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::runner-availability: no GH_TOKEN; using GitHub-hosted runners"
+            {
+              echo "linux=false"
+              echo "windows=false"
+              echo "macos=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh_api_stderr="$(mktemp)"
+          runner_list="$(gh api "/orgs/${OWNER}/actions/runners?per_page=100" 2>"$gh_api_stderr" || true)"
+          if [ -z "$runner_list" ] || ! echo "$runner_list" | jq -e '.runners' > /dev/null 2>&1; then
+            err_excerpt="$(head -c 300 "$gh_api_stderr" | tr '\n' ' ')"
+            body_excerpt="$(echo "$runner_list" | head -c 300 | tr '\n' ' ')"
+            echo "::warning::runner-availability: could not list /orgs/${OWNER}/actions/runners; falling back to GitHub-hosted. gh stderr: ${err_excerpt} | response body: ${body_excerpt}"
+            {
+              echo "linux=false"
+              echo "windows=false"
+              echo "macos=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for os_label in Linux Windows macOS; do
+            tag="$DEFAULT_TAG"
+            case "$os_label" in
+              Linux) tag="$LINUX_TAG" ;;
+              Windows) tag="$WINDOWS_TAG" ;;
+              macOS) tag="$MACOS_TAG" ;;
+            esac
+            count="$(echo "$runner_list" | jq -r --arg os "$os_label" --arg tag "$tag" '[.runners[] | select(.status == "online" and (.busy | not)) | select(any(.labels[].name; . == $tag)) | select(any(.labels[].name; . == $os))] | length')"
+            if [ "$count" -gt 0 ]; then
+              available=true
+            else
+              available=false
+            fi
+            key="$(echo "$os_label" | tr '[:upper:]' '[:lower:]')"
+            echo "${key}=${available}" >> "$GITHUB_OUTPUT"
+            echo "::notice::runner-availability ${key}=${available} (${count} idle ${os_label} ${tag} runner(s))"
+          done
