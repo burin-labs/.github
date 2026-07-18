@@ -18,6 +18,17 @@ name: runner-availability (reusable)
 # The `.busy | not` filter means a busy/absent self-hosted pool reports that OS
 # as unavailable, so callers route to hosted runners instead of queueing behind
 # active local work.
+#
+# Detection is scoped to the runner GROUPS named by `runner_groups`, never the
+# flat `/orgs/{org}/actions/runners` list. Managed-runner vendors (Blacksmith,
+# Namespace, ...) register one ephemeral runner per job into their own groups
+# and do not deregister them, so that flat list grows without bound: burin-labs
+# reached 1015 registrations, 1002 of them vendor ephemerals and 997 of those
+# offline. A single unpaginated page of it returned zero self-hosted matches
+# while 9 Linux and 4 macOS runners sat online and idle, so every caller routed
+# to paid GitHub-hosted runners. Group scoping keeps the query O(#groups)
+# regardless of vendor fleet size; paginating the flat list would only have
+# deferred the same failure.
 on:
   workflow_call:
     inputs:
@@ -25,6 +36,13 @@ on:
         description: "Default label required on self-hosted runners"
         type: string
         default: harn-ci
+        required: false
+      runner_groups:
+        description: >-
+          Comma-separated runner group names holding this org's own self-hosted
+          capacity. Must exclude vendor-managed groups.
+        type: string
+        default: Default,burin-labs-mac-mbp
         required: false
       linux_runner_tag:
         description: "Linux-specific self-hosted runner label"
@@ -98,6 +116,7 @@ jobs:
           LINUX_TAG: ${{ inputs.linux_runner_tag }}
           MACOS_TAG: ${{ inputs.macos_runner_tag }}
           WINDOWS_TAG: ${{ inputs.windows_runner_tag }}
+          RUNNER_GROUPS: ${{ inputs.runner_groups }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -111,17 +130,68 @@ jobs:
           fi
 
           gh_api_stderr="$(mktemp)"
-          runner_list="$(gh api "/orgs/${OWNER}/actions/runners?per_page=100" 2>"$gh_api_stderr" || true)"
-          if [ -z "$runner_list" ] || ! echo "$runner_list" | jq -e '.runners' > /dev/null 2>&1; then
-            err_excerpt="$(head -c 300 "$gh_api_stderr" | tr '\n' ' ')"
-            body_excerpt="$(echo "$runner_list" | head -c 300 | tr '\n' ' ')"
-            echo "::warning::runner-availability: could not list /orgs/${OWNER}/actions/runners; falling back to GitHub-hosted. gh stderr: ${err_excerpt} | response body: ${body_excerpt}"
+
+          # Every fall-through below is a FALSE report of "no self-hosted
+          # capacity" that silently routes the caller onto paid GitHub-hosted
+          # runners. It must always be loud: a probe that cannot see the fleet
+          # is not the same as a fleet that is busy, and the previous version
+          # of this detector conflated the two for six days.
+          fall_through() {
+            echo "::warning::runner-availability: $1; falling back to GitHub-hosted runners"
             {
               echo "linux=false"
               echo "windows=false"
               echo "macos=false"
             } >> "$GITHUB_OUTPUT"
             exit 0
+          }
+
+          group_list="$(gh api --paginate --slurp \
+            "/orgs/${OWNER}/actions/runner-groups?per_page=100" \
+            2>"$gh_api_stderr" || true)"
+          if [ -z "$group_list" ] || ! echo "$group_list" | jq -e '.[0].runner_groups' > /dev/null 2>&1; then
+            err_excerpt="$(head -c 300 "$gh_api_stderr" | tr '\n' ' ')"
+            body_excerpt="$(echo "$group_list" | head -c 300 | tr '\n' ' ')"
+            fall_through "could not list /orgs/${OWNER}/actions/runner-groups. gh stderr: ${err_excerpt} | response body: ${body_excerpt}"
+          fi
+
+          # Resolve the declared group names to ids. An unresolved name means
+          # the group was renamed or deleted, which silently shrinks the
+          # observable fleet, so treat it as a hard detection failure rather
+          # than quietly probing fewer groups.
+          resolved="$(echo "$group_list" | jq -c --arg names "$RUNNER_GROUPS" '
+            ([$names | split(",") | .[] | gsub("^\\s+|\\s+$"; "")] | map(select(. != ""))) as $want
+            | ([.[].runner_groups[]] | map({key: .name, value: .id}) | from_entries) as $have
+            | {
+                found: [$want[] | select($have[.] != null) | {name: ., id: $have[.]}],
+                missing: [$want[] | select($have[.] == null)],
+              }')"
+          missing="$(echo "$resolved" | jq -r '.missing | join(", ")')"
+          if [ -n "$missing" ]; then
+            known="$(echo "$group_list" | jq -r '[.[].runner_groups[].name] | join(", ")')"
+            fall_through "runner group(s) not found: ${missing}. Known groups: ${known}. Update the caller's runner_groups input"
+          fi
+
+          # Query each declared group instead of the flat org runner list. The
+          # flat list is dominated by vendor ephemerals (see header comment).
+          runners="[]"
+          for group_id in $(echo "$resolved" | jq -r '.found[].id'); do
+            group_runners="$(gh api --paginate --slurp \
+              "/orgs/${OWNER}/actions/runner-groups/${group_id}/runners?per_page=100" \
+              2>"$gh_api_stderr" || true)"
+            if [ -z "$group_runners" ] || ! echo "$group_runners" | jq -e '.[0].runners' > /dev/null 2>&1; then
+              err_excerpt="$(head -c 300 "$gh_api_stderr" | tr '\n' ' ')"
+              fall_through "could not list runners in group ${group_id}. gh stderr: ${err_excerpt}"
+            fi
+            runners="$(jq -c -n --argjson acc "$runners" --argjson next "$group_runners" \
+              '$acc + [$next[].runners[]]')"
+          done
+
+          runner_list="$(jq -c -n --argjson r "$runners" '{runners: $r}')"
+          observed="$(echo "$runner_list" | jq -r '.runners | length')"
+          echo "::notice::runner-availability: observed ${observed} runner(s) across group(s) ${RUNNER_GROUPS}"
+          if [ "$observed" -eq 0 ]; then
+            fall_through "declared groups (${RUNNER_GROUPS}) contain no runners at all, which indicates a misconfigured runner_groups input rather than a busy fleet"
           fi
 
           for os_label in Linux Windows macOS; do
