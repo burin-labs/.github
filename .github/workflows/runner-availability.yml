@@ -49,6 +49,13 @@ on:
         type: string
         default: harn-ci-stable
         required: false
+      linux_big_runner_tag:
+        description: >-
+          Label carried only by Linux runners sized (cores/disk) for
+          multi-gigabyte build+test lanes
+        type: string
+        default: harn-ci-big
+        required: false
       macos_runner_tag:
         description: "macOS-specific self-hosted runner label"
         type: string
@@ -71,6 +78,9 @@ on:
       linux:
         description: "true when an idle matching self-hosted Linux runner exists"
         value: ${{ jobs.detect.outputs.linux }}
+      linux_big:
+        description: "true when an idle big-lane self-hosted Linux runner exists"
+        value: ${{ jobs.detect.outputs.linux_big }}
       windows:
         description: "true when an idle matching self-hosted Windows runner exists"
         value: ${{ jobs.detect.outputs.windows }}
@@ -92,6 +102,7 @@ jobs:
       HAS_RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
     outputs:
       linux: ${{ steps.detect.outputs.linux }}
+      linux_big: ${{ steps.detect.outputs.linux_big }}
       windows: ${{ steps.detect.outputs.windows }}
       macos: ${{ steps.detect.outputs.macos }}
     steps:
@@ -114,6 +125,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           DEFAULT_TAG: ${{ inputs.runner_tag }}
           LINUX_TAG: ${{ inputs.linux_runner_tag }}
+          LINUX_BIG_TAG: ${{ inputs.linux_big_runner_tag }}
           MACOS_TAG: ${{ inputs.macos_runner_tag }}
           WINDOWS_TAG: ${{ inputs.windows_runner_tag }}
           RUNNER_GROUPS: ${{ inputs.runner_groups }}
@@ -123,6 +135,7 @@ jobs:
             echo "::notice::runner-availability: no GH_TOKEN; using GitHub-hosted runners"
             {
               echo "linux=false"
+              echo "linux_big=false"
               echo "windows=false"
               echo "macos=false"
             } >> "$GITHUB_OUTPUT"
@@ -140,6 +153,7 @@ jobs:
             echo "::warning::runner-availability: $1; falling back to GitHub-hosted runners"
             {
               echo "linux=false"
+              echo "linux_big=false"
               echo "windows=false"
               echo "macos=false"
             } >> "$GITHUB_OUTPUT"
@@ -211,3 +225,16 @@ jobs:
             echo "${key}=${available}" >> "$GITHUB_OUTPUT"
             echo "::notice::runner-availability ${key}=${available} (${count} idle ${os_label} ${tag} runner(s))"
           done
+
+          # Big-lane Linux capacity is a strict subset of the pool: only
+          # runners a human explicitly labeled for multi-gigabyte build+test
+          # workspaces (cores + disk headroom) count, and the same
+          # idle-and-online rule applies so callers overflow to hosted runners
+          # instead of queueing.
+          big_count="$(echo "$runner_list" | jq -r --arg tag "$LINUX_BIG_TAG" '[.runners[] | select(.status == "online" and (.busy | not)) | select(any(.labels[].name; . == $tag)) | select(any(.labels[].name; . == "Linux"))] | length')"
+          if [ "$big_count" -gt 0 ]; then
+            echo "linux_big=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "linux_big=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::notice::runner-availability linux_big=$([ "$big_count" -gt 0 ] && echo true || echo false) (${big_count} idle Linux ${LINUX_BIG_TAG} runner(s))"
