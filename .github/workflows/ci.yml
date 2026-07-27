@@ -12,4 +12,6 @@ jobs:
     name: CI status
     runs-on: ubuntu-latest
     steps:
-      - run: echo "OK"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Test package workflow policy
+        run: ruby .github/actions/harn-repo-policy/check-workflow_test.rb

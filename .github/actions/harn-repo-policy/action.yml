@@ -52,6 +52,16 @@ runs:
           exit 1
         fi
 
+        workflow=".github/workflows/ci.yml"
+        if [[ ! -f "$workflow" ]]; then
+          echo "::error file=${workflow}::Harn packages must expose the canonical CI workflow"
+          exit 1
+        fi
+        if ! ruby "$GITHUB_ACTION_PATH/check-workflow.rb" "$workflow"; then
+          echo "::error file=${workflow}::package CI must use the immutable organization workflow, merge queue trigger, and CI status roll-up"
+          exit 1
+        fi
+
         if grep -Eq '^[[:space:]]*\[\[providers\]\][[:space:]]*$' "$manifest"; then
           if ! grep -Eq 'docs/src/connectors/authoring\.md|docs\.harnlang\.com/connectors/authoring\.html' AGENTS.md; then
             echo "::error file=AGENTS.md::connector guidance must link to Harn's canonical authoring guide"
