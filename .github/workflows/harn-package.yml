@@ -23,11 +23,6 @@ on:
         required: false
         default: false
         type: boolean
-      test-jobs:
-        description: Parallel Harn test workers. Zero preserves Harn's automatic sizing.
-        required: false
-        default: 0
-        type: number
       runs-on:
         description: Runner label for package verification.
         required: false
@@ -66,13 +61,12 @@ jobs:
           package-path: ${{ inputs.package-path }}
 
       - name: Verify package
-        uses: burin-labs/.github/.github/actions/harn-package@1fe04c721f9469926aa447fb4ed7c56c14215f2a
+        uses: burin-labs/.github/.github/actions/harn-package@63b91c1e6a5c841e50e79ef084a53760f8cc2165
         with:
           harn-version: ${{ inputs.harn-version }}
           harn-version-file: ${{ inputs.harn-version-file }}
           package-path: ${{ inputs.package-path }}
           run-poll-tick: ${{ inputs.run-poll-tick }}
-          test-jobs: ${{ inputs.test-jobs }}
 
       - name: Upload verification receipts
         if: ${{ always() }}
