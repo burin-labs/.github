@@ -1,0 +1,69 @@
+name: Harn package
+
+on:
+  workflow_call:
+    inputs:
+      harn-version:
+        description: Harn version with or without a leading v.
+        required: false
+        default: ""
+        type: string
+      harn-version-file:
+        description: Repository-relative file containing the exact Harn version.
+        required: false
+        default: .harn-version
+        type: string
+      package-path:
+        description: Repository-relative package directory, manifest, or package-owned file.
+        required: false
+        default: .
+        type: string
+      run-poll-tick:
+        description: Exercise the first connector poll tick when bindings declare one.
+        required: false
+        default: false
+        type: boolean
+      runs-on:
+        description: Runner label for package verification.
+        required: false
+        default: ubuntu-latest
+        type: string
+      timeout-minutes:
+        description: Maximum verification duration.
+        required: false
+        default: 20
+        type: number
+      artifact-name:
+        description: Name of the uploaded verification receipt artifact.
+        required: false
+        default: harn-package-receipts
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Harn package
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - name: Check out package
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Verify package
+        uses: burin-labs/.github/.github/actions/harn-package@63b91c1e6a5c841e50e79ef084a53760f8cc2165
+        with:
+          harn-version: ${{ inputs.harn-version }}
+          harn-version-file: ${{ inputs.harn-version-file }}
+          package-path: ${{ inputs.package-path }}
+          run-poll-tick: ${{ inputs.run-poll-tick }}
+
+      - name: Upload verification receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: .harn/receipts
+          if-no-files-found: error
+          retention-days: 14
