@@ -1,0 +1,86 @@
+name: Verify Harn package
+description: Install an exact Harn release and run its canonical package contract.
+
+inputs:
+  harn-version:
+    description: Harn version with or without a leading v. Defaults to harn-version-file.
+    required: false
+    default: ""
+  harn-version-file:
+    description: Repository-relative file containing the exact Harn version.
+    required: false
+    default: .harn-version
+  package-path:
+    description: Repository-relative package directory, manifest, or package-owned file.
+    required: false
+    default: .
+  run-poll-tick:
+    description: Exercise the first connector poll tick when connector bindings declare one.
+    required: false
+    default: "false"
+  receipt-dir:
+    description: Repository-relative directory for bootstrap and package receipts.
+    required: false
+    default: .harn/receipts
+
+outputs:
+  harn-version:
+    description: Resolved Harn release without a leading v.
+    value: ${{ steps.setup.outputs.version }}
+  package-receipt:
+    description: Repository-relative path to the package verification receipt.
+    value: ${{ steps.paths.outputs.package-receipt }}
+  bootstrap-receipt:
+    description: Repository-relative path to the Harn bootstrap receipt.
+    value: ${{ steps.paths.outputs.bootstrap-receipt }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up exact Harn release
+      id: setup
+      uses: burin-labs/harn/.github/actions/setup-harn@e2089cd9628995bf2080cd1515086a891dff34f4
+      with:
+        version: ${{ inputs.harn-version }}
+        version-file: ${{ inputs.harn-version-file }}
+
+    - name: Resolve receipt paths
+      id: paths
+      shell: bash
+      env:
+        RECEIPT_DIR: ${{ inputs.receipt-dir }}
+      run: |
+        set -euo pipefail
+        {
+          echo "package-receipt=${RECEIPT_DIR}/package-verify.json"
+          echo "bootstrap-receipt=${RECEIPT_DIR}/bootstrap.json"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Persist bootstrap receipt
+      shell: bash
+      env:
+        BOOTSTRAP_RECEIPT: ${{ steps.setup.outputs.receipt }}
+        RECEIPT_DIR: ${{ inputs.receipt-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RECEIPT_DIR"
+        printf '%s\n' "$BOOTSTRAP_RECEIPT" > "$RECEIPT_DIR/bootstrap.json"
+
+    - name: Run canonical package contract
+      shell: bash
+      env:
+        PACKAGE_PATH: ${{ inputs.package-path }}
+        PACKAGE_RECEIPT: ${{ steps.paths.outputs.package-receipt }}
+        RUN_POLL_TICK: ${{ inputs.run-poll-tick }}
+      run: |
+        set -euo pipefail
+        args=(package verify "$PACKAGE_PATH" --json --receipt-out "$PACKAGE_RECEIPT")
+        case "$RUN_POLL_TICK" in
+          true) args+=(--run-poll-tick) ;;
+          false) ;;
+          *)
+            echo "::error::run-poll-tick must be 'true' or 'false'"
+            exit 2
+            ;;
+        esac
+        harn "${args[@]}"
