@@ -51,6 +51,11 @@ jobs:
       - name: Check out package
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
+      - name: Check repository projections
+        uses: burin-labs/.github/.github/actions/harn-repo-policy@4faf56d88945e0a52db98c78170c49b68959320b
+        with:
+          package-path: ${{ inputs.package-path }}
+
       - name: Verify package
         uses: burin-labs/.github/.github/actions/harn-package@63b91c1e6a5c841e50e79ef084a53760f8cc2165
         with:
