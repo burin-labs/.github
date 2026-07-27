@@ -16,7 +16,8 @@ runs:
         PACKAGE_PATH: ${{ inputs.package-path }}
       run: |
         set -euo pipefail
-        cd "$PACKAGE_PATH"
+        cd "$GITHUB_WORKSPACE"
+        manifest="$PACKAGE_PATH/harn.toml"
 
         if [[ ! -f AGENTS.md ]]; then
           echo "::error file=AGENTS.md::Harn package repositories must project the fleet agent contract"
@@ -38,7 +39,7 @@ runs:
           exit 1
         fi
 
-        if grep -Eq '^[[:space:]]*\[\[providers\]\][[:space:]]*$' harn.toml; then
+        if grep -Eq '^[[:space:]]*\[\[providers\]\][[:space:]]*$' "$manifest"; then
           if ! grep -Eq 'docs/src/connectors/authoring\.md|docs\.harnlang\.com/connectors/authoring\.html' AGENTS.md; then
             echo "::error file=AGENTS.md::connector guidance must link to Harn's canonical authoring guide"
             exit 1

@@ -34,3 +34,11 @@ The package workflow also applies `.github/actions/harn-repo-policy`. That
 action checks organization projections—the managed agent contract, its
 `CLAUDE.md` symlink, and connector-local guidance boundaries—while Harn owns
 package semantics.
+
+## Organization defaults
+
+- `.github/pull_request_template.md` is inherited by repositories that do not
+  carry a local override.
+- `templates/dependabot.yml` is the authoritative projection for repositories
+  using GitHub Actions. Dependabot does not inherit organization community
+  files, so the fleet tool mechanically checks and updates this file downstream.
