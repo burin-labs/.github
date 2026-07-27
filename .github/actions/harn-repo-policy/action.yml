@@ -1,0 +1,55 @@
+name: Check Harn repository policy
+description: Enforce organization-owned repository projections before package verification.
+
+inputs:
+  package-path:
+    description: Repository-relative Harn package directory.
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Check managed agent contract
+      shell: bash
+      env:
+        PACKAGE_PATH: ${{ inputs.package-path }}
+      run: |
+        set -euo pipefail
+        cd "$PACKAGE_PATH"
+
+        if [[ ! -f AGENTS.md ]]; then
+          echo "::error file=AGENTS.md::Harn package repositories must project the fleet agent contract"
+          exit 1
+        fi
+
+        begin='<!-- BEGIN HARN SHARED AGENT CONTRACT: managed by harn-bump-fleet -->'
+        end='<!-- END HARN SHARED AGENT CONTRACT -->'
+        for marker in "$begin" "$end"; do
+          count="$(grep -Fxc "$marker" AGENTS.md || true)"
+          if [[ "$count" != 1 ]]; then
+            echo "::error file=AGENTS.md::expected exactly one managed agent-contract marker: $marker"
+            exit 1
+          fi
+        done
+
+        if [[ ! -L CLAUDE.md || "$(readlink CLAUDE.md)" != AGENTS.md ]]; then
+          echo "::error file=CLAUDE.md::CLAUDE.md must be a symlink to AGENTS.md"
+          exit 1
+        fi
+
+        if grep -Eq '^[[:space:]]*\[\[providers\]\][[:space:]]*$' harn.toml; then
+          if ! grep -Eq 'docs/src/connectors/authoring\.md|docs\.harnlang\.com/connectors/authoring\.html' AGENTS.md; then
+            echo "::error file=AGENTS.md::connector guidance must link to Harn's canonical authoring guide"
+            exit 1
+          fi
+          if ! grep -Eiq '^## Provider notes$' AGENTS.md; then
+            echo "::error file=AGENTS.md::connector-local guidance belongs under '## Provider notes'"
+            exit 1
+          fi
+          copied_guidance='(^## (Quick repo conventions|How to test|Reference Rust impl|Upstream conventions|Harn module connectors|Connector package gate|Rust connectors|Testing|Development)$|File extension:|Entry point:|Tests live under|Run targeted checks|Run checks|cargo install harn-cli|harn --version|harn install|harn (check|lint|fmt|connector (check|test))|for test in tests/\*\.harn)'
+          if grep -Eiq "$copied_guidance" AGENTS.md; then
+            echo "::error file=AGENTS.md::connector repository is copying Harn-owned authoring guidance"
+            exit 1
+          fi
+        fi
