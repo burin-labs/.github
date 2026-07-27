@@ -39,6 +39,19 @@ runs:
           exit 1
         fi
 
+        dependabot=".github/dependabot.yml"
+        canonical_dependabot="${GITHUB_ACTION_PATH}/../../../templates/dependabot.yml"
+        canonical_bytes="$(wc -c < "$canonical_dependabot" | tr -d '[:space:]')"
+        if [[ ! -f "$dependabot" ]]; then
+          echo "::error file=${dependabot}::Harn package repositories must project templates/dependabot.yml"
+          exit 1
+        fi
+        if ! cmp -s -n "$canonical_bytes" "$canonical_dependabot" "$dependabot"; then
+          echo "::error file=${dependabot}::the GitHub Actions Dependabot block must be the byte-for-byte templates/dependabot.yml prefix"
+          diff -u "$canonical_dependabot" <(head -c "$canonical_bytes" "$dependabot") || true
+          exit 1
+        fi
+
         if grep -Eq '^[[:space:]]*\[\[providers\]\][[:space:]]*$' "$manifest"; then
           if ! grep -Eq 'docs/src/connectors/authoring\.md|docs\.harnlang\.com/connectors/authoring\.html' AGENTS.md; then
             echo "::error file=AGENTS.md::connector guidance must link to Harn's canonical authoring guide"
