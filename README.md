@@ -41,4 +41,6 @@ package semantics.
   carry a local override.
 - `templates/dependabot.yml` is the authoritative projection for repositories
   using GitHub Actions. Dependabot does not inherit organization community
-  files, so the fleet tool mechanically checks and updates this file downstream.
+  files, so Harn package repositories project it byte-for-byte at the start of
+  `.github/dependabot.yml`; repository-specific ecosystem entries may follow.
+  The reusable package workflow enforces the projection.
