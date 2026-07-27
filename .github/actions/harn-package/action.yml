@@ -18,6 +18,10 @@ inputs:
     description: Exercise the first connector poll tick when connector bindings declare one.
     required: false
     default: "false"
+  test-jobs:
+    description: Parallel Harn test workers. Zero preserves Harn's automatic sizing.
+    required: false
+    default: "0"
   receipt-dir:
     description: Repository-relative directory for bootstrap and package receipts.
     required: false
@@ -39,7 +43,7 @@ runs:
   steps:
     - name: Set up exact Harn release
       id: setup
-      uses: burin-labs/harn/.github/actions/setup-harn@e2089cd9628995bf2080cd1515086a891dff34f4
+      uses: burin-labs/harn/.github/actions/setup-harn@e7898bd182a38422f9e012c63c8cd4c61d254932
       with:
         version: ${{ inputs.harn-version }}
         version-file: ${{ inputs.harn-version-file }}
@@ -72,6 +76,7 @@ runs:
         PACKAGE_PATH: ${{ inputs.package-path }}
         PACKAGE_RECEIPT: ${{ steps.paths.outputs.package-receipt }}
         RUN_POLL_TICK: ${{ inputs.run-poll-tick }}
+        TEST_JOBS: ${{ inputs.test-jobs }}
       run: |
         set -euo pipefail
         args=(package verify "$PACKAGE_PATH" --json --receipt-out "$PACKAGE_RECEIPT")
@@ -83,4 +88,11 @@ runs:
             exit 2
             ;;
         esac
+        if [[ "$TEST_JOBS" != "0" ]]; then
+          if [[ ! "$TEST_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::test-jobs must be zero or a positive integer"
+            exit 2
+          fi
+          export HARN_TEST_JOBS="$TEST_JOBS"
+        fi
         harn "${args[@]}"
