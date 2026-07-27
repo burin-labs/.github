@@ -30,10 +30,12 @@ instead use the composite action after checkout:
 The action is a GitHub adapter only. Package policy and receipt semantics
 belong to `harn package verify`.
 
-The package workflow also applies `.github/actions/harn-repo-policy`. That
-action checks organization projections—the managed agent contract, its
-`CLAUDE.md` symlink, and connector-local guidance boundaries—while Harn owns
-package semantics.
+For callers owned by `burin-labs`, the package workflow also applies
+`.github/actions/harn-repo-policy`. That action checks organization
+projections—the managed agent contract, its `CLAUDE.md` symlink, and
+connector-local guidance boundaries—while Harn owns package semantics. Public
+callers receive the same package verification and receipts without inheriting
+Burin Labs repository governance.
 
 ## Organization defaults
 
