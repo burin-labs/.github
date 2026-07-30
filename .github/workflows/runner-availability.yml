@@ -263,13 +263,38 @@ jobs:
           # the group was renamed or deleted, which silently shrinks the
           # observable fleet, so treat it as a hard detection failure rather
           # than quietly probing fewer groups.
+          #
+          # A name can resolve to MORE than one id. Runner group names are not
+          # unique across scopes: burin-labs has two groups named "Default" -
+          # the org-level one holding all 9 Linux runners, and an empty
+          # enterprise-level one. The previous `from_entries` collapsed the
+          # duplicate and kept the LAST, which was the empty group, so the
+          # detector observed 4 runners instead of 13 and reported
+          # `linux=false` on every single run. Both callers' Linux lanes had
+          # silently routed to GitHub-hosted runners ever since, and nothing
+          # failed, because falling through to hosted is exactly what a busy
+          # fleet is supposed to look like. That is the failure mode the loud
+          # `fall_through` reporting was added to prevent, arriving through a
+          # path it did not cover.
+          #
+          # So take the union of every matching id rather than picking one. If
+          # two groups share a name, the honest reading of "probe the group
+          # called X" is to probe all of them.
           resolved="$(echo "$group_list" | jq -c --arg names "$RUNNER_GROUPS" '
             ([$names | split(",") | .[] | gsub("^\\s+|\\s+$"; "")] | map(select(. != ""))) as $want
-            | ([.[].runner_groups[]] | map({key: .name, value: .id}) | from_entries) as $have
+            | ([.[].runner_groups[]] | map({name, id})) as $have
             | {
-                found: [$want[] | select($have[.] != null) | {name: ., id: $have[.]}],
-                missing: [$want[] | select($have[.] == null)],
+                found: [$want[] as $n | $have[] | select(.name == $n) | {name, id}],
+                missing: [$want[] | select([$have[] | .name] | index(.) == null)],
+                ambiguous: [$want[] as $n
+                  | {name: $n, ids: [$have[] | select(.name == $n) | .id]}
+                  | select(.ids | length > 1)],
               }')"
+          # Surface the collapse rather than silently papering over it: a
+          # duplicate name is a real misconfiguration even though the union
+          # keeps detection correct.
+          echo "$resolved" | jq -r '.ambiguous[]
+            | "::warning::runner-availability: runner group name \(.name) resolves to \(.ids | length) groups (ids \(.ids | join(", "))); probing all of them. Rename them to be unique."'
           missing="$(echo "$resolved" | jq -r '.missing | join(", ")')"
           if [ -n "$missing" ]; then
             known="$(echo "$group_list" | jq -r '[.[].runner_groups[].name] | join(", ")')"
@@ -287,8 +312,11 @@ jobs:
               err_excerpt="$(head -c 300 "$gh_api_stderr" | tr '\n' ' ')"
               fall_through "could not list runners in group ${group_id}. gh stderr: ${err_excerpt}"
             fi
+            # Deduplicate by runner id: one runner can be visible through more
+            # than one probed group, and now that a name may resolve to several
+            # groups it would otherwise be counted twice.
             runners="$(jq -c -n --argjson acc "$runners" --argjson next "$group_runners" \
-              '$acc + [$next[].runners[]]')"
+              '($acc + [$next[].runners[]]) | unique_by(.id)')"
           done
 
           runner_list="$(jq -c -n --argjson r "$runners" '{runners: $r}')"
