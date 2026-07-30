@@ -17,3 +17,4 @@ jobs:
         run: |
           ruby .github/actions/harn-repo-policy/check-workflow_test.rb
           ruby .github/workflows/harn-package_test.rb
+          ruby .github/workflows/runner-availability_test.rb

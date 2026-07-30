@@ -113,6 +113,32 @@ on:
           on any busy day, which is the "busy fleet" / "deliberately off"
           conflation the loud fall-through reporting exists to prevent.
         value: ${{ jobs.detect.outputs.selfhosted_disabled }}
+      capacity:
+        description: >-
+          JSON object of the measured fleet, keyed by lane (linux, linux_big,
+          macos, windows), each `{online, idle, measured}`. Consume with
+          `fromJSON(...).linux.idle`.
+
+          The per-lane booleans above answer one question - "can a job land
+          right now" - by collapsing three distinct states into false: no pool
+          exists, the pool is busy, and the pool was never measured. A caller
+          whose policy needs to tell those apart cannot recover them from a
+          boolean, which is why harn-cloud forked this detector wholesale to
+          get at the counts. Two policies that need them:
+
+            * Reserve capacity. "Route Rust to self-hosted only when at least
+              two runners are idle, so the Docker job still has one" is
+              `fromJSON(...).linux.idle > 1`.
+            * Queue deliberately. "This lane prefers self-hosted and is willing
+              to wait behind in-flight work" is `.linux.online > 0`, which
+              stays true on a busy fleet where `linux` is already false.
+
+          `measured` is false whenever the counts are not an observation of the
+          fleet: the lane is retired by `CI_SELFHOSTED_DISABLED`, or the probe
+          could not see the fleet at all. Counts are 0 in both cases, so a
+          caller that treats 0 as "busy" would repeat the conflation this
+          detector exists to prevent. Gate on `measured` before reading counts.
+        value: ${{ jobs.detect.outputs.capacity }}
 
 permissions:
   contents: read
@@ -132,6 +158,7 @@ jobs:
       windows: ${{ steps.detect.outputs.windows }}
       macos: ${{ steps.detect.outputs.macos }}
       selfhosted_disabled: ${{ steps.detect.outputs.selfhosted_disabled }}
+      capacity: ${{ steps.detect.outputs.capacity }}
     steps:
       - name: Mint GitHub App token
         id: app-token
@@ -190,6 +217,25 @@ jobs:
 
           is_disabled() { case " $disabled " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
+          # Every early exit publishes the same thing: no lane is available and
+          # nothing was measured. Funnel them through one function rather than
+          # repeating the key list. GITHUB_OUTPUT is append-only and read once
+          # at step end, so an exit path that forgets a key does not fail - the
+          # key silently arrives at the caller as the empty string, and
+          # `fromJSON('')` then fails inside the caller's `runs-on`, where the
+          # error is far from its cause.
+          report_unmeasured() {
+            {
+              echo "linux=false"
+              echo "linux_big=false"
+              echo "windows=false"
+              echo "macos=false"
+              echo "capacity=$(jq -c -n '["linux", "linux_big", "macos", "windows"]
+                | map({key: ., value: {online: 0, idle: 0, measured: false}})
+                | from_entries')"
+            } >> "$GITHUB_OUTPUT"
+          }
+
           # Publish the switch state before any exit path below. GITHUB_OUTPUT is
           # append-only and read once at step end, so writing it here covers all
           # four returns (the fast path, the missing-token path, every
@@ -212,23 +258,13 @@ jobs:
           # answer cannot change the outcome.
           if is_disabled linux && is_disabled linux_big \
             && is_disabled macos && is_disabled windows; then
-            {
-              echo "linux=false"
-              echo "linux_big=false"
-              echo "windows=false"
-              echo "macos=false"
-            } >> "$GITHUB_OUTPUT"
+            report_unmeasured
             exit 0
           fi
 
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::notice::runner-availability: no GH_TOKEN; using GitHub-hosted runners"
-            {
-              echo "linux=false"
-              echo "linux_big=false"
-              echo "windows=false"
-              echo "macos=false"
-            } >> "$GITHUB_OUTPUT"
+            report_unmeasured
             exit 0
           fi
 
@@ -241,12 +277,7 @@ jobs:
           # of this detector conflated the two for six days.
           fall_through() {
             echo "::warning::runner-availability: $1; falling back to GitHub-hosted runners"
-            {
-              echo "linux=false"
-              echo "linux_big=false"
-              echo "windows=false"
-              echo "macos=false"
-            } >> "$GITHUB_OUTPUT"
+            report_unmeasured
             exit 0
           }
 
@@ -326,6 +357,30 @@ jobs:
             fall_through "declared groups (${RUNNER_GROUPS}) contain no runners at all, which indicates a misconfigured runner_groups input rather than a busy fleet"
           fi
 
+          # One query for both counts. `online` alone means the pool exists and
+          # is reachable; `idle` additionally requires the runner be free. The
+          # gap between them is in-flight work, and keeping the two separate is
+          # the whole point of the `capacity` output: collapsing them is what
+          # makes "no pool" and "busy pool" indistinguishable to a caller.
+          count_matching() {
+            # $1 OS label, $2 required tag, $3 "idle" to also require not busy
+            echo "$runner_list" | jq -r --arg os "$1" --arg tag "$2" --arg mode "$3" '
+              [ .runners[]
+                | select(.status == "online")
+                | select($mode != "idle" or (.busy | not))
+                | select(any(.labels[].name; . == $tag))
+                | select(any(.labels[].name; . == $os))
+              ] | length'
+          }
+
+          capacity='{}'
+          record_capacity() {
+            # $1 lane, $2 online, $3 idle, $4 measured
+            capacity="$(jq -c -n --argjson acc "$capacity" --arg lane "$1" \
+              --argjson online "$2" --argjson idle "$3" --argjson measured "$4" \
+              '$acc + {($lane): {online: $online, idle: $idle, measured: $measured}}')"
+          }
+
           for os_label in Linux Windows macOS; do
             tag="$DEFAULT_TAG"
             case "$os_label" in
@@ -337,16 +392,19 @@ jobs:
             if is_disabled "$key"; then
               echo "${key}=false" >> "$GITHUB_OUTPUT"
               echo "::notice::runner-availability ${key}=false (pinned to GitHub-hosted by CI_SELFHOSTED_DISABLED; capacity not measured)"
+              record_capacity "$key" 0 0 false
               continue
             fi
-            count="$(echo "$runner_list" | jq -r --arg os "$os_label" --arg tag "$tag" '[.runners[] | select(.status == "online" and (.busy | not)) | select(any(.labels[].name; . == $tag)) | select(any(.labels[].name; . == $os))] | length')"
+            count="$(count_matching "$os_label" "$tag" idle)"
+            online="$(count_matching "$os_label" "$tag" any)"
             if [ "$count" -gt 0 ]; then
               available=true
             else
               available=false
             fi
             echo "${key}=${available}" >> "$GITHUB_OUTPUT"
-            echo "::notice::runner-availability ${key}=${available} (${count} idle ${os_label} ${tag} runner(s))"
+            record_capacity "$key" "$online" "$count" true
+            echo "::notice::runner-availability ${key}=${available} (${count} idle of ${online} online ${os_label} ${tag} runner(s))"
           done
 
           # Big-lane Linux capacity is a strict subset of the pool: only
@@ -354,15 +412,25 @@ jobs:
           # workspaces (cores + disk headroom) count, and the same
           # idle-and-online rule applies so callers overflow to hosted runners
           # instead of queueing.
+          #
+          # This branch deliberately does not `exit 0`: the capacity object is
+          # published once at the end of the step, and an early exit here would
+          # drop it on exactly the kill-switch path.
           if is_disabled linux_big; then
             echo "linux_big=false" >> "$GITHUB_OUTPUT"
             echo "::notice::runner-availability linux_big=false (pinned to GitHub-hosted by CI_SELFHOSTED_DISABLED; capacity not measured)"
-            exit 0
-          fi
-          big_count="$(echo "$runner_list" | jq -r --arg tag "$LINUX_BIG_TAG" '[.runners[] | select(.status == "online" and (.busy | not)) | select(any(.labels[].name; . == $tag)) | select(any(.labels[].name; . == "Linux"))] | length')"
-          if [ "$big_count" -gt 0 ]; then
-            echo "linux_big=true" >> "$GITHUB_OUTPUT"
+            record_capacity linux_big 0 0 false
           else
-            echo "linux_big=false" >> "$GITHUB_OUTPUT"
+            big_count="$(count_matching Linux "$LINUX_BIG_TAG" idle)"
+            big_online="$(count_matching Linux "$LINUX_BIG_TAG" any)"
+            if [ "$big_count" -gt 0 ]; then
+              echo "linux_big=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "linux_big=false" >> "$GITHUB_OUTPUT"
+            fi
+            record_capacity linux_big "$big_online" "$big_count" true
+            echo "::notice::runner-availability linux_big=$([ "$big_count" -gt 0 ] && echo true || echo false) (${big_count} idle of ${big_online} online Linux ${LINUX_BIG_TAG} runner(s))"
           fi
-          echo "::notice::runner-availability linux_big=$([ "$big_count" -gt 0 ] && echo true || echo false) (${big_count} idle Linux ${LINUX_BIG_TAG} runner(s))"
+
+          echo "capacity=${capacity}" >> "$GITHUB_OUTPUT"
+          echo "::notice::runner-availability capacity=${capacity}"
