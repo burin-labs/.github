@@ -122,10 +122,21 @@ cmd_status() {
     | "    \(.name)\(" " * ([1, 18 - (.name | length)] | max))\(.status) \(if .busy then "busy" else "idle" end)  \([.labels[].name] | join(" "))"'
 
   echo
-  echo "Note: jobs that hardcode self-hosted labels with no availability gate"
-  echo "      ignore the switch entirely. Known: burin-code eval-golden-selftest,"
-  echo "      harn-cloud docker + terraform (the latter deliberately, so CI"
-  echo "      survives a hosted-minutes outage)."
+  # Keep this note honest about which job is deliberate. It previously said "the
+  # latter", attributing the deliberate choice to `terraform`, and listed
+  # burin-code's eval-golden-selftest as ungated after burin-code#5579 had
+  # already gated it on `selfhosted_disabled`. A note that misdescribes current
+  # behaviour is not cosmetic: reading one is what let a stale detector pin and a
+  # fail-closed detector fork both survive unnoticed.
+  echo "Note: a job that hardcodes self-hosted labels with no gate ignores this"
+  echo "      switch entirely - it queues instead of falling back, up to the 24h"
+  echo "      ceiling. On harn-cloud main: \`docker\` (deliberate - it needs the"
+  echo "      pool's shared Docker daemon, so it must outlive a hosted-minutes"
+  echo "      outage) and \`terraform\` (incidental - fmt/tflint/validate need"
+  echo "      nothing self-hosted). Tracked in burin-labs/harn-cloud#1397."
+  echo "      A job that is self-hosted by nature should gate on the detector's"
+  echo "      \`selfhosted_disabled\` output, never on its per-OS availability"
+  echo "      outputs, which also go false when the fleet is merely busy."
 }
 
 cmd_hosted_only() {

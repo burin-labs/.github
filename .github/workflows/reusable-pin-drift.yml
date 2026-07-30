@@ -1,0 +1,80 @@
+name: Reusable workflow pin drift
+
+# Consumers of this repository's reusable workflows pin them to a full SHA. Every
+# guard in the org checks that the pin IS a full SHA; nothing checked that the SHA
+# is still current. `harn` sat pinned at 3893a4d8 while runner-availability.yml
+# gained the kill-switch output and the duplicate-group union fix, so its Linux
+# lanes reported `false` on every run with `make lint-actions-source` green the
+# whole time. See burin-labs/harn#5803.
+#
+# This repository is the only place the check can live: it owns the reusable
+# workflows, so it is the only one that knows what "current" means.
+
+on:
+  schedule:
+    # Daily. Drift is introduced by merges here, so a push-triggered run would
+    # report the drift it just created before any consumer could reasonably have
+    # bumped. A daily cadence reports pins that have had a chance to catch up.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  # Changes to the checker itself are verified by `CI status` (which runs the
+  # offline truth table); this workflow is not PR-triggered because it needs an
+  # org-wide token that pull_request runs from forks cannot have.
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed. An unkeyed group in this org evicted queued runs and left PRs blocked;
+  # a drift report is also cheap enough that overlapping runs need not cancel.
+  group: reusable-pin-drift-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: Report drifted pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # No `repositories:` - the census must cover every repo in the org,
+          # including ones added after this workflow was written. Scoping to a
+          # list is what makes a new consumer invisible.
+          #
+          # `contents: read` reads each repo's workflow files; `issues: write`
+          # files and closes the single drift report in this repo.
+          permission-contents: read
+          permission-issues: write
+
+      - name: Report drifted pins
+        env:
+          # A drift check that cannot see the org must fail loudly rather than
+          # report "no drift". Silence and success are indistinguishable to a
+          # reader, and this job exists because a green gate hid a real defect.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::reusable-pin-drift: no app token; cannot enumerate consumers. Refusing to report 'no drift' from a blind run."
+            exit 1
+          fi
+          scripts/reusable-pin-drift.sh sync-issue
+
+      - name: Report drifted pins (summary)
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Duplicated into the run summary so the numbers are visible without
+          # opening the issue, and so a run that filed nothing still shows what
+          # it looked at - a census of 0 workflows would otherwise read as "clean".
+          scripts/reusable-pin-drift.sh report >> "$GITHUB_STEP_SUMMARY"
