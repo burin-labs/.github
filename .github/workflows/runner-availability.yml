@@ -102,6 +102,17 @@ on:
       macos:
         description: "true when an idle matching self-hosted macOS runner exists"
         value: ${{ jobs.detect.outputs.macos }}
+      selfhosted_disabled:
+        description: >-
+          Comma list of lanes `CI_SELFHOSTED_DISABLED` has retired, empty when
+          self-hosted routing is on offer. Deliberately distinct from the
+          per-OS outputs above, which also go false when the fleet is merely
+          busy. A job that is self-hosted-only by nature and *wants* to queue
+          behind busy runners must gate on this, not on `linux`/`macos`:
+          gating such a job on availability would silently drop its coverage
+          on any busy day, which is the "busy fleet" / "deliberately off"
+          conflation the loud fall-through reporting exists to prevent.
+        value: ${{ jobs.detect.outputs.selfhosted_disabled }}
 
 permissions:
   contents: read
@@ -120,6 +131,7 @@ jobs:
       linux_big: ${{ steps.detect.outputs.linux_big }}
       windows: ${{ steps.detect.outputs.windows }}
       macos: ${{ steps.detect.outputs.macos }}
+      selfhosted_disabled: ${{ steps.detect.outputs.selfhosted_disabled }}
     steps:
       - name: Mint GitHub App token
         id: app-token
@@ -177,6 +189,14 @@ jobs:
           esac
 
           is_disabled() { case " $disabled " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+          # Publish the switch state before any exit path below. GITHUB_OUTPUT is
+          # append-only and read once at step end, so writing it here covers all
+          # four returns (the fast path, the missing-token path, every
+          # `fall_through`, and the normal end) without repeating the line at
+          # each one, where a later-added path could forget it.
+          echo "selfhosted_disabled=$(printf '%s' "$disabled" | tr ' ' '\n' \
+            | sed '/^$/d' | sort -u | paste -sd, -)" >> "$GITHUB_OUTPUT"
 
           # Always announce the switch, including when it is off. An operator
           # reading a run log must be able to tell "the fleet was busy" from
