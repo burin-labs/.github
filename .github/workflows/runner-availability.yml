@@ -19,6 +19,21 @@ name: runner-availability (reusable)
 # as unavailable, so callers route to hosted runners instead of queueing behind
 # active local work.
 #
+# Self-hosted routing can also be retired wholesale by the organization variable
+# `CI_SELFHOSTED_DISABLED`, which this detector is the single owner of. Because
+# every caller already gates `runs-on` on these outputs, one flip of that
+# variable moves every repo's every lane to GitHub-hosted runners with no
+# per-repo variable, no workflow edit, and no runner-label surgery. Reach for it
+# when the hosted allowance would otherwise expire unused (it is a monthly
+# use-it-or-lose-it grant, and public repositories get hosted minutes free), or
+# when the self-hosted boxes are needed for local eval work.
+#
+# Label surgery is the wrong tool for the same job: it is invisible from the
+# workflow source, it silently strands the minority of jobs that hardcode
+# self-hosted labels without an availability gate, and on some runners here the
+# `self-hosted`/`Linux`/`X64` labels are registered as *custom* rather than
+# read-only, so a label rewrite can make a runner unaddressable entirely.
+#
 # Detection is scoped to the runner GROUPS named by `runner_groups`, never the
 # flat `/orgs/{org}/actions/runners` list. Managed-runner vendors (Blacksmith,
 # Namespace, ...) register one ephemeral runner per job into their own groups
@@ -129,8 +144,63 @@ jobs:
           MACOS_TAG: ${{ inputs.macos_runner_tag }}
           WINDOWS_TAG: ${{ inputs.windows_runner_tag }}
           RUNNER_GROUPS: ${{ inputs.runner_groups }}
+          SELFHOSTED_DISABLED: ${{ vars.CI_SELFHOSTED_DISABLED }}
         run: |
           set -euo pipefail
+
+          # Resolve the kill switch before probing anything. Accepted values:
+          #
+          #   unset | "" | none | false   self-hosted routing offered (default)
+          #   all | true                  every OS reports unavailable
+          #   comma list                  any of linux, linux_big, macos, windows
+          #
+          # `linux` implies `linux_big`. The big lane is a strict subset of the
+          # Linux pool, so disabling Linux while still advertising linux_big
+          # would report capacity on a pool callers were just told not to use.
+          disabled=""
+          case "$(printf '%s' "${SELFHOSTED_DISABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+            "" | none | false) : ;;
+            all | true) disabled="linux linux_big macos windows" ;;
+            *)
+              for token in $(printf '%s' "$SELFHOSTED_DISABLED" | tr ',' ' ' | tr '[:upper:]' '[:lower:]'); do
+                case "$token" in
+                  all | true) disabled="$disabled linux linux_big macos windows" ;;
+                  none | false) : ;;
+                  linux) disabled="$disabled linux linux_big" ;;
+                  linux_big) disabled="$disabled linux_big" ;;
+                  macos) disabled="$disabled macos" ;;
+                  windows) disabled="$disabled windows" ;;
+                  *) echo "::warning::runner-availability: ignoring unknown CI_SELFHOSTED_DISABLED token '$token'" ;;
+                esac
+              done
+              ;;
+          esac
+
+          is_disabled() { case " $disabled " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+          # Always announce the switch, including when it is off. An operator
+          # reading a run log must be able to tell "the fleet was busy" from
+          # "routing was deliberately pinned to hosted" without guessing.
+          if [ -n "$disabled" ]; then
+            echo "::notice::runner-availability: CI_SELFHOSTED_DISABLED='${SELFHOSTED_DISABLED}' pins to GitHub-hosted for:${disabled}"
+          else
+            echo "::notice::runner-availability: CI_SELFHOSTED_DISABLED is off; probing self-hosted capacity"
+          fi
+
+          # Fast path: with every OS disabled there is nothing to measure, so
+          # skip the org API calls entirely rather than probing a fleet whose
+          # answer cannot change the outcome.
+          if is_disabled linux && is_disabled linux_big \
+            && is_disabled macos && is_disabled windows; then
+            {
+              echo "linux=false"
+              echo "linux_big=false"
+              echo "windows=false"
+              echo "macos=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::notice::runner-availability: no GH_TOKEN; using GitHub-hosted runners"
             {
@@ -215,13 +285,18 @@ jobs:
               Windows) tag="$WINDOWS_TAG" ;;
               macOS) tag="$MACOS_TAG" ;;
             esac
+            key="$(echo "$os_label" | tr '[:upper:]' '[:lower:]')"
+            if is_disabled "$key"; then
+              echo "${key}=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::runner-availability ${key}=false (pinned to GitHub-hosted by CI_SELFHOSTED_DISABLED; capacity not measured)"
+              continue
+            fi
             count="$(echo "$runner_list" | jq -r --arg os "$os_label" --arg tag "$tag" '[.runners[] | select(.status == "online" and (.busy | not)) | select(any(.labels[].name; . == $tag)) | select(any(.labels[].name; . == $os))] | length')"
             if [ "$count" -gt 0 ]; then
               available=true
             else
               available=false
             fi
-            key="$(echo "$os_label" | tr '[:upper:]' '[:lower:]')"
             echo "${key}=${available}" >> "$GITHUB_OUTPUT"
             echo "::notice::runner-availability ${key}=${available} (${count} idle ${os_label} ${tag} runner(s))"
           done
@@ -231,6 +306,11 @@ jobs:
           # workspaces (cores + disk headroom) count, and the same
           # idle-and-online rule applies so callers overflow to hosted runners
           # instead of queueing.
+          if is_disabled linux_big; then
+            echo "linux_big=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::runner-availability linux_big=false (pinned to GitHub-hosted by CI_SELFHOSTED_DISABLED; capacity not measured)"
+            exit 0
+          fi
           big_count="$(echo "$runner_list" | jq -r --arg tag "$LINUX_BIG_TAG" '[.runners[] | select(.status == "online" and (.busy | not)) | select(any(.labels[].name; . == $tag)) | select(any(.labels[].name; . == "Linux"))] | length')"
           if [ "$big_count" -gt 0 ]; then
             echo "linux_big=true" >> "$GITHUB_OUTPUT"
