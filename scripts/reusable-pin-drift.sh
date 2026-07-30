@@ -381,13 +381,18 @@ fi
 # Render
 # ---------------------------------------------------------------------------
 
+# Every `printf` whose FORMAT begins with `-` needs the `--` terminator: bash's
+# printf builtin parses a leading `-` as an option and fails with
+# `printf: - : invalid option`. Markdown bullet lines hit this constantly, and
+# the failure is worse than it looks - see `require_report_fields` below for how
+# it shipped a truncated report while reporting success.
 render_markdown() {
   printf '%s\n\n' "$ISSUE_MARKER"
   printf 'Consumers of this repository'"'"'s reusable workflows whose pinned commit no longer\n'
   printf 'matches what `%s` publishes.\n\n' "$TARGET_REF"
-  printf '- Target: `%s` = `%s`\n' "$TARGET_REF" "$TARGET_SHA"
-  printf '- Workflow files scanned: %s across %s non-archived repositories\n' "$scanned_workflows" "$repo_count"
-  printf '- Actionable: **%s**\n\n' "$actionable_count"
+  printf -- '- Target: `%s` = `%s`\n' "$TARGET_REF" "$TARGET_SHA"
+  printf -- '- Workflow files scanned: %s across %s non-archived repositories\n' "$scanned_workflows" "$repo_count"
+  printf -- '- Actionable: **%s**\n\n' "$actionable_count"
 
   if [ "$actionable_count" -gt 0 ]; then
     printf '## Actionable\n\n'
@@ -451,7 +456,30 @@ existing="$(gh issue list --repo "${ORG}/${POLICY_REPO}" --state open \
   --limit 100 --json number,title,body \
   --jq "[.[] | select(.body | contains(\"${ISSUE_MARKER}\")) | .number] | first // empty")"
 
+# The rendered body IS the product, so verify it before publishing rather than
+# trusting the renderer's exit status. `body="$(render_markdown)"` did not
+# propagate a failing `printf` under `set -e` (errexit is not reliably inherited
+# into a command substitution used in an assignment), so on 2026-07-30 three
+# failed `printf` calls silently dropped the target SHA, the census size and the
+# actionable count, and the issue was filed and reported as a success. The
+# `report` subcommand caught the same failure only because it redirects, where
+# the exit status does propagate. This check is deliberately independent of exit
+# codes: a body that lost its headline numbers must never be published again, no
+# matter which mechanism drops them.
+require_report_fields() {
+  local rendered="$1" missing=""
+  local field
+  for field in '- Target:' '- Workflow files scanned:' '- Actionable:'; do
+    case "$rendered" in
+      *"$field"*) : ;;
+      *) missing="${missing}${missing:+, }${field}" ;;
+    esac
+  done
+  [ -z "$missing" ] || die "rendered report is missing required field(s): ${missing}"
+}
+
 body="$(render_markdown)"
+require_report_fields "$body"
 
 if [ "$actionable_count" -gt 0 ]; then
   if [ -n "$existing" ]; then
