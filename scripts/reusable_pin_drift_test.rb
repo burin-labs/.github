@@ -187,4 +187,50 @@ unless runs.include?("sync-issue")
   abort "#{workflow}: scheduled run must use `sync-issue`, not just `report`"
 end
 
+# ---------------------------------------------------------------------------
+# Render safety
+# ---------------------------------------------------------------------------
+#
+# The classifier is pure and fully covered above, but the RENDERER produces the
+# artifact a human reads, and nothing here executed it before 2026-07-30. A
+# printf whose format began with `-` then failed three times, dropping the
+# target SHA, the census size and the actionable count from a report that was
+# filed and reported as a success. These are structural guards on the two things
+# that allowed that.
+
+script_lines = File.readlines(script).each_with_index.map { |line, index| [index + 1, line.rstrip] }
+code_lines = script_lines.reject { |_, line| line.strip.start_with?("#") }
+
+# bash's printf builtin parses a leading `-` in the FORMAT as an option and dies
+# with `printf: - : invalid option`. Markdown bullet lines hit this constantly.
+bad_printf = code_lines.select { |_, line| line.match?(/printf\s+['"]-(?!-)/) }
+unless bad_printf.empty?
+  detail = bad_printf.map { |number, line| "#{number}: #{line.strip}" }.join("\n  ")
+  abort "#{script}: printf format starting with `-` needs the `--` terminator:\n  #{detail}"
+end
+
+# Independent of exit codes on purpose: `body="$(render_markdown)"` did NOT
+# propagate the failing printf under `set -e`, because errexit is not reliably
+# inherited into a command substitution used in an assignment. Only a check on
+# the body itself can stop a truncated report from being published.
+REQUIRED_REPORT_FIELDS = ["- Target:", "- Workflow files scanned:", "- Actionable:"].freeze
+
+unless code_lines.any? { |_, line| line.include?("require_report_fields") && line.include?("body") }
+  abort "#{script}: the rendered body must be checked by require_report_fields before it is published"
+end
+
+REQUIRED_REPORT_FIELDS.each do |field|
+  next if code_lines.any? { |_, line| line.include?("'#{field}'") }
+
+  abort "#{script}: require_report_fields must assert the `#{field}` field is present"
+end
+
+# Each required field must also actually be emitted by the renderer, or the
+# check above would fail every run instead of catching a regression.
+REQUIRED_REPORT_FIELDS.each do |field|
+  next if code_lines.any? { |_, line| line.include?("printf -- '#{field}") }
+
+  abort "#{script}: render_markdown must emit `#{field}` via `printf --`"
+end
+
 puts "reusable-pin-drift policy: ok"
