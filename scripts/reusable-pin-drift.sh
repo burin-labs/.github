@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# reusable-pin-drift.sh - report consumers of this repo's reusable workflows
-# whose pinned SHA no longer matches what `main` publishes.
+# reusable-pin-drift.sh - report stale reusable workflow pins and callers that
+# read outputs their exact pin does not declare.
 #
 #   reusable-pin-drift.sh report              human-readable table
 #   reusable-pin-drift.sh report --json       machine-readable rows
@@ -50,10 +50,12 @@ set -euo pipefail
 ORG="${PIN_DRIFT_ORG:-burin-labs}"
 POLICY_REPO="${PIN_DRIFT_POLICY_REPO:-.github}"
 TARGET_REF="${PIN_DRIFT_TARGET_REF:-main}"
-ISSUE_TITLE="${PIN_DRIFT_ISSUE_TITLE:-Reusable workflow pins have drifted from main}"
+ISSUE_TITLE="${PIN_DRIFT_ISSUE_TITLE:-Reusable workflow pin or output contract drift detected}"
 # Stable machine marker so the issue is re-findable without depending on a label
 # existing, on the title surviving an edit, or on search indexing being current.
 ISSUE_MARKER="<!-- reusable-pin-drift:report -->"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+CONTRACT_HELPER="${SCRIPT_DIR}/reusable_pin_contract.rb"
 
 OUTPUT_JSON=false
 WRITE_ISSUE=false
@@ -70,9 +72,15 @@ usage() {
 while [ $# -gt 0 ]; do
   case "$1" in
     report | sync-issue) COMMAND="$1" ;;
-    # Takes five positional arguments, so stop parsing and leave them in place.
+    # Pure test seams take positional arguments, so stop parsing and leave them
+    # in place.
     classify)
       COMMAND="classify"
+      shift
+      break
+      ;;
+    classify-outputs)
+      COMMAND="classify-outputs"
       shift
       break
       ;;
@@ -170,10 +178,45 @@ classify_reference() {
   esac
 }
 
-# Actionable drift is content drift plus the two hard defects. `behind-equivalent`
-# and `unpinned-ref` are deliberately excluded: acting on them would train the
-# reader to ignore this report, and on this org they are the majority of rows.
-ACTIONABLE='["behind-stale", "not-on-main", "broken"]'
+# Overlay the caller/callee output contract on the pin-freshness verdict.
+# classify_output_contract <base-verdict> <base-detail> <job> <workflow> <ref>
+#                          <required-json> <pinned-json> <target-json>
+classify_output_contract() {
+  local base_verdict="$1" base_detail="$2" job="$3" workflow="$4" ref="$5"
+  local required="$6" pinned="$7" target="$8"
+  local missing_pinned missing_target missing_text
+
+  VERDICT="$base_verdict"
+  DETAIL="$base_detail"
+  MISSING_OUTPUTS="[]"
+  missing_pinned="$(jq -cn --argjson required "$required" --argjson declared "$pinned" \
+    '$required - $declared | unique | sort')"
+  missing_target="$(jq -cn --argjson required "$required" --argjson declared "$target" \
+    '$required - $declared | unique | sort')"
+
+  if [ "$(jq 'length' <<< "$missing_pinned")" -gt 0 ]; then
+    VERDICT="missing-output"
+    MISSING_OUTPUTS="$missing_pinned"
+    missing_text="$(jq -r 'join(", ")' <<< "$missing_pinned")"
+    DETAIL="needs.${job}.outputs reads undeclared output(s) ${missing_text} at ${ref:0:12}"
+    if [ "$(jq 'length' <<< "$missing_target")" -eq 0 ]; then
+      DETAIL="${DETAIL}; target ${TARGET_SHA:0:12} declares them"
+    else
+      DETAIL="${DETAIL}; target ${TARGET_SHA:0:12} also omits them"
+    fi
+  elif [ "$(jq 'length' <<< "$missing_target")" -gt 0 ]; then
+    VERDICT="target-missing-output"
+    MISSING_OUTPUTS="$missing_target"
+    missing_text="$(jq -r 'join(", ")' <<< "$missing_target")"
+    DETAIL="target ${TARGET_SHA:0:12} removes output(s) ${missing_text} read through needs.${job}.outputs"
+  fi
+}
+
+# Actionable drift includes content drift, hard ref defects, and caller/callee
+# output-contract violations. `behind-equivalent` and `unpinned-ref` are
+# deliberately excluded: acting on them would train the reader to ignore this
+# report, and on this org they are the majority of rows.
+ACTIONABLE='["behind-stale", "not-on-main", "broken", "missing-output", "target-missing-output"]'
 
 # Answered before any network call, so the truth table is testable offline.
 if [ "$COMMAND" = "classify" ]; then
@@ -182,8 +225,20 @@ if [ "$COMMAND" = "classify" ]; then
   exit 0
 fi
 
+if [ "$COMMAND" = "classify-outputs" ]; then
+  command -v jq > /dev/null 2>&1 || die "jq is required"
+  TARGET_SHA="${8:-}"
+  classify_output_contract \
+    "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" \
+    "${6:-[]}" "${7:-[]}" "${9:-[]}"
+  printf '%s\t%s\t%s\n' "$VERDICT" "$MISSING_OUTPUTS" "$DETAIL"
+  exit 0
+fi
+
 command -v gh > /dev/null 2>&1 || die "gh is required"
 command -v jq > /dev/null 2>&1 || die "jq is required"
+command -v ruby > /dev/null 2>&1 || die "ruby is required"
+[ -f "$CONTRACT_HELPER" ] || die "missing structural contract helper: $CONTRACT_HELPER"
 
 # ---------------------------------------------------------------------------
 # Resolve what "current" means
@@ -216,8 +271,6 @@ note "target: ${ORG}/${POLICY_REPO}@${TARGET_REF} = ${TARGET_SHA}"
 # workflow blobs directly. It is more API calls than a code search and it is
 # exhaustive, which is the correct trade for a claim of completeness.
 
-REF_PATTERN="${ORG}/${POLICY_REPO}/(\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml)@([^[:space:]'\"]+)"
-
 repos_json="$(gh api --paginate "/orgs/${ORG}/repos?per_page=100&type=all" \
   --jq '.[] | select(.archived == false) | {name, default_branch}' | jq -s '.')" ||
   die "could not list ${ORG} repositories"
@@ -248,26 +301,17 @@ while IFS=$'\t' read -r repo default_branch; do
       --jq '.content' 2> /dev/null | base64 -d 2> /dev/null || true)"
     [ -n "$body" ] || continue
 
-    # Only real `uses:` lines count. A comment describing runner selection reads
-    # identically to the reference it describes, so the line must actually be a
-    # `uses:` mapping. Anchoring on `uses:` after optional `- ` and whitespace
-    # is what separates the two.
-    while IFS= read -r hit; do
-      [ -n "$hit" ] || continue
-      line_no="${hit%%:*}"
-      line_text="${hit#*:}"
-      [[ "$line_text" =~ ^[[:space:]]*-?[[:space:]]*uses:[[:space:]] ]] || continue
-      [[ "$line_text" =~ $REF_PATTERN ]] || continue
-
-      rows="$(jq -c \
-        --arg repo "$repo" \
-        --arg path "$wf_path" \
-        --arg line "$line_no" \
-        --arg workflow "${BASH_REMATCH[1]}" \
-        --arg ref "${BASH_REMATCH[2]}" \
-        '. + [{repo: $repo, path: $path, line: ($line | tonumber), workflow: $workflow, ref: $ref}]' \
-        <<< "$rows")"
-    done <<< "$(grep -nE "$REF_PATTERN" <<< "$body" || true)"
+    # Parse the workflow as YAML so comments and arbitrary prose cannot become
+    # false call sites. The same structural pass associates every reusable job
+    # with the exact `needs.<job>.outputs.<name>` values its caller reads.
+    references="$(ruby "$CONTRACT_HELPER" references "$ORG" "$POLICY_REPO" <<< "$body")" ||
+      die "could not parse ${repo}:${wf_path}"
+    rows="$(jq -c \
+      --arg repo "$repo" \
+      --arg path "$wf_path" \
+      --argjson references "$references" \
+      '. + ($references | map(. + {repo: $repo, path: $path}))' \
+      <<< "$rows")"
   done <<< "$workflow_paths"
 done <<< "$(jq -r '.[] | [.name, .default_branch] | @tsv' <<< "$repos_json")"
 
@@ -332,8 +376,26 @@ cached_blob() {
 "
 }
 
+cached_declared_outputs() {
+  local ref="$1" path="$2" encoded=""
+  if memo_lookup "outputs:${ref}:${path}"; then
+    [ "$MEMO_RESULT" = "$ABSENT" ] && MEMO_RESULT=""
+    return 0
+  fi
+  encoded="$(gh api "repos/${ORG}/${POLICY_REPO}/contents/${path}?ref=${ref}" \
+    --jq '.content' 2> /dev/null || true)"
+  if [ -z "$encoded" ]; then
+    MEMO_RESULT=""
+    MEMO="${MEMO}outputs:${ref}:${path}"$'\t'"${ABSENT}"$'\n'
+    return 0
+  fi
+  MEMO_RESULT="$(printf '%s' "$encoded" | base64 -d | ruby "$CONTRACT_HELPER" declared-outputs | jq -c .)" ||
+    die "could not decode workflow outputs for ${path}@${ref}"
+  MEMO="${MEMO}outputs:${ref}:${path}"$'\t'"${MEMO_RESULT}"$'\n'
+}
+
 classified="[]"
-while IFS=$'\t' read -r repo path line workflow ref; do
+while IFS=$'\t' read -r repo path line job workflow ref required_outputs; do
   [ -n "$repo" ] || continue
 
   relation="n/a"
@@ -354,16 +416,34 @@ while IFS=$'\t' read -r repo path line workflow ref; do
   verdict="$VERDICT"
   content="$CONTENT"
   detail="$DETAIL"
+  missing_outputs="[]"
+
+  if is_full_sha "$ref" && [ "$(jq 'length' <<< "$required_outputs")" -gt 0 ]; then
+    cached_declared_outputs "$ref" "$workflow"
+    pinned_outputs="$MEMO_RESULT"
+    cached_declared_outputs "$TARGET_SHA" "$workflow"
+    target_outputs="$MEMO_RESULT"
+    if [ -n "$pinned_outputs" ] && [ -n "$target_outputs" ]; then
+      classify_output_contract \
+        "$verdict" "$detail" "$job" "$workflow" "$ref" \
+        "$required_outputs" "$pinned_outputs" "$target_outputs"
+      verdict="$VERDICT"
+      detail="$DETAIL"
+      missing_outputs="$MISSING_OUTPUTS"
+    fi
+  fi
 
   classified="$(jq -c \
     --arg repo "$repo" --arg path "$path" --arg line "$line" \
-    --arg workflow "$workflow" --arg ref "$ref" \
+    --arg job "$job" --arg workflow "$workflow" --arg ref "$ref" \
+    --argjson required_outputs "$required_outputs" --argjson missing_outputs "$missing_outputs" \
     --arg verdict "$verdict" --arg relation "$relation" \
     --arg content "$content" --arg detail "$detail" \
-    '. + [{repo: $repo, path: $path, line: ($line | tonumber), workflow: $workflow,
+    '. + [{repo: $repo, path: $path, line: ($line | tonumber), job: $job, workflow: $workflow,
            ref: $ref, verdict: $verdict, relation: $relation, content: $content,
+           required_outputs: $required_outputs, missing_outputs: $missing_outputs,
            detail: $detail}]' <<< "$classified")"
-done <<< "$(jq -r '.[] | [.repo, .path, .line, .workflow, .ref] | @tsv' <<< "$rows")"
+done <<< "$(jq -r '.[] | [.repo, .path, .line, .job, .workflow, .ref, (.required_outputs | @json)] | @tsv' <<< "$rows")"
 
 actionable_count="$(jq --argjson a "$ACTIONABLE" '[.[] | select(.verdict as $v | $a | index($v))] | length' <<< "$classified")"
 
@@ -388,15 +468,17 @@ fi
 # it shipped a truncated report while reporting success.
 render_markdown() {
   printf '%s\n\n' "$ISSUE_MARKER"
-  printf 'Consumers of this repository'"'"'s reusable workflows whose pinned commit no longer\n'
-  printf 'matches what `%s` publishes.\n\n' "$TARGET_REF"
+  printf 'Consumers of this repository'"'"'s reusable workflows with stale code or an\n'
+  printf 'output read that the pinned or target workflow does not declare.\n\n'
   printf -- '- Target: `%s` = `%s`\n' "$TARGET_REF" "$TARGET_SHA"
   printf -- '- Workflow files scanned: %s across %s non-archived repositories\n' "$scanned_workflows" "$repo_count"
   printf -- '- Actionable: **%s**\n\n' "$actionable_count"
 
   if [ "$actionable_count" -gt 0 ]; then
     printf '## Actionable\n\n'
-    printf 'Bump these to `%s`. Enumerate a repo'"'"'s call sites with\n' "$TARGET_SHA"
+    printf 'For stale pins, update to `%s`. For output-contract rows, follow the\n' "$TARGET_SHA"
+    printf 'row detail: update only when the target declares the required output; repair\n'
+    printf 'the target workflow first when it does not. Enumerate a repo'"'"'s call sites with\n'
     printf '`git grep -n '"'"'%s/%s/.github/workflows'"'"' origin/main -- .github/`\n' "$ORG" "$POLICY_REPO"
     printf 'rather than the code-search API, which drops results per query.\n\n'
     printf '| Consumer | Workflow | Pinned | State | Why |\n'
@@ -409,7 +491,8 @@ render_markdown() {
     printf '\n'
   else
     printf '## No drift\n\n'
-    printf 'Every pinned consumer resolves to the same workflow content as `%s`.\n\n' "$TARGET_REF"
+    printf 'Every pinned consumer resolves to current or byte-equivalent workflow content,\n'
+    printf 'and every output read is declared at both the pin and `%s`.\n\n' "$TARGET_REF"
   fi
 
   local informational
@@ -429,8 +512,8 @@ render_markdown() {
   fi
 
   printf -- '---\n\n'
-  printf 'Filed by `scripts/reusable-pin-drift.sh`. A full-SHA pin guard checks pin\n'
-  printf 'SHAPE, not freshness, which is why this check exists separately.\n'
+  printf 'Filed by `scripts/reusable-pin-drift.sh`. Static consumer guards check pin\n'
+  printf 'shape; this network-owning audit checks content freshness and exact-SHA output contracts.\n'
 }
 
 if [ "$WRITE_ISSUE" = false ]; then

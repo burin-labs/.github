@@ -30,6 +30,11 @@ instead use the composite action after checkout:
 The action is a GitHub adapter only. Package policy and receipt semantics
 belong to `harn package verify`.
 
+The daily reusable-workflow audit compares each exact pin with current workflow
+content and structurally verifies that every `needs.<job>.outputs.<name>` read is
+declared by both the pinned and current workflow. This network-backed contract
+belongs here; consumer repositories keep only offline pin-shape checks.
+
 For callers owned by `burin-labs`, the package workflow also applies
 `.github/actions/harn-repo-policy`. That action checks organization
 projections—the managed agent contract, its `CLAUDE.md` symlink, and

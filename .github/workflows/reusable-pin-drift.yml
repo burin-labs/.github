@@ -1,4 +1,4 @@
-name: Reusable workflow pin drift
+name: Reusable workflow contract drift
 
 # Consumers of this repository's reusable workflows pin them to a full SHA. Every
 # guard in the org checks that the pin IS a full SHA; nothing checked that the SHA
@@ -6,9 +6,12 @@ name: Reusable workflow pin drift
 # gained the kill-switch output and the duplicate-group union fix, so its Linux
 # lanes reported `false` on every run with `make lint-actions-source` green the
 # whole time. See burin-labs/harn#5803.
+# A later caller read `capacity` from a SHA that did not declare that output;
+# GitHub substituted an empty string and kept the run green. See #27.
 #
 # This repository is the only place the check can live: it owns the reusable
-# workflows, so it is the only one that knows what "current" means.
+# workflows, so it is the only one that knows what "current" means and can
+# compare a caller's output reads with the contract at its exact pinned SHA.
 
 on:
   schedule:
@@ -32,7 +35,7 @@ concurrency:
 
 jobs:
   drift:
-    name: Report drifted pins
+    name: Report workflow contract drift
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -54,7 +57,7 @@ jobs:
           permission-contents: read
           permission-issues: write
 
-      - name: Report drifted pins
+      - name: Report workflow contract drift
         env:
           # A drift check that cannot see the org must fail loudly rather than
           # report "no drift". Silence and success are indistinguishable to a
@@ -68,7 +71,7 @@ jobs:
           fi
           scripts/reusable-pin-drift.sh sync-issue
 
-      - name: Report drifted pins (summary)
+      - name: Report workflow contract drift (summary)
         if: always()
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
