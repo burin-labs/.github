@@ -2,6 +2,7 @@
 
 require "open3"
 require "yaml"
+require_relative "reusable_pin_contract"
 
 script = File.join(__dir__, "reusable-pin-drift.sh")
 workflow = File.join(__dir__, "..", ".github", "workflows", "reusable-pin-drift.yml")
@@ -27,7 +28,7 @@ abort "#{script}: must be executable" unless File.executable?(script)
 # and never be acted on. That is the vacuity failure this whole check exists to
 # prevent, reproduced one level up. So the two sets must partition exactly.
 
-ACTIONABLE = %w[behind-stale not-on-main broken].freeze
+ACTIONABLE = %w[behind-stale not-on-main broken missing-output target-missing-output].freeze
 INFORMATIONAL = %w[current behind-equivalent unpinned-ref].freeze
 
 declared = source[/^ACTIONABLE='(\[.*?\])'/m, 1]
@@ -92,6 +93,74 @@ CASES.each do |ref, relation, pinned, target, want|
 
   abort "#{script}: classify(ref=#{ref.inspect}, relation=#{relation.inspect}, " \
         "pinned=#{pinned.inspect}, target=#{target.inspect}) = #{got.inspect}, want #{want.inspect}"
+end
+
+# ---------------------------------------------------------------------------
+# Caller/callee output contracts, exercised offline
+# ---------------------------------------------------------------------------
+
+caller = <<~YAML
+  on:
+    pull_request:
+  jobs:
+    detector:
+      uses: burin-labs/.github/.github/workflows/runner-availability.yml@#{FULL_SHA}
+    consumer:
+      needs: detector
+      if: needs.detector.outputs.capacity != ''
+      env:
+        LINUX: ${{ needs['detector'].outputs['linux'] }}
+        DUPLICATE: ${{ needs.detector.outputs.capacity }}
+    local:
+      runs-on: ubuntu-latest
+      steps:
+        # uses: burin-labs/.github/.github/workflows/not-a-call.yml@#{FULL_SHA}
+        - run: echo needs.unrelated.outputs.value
+YAML
+
+references = ReusablePinContract.references(caller, org: "burin-labs", policy_repo: ".github")
+unless references == [{
+  job: "detector",
+  workflow: ".github/workflows/runner-availability.yml",
+  ref: FULL_SHA,
+  line: 5,
+  required_outputs: %w[capacity linux]
+}]
+  abort "reusable output reference projection is wrong: #{references.inspect}"
+end
+
+callee = <<~YAML
+  on:
+    workflow_call:
+      outputs:
+        linux:
+          value: ${{ jobs.detect.outputs.linux }}
+        capacity:
+          value: ${{ jobs.detect.outputs.capacity }}
+YAML
+unless ReusablePinContract.declared_outputs(callee) == %w[capacity linux]
+  abort "reusable output declarations must come from on.workflow_call.outputs"
+end
+
+OUTPUT_CASES = [
+  # base verdict, required, pinned, target, expected output verdict
+  ["current", %w[capacity], [], %w[capacity], "missing-output"],
+  ["current", %w[linux], %w[linux], [], "target-missing-output"],
+  ["behind-stale", %w[linux], %w[linux], %w[linux], "behind-stale"]
+].freeze
+
+OUTPUT_CASES.each do |base, required, pinned, target, want|
+  out, err, status = Open3.capture3(
+    "bash", script, "classify-outputs", base, "base detail", "detector",
+    ".github/workflows/runner-availability.yml", FULL_SHA,
+    JSON.generate(required), JSON.generate(pinned), ("b" * 40), JSON.generate(target)
+  )
+  abort "#{script}: output classification failed: #{err}" unless status.success?
+
+  got = out.split("\t").first.to_s.strip
+  next if got == want
+
+  abort "#{script}: output classification #{required}/#{pinned}/#{target} = #{got}, want #{want}"
 end
 
 # "Is this a pin" has one owner. The fetching loop needs the same answer as the
@@ -175,7 +244,7 @@ abort "#{workflow}: must be scheduled" unless triggers.is_a?(Hash) && triggers.k
 abort "#{workflow}: must be manually dispatchable" unless triggers.key?("workflow_dispatch")
 
 steps = document.fetch("jobs").values.flat_map { |job| job.fetch("steps") }
-runs = steps.filter_map { |step| step["run"] }.join("\n")
+runs = steps.map { |step| step["run"] }.compact.join("\n")
 unless runs.include?("reusable-pin-drift.sh")
   abort "#{workflow}: must invoke scripts/reusable-pin-drift.sh rather than reimplementing it"
 end
