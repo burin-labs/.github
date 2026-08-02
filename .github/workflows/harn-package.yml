@@ -64,24 +64,31 @@ jobs:
       - name: Check out package
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
+      - name: Require called-workflow identity
+        if: ${{ fromJSON(toJSON(job)).workflow_repository == '' || fromJSON(toJSON(job)).workflow_sha == '' }}
+        shell: bash
+        run: |
+          echo "::error::harn-package.yml requires GitHub.com job.workflow_repository and job.workflow_sha; GitHub Enterprise Server is not supported"
+          exit 2
+
       - name: Check out workflow implementation
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          # The JSON round-trip preserves GitHub.com's reusable-workflow
-          # identity fields while actionlint's typed job context catches up.
+          # actionlint v1.7.12 predates these GitHub.com fields; the JSON
+          # round-trip keeps this workflow lintable without changing runtime.
           repository: ${{ fromJSON(toJSON(job)).workflow_repository }}
           ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
-          path: .harn-policy
+          path: .harn/workflow-policy
           persist-credentials: false
 
       - name: Check repository projections
         if: ${{ github.repository_owner == 'burin-labs' }}
-        uses: ./.harn-policy/.github/actions/harn-repo-policy
+        uses: ./.harn/workflow-policy/.github/actions/harn-repo-policy
         with:
           package-path: ${{ inputs.package-path }}
 
       - name: Verify package
-        uses: ./.harn-policy/.github/actions/harn-package
+        uses: ./.harn/workflow-policy/.github/actions/harn-package
         with:
           harn-version: ${{ inputs.harn-version }}
           harn-version-file: ${{ inputs.harn-version-file }}

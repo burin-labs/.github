@@ -20,15 +20,26 @@ abort "missing workflow implementation checkout" unless implementation
 expected_checkout = {
   "repository" => "${{ fromJSON(toJSON(job)).workflow_repository }}",
   "ref" => "${{ fromJSON(toJSON(job)).workflow_sha }}",
-  "path" => ".harn-policy",
+  "path" => ".harn/workflow-policy",
   "persist-credentials" => false
 }
 unless implementation.fetch("with") == expected_checkout
   abort "workflow implementation must be the exact called-workflow revision"
 end
-expected_action = "./.harn-policy/.github/actions/harn-package"
+identity = steps.find { |step| step["name"] == "Require called-workflow identity" }
+abort "missing called-workflow identity guard" unless identity
+expected_identity_condition =
+  "${{ fromJSON(toJSON(job)).workflow_repository == '' || fromJSON(toJSON(job)).workflow_sha == '' }}"
+abort "workflow identity guard drifted" unless identity.fetch("if") == expected_identity_condition
+expected_identity_error = <<~BASH
+  echo "::error::harn-package.yml requires GitHub.com job.workflow_repository and job.workflow_sha; GitHub Enterprise Server is not supported"
+  exit 2
+BASH
+abort "workflow identity diagnostic drifted" unless identity.fetch("run") == expected_identity_error
+
+expected_action = "./.harn/workflow-policy/.github/actions/harn-package"
 abort "package verification must use the co-versioned local action" unless package.fetch("uses") == expected_action
-expected_policy = "./.harn-policy/.github/actions/harn-repo-policy"
+expected_policy = "./.harn/workflow-policy/.github/actions/harn-repo-policy"
 abort "repository policy must use the co-versioned local action" unless policy.fetch("uses") == expected_policy
 
 strict = document.fetch(true).fetch("workflow_call").fetch("inputs").fetch("strict")

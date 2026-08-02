@@ -34,8 +34,11 @@ instead use the composite action after checkout:
 The action is a GitHub adapter only. Package policy and receipt semantics
 belong to `harn package verify`.
 
-The reusable workflow checks out `job.workflow_repository` at
-`job.workflow_sha` and invokes the composite action from that checkout.
+On GitHub.com, the reusable workflow checks out `job.workflow_repository` at
+`job.workflow_sha` under Harn's excluded `.harn/` directory and invokes the
+composite action from that checkout. GitHub Enterprise Server does not expose
+those called-workflow identity fields, so the workflow fails early with a
+specific unsupported-platform error there.
 The workflow and its adapter therefore share one immutable version; there is
 no second self-pin that can silently trail a newly forwarded input.
 
