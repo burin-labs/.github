@@ -34,6 +34,11 @@ instead use the composite action after checkout:
 The action is a GitHub adapter only. Package policy and receipt semantics
 belong to `harn package verify`.
 
+The reusable workflow checks out `job.workflow_repository` at
+`job.workflow_sha` and invokes the composite action from that checkout.
+The workflow and its adapter therefore share one immutable version; there is
+no second self-pin that can silently trail a newly forwarded input.
+
 `strict: true` delegates warning-fatal check/lint gates and strict boundary
 typing to Harn's canonical package contract. It remains opt-in so existing
 package callers keep their current admission policy.

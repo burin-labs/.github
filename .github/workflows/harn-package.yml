@@ -64,14 +64,24 @@ jobs:
       - name: Check out package
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
+      - name: Check out workflow implementation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          # The JSON round-trip preserves GitHub.com's reusable-workflow
+          # identity fields while actionlint's typed job context catches up.
+          repository: ${{ fromJSON(toJSON(job)).workflow_repository }}
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          path: .harn-policy
+          persist-credentials: false
+
       - name: Check repository projections
         if: ${{ github.repository_owner == 'burin-labs' }}
-        uses: burin-labs/.github/.github/actions/harn-repo-policy@a6fb4929c7ca9e66fd4772c76f8af4d4a6665e16
+        uses: ./.harn-policy/.github/actions/harn-repo-policy
         with:
           package-path: ${{ inputs.package-path }}
 
       - name: Verify package
-        uses: burin-labs/.github/.github/actions/harn-package@80e8ab151ef7faa9b8e2c8d00dd687a04c6c3e00
+        uses: ./.harn-policy/.github/actions/harn-package
         with:
           harn-version: ${{ inputs.harn-version }}
           harn-version-file: ${{ inputs.harn-version-file }}
