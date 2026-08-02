@@ -47,7 +47,7 @@ runs:
   steps:
     - name: Set up exact Harn release
       id: setup
-      uses: burin-labs/harn/.github/actions/setup-harn@e7898bd182a38422f9e012c63c8cd4c61d254932
+      uses: burin-labs/harn/.github/actions/setup-harn@cf52e20564cb722f2f060bc222fa79d996cd3c30 # v0.10.52
       with:
         version: ${{ inputs.harn-version }}
         version-file: ${{ inputs.harn-version-file }}
@@ -82,30 +82,4 @@ runs:
         RUN_POLL_TICK: ${{ inputs.run-poll-tick }}
         STRICT: ${{ inputs.strict }}
         TEST_JOBS: ${{ inputs.test-jobs }}
-      run: |
-        set -euo pipefail
-        args=(package verify "$PACKAGE_PATH" --json --receipt-out "$PACKAGE_RECEIPT")
-        case "$RUN_POLL_TICK" in
-          true) args+=(--run-poll-tick) ;;
-          false) ;;
-          *)
-            echo "::error::run-poll-tick must be 'true' or 'false'"
-            exit 2
-            ;;
-        esac
-        case "$STRICT" in
-          true) args+=(--strict) ;;
-          false) ;;
-          *)
-            echo "::error::strict must be 'true' or 'false'"
-            exit 2
-            ;;
-        esac
-        if [[ "$TEST_JOBS" != "0" ]]; then
-          if [[ ! "$TEST_JOBS" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::test-jobs must be zero or a positive integer"
-            exit 2
-          fi
-          export HARN_TEST_JOBS="$TEST_JOBS"
-        fi
-        harn "${args[@]}"
+      run: bash "$GITHUB_ACTION_PATH/run-contract.sh"

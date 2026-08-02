@@ -12,32 +12,65 @@ Burin Labs organization defaults and reusable GitHub Actions workflows.
   structured receipts.
 
 Package repositories should keep the exact release in `.harn-version`.
-Their complete CI adapter is one job:
+Their complete CI adapter delegates package verification and rolls every
+required job into one stable status check:
 
 ```yaml
 jobs:
   package:
     uses: burin-labs/.github/.github/workflows/harn-package.yml@<full-commit-sha>
-    with:
-      strict: true
+
+  status:
+    name: CI status
+    if: always()
+    needs: [package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: burin-labs/.github/.github/actions/require-successful-needs@<same-full-commit-sha>
+        with:
+          results-json: ${{ toJSON(needs.*.result) }}
 ```
+
+Product-specific verification jobs belong beside `package` and in the status
+job's `needs` list. The co-versioned status action validates every dependency
+result and fails on failure, cancellation, skipping, or malformed data. It
+receives no dependency outputs. This prevents a green roll-up from hiding a
+failed package job and replaces repository-local shell expressions with one
+tested contract.
 
 Repositories that must compose package verification into an existing job can
 instead use the composite action after checkout:
 
 ```yaml
 - uses: burin-labs/.github/.github/actions/harn-package@<full-commit-sha>
+  with:
+    strict: "true" # opt in to strict type and lint gates
 ```
 
 The action is a GitHub adapter only. Package policy and receipt semantics
 belong to `harn package verify`.
 
-`strict: true` delegates warning-fatal check/lint gates and strict boundary
-typing to Harn's canonical package contract. It remains opt-in so existing
-package callers keep their current admission policy.
+On GitHub.com, the reusable workflow checks out `job.workflow_repository` at
+`job.workflow_sha` under Harn's excluded `.harn/` directory and invokes the
+composite action from that checkout. GitHub Enterprise Server does not expose
+those called-workflow identity fields, so the workflow fails early with a
+specific unsupported-platform error there.
+The workflow and its adapter therefore share one immutable version; there is
+no second self-pin that can silently trail a newly forwarded input.
+
+The reusable workflow delegates warning-fatal check/lint gates and strict
+boundary typing to Harn's canonical package contract by default. Burin Labs
+package CI may not opt out. The lower-level composite action keeps strict mode
+explicit so callers outside the organization choose their own admission
+policy.
+
+Strict verification requires Harn v0.10.52 or later, where `harn package
+verify --strict` became part of the typed package contract. That release also
+moves package verification receipts from schema v1 to v2 and adds the
+`strict_requested` field on every receipt.
 
 The daily reusable-workflow audit compares each exact pin with current workflow
-content and structurally verifies that every `needs.<job>.outputs.<name>` read is
+content. It structurally verifies that every `needs.<job>.outputs.<name>` read is
 declared by both the pinned and current workflow. This network-backed contract
 belongs here; consumer repositories keep only offline pin-shape checks.
 

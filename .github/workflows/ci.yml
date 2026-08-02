@@ -8,14 +8,61 @@ on:
   workflow_dispatch:
 
 jobs:
+  package-smoke:
+    name: Reusable Harn package smoke (${{ matrix.strict && 'strict' || 'default' }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        strict: [false, true]
+    uses: ./.github/workflows/harn-package.yml
+    with:
+      harn-version: 0.10.52
+      package-path: .github/fixtures/harn-package
+      strict: ${{ matrix.strict }}
+      artifact-name: harn-package-smoke-${{ matrix.strict && 'strict' || 'default' }}-receipts
+
   ci-status:
     name: CI status
+    needs: [package-smoke]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Markdown lint
+        uses: DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe # v24.1.0
+        with:
+          globs: "**/*.md"
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          bin_dir="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin_dir}"
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl -fsSL \
+            -o "${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "${archive}" -C "${bin_dir}" actionlint
+          echo "${bin_dir}" >> "$GITHUB_PATH"
+      - name: GitHub Actions lint
+        run: actionlint
+      - name: Require reusable package smoke
+        env:
+          PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
+        run: test "$PACKAGE_SMOKE_RESULT" = success
       - name: Test package workflow policy
         run: |
           ruby .github/actions/harn-repo-policy/check-workflow_test.rb
+          ruby .github/actions/harn-package/run-contract_test.rb
+          ruby .github/actions/require-successful-needs/require-successful-needs_test.rb
+          ruby .github/workflows/ci_test.rb
           ruby .github/workflows/harn-package_test.rb
           ruby .github/workflows/runner-availability_test.rb
           ruby scripts/reusable_pin_drift_test.rb
@@ -24,5 +71,6 @@ jobs:
           # The drift checker is only ever executed by a scheduled run, so a
           # syntax error in it would otherwise surface a day later, in a job
           # nobody is watching, as the absence of a report.
+          bash -n .github/actions/harn-package/run-contract.sh
           bash -n scripts/ci-routing.sh
           bash -n scripts/reusable-pin-drift.sh
