@@ -18,6 +18,8 @@ Their complete CI adapter is one job:
 jobs:
   package:
     uses: burin-labs/.github/.github/workflows/harn-package.yml@<full-commit-sha>
+    with:
+      strict: true
 ```
 
 Repositories that must compose package verification into an existing job can
@@ -29,6 +31,10 @@ instead use the composite action after checkout:
 
 The action is a GitHub adapter only. Package policy and receipt semantics
 belong to `harn package verify`.
+
+`strict: true` delegates warning-fatal check/lint gates and strict boundary
+typing to Harn's canonical package contract. It remains opt-in so existing
+package callers keep their current admission policy.
 
 The daily reusable-workflow audit compares each exact pin with current workflow
 content and structurally verifies that every `needs.<job>.outputs.<name>` read is
