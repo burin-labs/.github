@@ -28,14 +28,27 @@ checkout = steps.find { |step| step["uses"]&.start_with?("actions/checkout@") }
 expected_checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 abort "CI must use the current immutable checkout action" unless checkout&.fetch("uses") == expected_checkout
 abort "CI checkout must not persist credentials" unless checkout.fetch("with") == {"persist-credentials" => false}
+
+workflow_paths = Dir.glob(File.join(__dir__, "*.yml")).sort
+checkout_uses = workflow_paths.flat_map do |workflow_path|
+  workflow = YAML.safe_load(File.read(workflow_path), aliases: true)
+  workflow.fetch("jobs", {}).values.flat_map do |job|
+    job.fetch("steps", []).map do |step|
+      step["uses"] if step["uses"]&.start_with?("actions/checkout@")
+    end.compact
+  end
+end
+abort "every workflow checkout must use the current immutable action" unless checkout_uses.all?(expected_checkout)
+
 markdown = steps.find { |step| step["name"] == "Markdown lint" }
 expected_markdown = "DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe"
 abort "CI must lint Markdown through an immutable action" unless markdown&.fetch("uses") == expected_markdown
+abort "CI must lint Markdown recursively" unless markdown.fetch("with") == {"globs" => "**/*.md"}
 install_actionlint = steps.find { |step| step["name"] == "Install actionlint" }
 abort "CI must install checksum-pinned actionlint" unless install_actionlint&.dig("env", "ACTIONLINT_VERSION") == "1.7.12"
 abort "CI must pin the actionlint archive checksum" unless install_actionlint.dig("env", "ACTIONLINT_SHA256") == "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
 actions_lint = steps.find { |step| step["name"] == "GitHub Actions lint" }
-abort "CI must execute actionlint" unless actions_lint&.fetch("run") == "actionlint-bin"
+abort "CI must execute actionlint" unless actions_lint&.fetch("run") == "actionlint"
 require_smoke = status.fetch("steps").find { |step| step["name"] == "Require reusable package smoke" }
 abort "CI status does not require the smoke result" unless require_smoke
 expected_result = "${{ needs.package-smoke.result }}"

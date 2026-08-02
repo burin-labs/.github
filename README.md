@@ -52,7 +52,7 @@ moves package verification receipts from schema v1 to v2 and adds the
 `strict_requested` field on every receipt.
 
 The daily reusable-workflow audit compares each exact pin with current workflow
-content and structurally verifies that every `needs.<job>.outputs.<name>` read is
+content. It structurally verifies that every `needs.<job>.outputs.<name>` read is
 declared by both the pinned and current workflow. This network-backed contract
 belongs here; consumer repositories keep only offline pin-shape checks.
 
