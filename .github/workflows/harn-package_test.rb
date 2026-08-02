@@ -6,6 +6,12 @@ path = File.join(__dir__, "harn-package.yml")
 document = YAML.safe_load(File.read(path), aliases: true)
 steps = document.fetch("jobs").fetch("verify").fetch("steps")
 
+package_checkout = steps.find { |step| step["name"] == "Check out package" }
+abort "missing package checkout" unless package_checkout
+unless package_checkout.fetch("with") == {"persist-credentials" => false}
+  abort "package checkout must not persist the caller credential"
+end
+
 policy = steps.find { |step| step["name"] == "Check repository projections" }
 abort "missing repository projection step" unless policy
 expected_scope =
@@ -49,7 +55,7 @@ abort "repository policy must use the co-versioned local action" unless policy.f
 
 strict = document.fetch(true).fetch("workflow_call").fetch("inputs").fetch("strict")
 abort "strict package policy must be a boolean input" unless strict["type"] == "boolean"
-abort "strict package policy must stay opt-in" unless strict["default"] == false
+abort "strict package policy must be the organization default" unless strict["default"] == true
 
 forwarded_strict = package.fetch("with").fetch("strict")
 expected_strict = "${{ inputs.strict }}"

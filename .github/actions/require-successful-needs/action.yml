@@ -1,0 +1,16 @@
+name: Require successful CI dependencies
+description: Fail a CI status roll-up unless every declared dependency succeeded.
+
+inputs:
+  results-json:
+    description: Every caller dependency result as a JSON array.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate dependency results
+      shell: bash
+      env:
+        NEEDS_RESULTS_JSON: ${{ inputs.results-json }}
+      run: ruby "$GITHUB_ACTION_PATH/require-successful-needs.rb"

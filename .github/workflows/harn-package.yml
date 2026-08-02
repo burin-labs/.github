@@ -26,7 +26,7 @@ on:
       strict:
         description: Make package check/lint warnings fatal and require strict boundary typing.
         required: false
-        default: false
+        default: true
         type: boolean
       test-jobs:
         description: Parallel Harn test workers. Zero preserves Harn's automatic sizing.
@@ -63,6 +63,8 @@ jobs:
     steps:
       - name: Check out package
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Require called-workflow identity
         if: ${{ fromJSON(toJSON(job)).workflow_repository == '' || fromJSON(toJSON(job)).workflow_sha == '' }}

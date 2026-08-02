@@ -13,5 +13,6 @@ Version: `0.1.0`
 Return a deterministic smoke value.
 
 ```harn
-pub fn smoke_value() -> string
+pub fn smoke_value() -> string {
+}
 ```
