@@ -23,6 +23,11 @@ on:
         required: false
         default: false
         type: boolean
+      strict:
+        description: Make package check/lint warnings fatal and require strict boundary typing.
+        required: false
+        default: false
+        type: boolean
       test-jobs:
         description: Parallel Harn test workers. Zero preserves Harn's automatic sizing.
         required: false
@@ -72,6 +77,7 @@ jobs:
           harn-version-file: ${{ inputs.harn-version-file }}
           package-path: ${{ inputs.package-path }}
           run-poll-tick: ${{ inputs.run-poll-tick }}
+          strict: ${{ inputs.strict }}
           test-jobs: ${{ inputs.test-jobs }}
 
       - name: Upload verification receipts

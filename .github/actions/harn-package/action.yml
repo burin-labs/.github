@@ -18,6 +18,10 @@ inputs:
     description: Exercise the first connector poll tick when connector bindings declare one.
     required: false
     default: "false"
+  strict:
+    description: Make package check/lint warnings fatal and require strict boundary typing.
+    required: false
+    default: "false"
   test-jobs:
     description: Parallel Harn test workers. Zero preserves Harn's automatic sizing.
     required: false
@@ -76,6 +80,7 @@ runs:
         PACKAGE_PATH: ${{ inputs.package-path }}
         PACKAGE_RECEIPT: ${{ steps.paths.outputs.package-receipt }}
         RUN_POLL_TICK: ${{ inputs.run-poll-tick }}
+        STRICT: ${{ inputs.strict }}
         TEST_JOBS: ${{ inputs.test-jobs }}
       run: |
         set -euo pipefail
@@ -85,6 +90,14 @@ runs:
           false) ;;
           *)
             echo "::error::run-poll-tick must be 'true' or 'false'"
+            exit 2
+            ;;
+        esac
+        case "$STRICT" in
+          true) args+=(--strict) ;;
+          false) ;;
+          *)
+            echo "::error::strict must be 'true' or 'false'"
             exit 2
             ;;
         esac
