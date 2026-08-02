@@ -1,4 +1,4 @@
-## Hi there 👋
+# Hi there 👋
 
 **Burin Labs** is working on a suite of precision tools for the AI age.
 

@@ -29,15 +29,22 @@ expected_checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 abort "CI must use the current immutable checkout action" unless checkout&.fetch("uses") == expected_checkout
 abort "CI checkout must not persist credentials" unless checkout.fetch("with") == {"persist-credentials" => false}
 
-workflow_paths = Dir.glob(File.join(__dir__, "*.yml")).sort
-checkout_uses = workflow_paths.flat_map do |workflow_path|
-  workflow = YAML.safe_load(File.read(workflow_path), aliases: true)
-  workflow.fetch("jobs", {}).values.flat_map do |job|
-    job.fetch("steps", []).map do |step|
-      step["uses"] if step["uses"]&.start_with?("actions/checkout@")
-    end.compact
+checkout_policy_paths = [
+  File.join(__dir__, "*.{yml,yaml}"),
+  File.expand_path("../actions/**/action.{yml,yaml}", __dir__)
+]
+checkout_uses = Dir.glob(checkout_policy_paths).sort.flat_map do |policy_path|
+  policy = YAML.safe_load(File.read(policy_path), aliases: true)
+  step_groups = if policy.key?("jobs")
+    policy.fetch("jobs").values.map { |job| job.fetch("steps", []) }
+  else
+    [policy.dig("runs", "steps") || []]
   end
+  step_groups.flatten.map do |step|
+      step["uses"] if step["uses"]&.start_with?("actions/checkout@")
+  end.compact
 end
+abort "checkout policy scan must not be vacuous" if checkout_uses.empty?
 abort "every workflow checkout must use the current immutable action" unless checkout_uses.all?(expected_checkout)
 
 markdown = steps.find { |step| step["name"] == "Markdown lint" }
