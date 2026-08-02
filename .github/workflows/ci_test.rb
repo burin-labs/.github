@@ -18,7 +18,7 @@ expected_strategy = {
 }
 abort "smoke must exercise default and strict package policy" unless smoke.fetch("strategy") == expected_strategy
 expected_inputs = {
-  "harn-version" => "0.10.50",
+  "harn-version" => "0.10.52",
   "package-path" => ".github/fixtures/harn-package",
   "strict" => "${{ matrix.strict }}",
   "artifact-name" => "harn-package-smoke-${{ matrix.strict && 'strict' || 'default' }}-receipts"

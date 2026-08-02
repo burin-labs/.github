@@ -47,7 +47,7 @@ runs:
   steps:
     - name: Set up exact Harn release
       id: setup
-      uses: burin-labs/harn/.github/actions/setup-harn@e7898bd182a38422f9e012c63c8cd4c61d254932
+      uses: burin-labs/harn/.github/actions/setup-harn@cf52e20564cb722f2f060bc222fa79d996cd3c30 # v0.10.52
       with:
         version: ${{ inputs.harn-version }}
         version-file: ${{ inputs.harn-version-file }}
