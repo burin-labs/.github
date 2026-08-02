@@ -6,6 +6,10 @@ path = File.join(__dir__, "ci.yml")
 document = YAML.safe_load(File.read(path), aliases: true)
 jobs = document.fetch("jobs")
 
+projection = File.read(File.expand_path("../dependabot.yml", __dir__))
+template = File.read(File.expand_path("../../templates/dependabot.yml", __dir__))
+abort "Dependabot projection drifted from its owning template" unless projection.start_with?(template)
+
 smoke = jobs.fetch("package-smoke")
 abort "smoke must call the local reusable workflow revision" unless smoke.fetch("uses") == "./.github/workflows/harn-package.yml"
 expected_inputs = {
