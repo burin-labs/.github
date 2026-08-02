@@ -9,8 +9,12 @@ steps = document.fetch("jobs").fetch("verify").fetch("steps")
 policy = steps.find { |step| step["name"] == "Check repository projections" }
 abort "missing repository projection step" unless policy
 expected_scope =
-  "${{ github.repository_owner == 'burin-labs' && github.repository != 'burin-labs/.github' }}"
-abort "repository policy must be scoped to Burin Labs callers" unless policy["if"] == expected_scope
+  "${{ github.repository_owner == 'burin-labs' && " \
+  "(github.repository != 'burin-labs/.github' || " \
+  "inputs.package-path != '.github/fixtures/harn-package') }}"
+unless policy["if"] == expected_scope
+  abort "repository policy must be scoped to Burin Labs callers and the exact local smoke fixture"
+end
 
 package = steps.find { |step| step["name"] == "Verify package" }
 abort "missing package verification step" unless package
