@@ -16,6 +16,7 @@ jobs:
       - name: Test package workflow policy
         run: |
           ruby .github/actions/harn-repo-policy/check-workflow_test.rb
+          ruby .github/actions/harn-package/run-contract_test.rb
           ruby .github/workflows/harn-package_test.rb
           ruby .github/workflows/runner-availability_test.rb
           ruby scripts/reusable_pin_drift_test.rb
@@ -24,5 +25,6 @@ jobs:
           # The drift checker is only ever executed by a scheduled run, so a
           # syntax error in it would otherwise surface a day later, in a job
           # nobody is watching, as the absence of a report.
+          bash -n .github/actions/harn-package/run-contract.sh
           bash -n scripts/ci-routing.sh
           bash -n scripts/reusable-pin-drift.sh

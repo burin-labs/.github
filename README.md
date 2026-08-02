@@ -27,6 +27,8 @@ instead use the composite action after checkout:
 
 ```yaml
 - uses: burin-labs/.github/.github/actions/harn-package@<full-commit-sha>
+  with:
+    strict: "true" # opt in to strict type and lint gates
 ```
 
 The action is a GitHub adapter only. Package policy and receipt semantics
@@ -35,6 +37,11 @@ belong to `harn package verify`.
 `strict: true` delegates warning-fatal check/lint gates and strict boundary
 typing to Harn's canonical package contract. It remains opt-in so existing
 package callers keep their current admission policy.
+
+Strict verification requires Harn v0.10.52 or later, where `harn package
+verify --strict` became part of the typed package contract. That release also
+moves package verification receipts from schema v1 to v2 and adds the
+`strict_requested` field on every receipt.
 
 The daily reusable-workflow audit compares each exact pin with current workflow
 content and structurally verifies that every `needs.<job>.outputs.<name>` read is

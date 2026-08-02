@@ -32,4 +32,5 @@ contract = action.fetch("runs").fetch("steps").find do |step|
 end
 abort "missing canonical package contract step" unless contract
 abort "strict input must be passed at the command boundary" unless contract.fetch("env")["STRICT"] == "${{ inputs.strict }}"
-abort "strict policy must delegate to Harn's owned flag" unless contract.fetch("run").include?("true) args+=(--strict)")
+expected_runner = 'bash "$GITHUB_ACTION_PATH/run-contract.sh"'
+abort "package contract must route through its tested runner" unless contract.fetch("run") == expected_runner
