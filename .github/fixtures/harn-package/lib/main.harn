@@ -1,0 +1,4 @@
+/** Return a deterministic smoke value. */
+pub fn smoke_value() -> string {
+  return "ready"
+}

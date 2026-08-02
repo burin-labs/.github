@@ -1,0 +1,5 @@
+import "../lib/main"
+
+pipeline test_smoke_value(task) {
+  assert_eq(smoke_value(), "ready")
+}

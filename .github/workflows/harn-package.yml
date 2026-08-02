@@ -82,7 +82,7 @@ jobs:
           persist-credentials: false
 
       - name: Check repository projections
-        if: ${{ github.repository_owner == 'burin-labs' }}
+        if: ${{ github.repository_owner == 'burin-labs' && github.repository != 'burin-labs/.github' }}
         uses: ./.harn/workflow-policy/.github/actions/harn-repo-policy
         with:
           package-path: ${{ inputs.package-path }}
