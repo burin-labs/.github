@@ -28,6 +28,11 @@ on:
         required: false
         default: true
         type: boolean
+      validate-command:
+        description: Caller-owned verification run after the canonical package contract.
+        required: false
+        default: ""
+        type: string
       test-jobs:
         description: Parallel Harn test workers. Zero preserves Harn's automatic sizing.
         required: false
@@ -98,6 +103,15 @@ jobs:
           run-poll-tick: ${{ inputs.run-poll-tick }}
           strict: ${{ inputs.strict }}
           test-jobs: ${{ inputs.test-jobs }}
+
+      - name: Run caller validation
+        if: ${{ inputs.validate-command != '' }}
+        shell: bash
+        env:
+          PACKAGE_VALIDATE_COMMAND: ${{ inputs.validate-command }}
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$PACKAGE_VALIDATE_COMMAND"
 
       - name: Upload verification receipts
         if: ${{ always() }}

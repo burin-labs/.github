@@ -38,6 +38,12 @@ receives no dependency outputs. This prevents a green roll-up from hiding a
 failed package job and replaces repository-local shell expressions with one
 tested contract.
 
+When a package needs deterministic repository-specific checks but no distinct
+runner, pass them through the workflow's optional `validate-command`. It runs
+after the canonical package contract under the same installed Harn version and
+read-only permissions. Keep a separate job only when the check needs a distinct
+runner, permission boundary, service, or independently visible result.
+
 Repositories that must compose package verification into an existing job can
 instead use the composite action after checkout:
 

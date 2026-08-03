@@ -21,6 +21,7 @@ expected_inputs = {
   "harn-version" => "0.10.52",
   "package-path" => ".github/fixtures/harn-package",
   "strict" => "${{ matrix.strict }}",
+  "validate-command" => "test \"$(harn --version)\" = \"harn 0.10.52\" && test -s .harn/receipts/package-verify.json",
   "artifact-name" => "harn-package-smoke-${{ matrix.strict && 'strict' || 'default' }}-receipts"
 }
 abort "smoke inputs drifted" unless smoke.fetch("with") == expected_inputs
