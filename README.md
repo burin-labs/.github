@@ -87,6 +87,25 @@ connector-local guidance boundaries—while Harn owns package semantics. Public
 callers receive the same package verification and receipts without inheriting
 Burin Labs repository governance.
 
+## Release integrity
+
+These repositories publish by pushing a tag, so the manifest version, changelog
+notes, and package verification are all checked against an object that is
+already immutable and signed. A gate that fails there cannot be repaired in
+place: the version is burned and the tag is left with nothing behind it. That is
+how `harn-github-connector` accumulated `v0.6.1` (tagged a commit whose
+`harn.toml` still read `0.6.0`) and `v0.6.7` (a release gate that only failed in
+the release environment). Neither was noticed until someone went looking.
+
+`harn-repo-policy` therefore asserts, on every package CI run, that every
+`vX.Y.Z` tag has a published GitHub release, that no release is left as a draft,
+and that no release outlives its tag. A tag pushed within
+`release-integrity-grace-seconds` (one hour by default) is treated as still in
+flight, so the release commit's own CI does not race the publishing job.
+
+The check is deliberately narrow: it only recognizes `vX.Y.Z`, so deployment
+markers and upstream naming schemes are left alone.
+
 ## Organization defaults
 
 - `.github/pull_request_template.md` is inherited by repositories that do not
