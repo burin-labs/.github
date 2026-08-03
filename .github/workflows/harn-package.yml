@@ -108,10 +108,10 @@ jobs:
         if: ${{ inputs.validate-command != '' }}
         shell: bash
         env:
-          HARN_PACKAGE_VALIDATE_COMMAND: ${{ inputs.validate-command }}
+          PACKAGE_VALIDATE_COMMAND: ${{ inputs.validate-command }}
         run: |
           set -euo pipefail
-          bash -euo pipefail -c "$HARN_PACKAGE_VALIDATE_COMMAND"
+          bash -euo pipefail -c "$PACKAGE_VALIDATE_COMMAND"
 
       - name: Upload verification receipts
         if: ${{ always() }}

@@ -37,11 +37,11 @@ expected_validate_input = {
 }
 abort "caller validation input drifted" unless validate_input == expected_validate_input
 abort "caller validation must remain optional" unless validation.fetch("if") == "${{ inputs.validate-command != '' }}"
-expected_validation_env = {"HARN_PACKAGE_VALIDATE_COMMAND" => "${{ inputs.validate-command }}"}
+expected_validation_env = {"PACKAGE_VALIDATE_COMMAND" => "${{ inputs.validate-command }}"}
 abort "caller validation must cross one named environment boundary" unless validation.fetch("env") == expected_validation_env
 expected_validation_run = <<~BASH
   set -euo pipefail
-  bash -euo pipefail -c "$HARN_PACKAGE_VALIDATE_COMMAND"
+  bash -euo pipefail -c "$PACKAGE_VALIDATE_COMMAND"
 BASH
 abort "caller validation execution drifted" unless validation.fetch("run") == expected_validation_run
 abort "caller validation must run after package verification" unless steps.index(validation) == steps.index(package) + 1
