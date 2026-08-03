@@ -6,6 +6,14 @@ inputs:
     description: Repository-relative Harn package directory.
     required: false
     default: .
+  token:
+    description: Token used to read the repository's tags and releases.
+    required: false
+    default: ${{ github.token }}
+  release-integrity-grace-seconds:
+    description: How long a freshly pushed tag may go unpublished before it counts as stranded.
+    required: false
+    default: "3600"
 
 runs:
   using: composite
@@ -76,4 +84,65 @@ runs:
             echo "::error file=AGENTS.md::connector repository is copying Harn-owned authoring guidance"
             exit 1
           fi
+        fi
+
+    # These repositories publish by pushing a tag, so the manifest, changelog,
+    # and package gates all run against an object that is already immutable and
+    # signed. When one of those gates fails the version is burned and the tag is
+    # stranded with nothing behind it -- the state that left v0.6.1 and v0.6.7
+    # dangling in harn-github-connector. Nothing noticed either one until someone
+    # went looking, so the invariant is asserted here on every package CI run.
+    - name: Check release integrity
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        RELEASE_INTEGRITY_GRACE_SECONDS: ${{ inputs.release-integrity-grace-seconds }}
+      run: |
+        set -euo pipefail
+        cd "$GITHUB_WORKSPACE"
+
+        # --slurp merges the paginated pages into one array of pages; gh refuses
+        # to combine it with --jq, so the flattening happens in a separate pipe.
+        tags="$(gh api "repos/${REPO}/tags?per_page=100" --paginate --slurp \
+          | jq -c '[.[] | .[] | {name: .name}]')"
+        releases="$(gh api "repos/${REPO}/releases?per_page=100" --paginate --slurp \
+          | jq -c '[.[] | .[] | {tag_name: .tag_name, draft: .draft}]')"
+
+        # Dating every tag would cost a request per tag on a repository like harn
+        # with hundreds of them. Only a tag with no release can be forgiven by the
+        # grace window, so only those need a date; normally there are none.
+        undated="$(jq -r --argjson releases "$releases" '
+          ($releases | map(.tag_name)) as $published
+          | map(select(.name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))
+          | map(select(.name as $n | ($published | index($n)) | not))
+          | .[].name
+        ' <<<"$tags")"
+
+        dated="[]"
+        while IFS= read -r tag; do
+          [[ -z "$tag" ]] && continue
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${tag}" 2>/dev/null || true)"
+          date=""
+          if [[ -n "$ref" ]]; then
+            object_type="$(jq -r '.object.type' <<<"$ref")"
+            object_sha="$(jq -r '.object.sha' <<<"$ref")"
+            if [[ "$object_type" == "tag" ]]; then
+              date="$(gh api "repos/${REPO}/git/tags/${object_sha}" --jq '.tagger.date' 2>/dev/null || true)"
+            else
+              date="$(gh api "repos/${REPO}/git/commits/${object_sha}" --jq '.committer.date' 2>/dev/null || true)"
+            fi
+          fi
+          dated="$(jq -c --arg name "$tag" --arg date "$date" \
+            '. + [{name: $name, date: (if $date == "" then null else $date end)}]' <<<"$dated")"
+        done <<<"$undated"
+
+        payload="$(jq -nc --argjson tags "$tags" --argjson dated "$dated" --argjson releases "$releases" '
+          ($dated | map({(.name): .date}) | add // {}) as $dates
+          | {tags: ($tags | map(. + {date: $dates[.name]})), releases: $releases}
+        ')"
+
+        if ! ruby "$GITHUB_ACTION_PATH/check-release-integrity.rb" <<<"$payload"; then
+          echo "::error::every vX.Y.Z tag must have a published GitHub release; publish or delete the tags listed above"
+          exit 1
         fi
