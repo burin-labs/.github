@@ -26,6 +26,26 @@ package = steps.find { |step| step["name"] == "Verify package" }
 abort "missing package verification step" unless package
 abort "package verification must remain universal" if package.key?("if")
 
+validation = steps.find { |step| step["name"] == "Run caller validation" }
+abort "missing caller validation boundary" unless validation
+validate_input = document.fetch(true).fetch("workflow_call").fetch("inputs").fetch("validate-command")
+expected_validate_input = {
+  "description" => "Caller-owned verification run after the canonical package contract.",
+  "required" => false,
+  "default" => "",
+  "type" => "string"
+}
+abort "caller validation input drifted" unless validate_input == expected_validate_input
+abort "caller validation must remain optional" unless validation.fetch("if") == "${{ inputs.validate-command != '' }}"
+expected_validation_env = {"HARN_PACKAGE_VALIDATE_COMMAND" => "${{ inputs.validate-command }}"}
+abort "caller validation must cross one named environment boundary" unless validation.fetch("env") == expected_validation_env
+expected_validation_run = <<~BASH
+  set -euo pipefail
+  bash -euo pipefail -c "$HARN_PACKAGE_VALIDATE_COMMAND"
+BASH
+abort "caller validation execution drifted" unless validation.fetch("run") == expected_validation_run
+abort "caller validation must run after package verification" unless steps.index(validation) == steps.index(package) + 1
+
 implementation = steps.find { |step| step["name"] == "Check out workflow implementation" }
 abort "missing workflow implementation checkout" unless implementation
 expected_checkout = {
