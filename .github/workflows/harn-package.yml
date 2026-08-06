@@ -94,6 +94,13 @@ jobs:
         with:
           package-path: ${{ inputs.package-path }}
 
+      # Delivery-policy gate for every Burin Labs package CI run. Failures are
+      # absences of Dependabot PRs; keep it on the reusable path so a new
+      # connector cannot omit the check by forgetting a local hygiene job.
+      - name: Check Dependabot config
+        if: ${{ github.repository_owner == 'burin-labs' }}
+        uses: ./.harn/workflow-policy/.github/actions/check-dependabot-config
+
       - name: Verify package
         uses: ./.harn/workflow-policy/.github/actions/harn-package
         with:
