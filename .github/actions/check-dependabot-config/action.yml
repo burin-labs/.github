@@ -1,0 +1,35 @@
+name: Check Dependabot config
+description: >
+  Fail when Dependabot cannot act — missing catch-alls, uncovered lockfiles,
+  cargo scope escapes, or frozen exact pnpm overrides. Static Ruby/Psych; no
+  network and no Harn binary, so always-on hygiene jobs can call it.
+
+inputs:
+  repo-root:
+    description: Repository root that contains .github/dependabot.yml
+    required: false
+    default: ${{ github.workspace }}
+  require-lockfiles:
+    description: >
+      Fail if the scanner finds zero committed lockfiles. Enable in repos that
+      always ship lockfiles (anti-vacuity). Leave off for actions-only package
+      repos.
+    required: false
+    default: "false"
+  require-overrides:
+    description: >
+      Fail if the scanner reads zero pnpm overrides. Enable in repos that always
+      declare pnpm-workspace.yaml overrides (anti-vacuity).
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Check Dependabot config
+      shell: bash
+      env:
+        DEPENDABOT_CHECK_ROOT: ${{ inputs.repo-root }}
+        DEPENDABOT_CHECK_REQUIRE_LOCKFILES: ${{ inputs.require-lockfiles == 'true' && '1' || '0' }}
+        DEPENDABOT_CHECK_REQUIRE_OVERRIDES: ${{ inputs.require-overrides == 'true' && '1' || '0' }}
+      run: ruby "$GITHUB_ACTION_PATH/check_dependabot_config.rb"

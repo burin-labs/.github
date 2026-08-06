@@ -115,3 +115,19 @@ markers and upstream naming schemes are left alone.
   files, so Harn package repositories project it byte-for-byte at the start of
   `.github/dependabot.yml`; repository-specific ecosystem entries may follow.
   The reusable package workflow enforces the projection.
+- `.github/actions/check-dependabot-config` is the shared, flake-free checker
+  for Dependabot *delivery* policy: every update entry needs a catch-all group
+  (block or inline `patterns`), every committed lockfile needs a matching
+  ecosystem entry, Cargo workspace members and path deps must stay inside the
+  configured `directory`, and exact `pnpm-workspace.yaml` overrides need a
+  `# pin:` annotation. It uses Ruby/Psych only — no network, no Harn binary —
+  so always-on hygiene jobs can call it. Fleet prose for schedule/grouping
+  lives in `harn-bump-fleet`; Harn-local family membership stays in Harn.
+
+```yaml
+- uses: burin-labs/.github/.github/actions/check-dependabot-config@<full-commit-sha>
+  with:
+    # Optional anti-vacuity for repos that always ship lockfiles / overrides:
+    require-lockfiles: "true"
+    require-overrides: "true"
+```
