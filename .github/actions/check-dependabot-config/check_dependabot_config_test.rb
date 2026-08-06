@@ -216,6 +216,61 @@ class CheckDependabotConfigTest < Minitest::Test
     assert_equal 0, result[:status], result[:output]
   end
 
+  def test_rejects_star_only_under_exclude_patterns
+    result = run_check(
+      config: <<~YAML,
+        version: 2
+        updates:
+          - package-ecosystem: "npm"
+            directory: "/"
+            schedule:
+              interval: "weekly"
+            groups:
+              named:
+                patterns: ["left-pad"]
+                exclude-patterns: ["*"]
+      YAML
+      bare: true,
+      files: { "pnpm-lock.yaml" => "lockfileVersion: '9.0'\n" },
+    )
+    assert_equal 1, result[:status], result[:output]
+    assert_match(/no catch-all group/, result[:output])
+  end
+
+  def test_rejects_scalar_star_as_catch_all
+    result = run_check(
+      config: <<~YAML,
+        version: 2
+        updates:
+          - package-ecosystem: "npm"
+            directory: "/"
+            schedule:
+              interval: "weekly"
+            groups:
+              named:
+                dependency-type: "*"
+      YAML
+      bare: true,
+      files: { "pnpm-lock.yaml" => "lockfileVersion: '9.0'\n" },
+    )
+    assert_equal 1, result[:status], result[:output]
+    assert_match(/no catch-all group/, result[:output])
+  end
+
+  def test_rejects_default_members_outside_directory
+    cargo = [
+      {
+        dir: "crates/tui",
+        body: "[workspace]\nmembers = [\"util\"]\ndefault-members = [\"../shared\"]\n",
+      },
+      { dir: "crates/tui/util", body: "[package]\nname = \"util\"\n" },
+      { dir: "crates/shared", body: "[package]\nname = \"shared\"\n" },
+    ]
+    result = run_check(config: cargo_config, cargo: cargo)
+    assert_equal 1, result[:status], result[:output]
+    assert_match(/default-members.*outside/, result[:output])
+  end
+
   def test_accepts_directories_plural
     result = run_check(
       config: <<~YAML,
