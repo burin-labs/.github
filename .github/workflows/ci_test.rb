@@ -43,6 +43,7 @@ checkout_policy_globs = [
 policy_sources = Dir.glob(checkout_policy_globs).sort
 actual_policy_sources = policy_sources.map { |path| path.delete_prefix("#{repository_root}/") }
 expected_policy_sources = [
+  ".github/actions/check-dependabot-config/action.yml",
   ".github/actions/harn-package/action.yml",
   ".github/actions/harn-repo-policy/action.yml",
   ".github/actions/require-successful-needs/action.yml",
@@ -103,3 +104,7 @@ require_smoke = status.fetch("steps").find { |step| step["name"] == "Require reu
 abort "CI status does not require the smoke result" unless require_smoke
 expected_result = "${{ needs.package-smoke.result }}"
 abort "CI status reads the wrong result" unless require_smoke.fetch("env") == {"PACKAGE_SMOKE_RESULT" => expected_result}
+
+dependabot_check = steps.find { |step| step["name"] == "Check Dependabot config" }
+abort "CI must dogfood the Dependabot delivery-policy action" unless dependabot_check
+abort "CI Dependabot check must use the local composite action" unless dependabot_check.fetch("uses") == "./.github/actions/check-dependabot-config"
