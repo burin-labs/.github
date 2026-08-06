@@ -73,6 +73,20 @@ abort "package verification must use the co-versioned local action" unless packa
 expected_policy = "./.harn/workflow-policy/.github/actions/harn-repo-policy"
 abort "repository policy must use the co-versioned local action" unless policy.fetch("uses") == expected_policy
 
+dependabot = steps.find { |step| step["name"] == "Check Dependabot config" }
+abort "missing Dependabot delivery-policy step" unless dependabot
+unless dependabot.fetch("if") == "${{ github.repository_owner == 'burin-labs' }}"
+  abort "Dependabot delivery check must be scoped to Burin Labs callers"
+end
+expected_dependabot = "./.harn/workflow-policy/.github/actions/check-dependabot-config"
+abort "Dependabot delivery check must use the co-versioned local action" unless dependabot.fetch("uses") == expected_dependabot
+unless steps.index(dependabot) == steps.index(policy) + 1
+  abort "Dependabot delivery check must follow repository projections"
+end
+unless steps.index(package) == steps.index(dependabot) + 1
+  abort "package verification must follow the Dependabot delivery check"
+end
+
 strict = document.fetch(true).fetch("workflow_call").fetch("inputs").fetch("strict")
 abort "strict package policy must be a boolean input" unless strict["type"] == "boolean"
 abort "strict package policy must be the organization default" unless strict["default"] == true

@@ -121,8 +121,11 @@ markers and upstream naming schemes are left alone.
   ecosystem entry, Cargo workspace members and path deps must stay inside the
   configured `directory`, and exact `pnpm-workspace.yaml` overrides need a
   `# pin:` annotation. It uses Ruby/Psych only — no network, no Harn binary —
-  so always-on hygiene jobs can call it. Fleet prose for schedule/grouping
-  lives in `harn-bump-fleet`; Harn-local family membership stays in Harn.
+  so always-on hygiene jobs can call it. The reusable `harn-package.yml`
+  workflow runs it for every Burin Labs package CI caller. Product monorepos
+  that do not use that workflow should call the action from an always-on job.
+  Fleet prose for schedule/grouping lives in `harn-bump-fleet`; Harn-local
+  family membership stays in Harn.
 
 ```yaml
 - uses: burin-labs/.github/.github/actions/check-dependabot-config@<full-commit-sha>
