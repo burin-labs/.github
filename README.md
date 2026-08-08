@@ -114,11 +114,12 @@ organization-admin membership is the authority. The reusable workflow rejects
 non-admins and fork pull requests, then acts with the `harn-release-bot`
 installation token (a ruleset bypass actor).
 
-| Label | Effect |
-| --- | --- |
-| `bypass-ci` | Cancel competing runs for the head SHA and publish a successful `CI status` check. Does not merge. |
-| `bypass-merge-queue` | Squash-merge immediately when `CI status` is already green. Skips the merge queue. |
-| `force-merge` | Publish successful `CI status`, then squash-merge immediately. Skips CI proof and the merge queue. |
+- `bypass-ci`: cancel competing runs for the head SHA and publish a successful
+  `CI status` check. Does not merge.
+- `bypass-merge-queue`: squash-merge immediately when `CI status` is already
+  green. Skips the merge queue.
+- `force-merge`: publish successful `CI status`, then squash-merge immediately.
+  Skips CI proof and the merge queue.
 
 ### When to use an override
 
@@ -158,7 +159,8 @@ to the full commit SHA of this repository that introduced or last changed
 ```bash
 for name in bypass-ci bypass-merge-queue force-merge; do
   gh label create "$name" --repo burin-labs/<repo> \
-    --color B60205 --description "Privileged merge/CI override (org admin only)" \
+    --color B60205 \
+    --description "Privileged merge/CI override (org admin only)" \
     2>/dev/null || true
 done
 ```
