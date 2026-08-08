@@ -106,6 +106,67 @@ flight, so the release commit's own CI does not race the publishing job.
 The check is deliberately narrow: it only recognizes `vX.Y.Z`, so deployment
 markers and upstream naming schemes are left alone.
 
+## Merge overrides
+
+Use these labels when the normal merge queue or required `CI status` check is
+the wrong tool for a rare, time-sensitive land. Labels are the trigger;
+organization-admin membership is the authority. The reusable workflow rejects
+non-admins and fork pull requests, then acts with the `harn-release-bot`
+installation token (a ruleset bypass actor).
+
+| Label | Effect |
+| --- | --- |
+| `bypass-ci` | Cancel competing runs for the head SHA and publish a successful `CI status` check. Does not merge. |
+| `bypass-merge-queue` | Squash-merge immediately when `CI status` is already green. Skips the merge queue. |
+| `force-merge` | Publish successful `CI status`, then squash-merge immediately. Skips CI proof and the merge queue. |
+
+### When to use an override
+
+- The merge queue is backed up enough that speculative CI would burn material
+  Actions spend, and one PR must land before the rest.
+- Required CI is broken in a way you can fix forward on `main` within the same
+  working session.
+- You need to serialize a single founder land ahead of a long queue (release
+  unblock, production incident, or similar).
+
+### When not to use an override
+
+- Ordinary feature work, dependency bumps, or “CI is slow today.”
+- Changes you cannot fix forward if they break `main`.
+- Pull requests from forks (the workflow refuses them).
+
+### How to apply
+
+1. Confirm you are an organization owner/admin on `burin-labs`.
+2. On a same-repo PR, add exactly one override label.
+3. Read the audit comment the workflow posts. For `force-merge` /
+   `bypass-merge-queue`, confirm the PR merged.
+4. Remove the label after the land if you want a clean label set; the audit
+   comment remains.
+
+Organization admins can also use GitHub’s “Bypass rules and merge” UI: the
+org-wide `main protection` ruleset grants `OrganizationAdmin` bypass in
+`pull_request` mode.
+
+### Wire a repository
+
+Copy `templates/merge-override-dispatch.yml` to
+`.github/workflows/merge-override-dispatch.yml` and pin the reusable workflow
+to the full commit SHA of this repository that introduced or last changed
+`merge-override.yml`. Create the three labels once:
+
+```bash
+for name in bypass-ci bypass-merge-queue force-merge; do
+  gh label create "$name" --repo burin-labs/<repo> \
+    --color B60205 --description "Privileged merge/CI override (org admin only)" \
+    2>/dev/null || true
+done
+```
+
+Public repositories stay in scope: applying a label still requires triage or
+higher, and the workflow re-checks organization-admin membership before any
+privileged action.
+
 ## Organization defaults
 
 - `.github/pull_request_template.md` is inherited by repositories that do not

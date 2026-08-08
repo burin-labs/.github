@@ -70,6 +70,7 @@ jobs:
           ruby .github/workflows/ci_test.rb
           ruby .github/workflows/harn-package_test.rb
           ruby .github/workflows/runner-availability_test.rb
+          ruby scripts/merge_override_test.rb
           ruby scripts/reusable_pin_drift_test.rb
       - name: Check Dependabot config
         uses: ./.github/actions/check-dependabot-config

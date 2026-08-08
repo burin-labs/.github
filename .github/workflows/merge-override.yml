@@ -1,0 +1,256 @@
+# Reusable privileged override for bypass-ci / bypass-merge-queue / force-merge.
+#
+# Labels are the UX. Authority is re-checked: organization admin only, same-repo
+# heads only. Merges use the harn-release-bot installation token, which is a
+# ruleset bypass actor on burin-labs main protection and merge-queue rulesets.
+#
+# Caller workflow (pin @ full commit SHA after this lands on main):
+#
+#   on:
+#     pull_request:
+#       types: [labeled]
+#   jobs:
+#     override:
+#       if: contains(fromJSON('["bypass-ci","bypass-merge-queue","force-merge"]'), github.event.label.name)
+#       uses: burin-labs/.github/.github/workflows/merge-override.yml@<sha>
+#       with:
+#         label: ${{ github.event.label.name }}
+#         actor: ${{ github.actor }}
+#         pr-number: ${{ github.event.pull_request.number }}
+#         head-sha: ${{ github.event.pull_request.head.sha }}
+#         head-repository: ${{ github.event.pull_request.head.repo.full_name }}
+#       secrets: inherit
+
+name: Merge override
+
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: Override label that was applied.
+        required: true
+        type: string
+      actor:
+        description: GitHub login that applied the label.
+        required: true
+        type: string
+      pr-number:
+        description: Pull request number.
+        required: true
+        type: number
+      head-sha:
+        description: Pull request head commit SHA.
+        required: true
+        type: string
+      head-repository:
+        description: owner/name of the pull request head repository.
+        required: true
+        type: string
+      organization:
+        description: Organization that must list the actor as an admin.
+        required: false
+        default: burin-labs
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  apply:
+    name: Apply merge override
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out override implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: burin-labs/.github
+          # Prefer the called-workflow SHA when GitHub.com exposes it so callers
+          # cannot drift from the pinned reusable revision.
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha || github.sha }}
+
+      - name: Authorize actor and same-repo head
+        id: auth
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORG: ${{ inputs.organization }}
+          ACTOR: ${{ inputs.actor }}
+          HEAD_REPOSITORY: ${{ inputs.head-repository }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          LABEL: ${{ inputs.label }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$LABEL" != "bypass-ci" && "$LABEL" != "bypass-merge-queue" && "$LABEL" != "force-merge" ]]; then
+            echo "::error::unknown override label: $LABEL"
+            exit 2
+          fi
+          role="$(gh api "orgs/${ORG}/memberships/${ACTOR}" --jq '.role' 2>/dev/null || true)"
+          if [[ -z "$role" ]]; then
+            role="none"
+          fi
+          printf '%s' "$(jq -n \
+            --arg org "$ORG" \
+            --arg actor "$ACTOR" \
+            --arg membership_role "$role" \
+            --arg head_repository "$HEAD_REPOSITORY" \
+            --arg base_repository "$BASE_REPOSITORY" \
+            '{
+              org: $org,
+              actor: $actor,
+              membership_role: $membership_role,
+              head_repository: $head_repository,
+              base_repository: $base_repository
+            }')" | ruby scripts/merge_override.rb authorize
+
+      - name: Resolve CI status conclusion
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          conclusion="$(gh api \
+            "repos/${REPO}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name == "CI status")] | sort_by(.completed_at // .started_at) | last | .conclusion // "missing"')"
+          echo "conclusion=${conclusion}" >> "$GITHUB_OUTPUT"
+          echo "Latest CI status conclusion: ${conclusion}"
+
+      - name: Plan override actions
+        id: plan
+        env:
+          LABEL: ${{ inputs.label }}
+          CI_CONCLUSION: ${{ steps.ci.outputs.conclusion }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          plan="$(printf '%s' "$(jq -n \
+            --arg label "$LABEL" \
+            --arg ci_status_conclusion "$CI_CONCLUSION" \
+            '{label: $label, ci_status_conclusion: $ci_status_conclusion}')" \
+            | ruby scripts/merge_override.rb plan)"
+          cancel="$(printf '%s' "$plan" | jq -r '.cancel_workflows')"
+          publish="$(printf '%s' "$plan" | jq -r '.publish_ci_status')"
+          merge="$(printf '%s' "$plan" | jq -r '.merge')"
+          {
+            echo "plan=${plan}"
+            echo "cancel_workflows=${cancel}"
+            echo "publish_ci_status=${publish}"
+            echo "merge=${merge}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cancel competing workflow runs
+        if: steps.plan.outputs.cancel_workflows == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          THIS_RUN: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cancel in-progress and queued runs for this head so a later failing
+          # "CI status" job cannot race the published override check.
+          mapfile -t run_ids < <(gh api \
+            "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" \
+            --jq "[.workflow_runs[]
+              | select(.id != ${THIS_RUN})
+              | select(.status == \"queued\" or .status == \"in_progress\" or .status == \"waiting\" or .status == \"pending\")
+              | .id] | .[]")
+          if [[ "${#run_ids[@]}" -eq 0 ]]; then
+            echo "No competing workflow runs to cancel."
+            exit 0
+          fi
+          for run_id in "${run_ids[@]}"; do
+            echo "Cancelling workflow run ${run_id}"
+            gh api -X POST "repos/${REPO}/actions/runs/${run_id}/cancel" >/dev/null || true
+          done
+
+      - name: Publish successful CI status check
+        if: steps.plan.outputs.publish_ci_status == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          LABEL: ${{ inputs.label }}
+          ACTOR: ${{ inputs.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${REPO}/check-runs" \
+            -f name='CI status' \
+            -f head_sha="${HEAD_SHA}" \
+            -f status=completed \
+            -f conclusion=success \
+            -f 'output[title]=Merge override' \
+            -f "output[summary]=Published by merge override \`${LABEL}\` from @${ACTOR}." >/dev/null
+          echo "Published successful CI status check for ${HEAD_SHA}"
+
+      - name: Mint release-app token for privileged merge
+        if: steps.plan.outputs.merge == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.organization }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: write
+
+      - name: Squash-merge pull request
+        if: steps.plan.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr-number }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          LABEL: ${{ inputs.label }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Direct merge API honors ruleset bypass for the release app and skips
+          # the merge queue. If the PR is still queued, dequeue first.
+          pr_node="$(gh api "repos/${REPO}/pulls/${PR}" --jq .node_id)"
+          # GraphQL variable markers must stay literal for gh.
+          # shellcheck disable=SC2016
+          dequeue_query='mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}'
+          gh api graphql -f query="$dequeue_query" -f id="$pr_node" >/dev/null 2>&1 || true
+          title="$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)"
+          commit_message="Merged with override label \`${LABEL}\`."
+          gh api -X PUT "repos/${REPO}/pulls/${PR}/merge" \
+            -f merge_method=squash \
+            -f sha="${HEAD_SHA}" \
+            -f "commit_title=${title} (#${PR})" \
+            -f "commit_message=${commit_message}"
+          echo "Merged PR #${PR} via privileged squash merge"
+
+      - name: Audit comment
+        if: always() && steps.auth.outcome == 'success' && steps.plan.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr-number }}
+          LABEL: ${{ inputs.label }}
+          ACTOR: ${{ inputs.actor }}
+          PLAN_JSON: ${{ steps.plan.outputs.plan }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="$(printf '%s' "$(jq -n \
+            --arg label "$LABEL" \
+            --arg actor "$ACTOR" \
+            --argjson plan "$PLAN_JSON" \
+            '{label: $label, actor: $actor, plan: $plan}')" \
+            | ruby scripts/merge_override.rb audit-body)"
+          gh pr comment "$PR" --repo "$REPO" --body "$body"
