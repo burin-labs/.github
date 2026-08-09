@@ -24,7 +24,9 @@ runner:
 ```yaml
 - uses: burin-labs/.github/.github/actions/ci-latency-policy@<full-commit-sha>
   with:
-    baseline-sha: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+    baseline-sha: >-
+      ${{ github.event.pull_request.base.sha ||
+          github.event.merge_group.base_sha || '' }}
     github-token: ${{ github.token }}
 ```
 
