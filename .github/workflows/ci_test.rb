@@ -48,6 +48,7 @@ expected_policy_sources = [
   ".github/actions/harn-package/action.yml",
   ".github/actions/harn-repo-policy/action.yml",
   ".github/actions/require-successful-needs/action.yml",
+  ".github/actions/rust-test-impact/action.yml",
   ".github/workflows/ci-latency-observer.yml",
   ".github/workflows/ci.yml",
   ".github/workflows/harn-package.yml",
@@ -108,6 +109,10 @@ abort "CI must install checksum-pinned actionlint" unless install_actionlint&.di
 abort "CI must pin the actionlint archive checksum" unless install_actionlint.dig("env", "ACTIONLINT_SHA256") == "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
 actions_lint = steps.find { |step| step["name"] == "GitHub Actions lint" }
 abort "CI must execute actionlint" unless actions_lint&.fetch("run") == "actionlint"
+impact_tests = steps.find { |step| step["name"] == "Test graph-derived Rust impact planning" }
+unless impact_tests&.fetch("run") == "node --test .github/actions/rust-test-impact/plan.test.mjs"
+  abort "CI must execute the shared Rust impact planner tests"
+end
 
 policy_tests = steps.find { |step| step["name"] == "Test package workflow policy" }
 abort "CI must execute repository contract tests" unless policy_tests

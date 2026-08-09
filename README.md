@@ -2,6 +2,33 @@
 
 Burin Labs organization defaults and reusable GitHub Actions workflows.
 
+## Selective Rust tests
+
+`burin-labs/.github/.github/actions/rust-test-impact` is the organization-owned
+adapter for branch-only Rust test impact analysis. It reads Cargo's real
+workspace graph, expands directly changed packages through the transitive
+reverse-dependency closure, and emits `full`, `partial`, or `empty` plus Cargo
+package arguments. Merge queues, main pushes, schedules, workflow changes,
+workspace manifests, lockfiles, and unresolved diffs retain the complete
+workspace.
+
+Repositories provide only the Cargo workspace path and genuinely global inputs;
+they do not maintain crate dependency tables. Keep the action pinned to an exact
+commit and pass exact pull-request base/head SHAs.
+
+```yaml
+- id: rust-impact
+  uses: burin-labs/.github/.github/actions/rust-test-impact@<full-commit-sha>
+  with:
+    event-name: ${{ github.event_name }}
+    base: ${{ github.event.pull_request.base.sha || github.sha }}
+    head: ${{ github.event.pull_request.head.sha || github.sha }}
+    workspace: crates/my-workspace
+    extra-package-paths: |
+      my-api=docs/openapi
+- run: cargo nextest run ${{ steps.rust-impact.outputs.package-args }}
+```
+
 ## Reusable workflows
 
 - `.github/workflows/runner-availability.yml` detects idle self-hosted Linux,
