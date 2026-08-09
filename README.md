@@ -110,9 +110,9 @@ markers and upstream naming schemes are left alone.
 
 Use these labels when the normal merge queue or required `CI status` check is
 the wrong tool for a rare, time-sensitive land. Labels are the trigger;
-organization-admin membership is the authority. The reusable workflow rejects
-non-admins and fork pull requests, then acts with the `harn-release-bot`
-installation token (a ruleset bypass actor).
+organization or repository admin membership is the authority. The reusable
+workflow rejects non-admins and fork pull requests, then acts with the
+`harn-release-bot` installation token (a ruleset bypass actor).
 
 - `bypass-ci`: cancel competing runs for the head SHA and publish a successful
   `CI status` check. Does not merge.
@@ -138,7 +138,7 @@ installation token (a ruleset bypass actor).
 
 ### How to apply
 
-1. Confirm you are an organization owner/admin on `burin-labs`.
+1. Confirm you are an organization owner/admin or repository admin.
 2. On a same-repo PR, add exactly one override label.
 3. Read the audit comment the workflow posts. For `force-merge` /
    `bypass-merge-queue`, confirm the PR merged.
@@ -166,8 +166,8 @@ done
 ```
 
 Public repositories stay in scope: applying a label still requires triage or
-higher, and the workflow re-checks organization-admin membership before any
-privileged action.
+higher, and the workflow re-checks organization or repository admin permission
+before any privileged action.
 
 ## Organization defaults
 
