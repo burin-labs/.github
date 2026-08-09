@@ -1,0 +1,58 @@
+name: Check CI latency policy
+description: Reject undeclared required jobs, invalid SLOs, and upward budget drift.
+
+inputs:
+  policy:
+    description: Repository-relative CI latency policy JSON.
+    required: false
+    default: .github/ci-latency.json
+  workflow:
+    description: Repository-relative workflow YAML governed by the policy.
+    required: false
+    default: .github/workflows/ci.yml
+  baseline-sha:
+    description: Optional base commit whose policy is the down-only budget baseline.
+    required: false
+    default: ""
+  github-token:
+    description: Read-only token used to fetch the policy at baseline-sha.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Check declared CI latency contract
+      shell: bash
+      env:
+        BASELINE_SHA: ${{ inputs.baseline-sha }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        POLICY_PATH: ${{ inputs.policy }}
+        WORKFLOW_PATH: ${{ inputs.workflow }}
+      run: |
+        set -euo pipefail
+        baseline_args=()
+        if [ -n "$BASELINE_SHA" ]; then
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::github-token is required when baseline-sha is set"
+            exit 2
+          fi
+          baseline_file="$RUNNER_TEMP/ci-latency-baseline.json"
+          baseline_error="$RUNNER_TEMP/ci-latency-baseline.err"
+          if gh api \
+              -H "Accept: application/vnd.github.raw+json" \
+              "/repos/${GITHUB_REPOSITORY}/contents/${POLICY_PATH}?ref=${BASELINE_SHA}" \
+              > "$baseline_file" 2> "$baseline_error"; then
+            baseline_args=(--baseline "$baseline_file")
+          elif grep -Fq "HTTP 404" "$baseline_error"; then
+            echo "::notice::No baseline CI latency policy exists at ${BASELINE_SHA}; validating the initial contract"
+          else
+            cat "$baseline_error" >&2
+            exit 1
+          fi
+        fi
+        ruby "$GITHUB_ACTION_PATH/check_ci_latency_policy.rb" \
+          --policy "$POLICY_PATH" \
+          --workflow "$WORKFLOW_PATH" \
+          --repository "$GITHUB_REPOSITORY" \
+          "${baseline_args[@]}"

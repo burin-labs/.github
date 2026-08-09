@@ -11,6 +11,41 @@ Burin Labs organization defaults and reusable GitHub Actions workflows.
   exact `.harn-version`, runs the Harn-owned package contract, and uploads the
   structured receipts.
 
+## CI latency policy
+
+`.github/actions/ci-latency-policy` checks a repository's
+`.github/ci-latency.json` against its CI workflow. The policy names the
+end-to-end SLO, the jobs that distinguish a full run from a fast lane, and a
+budget for every job required by the aggregate status job.
+
+Call the action from an existing source-only CI job so the check does not add a
+runner:
+
+```yaml
+- uses: burin-labs/.github/.github/actions/ci-latency-policy@<full-commit-sha>
+  with:
+    baseline-sha: >-
+      ${{ github.event.pull_request.base.sha ||
+          github.event.merge_group.base_sha || '' }}
+    github-token: ${{ github.token }}
+```
+
+The token needs `contents: read` only. When `baseline-sha` is present, the
+action reads the policy at that commit and rejects increases to the
+critical-path allowance or an existing job budget. It also rejects missing or
+stale required-job entries, empty sentinel sets, and invalid SLO ordering.
+
+Runtime measurement belongs off the pull-request path. The organization-level
+observer runs every six hours and on demand. It uses Harn's
+`scripts/ci_walltime_report.harn` implementation and the existing release-app
+installation token with `actions: read` and `contents: read`. It runs on this
+public repository's standard Linux runner, so observing private repositories
+does not consume their hosted-runner minutes. The observer executes no code or
+artifacts from measured workflow runs. It emits a job summary, retains compact
+JSON reports for seven days, and fails on a sustained p90 breach or one run past
+the hard maximum. A single p90 window warns without paging, which keeps one-off
+runner contention visible without creating alert churn.
+
 Package repositories should keep the exact release in `.harn-version`.
 Their complete CI adapter delegates package verification and rolls every
 required job into one stable status check:

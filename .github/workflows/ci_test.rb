@@ -44,9 +44,11 @@ policy_sources = Dir.glob(checkout_policy_globs).sort
 actual_policy_sources = policy_sources.map { |path| path.delete_prefix("#{repository_root}/") }
 expected_policy_sources = [
   ".github/actions/check-dependabot-config/action.yml",
+  ".github/actions/ci-latency-policy/action.yml",
   ".github/actions/harn-package/action.yml",
   ".github/actions/harn-repo-policy/action.yml",
   ".github/actions/require-successful-needs/action.yml",
+  ".github/workflows/ci-latency-observer.yml",
   ".github/workflows/ci.yml",
   ".github/workflows/harn-package.yml",
   ".github/workflows/merge-override-dispatch.yml",
@@ -74,6 +76,26 @@ end
 unless checkout_steps.all? { |step| step.fetch("with", {}).fetch("persist-credentials", true) == false }
   abort "workflow checkouts must not persist credentials"
 end
+
+observer_path = File.join(__dir__, "ci-latency-observer.yml")
+observer = YAML.safe_load(File.read(observer_path), aliases: true)
+observer_events = observer.fetch(true)
+abort "latency observer must run every six hours" unless observer_events.dig("schedule", 0, "cron") == "17 */6 * * *"
+abort "latency observer must remain manually runnable" unless observer_events.key?("workflow_dispatch")
+abort "latency observer must have read-only workflow permissions" unless observer.fetch("permissions") == {"contents" => "read"}
+observe_job = observer.fetch("jobs").fetch("observe")
+abort "latency observer must stay on free public hosted compute" unless observe_job.fetch("runs-on") == "ubuntu-latest"
+app_step = observe_job.fetch("steps").find { |step| step["name"] == "Mint read-only release-app token" }
+expected_app_permissions = {
+  "permission-actions" => "read",
+  "permission-contents" => "read"
+}
+unless app_step&.fetch("with")&.slice(*expected_app_permissions.keys) == expected_app_permissions
+  abort "latency observer release-app token must remain read-only"
+end
+run_step = observe_job.fetch("steps").find { |step| step["name"] == "Observe full CI runs" }
+abort "latency observer must check every governed repository" unless run_step&.fetch("run")&.include?("for repository in .github harn burin-code harn-cloud")
+abort "latency observer must enforce the policy" unless run_step.fetch("run").include?("--check")
 
 markdown = steps.find { |step| step["name"] == "Markdown lint" }
 expected_markdown = "DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe"

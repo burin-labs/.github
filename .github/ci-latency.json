@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "repository": "burin-labs/.github",
+  "workflow": "ci.yml",
+  "event": "pull_request",
+  "topology_epoch": "2026-08-08T00:00:00Z",
+  "full_run_jobs": [
+    { "name": "Reusable Harn package smoke", "match": "prefix" },
+    { "name": "CI status", "match": "exact" }
+  ],
+  "slo": {
+    "warning_ms": 240000,
+    "p90_ms": 300000,
+    "hard_max_ms": 600000,
+    "min_samples": 5,
+    "window_samples": 5
+  },
+  "required": {
+    "aggregate_job": "ci-status",
+    "critical_path_allowance_ms": 300000,
+    "jobs": {
+      "package-smoke": { "budget_ms": 300000 }
+    }
+  }
+}
