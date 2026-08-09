@@ -68,6 +68,10 @@ jobs:
           failed=0
 
           for repository in .github harn burin-code harn-cloud; do
+            # Strip the leading dot from the org repository name. Upload-artifact
+            # excludes hidden files by default, so `.github.json` would silently
+            # drop one of the four governed reports from the evidence bundle.
+            report="$reports/${repository#.}.json"
             policy_ok=false
             for attempt in 1 2 3; do
               if gh api \
@@ -93,13 +97,13 @@ jobs:
                   --limit 100 \
                   --json \
                   --check \
-                  > "$reports/${repository}.json"
+                  > "$report"
                 set -e
                 # A policy breach intentionally exits non-zero but still emits
                 # its complete report. Retry only transport/tool failures that
                 # did not produce a valid evaluation.
                 if jq -e '.schema_version == 2 and (.evaluation.ok | type == "boolean")' \
-                    "$reports/${repository}.json" >/dev/null 2>&1; then
+                    "$report" >/dev/null 2>&1; then
                   report_ok=true
                   break
                 fi
@@ -108,19 +112,19 @@ jobs:
             fi
 
             if [ "$report_ok" = true ]; then
-              result="$(jq -r 'if .evaluation.ok then "pass" else "fail" end' "$reports/${repository}.json")"
+              result="$(jq -r 'if .evaluation.ok then "pass" else "fail" end' "$report")"
             else
               result=fail
               jq -n --arg repository "burin-labs/${repository}" \
                 '{schema_version: 2, policy: {repository: $repository}, evaluation: {status: "observer_error", ok: false}, wall: {count: 0, p50_ms: 0, p90_ms: 0, max_ms: 0}}' \
-                > "$reports/${repository}.json"
+                > "$report"
             fi
             if [ "$result" = fail ]; then
               failed=1
             fi
             jq --arg result "$result" '. + {observer_result: $result}' \
-              "$reports/${repository}.json" > "$reports/${repository}.tmp"
-            mv "$reports/${repository}.tmp" "$reports/${repository}.json"
+              "$report" > "$report.tmp"
+            mv "$report.tmp" "$report"
           done
 
           {
