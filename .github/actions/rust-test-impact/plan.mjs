@@ -121,7 +121,7 @@ function changedFiles(base, head, repoRoot) {
   }
   const raw = command(
     "git",
-    ["diff", "--name-status", "-z", "--find-renames", `${base}...${head}`, "--"],
+    ["diff", "--name-status", "-z", "--find-renames", base, head, "--"],
     { cwd: repoRoot, encoding: "buffer" },
   );
   const fields = raw.toString("utf8").split("\0").filter(Boolean);
@@ -215,6 +215,7 @@ function main() {
     : plan.packages.flatMap((name) => ["-p", name]).join(" ");
   writeOutput("mode", plan.mode);
   writeOutput("packages", JSON.stringify(plan.packages));
+  writeOutput("package-list", plan.packages.join(" "));
   writeOutput("package-args", packageArgs);
   writeOutput("reason", plan.reason.replaceAll("\n", " "));
   process.stdout.write(`Rust test impact: ${plan.mode} (${plan.reason})\n`);

@@ -16,6 +16,10 @@ Repositories provide only the Cargo workspace path and genuinely global inputs;
 they do not maintain crate dependency tables. Keep the action pinned to an exact
 commit and pass exact pull-request base/head SHAs.
 
+The planner compares those two exact trees directly. A branch behind its base
+may over-select packages changed on main, but cannot omit a package changed by
+the pull request; this keeps shallow checkouts fast without weakening coverage.
+
 ```yaml
 - id: rust-impact
   uses: burin-labs/.github/.github/actions/rust-test-impact@<full-commit-sha>
