@@ -31,10 +31,17 @@ jobs:
     needs: [package-smoke]
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check CI latency policy
+        uses: ./.github/actions/ci-latency-policy
+        with:
+          baseline-sha: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+          github-token: ${{ github.token }}
       - name: Markdown lint
         uses: DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe # v24.1.0
         with:
@@ -67,6 +74,7 @@ jobs:
           ruby .github/actions/harn-package/run-contract_test.rb
           ruby .github/actions/require-successful-needs/require-successful-needs_test.rb
           ruby .github/actions/check-dependabot-config/check_dependabot_config_test.rb
+          ruby .github/actions/ci-latency-policy/check_ci_latency_policy_test.rb
           ruby .github/workflows/ci_test.rb
           ruby .github/workflows/harn-package_test.rb
           ruby .github/workflows/runner-availability_test.rb
