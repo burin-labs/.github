@@ -63,6 +63,8 @@ jobs:
           echo "${bin_dir}" >> "$GITHUB_PATH"
       - name: GitHub Actions lint
         run: actionlint
+      - name: Test graph-derived Rust impact planning
+        run: node --test .github/actions/rust-test-impact/plan.test.mjs
       - name: Require reusable package smoke
         env:
           PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}

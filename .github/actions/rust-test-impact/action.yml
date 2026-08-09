@@ -1,0 +1,55 @@
+name: Plan affected Rust tests
+description: Conservatively select changed Cargo packages and their transitive reverse dependencies for pull-request CI.
+
+inputs:
+  event-name:
+    description: GitHub event name. Only pull_request is eligible for pruning.
+    required: true
+  base:
+    description: Base Git ref or exact commit used for the three-dot comparison.
+    required: true
+  head:
+    description: Head Git ref or exact commit. Defaults to HEAD.
+    required: false
+    default: HEAD
+  workspace:
+    description: Cargo workspace directory, relative to the repository root.
+    required: false
+    default: .
+  global-paths:
+    description: Newline-separated repository-relative prefixes that force the complete workspace.
+    required: false
+    default: ""
+  extra-package-paths:
+    description: Newline-separated PACKAGE=PATH_PREFIX mappings for generated or non-Cargo inputs owned by one package.
+    required: false
+    default: ""
+
+outputs:
+  mode:
+    description: full, partial, or empty.
+    value: ${{ steps.plan.outputs.mode }}
+  packages:
+    description: JSON array of selected package names.
+    value: ${{ steps.plan.outputs.packages }}
+  package-args:
+    description: Shell words for Cargo package selection, or --workspace for full mode.
+    value: ${{ steps.plan.outputs.package-args }}
+  reason:
+    description: Human-readable explanation of the selected mode.
+    value: ${{ steps.plan.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - name: Derive Rust test impact from the Cargo graph
+      id: plan
+      shell: bash
+      env:
+        RUST_IMPACT_EVENT_NAME: ${{ inputs.event-name }}
+        RUST_IMPACT_BASE: ${{ inputs.base }}
+        RUST_IMPACT_HEAD: ${{ inputs.head }}
+        RUST_IMPACT_WORKSPACE: ${{ inputs.workspace }}
+        RUST_IMPACT_GLOBAL_PATHS: ${{ inputs.global-paths }}
+        RUST_IMPACT_EXTRA_PACKAGE_PATHS: ${{ inputs.extra-package-paths }}
+      run: node "$GITHUB_ACTION_PATH/plan.mjs"
