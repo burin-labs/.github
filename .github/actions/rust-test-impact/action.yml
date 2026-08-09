@@ -6,7 +6,7 @@ inputs:
     description: GitHub event name. Only pull_request is eligible for pruning.
     required: true
   base:
-    description: Base Git ref or exact commit used for the three-dot comparison.
+    description: Exact base tree Git ref or commit.
     required: true
   head:
     description: Head Git ref or exact commit. Defaults to HEAD.
@@ -32,6 +32,9 @@ outputs:
   packages:
     description: JSON array of selected package names.
     value: ${{ steps.plan.outputs.packages }}
+  package-list:
+    description: Space-separated selected package names for shell consumers.
+    value: ${{ steps.plan.outputs.package-list }}
   package-args:
     description: Shell words for Cargo package selection, or --workspace for full mode.
     value: ${{ steps.plan.outputs.package-args }}
