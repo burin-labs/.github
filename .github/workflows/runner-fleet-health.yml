@@ -1,0 +1,88 @@
+name: Self-hosted runner health
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-hosted-runner-health
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    name: Verify expected runners stay online
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mint read-only release-app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: .github
+          permission-organization-self-hosted-runners: read
+
+      - name: Observe two consecutive fleet snapshots
+        id: observe
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          first="$RUNNER_TEMP/runner-fleet-first.json"
+          second="$RUNNER_TEMP/runner-fleet-second.json"
+          report="$RUNNER_TEMP/runner-fleet-health.json"
+
+          snapshot() {
+            local destination="$1"
+            for attempt in 1 2 3; do
+              if ./scripts/runner-fleet-health.sh snapshot > "$destination"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 5))"; fi
+            done
+            return 1
+          }
+
+          snapshot "$first"
+          interval="$(jq -r '.probe_interval_seconds' .github/runner-fleet.json)"
+          sleep "$interval"
+          snapshot "$second"
+
+          set +e
+          ./scripts/runner-fleet-health.sh evaluate "$first" "$second" > "$report"
+          result=$?
+          set -e
+
+          {
+            echo "## Self-hosted runner health"
+            echo
+            jq -r '
+              "Expected: \(.expected_count); observed: \(.first_observed_count) then \(.second_observed_count); result: "
+                + (if .ok then "healthy" else "unhealthy" end),
+              "",
+              (if .ok then "All expected runners were online in at least one probe."
+               else (.unhealthy[] | "- `\(.name)`: \(.first.status) then \(.second.status)") end)
+            ' "$report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Upload runner health report
+        if: always() && steps.observe.outputs.report != ''
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.2
+        with:
+          name: runner-fleet-health
+          path: ${{ steps.observe.outputs.report }}
+          if-no-files-found: error
+          retention-days: 7
