@@ -96,6 +96,7 @@ end
 run_step = observe_job.fetch("steps").find { |step| step["name"] == "Observe full CI runs" }
 abort "latency observer must check every governed repository" unless run_step&.fetch("run")&.include?("for repository in .github harn burin-code harn-cloud")
 abort "latency observer must enforce the policy" unless run_step.fetch("run").include?("--check")
+abort "latency observer must publish the org report as a visible artifact file" unless run_step.fetch("run").include?('report="$reports/${repository#.}.json"')
 
 markdown = steps.find { |step| step["name"] == "Markdown lint" }
 expected_markdown = "DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe"
