@@ -20,7 +20,9 @@
 #         pr-number: ${{ github.event.pull_request.number }}
 #         head-sha: ${{ github.event.pull_request.head.sha }}
 #         head-repository: ${{ github.event.pull_request.head.repo.full_name }}
-#       secrets: inherit
+#       secrets:
+#         RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+#         RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
 name: Merge override
 
@@ -52,6 +54,13 @@ on:
         required: false
         default: burin-labs
         type: string
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        description: GitHub App client id for privileged merges.
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        description: GitHub App private key for privileged merges.
+        required: false
 
 permissions:
   contents: read
