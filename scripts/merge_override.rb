@@ -16,9 +16,21 @@ module MergeOverride
     LABELS.include?(label)
   end
 
-  def authorize!(org:, actor:, membership_role:, head_repository:, base_repository:)
+  def authorize!(
+    org:,
+    actor:,
+    membership_role:,
+    repository_permission:,
+    head_repository:,
+    base_repository:
+  )
     errors = []
-    errors << "actor #{actor.inspect} is not an organization admin of #{org}" unless membership_role == "admin"
+    # GITHUB_TOKEN often cannot read private org membership. Accept either an
+    # organization-admin membership role or repository admin permission.
+    admin = membership_role == "admin" || repository_permission == "admin"
+    unless admin
+      errors << "actor #{actor.inspect} is not an organization or repository admin of #{org}"
+    end
     errors << "refusing override on a fork PR (head #{head_repository} != #{base_repository})" unless head_repository == base_repository
     raise AuthorizationError, errors.join("; ") unless errors.empty?
   end
@@ -65,7 +77,7 @@ module MergeOverride
       ### Merge override applied
 
       - Label: `#{label}`
-      - Authorized actor: `@#{actor}` (organization admin)
+      - Authorized actor: `@#{actor}` (organization or repository admin)
       - Actions: #{actions.empty? ? "none" : actions.join("; ")}
 
       Overrides are for CI incidents, merge-queue cost spikes, or rare fix-forward merges.
@@ -88,6 +100,7 @@ if $PROGRAM_NAME == __FILE__
       org: payload.fetch("org"),
       actor: payload.fetch("actor"),
       membership_role: payload.fetch("membership_role"),
+      repository_permission: payload.fetch("repository_permission"),
       head_repository: payload.fetch("head_repository"),
       base_repository: payload.fetch("base_repository")
     )

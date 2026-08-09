@@ -15,12 +15,13 @@ begin
     org: "burin-labs",
     actor: "alice",
     membership_role: "member",
+    repository_permission: "write",
     head_repository: "burin-labs/harn",
     base_repository: "burin-labs/harn"
   )
   abort "non-admin must be rejected"
 rescue MergeOverride::AuthorizationError => error
-  assert error.message.include?("not an organization admin"), error.message
+  assert error.message.include?("not an organization or repository admin"), error.message
 end
 
 begin
@@ -28,6 +29,7 @@ begin
     org: "burin-labs",
     actor: "kennethsinder",
     membership_role: "admin",
+    repository_permission: "admin",
     head_repository: "outsider/harn",
     base_repository: "burin-labs/harn"
   )
@@ -36,10 +38,21 @@ rescue MergeOverride::AuthorizationError => error
   assert error.message.include?("fork"), error.message
 end
 
+# Org membership may be unreadable to GITHUB_TOKEN; repository admin still works.
+MergeOverride.authorize!(
+  org: "burin-labs",
+  actor: "kennethsinder",
+  membership_role: "none",
+  repository_permission: "admin",
+  head_repository: "burin-labs/harn",
+  base_repository: "burin-labs/harn"
+)
+
 MergeOverride.authorize!(
   org: "burin-labs",
   actor: "kennethsinder",
   membership_role: "admin",
+  repository_permission: "none",
   head_repository: "burin-labs/harn",
   base_repository: "burin-labs/harn"
 )
@@ -72,11 +85,11 @@ body = MergeOverride.audit_body(label: "force-merge", actor: "kennethsinder", pl
 assert body.include?("`force-merge`"), body
 assert body.include?("@kennethsinder"), body
 
-# CLI surface used by the workflow
 authorize_json = {
   "org" => "burin-labs",
   "actor" => "kennethsinder",
-  "membership_role" => "admin",
+  "membership_role" => "none",
+  "repository_permission" => "admin",
   "head_repository" => "burin-labs/harn",
   "base_repository" => "burin-labs/harn"
 }

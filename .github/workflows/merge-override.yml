@@ -1,8 +1,9 @@
 # Reusable privileged override for bypass-ci / bypass-merge-queue / force-merge.
 #
-# Labels are the UX. Authority is re-checked: organization admin only, same-repo
-# heads only. Merges use the harn-release-bot installation token, which is a
-# ruleset bypass actor on burin-labs main protection and merge-queue rulesets.
+# Labels are the UX. Authority is re-checked: organization or repository admin,
+# same-repo heads only. Merges use the harn-release-bot installation token,
+# which is a ruleset bypass actor on burin-labs main protection and merge-queue
+# rulesets.
 #
 # Caller workflow (pin @ full commit SHA after this lands on main):
 #
@@ -92,20 +93,29 @@ jobs:
             echo "::error::unknown override label: $LABEL"
             exit 2
           fi
+          # Private org membership is often invisible to GITHUB_TOKEN. Prefer
+          # membership when readable; always also load repository permission.
           role="$(gh api "orgs/${ORG}/memberships/${ACTOR}" --jq '.role' 2>/dev/null || true)"
           if [[ -z "$role" ]]; then
             role="none"
+          fi
+          permission="$(gh api "repos/${BASE_REPOSITORY}/collaborators/${ACTOR}/permission" \
+            --jq '.permission' 2>/dev/null || true)"
+          if [[ -z "$permission" ]]; then
+            permission="none"
           fi
           printf '%s' "$(jq -n \
             --arg org "$ORG" \
             --arg actor "$ACTOR" \
             --arg membership_role "$role" \
+            --arg repository_permission "$permission" \
             --arg head_repository "$HEAD_REPOSITORY" \
             --arg base_repository "$BASE_REPOSITORY" \
             '{
               org: $org,
               actor: $actor,
               membership_role: $membership_role,
+              repository_permission: $repository_permission,
               head_repository: $head_repository,
               base_repository: $base_repository
             }')" | ruby scripts/merge_override.rb authorize
