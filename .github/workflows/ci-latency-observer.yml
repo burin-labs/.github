@@ -42,7 +42,7 @@ jobs:
         with:
           repository: burin-labs/harn
           # Updated only after the owning Harn change is integrated on main.
-          ref: 7d6fafcde3eaeb05e798d272ab10f95801c09fcb
+          ref: 143608ec8fe14341464728ebdf5860b03cc1b9c7
           path: .harn/ci-latency-harn
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
