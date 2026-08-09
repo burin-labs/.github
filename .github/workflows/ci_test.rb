@@ -54,7 +54,8 @@ expected_policy_sources = [
   ".github/workflows/merge-override-dispatch.yml",
   ".github/workflows/merge-override.yml",
   ".github/workflows/reusable-pin-drift.yml",
-  ".github/workflows/runner-availability.yml"
+  ".github/workflows/runner-availability.yml",
+  ".github/workflows/runner-fleet-health.yml"
 ]
 unless actual_policy_sources == expected_policy_sources
   abort "workflow/action policy source census drifted: #{actual_policy_sources.inspect}"

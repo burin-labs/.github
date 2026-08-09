@@ -11,6 +11,16 @@ Burin Labs organization defaults and reusable GitHub Actions workflows.
   exact `.harn-version`, runs the Harn-owned package contract, and uploads the
   structured receipts.
 
+## Self-hosted runner health
+
+`.github/runner-fleet.json` is the typed inventory of Burin Labs-owned runners.
+The hourly `Self-hosted runner health` workflow takes two read-only GitHub
+snapshots one minute apart and fails only when the same expected runner remains
+missing or offline in both. Exact names exclude Blacksmith's short-lived runner
+registrations. The workflow uploads a compact seven-day report and never
+restarts a host; machine-local remediation remains an explicit idle-only
+operation.
+
 ## CI latency policy
 
 `.github/actions/ci-latency-policy` checks a repository's
