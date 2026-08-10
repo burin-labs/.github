@@ -109,6 +109,27 @@ abort "CI must install checksum-pinned actionlint" unless install_actionlint&.di
 abort "CI must pin the actionlint archive checksum" unless install_actionlint.dig("env", "ACTIONLINT_SHA256") == "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
 actions_lint = steps.find { |step| step["name"] == "GitHub Actions lint" }
 abort "CI must execute actionlint" unless actions_lint&.fetch("run") == "actionlint"
+
+override_path = File.join(__dir__, "merge-override.yml")
+override = YAML.safe_load(File.read(override_path), aliases: true)
+override_steps = override.fetch("jobs").fetch("apply").fetch("steps")
+cancel_step = override_steps.find { |step| step["name"] == "Cancel competing workflow runs" }
+publish_step = override_steps.find { |step| step["name"] == "Publish successful CI status check" }
+abort "merge override must cancel competing workflows" unless cancel_step
+abort "merge override must publish its CI result" unless publish_step
+unless override_steps.index(cancel_step) < override_steps.index(publish_step)
+  abort "merge override must cancel workflows before publishing CI status"
+end
+unless cancel_step.fetch("run").include?('gh run watch "$run_id"')
+  abort "merge override must wait for cancelled workflows to finish"
+end
+unless cancel_step.fetch("run").include?("timeout 120")
+  abort "merge override cancellation wait must stay bounded"
+end
+unless cancel_step.fetch("run").include?('run_status="$(gh api')
+  abort "merge override must confirm cancelled workflows are terminal"
+end
+
 impact_tests = steps.find { |step| step["name"] == "Test graph-derived Rust impact planning" }
 unless impact_tests&.fetch("run") == "node --test .github/actions/rust-test-impact/plan.test.mjs"
   abort "CI must execute the shared Rust impact planner tests"
