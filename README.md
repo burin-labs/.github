@@ -191,7 +191,9 @@ workflow rejects non-admins and fork pull requests, then acts with the
 `harn-release-bot` installation token (a ruleset bypass actor).
 
 - `bypass-ci`: cancel competing runs for the head SHA and publish a successful
-  `CI status` check. Does not merge.
+  `CI status` check after those runs stop. Does not merge. If GitHub cannot
+  stop a run within two minutes, the override fails closed instead of racing
+  that run's final status.
 - `bypass-merge-queue`: squash-merge immediately when `CI status` is already
   green. Skips the merge queue.
 - `force-merge`: publish successful `CI status`, then squash-merge immediately.
