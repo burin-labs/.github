@@ -101,7 +101,7 @@ abort "latency observer must enforce the policy" unless run_step.fetch("run").in
 abort "latency observer must publish the org report as a visible artifact file" unless run_step.fetch("run").include?('report="$reports/${repository#.}.json"')
 
 markdown = steps.find { |step| step["name"] == "Markdown lint" }
-expected_markdown = "DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe"
+expected_markdown = "DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff"
 abort "CI must lint Markdown through an immutable action" unless markdown&.fetch("uses") == expected_markdown
 abort "CI must lint Markdown recursively" unless markdown.fetch("with") == {"globs" => "**/*.md"}
 install_actionlint = steps.find { |step| step["name"] == "Install actionlint" }
