@@ -111,11 +111,10 @@ jobs:
           run_id=""
           for _ in $(seq 1 30); do
             sleep 4
-            # shellcheck disable=SC2016 # $reason is a jq variable, not a shell one.
             run_id="$(gh run list --repo "$INDEX_REPO" --workflow "$WORKFLOW" \
-              --limit 30 --json databaseId,displayTitle \
-              --jq --arg reason "$REASON" \
-              'map(select(.displayTitle | contains($reason))) | .[0].databaseId // empty')"
+              --limit 30 --json databaseId,displayTitle | \
+              jq -r --arg reason "$REASON" \
+                'map(select(.displayTitle | contains($reason))) | .[0].databaseId // empty')"
             if [[ -n "$run_id" ]]; then
               break
             fi
