@@ -94,11 +94,16 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           INDEX_REPO: ${{ inputs.index-owner }}/${{ inputs.index-repository }}
           WORKFLOW: ${{ inputs.workflow }}
-          REASON: ${{ github.repository }} ${{ github.ref_name }}
+          # Unique per calling run, which is what makes the reconcile run
+          # identifiable: the reconciler puts this reason in its run name.
+          REASON: ${{ github.repository }} ${{ github.ref_name }} (run ${{ github.run_id }})
         run: |
           set -euo pipefail
-          # Identify the run by what appeared after the dispatch rather than by
-          # a timestamp, so the two clocks involved never have to agree.
+          # The dispatch API returns nothing identifying, so the run has to be
+          # recognized after the fact. Matching the reason carried in the run
+          # name is exact; a timestamp comparison would need two clocks to
+          # agree, and a before-and-after diff of the run list would adopt a
+          # concurrent caller's run when two packages release at once.
           before="$(gh run list --repo "$INDEX_REPO" --workflow "$WORKFLOW" \
             --limit 30 --json databaseId --jq '[.[].databaseId] | join(" ")')"
           gh workflow run "$WORKFLOW" --repo "$INDEX_REPO" \
@@ -106,8 +111,17 @@ jobs:
           run_id=""
           for _ in $(seq 1 30); do
             sleep 4
-            # Newest first, so the first identifier that is not in the
-            # pre-dispatch set is the run this job just asked for.
+            # shellcheck disable=SC2016 # $reason is a jq variable, not a shell one.
+            run_id="$(gh run list --repo "$INDEX_REPO" --workflow "$WORKFLOW" \
+              --limit 30 --json databaseId,displayTitle \
+              --jq --arg reason "$REASON" \
+              'map(select(.displayTitle | contains($reason))) | .[0].databaseId // empty')"
+            if [[ -n "$run_id" ]]; then
+              break
+            fi
+            # An index whose reconciler predates run naming cannot be matched
+            # by title. Fall back to the run that appeared after the dispatch
+            # rather than failing a release over a pin that has not advanced.
             for candidate in $(gh run list --repo "$INDEX_REPO" --workflow "$WORKFLOW" \
               --limit 30 --json databaseId --jq '.[].databaseId'); do
               case " $before " in
@@ -117,6 +131,7 @@ jobs:
               break
             done
             if [[ -n "$run_id" ]]; then
+              echo "Matched by dispatch order; the index reconciler does not name its runs yet."
               break
             fi
           done
