@@ -51,6 +51,15 @@ unless dispatch.dig("env", "REASON").to_s.include?("github.run_id")
   abort "the dispatch reason must be unique per calling run, or it cannot identify a run"
 end
 abort "release registration must match the run by its name" unless run.include?("displayTitle")
+# `--arg` belongs to jq, not to `gh run list`. Keeping the JSON producer and
+# matcher as separate commands makes that authority boundary executable rather
+# than depending on an unsupported gh option that fails every release late.
+unless run.include?('jq -r --arg reason "$REASON"')
+  abort "release registration must pass matcher variables to jq, not gh"
+end
+if run.match?(/gh run list[^|]*--arg/m)
+  abort "release registration must not pass jq options to gh run list"
+end
 # The fallback exists for an index whose reconciler predates run naming. It is
 # the old before-and-after diff, which is exact except against a concurrent
 # caller, and that beats failing a release over an unadvanced pin.
