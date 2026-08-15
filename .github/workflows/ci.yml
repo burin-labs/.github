@@ -79,6 +79,7 @@ jobs:
           ruby .github/actions/ci-latency-policy/check_ci_latency_policy_test.rb
           ruby .github/workflows/ci_test.rb
           ruby .github/workflows/harn-package_test.rb
+          ruby .github/workflows/register-package-release_test.rb
           ruby .github/workflows/runner-availability_test.rb
           ruby .github/workflows/runner-fleet-health_test.rb
           ruby scripts/merge_override_test.rb

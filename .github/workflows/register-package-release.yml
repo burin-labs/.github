@@ -1,0 +1,164 @@
+# Register a package release in the Harn package index.
+#
+# A release tag and the index are two facts that have to agree, and until now
+# nothing made them agree: `harn publish` is author-invoked and wired into no
+# release pipeline, so `@burin/github-connector` served 0.3.0 while v0.8.3 had
+# shipped (burin-labs/harn-github-connector#289). The reconciler in
+# burin-labs/harn-packages owns what the index should say. This workflow is how
+# a package repository tells it that something changed, instead of waiting for
+# the daily schedule.
+#
+# It is hosted here so that a package repository carries one call rather than a
+# copy of the mechanism. Call it from a release workflow, where its failure
+# makes the release run fail, or from a tag-triggered workflow in a repository
+# that cuts releases outside CI:
+#
+#   on:
+#     push:
+#       tags: ["v*.*.*"]
+#   jobs:
+#     register:
+#       uses: burin-labs/.github/.github/workflows/register-package-release.yml@<sha>
+#       secrets:
+#         RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+#         RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+#
+# The reconciler proposes; it does not publish. A successful run means the
+# index either already agreed or now has an open pull request naming the
+# releases it is missing.
+
+name: Register package release
+
+on:
+  workflow_call:
+    inputs:
+      index-owner:
+        description: Organization that owns the package index.
+        required: false
+        default: burin-labs
+        type: string
+      index-repository:
+        description: Repository name of the package index.
+        required: false
+        default: harn-packages
+        type: string
+      workflow:
+        description: Reconciler workflow file in the index repository.
+        required: false
+        default: reconcile-index.yml
+        type: string
+      wait:
+        description: Fail this job when the reconcile run fails. Turning it off makes registration advisory.
+        required: false
+        default: true
+        type: boolean
+      timeout-minutes:
+        description: How long to wait for the reconcile run, including queue time.
+        required: false
+        default: 20
+        type: number
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        description: GitHub App client id with actions write on the index repository.
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        description: GitHub App private key.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  register:
+    name: Register in the package index
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - name: Mint the reconciler dispatch token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.index-owner }}
+          repositories: ${{ inputs.index-repository }}
+          # Dispatching and reading the resulting run is the whole authority
+          # this workflow needs. Writing the index is the reconciler's job, on
+          # its own token, in its own repository.
+          permission-actions: write
+
+      - name: Ask the index to reconcile
+        id: dispatch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          INDEX_REPO: ${{ inputs.index-owner }}/${{ inputs.index-repository }}
+          WORKFLOW: ${{ inputs.workflow }}
+          REASON: ${{ github.repository }} ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Identify the run by what appeared after the dispatch rather than by
+          # a timestamp, so the two clocks involved never have to agree.
+          before="$(gh run list --repo "$INDEX_REPO" --workflow "$WORKFLOW" \
+            --limit 30 --json databaseId --jq '[.[].databaseId] | join(" ")')"
+          gh workflow run "$WORKFLOW" --repo "$INDEX_REPO" \
+            -f mode=propose -f reason="$REASON"
+          run_id=""
+          for _ in $(seq 1 30); do
+            sleep 4
+            # Newest first, so the first identifier that is not in the
+            # pre-dispatch set is the run this job just asked for.
+            for candidate in $(gh run list --repo "$INDEX_REPO" --workflow "$WORKFLOW" \
+              --limit 30 --json databaseId --jq '.[].databaseId'); do
+              case " $before " in
+                *" $candidate "*) continue ;;
+              esac
+              run_id="$candidate"
+              break
+            done
+            if [[ -n "$run_id" ]]; then
+              break
+            fi
+          done
+          if [[ -z "$run_id" ]]; then
+            echo "Dispatched $WORKFLOW in $INDEX_REPO but no new run appeared." >&2
+            exit 1
+          fi
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run-url=$(gh run view "$run_id" --repo "$INDEX_REPO" --json url --jq .url)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the index to agree
+        if: inputs.wait
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          INDEX_REPO: ${{ inputs.index-owner }}/${{ inputs.index-repository }}
+          RUN_ID: ${{ steps.dispatch.outputs.run-id }}
+          RUN_URL: ${{ steps.dispatch.outputs.run-url }}
+        run: |
+          set -euo pipefail
+          # The job timeout bounds this loop, including time the run spends
+          # queued behind another repository's reconcile.
+          while true; do
+            status="$(gh run view "$RUN_ID" --repo "$INDEX_REPO" --json status --jq .status)"
+            [[ "$status" == "completed" ]] && break
+            sleep 15
+          done
+          conclusion="$(gh run view "$RUN_ID" --repo "$INDEX_REPO" --json conclusion --jq .conclusion)"
+          echo "Reconcile run: $RUN_URL ($conclusion)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "The package index did not reconcile: $RUN_URL" >&2
+            echo "This release is not registered. A failed reconcile means drift" >&2
+            echo "the reconciler cannot correct on its own." >&2
+            exit 1
+          fi
+          echo "The package index reconciled: $RUN_URL"
+
+      - name: Record the dispatch
+        if: ${{ !inputs.wait }}
+        shell: bash
+        env:
+          RUN_URL: ${{ steps.dispatch.outputs.run-url }}
+        run: |
+          echo "Reconcile run: $RUN_URL (not awaited)" >> "$GITHUB_STEP_SUMMARY"

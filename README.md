@@ -41,6 +41,41 @@ the pull request; this keeps shallow checkouts fast without weakening coverage.
 - `.github/workflows/harn-package.yml` checks out a Harn package, installs its
   exact `.harn-version`, runs the Harn-owned package contract, and uploads the
   structured receipts.
+- `.github/workflows/register-package-release.yml` tells the package index that
+  a release shipped, so the index reconciles within minutes instead of at the
+  next daily run.
+
+## Registering package releases
+
+A release tag and the Harn package index are two facts that have to agree, and
+nothing made them agree: `harn publish` is author-invoked and wired into no
+release pipeline, so `@burin/github-connector` served 0.3.0 while v0.8.3 had
+shipped. See burin-labs/harn-github-connector#289.
+
+`burin-labs/harn-packages` owns what the index should say; its reconciler
+compares every indexed package against `git ls-remote` and the published
+`harn.toml`, and proposes the corrections it can derive. This workflow is only
+how a package repository tells the reconciler that something changed, which is
+why it is one call rather than a copy of the mechanism in every package
+repository:
+
+```yaml
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  register:
+    uses: burin-labs/.github/.github/workflows/register-package-release.yml@<full-commit-sha>
+    secrets:
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+```
+
+Call it as a dependent job in a release workflow where one exists, so an
+unregistered release fails the release run. The token it mints can dispatch the
+reconciler and read the resulting run; it cannot write the index, which stays
+with the reconciler in the repository that owns it.
 
 ## Self-hosted runner health
 
