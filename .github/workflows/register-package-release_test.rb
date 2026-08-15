@@ -44,10 +44,17 @@ end
 dispatch = steps.find { |step| step["name"] == "Ask the index to reconcile" }
 run = dispatch.fetch("run")
 abort "release registration must ask for a proposal" unless run.include?("-f mode=propose")
-# Identifying the run by what appeared after the dispatch keeps two clocks out
-# of the correlation. A timestamp comparison would silently pick the wrong run
-# when the runner and the API disagree.
-abort "release registration must correlate the run it started" unless run.include?("before=")
+# The dispatch API returns nothing identifying, so the run has to be recognized
+# after the fact. The reason is unique per calling run and the reconciler
+# carries it in the run name, which is what makes the match exact.
+unless dispatch.dig("env", "REASON").to_s.include?("github.run_id")
+  abort "the dispatch reason must be unique per calling run, or it cannot identify a run"
+end
+abort "release registration must match the run by its name" unless run.include?("displayTitle")
+# The fallback exists for an index whose reconciler predates run naming. It is
+# the old before-and-after diff, which is exact except against a concurrent
+# caller, and that beats failing a release over an unadvanced pin.
+abort "release registration must survive an index that does not name runs" unless run.include?("before=")
 abort "release registration must fail when no run appears" unless run.include?("no new run appeared")
 
 wait = steps.find { |step| step["name"] == "Wait for the index to agree" }
