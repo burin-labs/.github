@@ -54,6 +54,7 @@ expected_policy_sources = [
   ".github/workflows/harn-package.yml",
   ".github/workflows/merge-override-dispatch.yml",
   ".github/workflows/merge-override.yml",
+  ".github/workflows/register-package-release.yml",
   ".github/workflows/reusable-pin-drift.yml",
   ".github/workflows/runner-availability.yml",
   ".github/workflows/runner-fleet-health.yml"
