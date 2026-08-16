@@ -58,6 +58,51 @@ refuses("waiving an alert that has a fix") do
   W.validate!(document([waiver("observed" => {"severity" => "high", "fix_available" => true, "first_patched_version" => "11.1.1"})]))
 end
 
+# --- fixes that exist but are capped out of reach --------------------------
+
+def blocker(overrides = {})
+  {
+    "package" => "tui-textarea",
+    "ecosystem" => "cargo",
+    "version" => "0.7.0",
+    "requirement" => "^0.29.0",
+    "constrains" => "ratatui",
+    "override_rejected" => "Forcing ratatui 0.30 into tui-textarea 0.7.0 does not compile; the widget trait it implements changed."
+  }.merge(overrides)
+end
+
+def blocked(overrides = {})
+  waiver("dismissed_reason" => "tolerable_risk", "observed" => {
+    "severity" => "low", "fix_available" => true,
+    "first_patched_version" => "0.16.3", "blocked_by" => blocker(overrides)
+  })
+end
+
+W.validate!(document([blocked]))
+
+refuses("a blocker with no ecosystem the audit can re-read") { W.validate!(document([blocked("ecosystem" => "conda")])) }
+# The blocker often caps an intermediate, not the vulnerable package itself:
+# tui-textarea caps ratatui, and ratatui is what pulls in the vulnerable lru.
+# Leaving this implicit made the audit read an edge that does not exist and
+# reopen the alert on every run.
+refuses("a blocker that does not say which edge to re-read") { W.validate!(document([blocked("constrains" => "")])) }
+refuses("a blocker missing the version it was read from") { W.validate!(document([blocked("version" => "")])) }
+refuses("a blocker missing the requirement string") { W.validate!(document([blocked("requirement" => "")])) }
+
+# The exception exists for genuinely unreachable fixes. Without this, anyone
+# could name a dependency that pins an old major and launder a real task
+# through it -- exactly what an override would solve.
+refuses("a blocker that does not say why an override was rejected") do
+  W.validate!(document([blocked("override_rejected" => "upstream pins it")]))
+end
+
+refuses("a blocker attached to a waiver claiming no fix exists") do
+  W.validate!(document([waiver("observed" => {
+    "severity" => "low", "fix_available" => false,
+    "first_patched_version" => nil, "blocked_by" => blocker
+  })]))
+end
+
 # --- reconciliation -------------------------------------------------------
 
 TODAY = "2026-08-15"
@@ -109,6 +154,35 @@ abort "a lapsed review date must fail the audit" unless
 
 abort "reopening must win over an expired review date" unless
   verdict_of(waiver: waiver, alert: alert, fix_installable: true, today: "2026-11-16") == :reopen
+
+# --- re-checking the cap rather than the patch ----------------------------
+
+BLOCKED_ALERT = alert("security_advisory" => {"ghsa_id" => "GHSA-x744-4wpc-v9h2", "severity" => "low"},
+                      "security_vulnerability" => {"first_patched_version" => {"identifier" => "0.16.3"}})
+
+def blocked_verdict(live, today: TODAY)
+  W.reconcile(waiver: blocked, alert: BLOCKED_ALERT, fix_installable: true,
+              today: today, blocker_state: live).first
+end
+
+# The patch exists and is installable. That must NOT reopen the alert on its
+# own, or every capped dependency reopens on every run -- the whole point is
+# that the cap, not the patch, is what changed.
+abort "an installable but capped fix must stay parked" unless
+  blocked_verdict({"version" => "0.7.0", "requirement" => "^0.29.0"}) == :ok
+
+abort "a new blocker release must reopen" unless
+  blocked_verdict({"version" => "0.8.0", "requirement" => "^0.29.0"}) == :reopen
+
+abort "a relaxed requirement must reopen" unless
+  blocked_verdict({"version" => "0.7.0", "requirement" => "^0.30.0"}) == :reopen
+
+# A registry outage must never be read as "the block lifted".
+abort "an unreadable registry must leave the waiver alone" unless
+  blocked_verdict(nil) == :ok
+
+abort "a capped waiver still expires" unless
+  blocked_verdict({"version" => "0.7.0", "requirement" => "^0.29.0"}, today: "2026-11-16") == :overdue
 
 # --- reporting ------------------------------------------------------------
 

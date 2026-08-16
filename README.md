@@ -137,6 +137,32 @@ audit also fails on a dismissed alert that has *no* waiver, since such a
 dismissal records no reason and never expires. Repositories without a registry
 are skipped entirely.
 
+### When the fix exists but nothing can reach it
+
+Some alerts have a published fix that this dependency graph cannot adopt,
+because a third party caps the version. `tui-textarea` requires
+`ratatui ^0.29`, and `ratatui 0.29` is the only thing still pulling the
+vulnerable `lru`; `unsloth` requires `torch<2.12`, while the patch is `2.13`.
+These are not fixable today and are not "no patch exists" either.
+
+Such a waiver sets `observed.fix_available: true` and must add
+`observed.blocked_by`, naming the blocking package, the version and requirement
+read from it, the edge it `constrains`, and `override_rejected`: why forcing
+the fix past the cap is not viable. That last field is required because almost
+any cap *can* be overridden, and whether that is safe is a judgement no schema
+can make — so it has to be made in writing and reviewed.
+
+For these, the audit re-reads **the cap, not the patch**: any change to what the
+blocking package publishes reopens the alert. It deliberately does not attempt
+version-range arithmetic across three ecosystems' dialects; a changed
+requirement puts a human back in the loop. Note `constrains` is often not the
+vulnerable package — `tui-textarea` caps `ratatui`, and `ratatui` is what drags
+in `lru`.
+
+This is the one exception to "an available fix means it is a task, not a
+waiver", and it is narrow on purpose. If the fix is reachable at all, even
+awkwardly, leave the alert open and file it.
+
 Crucially, the audit checks whether a patched version is *installable*, not
 whether the advisory *claims* one. GitHub's `first_patched_version` is an
 advisory claim about a product release; `GHSA-x744-4wpc-v9h2` names Docker
