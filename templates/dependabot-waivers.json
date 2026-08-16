@@ -15,6 +15,28 @@
         "fix_available": false,
         "first_patched_version": null
       }
+    },
+    {
+      "alert_number": 2,
+      "ghsa_id": "GHSA-1111-1111-1111",
+      "package": "example-capped-package",
+      "ecosystem": "cargo",
+      "dismissed_reason": "tolerable_risk",
+      "why": "Use this shape only when a patched version exists but nothing in this dependency graph can reach it. Say what the patch is and what stands between you and it. If the fix is reachable at all, even awkwardly, this is a task: leave the alert open and file it.",
+      "review_by": "2027-01-01",
+      "observed": {
+        "severity": "low",
+        "fix_available": true,
+        "first_patched_version": "1.2.3",
+        "blocked_by": {
+          "package": "example-blocking-package",
+          "ecosystem": "cargo",
+          "version": "0.7.0",
+          "requirement": "^0.1.0",
+          "override_rejected": "Explain concretely why forcing the fix past this cap does not work: it fails to compile, it breaks a resolver the build depends on, or it silently changes behaviour no test covers. 'Upstream pins it' is not an answer, because an override could defeat that.",
+          "constrains": "example-constrained-package"
+        }
+      }
     }
   ]
 }

@@ -31,6 +31,8 @@ module DependabotWaivers
   REASONS = %w[fix_started inaccurate no_bandwidth not_used tolerable_risk].freeze
   SEVERITY_RANK = {"low" => 0, "medium" => 1, "high" => 2, "critical" => 3}.freeze
   WAIVER_PATH = ".github/dependabot-waivers.json"
+  # Ecosystems whose upstream version caps the audit knows how to re-read.
+  BLOCKER_REGISTRIES = {"cargo" => :crates, "pip" => :pypi, "npm" => :npm}.freeze
 
   class SchemaError < StandardError; end
 
@@ -102,15 +104,49 @@ module DependabotWaivers
       unless observed.key?("first_patched_version")
         errors << "#{at}.observed.first_patched_version must be present (null when upstream has shipped nothing)"
       end
-      # A waiver that already admits an installable fix exists is not a waiver,
-      # it is an unfiled task. Keep the two from being confused.
+      # A waiver that admits an installable fix exists is normally an unfiled
+      # task, not a waiver. The one honest exception is a patch that is
+      # published but unreachable in this dependency graph because a third
+      # party caps the version -- and that has to be stated, with the reason
+      # the obvious override does not work, or the exception becomes the
+      # loophole that swallows every real task.
       if observed["fix_available"] == true && waiver["dismissed_reason"] != "fix_started"
-        errors << "#{at} records an available fix, so it is actionable and must not be waived"
+        if observed["blocked_by"].nil?
+          errors << "#{at} records an available fix, so it is actionable and must not be waived " \
+                    "unless observed.blocked_by names the upstream constraint that prevents adopting it"
+        else
+          errors.concat(blocker_errors(observed["blocked_by"], "#{at}.observed.blocked_by"))
+        end
+      elsif observed["blocked_by"]
+        errors << "#{at}.observed.blocked_by only means something when fix_available is true"
       end
     else
       errors << "#{at}.observed must be an object"
     end
 
+    errors
+  end
+
+  def blocker_errors(blocker, at)
+    return ["#{at} must be an object"] unless blocker.is_a?(Hash)
+
+    errors = []
+    # `constrains` is not always the vulnerable package. tui-textarea caps
+    # ratatui, and ratatui is what drags in the vulnerable lru -- so the audit
+    # has to be told which edge to re-read, or it silently reads a dependency
+    # the blocker does not declare and reopens the alert every run.
+    %w[package ecosystem version requirement constrains].each do |key|
+      errors << "#{at}.#{key} must be a non-empty string" unless blocker[key].is_a?(String) && !blocker[key].empty?
+    end
+    unless BLOCKER_REGISTRIES.key?(blocker["ecosystem"])
+      errors << "#{at}.ecosystem must be one of #{BLOCKER_REGISTRIES.keys.join(", ")} so the audit can re-check it"
+    end
+    # Nearly every capped dependency can technically be forced with an override
+    # or a resolution pin. Whether that is safe is a judgement no schema can
+    # make, so require it to be made in writing and reviewed.
+    unless blocker["override_rejected"].is_a?(String) && blocker["override_rejected"].length >= 40
+      errors << "#{at}.override_rejected must explain, in at least 40 characters, why forcing the fix past this constraint is not viable"
+    end
     errors
   end
 
@@ -122,7 +158,7 @@ module DependabotWaivers
   #   :reopen   -- became actionable, put it back in front of a human
   #   :stale    -- the waiver no longer describes a dismissed alert, delete it
   #   :overdue  -- still not actionable but past its review date
-  def reconcile(waiver:, alert:, fix_installable:, today:)
+  def reconcile(waiver:, alert:, fix_installable:, today:, blocker_state: nil)
     return [:stale, "alert #{waiver["alert_number"]} no longer exists"] if alert.nil?
 
     state = alert.dig("state")
@@ -144,6 +180,19 @@ module DependabotWaivers
     if fix_installable && !observed["fix_available"]
       patched = alert.dig("security_vulnerability", "first_patched_version", "identifier")
       return [:reopen, "an installable fix now exists (#{patched}); the waiver assumed none"]
+    end
+
+    # For a fix that exists but is capped out of reach, the thing to re-check is
+    # the cap, not the patch. Any movement in what upstream publishes puts a
+    # human back in the loop rather than trying to re-derive the semver maths.
+    blocker = observed["blocked_by"]
+    if blocker && blocker_state
+      recorded = blocker.values_at("version", "requirement")
+      live = blocker_state.values_at("version", "requirement")
+      if live != recorded
+        return [:reopen, "#{blocker["package"]} moved from #{recorded[0]} (#{recorded[1]}) " \
+                         "to #{live[0]} (#{live[1]}); re-check whether the fix is reachable now"]
+      end
     end
 
     return [:overdue, "review_by #{waiver["review_by"]} has passed"] if waiver["review_by"] < today
@@ -197,6 +246,57 @@ module DependabotWaivers
 
   def npm_version?(package, version)
     head_ok?("https://registry.npmjs.org/#{package}/#{version}")
+  end
+
+  # Read what the blocking package currently publishes: its newest release and
+  # the requirement that release places on the dependency we cannot upgrade.
+  # Returns nil on any failure, which leaves the waiver untouched -- a registry
+  # outage must never read as "the block lifted".
+  def blocker_state(package:, ecosystem:, dependency:)
+    case BLOCKER_REGISTRIES[ecosystem]
+    when :crates then crates_blocker(package, dependency)
+    when :pypi then pypi_blocker(package, dependency)
+    when :npm then npm_blocker(package, dependency)
+    end
+  rescue StandardError
+    nil
+  end
+
+  def crates_blocker(package, dependency)
+    crate = get_json("https://crates.io/api/v1/crates/#{package}")
+    version = crate.dig("crate", "max_stable_version") or return nil
+    deps = get_json("https://crates.io/api/v1/crates/#{package}/#{version}/dependencies").fetch("dependencies")
+    requirement = deps.select { |dep| dep["crate_id"] == dependency }.map { |dep| dep["req"] }.sort.join(", ")
+    {"version" => version, "requirement" => requirement}
+  end
+
+  def pypi_blocker(package, dependency)
+    info = get_json("https://pypi.org/pypi/#{package}/json").fetch("info")
+    # Keep only the plain runtime requirement. Extras and environment markers
+    # come and go for unrelated reasons and would reopen the alert as noise.
+    requirement = Array(info["requires_dist"])
+      .select { |req| req.split(/[\s<>=!~;\[]/, 2).first == dependency && !req.include?(";") }
+      .sort.join(", ")
+    {"version" => info.fetch("version"), "requirement" => requirement}
+  end
+
+  def npm_blocker(package, dependency)
+    packument = get_json("https://registry.npmjs.org/#{package}")
+    version = packument.dig("dist-tags", "latest") or return nil
+    requirement = packument.dig("versions", version, "dependencies", dependency).to_s
+    {"version" => version, "requirement" => requirement}
+  end
+
+  def get_json(url)
+    uri = URI.parse(url)
+    request = Net::HTTP::Get.new(uri)
+    # crates.io rejects requests without a descriptive User-Agent.
+    request["User-Agent"] = "burin-labs-dependabot-waiver-audit"
+    response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 10, read_timeout: 10) do |http|
+      http.request(request)
+    end
+    raise "#{url} returned #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+    JSON.parse(response.body)
   end
 
   def head_ok?(url)
@@ -264,7 +364,16 @@ module DependabotWaivers
           package: waiver["package"],
           version: alert.dig("security_vulnerability", "first_patched_version", "identifier")
         )
-        verdict, detail = reconcile(waiver: waiver, alert: alert, fix_installable: installable, today: today)
+        blocker = waiver.dig("observed", "blocked_by")
+        live_blocker = blocker && blocker_state(
+          package: blocker.fetch("package"),
+          ecosystem: blocker.fetch("ecosystem"),
+          dependency: blocker.fetch("constrains")
+        )
+        verdict, detail = reconcile(
+          waiver: waiver, alert: alert, fix_installable: installable,
+          today: today, blocker_state: live_blocker
+        )
         reopen!(repository, waiver["alert_number"]) if verdict == :reopen && apply
         results << {
           "repository" => repository,
