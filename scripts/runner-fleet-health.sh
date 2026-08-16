@@ -12,6 +12,15 @@ jq -e '
   and (.expected_runners | type == "array" and length > 0)
   and (.expected_runners | all(type == "string" and length > 0))
   and ((.expected_runners | unique | length) == (.expected_runners | length))
+  # A host that is owned but deliberately not running CI stays in the inventory
+  # with a reason instead of being silently deleted, so the file keeps saying
+  # what exists. It must not also be expected online, or the alarm asserts both
+  # that a host must answer and that it will not.
+  and ((has("deliberately_offline") | not)
+       or (.deliberately_offline | type == "object"
+           and (to_entries | all(.value | type == "string" and length > 0))))
+  and (((.deliberately_offline // {}) | keys) as $offline
+       | (($offline - .expected_runners) | length) == ($offline | length))
 ' "$policy_path" >/dev/null
 
 snapshot() {
