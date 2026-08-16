@@ -82,6 +82,8 @@ jobs:
           ruby .github/workflows/register-package-release_test.rb
           ruby .github/workflows/runner-availability_test.rb
           ruby .github/workflows/runner-fleet-health_test.rb
+          ruby .github/workflows/dependabot-waiver-audit_test.rb
+          ruby scripts/dependabot_waivers_test.rb
           ruby scripts/merge_override_test.rb
           ruby scripts/reusable_pin_drift_test.rb
       - name: Check Dependabot config

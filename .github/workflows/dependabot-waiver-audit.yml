@@ -1,0 +1,80 @@
+name: Dependabot waiver audit
+
+# GitHub only auto-reopens alerts that one of its own auto-triage rules
+# dismissed. Anything dismissed by a human or by the REST API stays dismissed
+# forever, including after upstream ships the fix. This is the weekly re-check
+# that turns every checked-in waiver back into an open alert the moment it
+# stops being true.
+
+on:
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-waiver-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Re-check dismissed Dependabot alerts
+    # Unarmed until a human grants the release app the Dependabot alerts
+    # permission (see README). A skipped job is honest about not having run;
+    # arming this before the permission exists would make the audit red on
+    # every schedule, which is the exact failure mode it was built to remove.
+    if: ${{ vars.DEPENDABOT_WAIVER_AUDIT == 'enabled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mint release-app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-metadata: read
+          permission-vulnerability-alerts: write
+
+      - name: Reconcile waivers against live alerts
+        id: audit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/dependabot-waiver-audit.json"
+          ruby scripts/dependabot_waivers.rb audit \
+            --org "${{ github.repository_owner }}" --apply > "$report"
+          result=$?
+
+          {
+            echo "## Dependabot waiver audit"
+            echo
+            jq -r '
+              "Checked \(.checked) waiver(s): \(.ok) still parked, \(.reopened) reopened, "
+                + "\(.stale) stale, \(.overdue) overdue.",
+              "",
+              (.results[] | select(.verdict != "ok")
+                | "- **\(.verdict)** `\(.repository)` #\(.alert_number) (\(.package)): \(.detail)")
+            ' "$report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Upload waiver audit report
+        if: always() && steps.audit.outputs.report != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2
+        with:
+          name: dependabot-waiver-audit
+          path: ${{ steps.audit.outputs.report }}
+          if-no-files-found: error
+          retention-days: 30

@@ -51,6 +51,7 @@ expected_policy_sources = [
   ".github/actions/rust-test-impact/action.yml",
   ".github/workflows/ci-latency-observer.yml",
   ".github/workflows/ci.yml",
+  ".github/workflows/dependabot-waiver-audit.yml",
   ".github/workflows/harn-package.yml",
   ".github/workflows/merge-override-dispatch.yml",
   ".github/workflows/merge-override.yml",

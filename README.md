@@ -87,6 +87,90 @@ registrations. The workflow uploads a compact seven-day report and never
 restarts a host; machine-local remediation remains an explicit idle-only
 operation.
 
+## Dependabot alert waivers
+
+An open Dependabot alert must mean "a human should act". Alerts that cannot be
+actioned — because upstream has published no patched version — otherwise sit
+open forever, and a queue that is permanently non-empty stops being read.
+
+The policy, in order of preference:
+
+1. **Fix it.** If an installable patched version exists, the alert is a task,
+   not noise. File it and leave the alert open.
+2. **Let GitHub triage it.** GitHub's preset auto-triage rules are available on
+   every repository, including private ones, and are the right tool when they
+   apply. The `Dismiss low impact issues for development-scoped dependencies`
+   preset only matches npm dependencies at `scope: development` carrying one of
+   a curated CWE list, so it does not cover runtime-scoped findings. Custom
+   auto-triage rules — which support a `snooze until a patch is available`
+   action, the self-healing behaviour we want — require GitHub Code Security on
+   private repositories and are UI-only; there is no REST or GraphQL API for
+   them, so they cannot be provisioned from a workflow.
+3. **Waive it, with evidence and an expiry.** Dismiss the alert with the closest
+   accurate GitHub reason and record a waiver in the affected repository at
+   `.github/dependabot-waivers.json`.
+
+Do **not** use a `dependabot.yml` `ignore` entry for this. `ignore` suppresses
+Dependabot's *pull requests*, not its *alerts* — "There is no interaction
+between the settings specified in the `dependabot.yml` file and Dependabot
+security alerts". It would leave the alert open and simultaneously block the
+future fix, which is the same class of failure as an exact-version override.
+
+### Why waivers need a re-check
+
+GitHub only auto-reopens alerts that one of *its own* auto-triage rules
+dismissed, and only when "the alert metadata or rule changed". An alert
+dismissed by a human or through `PATCH /repos/{owner}/{repo}/dependabot/alerts/
+{alert_number}` is never resurfaced — including on the day upstream finally
+ships the fix. Nothing in a dismissal expires by itself.
+
+`scripts/dependabot_waivers.rb` closes that gap. The weekly
+`Dependabot waiver audit` workflow reads every repository's waiver file,
+compares it against the live alert, and **reopens** the alert when the waiver
+stops being true: an installable fix appeared, the severity rose, or the alert
+now points at a different advisory. It fails the job when a waiver has gone
+stale or has passed its `review_by` date, so the registry cannot quietly become
+the new place noise accumulates.
+
+Crucially, the audit checks whether a patched version is *installable*, not
+whether the advisory *claims* one. GitHub's `first_patched_version` is an
+advisory claim about a product release; `GHSA-x744-4wpc-v9h2` names Docker
+"29.3.1" while no such version of the `github.com/docker/docker` Go module is
+published anywhere. Trusting the claim would reopen that alert on every run.
+
+### Adding a waiver
+
+Copy `templates/dependabot-waivers.json` into the affected repository at
+`.github/dependabot-waivers.json` and check it with:
+
+```console
+ruby scripts/dependabot_waivers.rb verify .github/dependabot-waivers.json owner/repo
+```
+
+The registry deliberately lives in the repository it describes, not here: this
+repository is public, and a central list of unpatched vulnerabilities in private
+repositories would publish an attack surface. Each waiver must carry prose
+explaining *why* the alert cannot be actioned and the evidence for it, because
+GitHub has no dismissal reason meaning "upstream shipped no patch" — the
+checker rejects a waiver that omits it, and rejects one whose own recorded
+evidence admits an available fix.
+
+### Arming the audit
+
+The workflow is gated on the `DEPENDABOT_WAIVER_AUDIT` variable and stays
+skipped until two things a workflow cannot do for itself are done by hand:
+
+1. Grant the `harn-release-bot` GitHub App the **Dependabot alerts:
+   read and write** repository permission (App settings → Permissions), and
+   accept the permission change on the organization installation. Reopening an
+   alert is a write; nothing less will do.
+2. Set the repository or organization variable `DEPENDABOT_WAIVER_AUDIT` to
+   `enabled`.
+
+Until then the job reports as skipped rather than running red every week, since
+a permanently failing alarm is the failure mode this whole mechanism exists to
+prevent.
+
 ## CI latency policy
 
 `.github/actions/ci-latency-policy` checks a repository's
