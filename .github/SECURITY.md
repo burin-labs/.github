@@ -6,7 +6,7 @@ policy always wins over this one.
 
 ## Reporting a vulnerability
 
-Email **[security@burinlabs.com](mailto:security@burinlabs.com)** with the
+Email **[security@harn.cloud](mailto:security@harn.cloud)** with the
 details. Encrypt with our public key if the report contains exploit material
 (key available on request).
 
