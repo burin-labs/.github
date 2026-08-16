@@ -151,6 +151,15 @@ module DependabotWaivers
     [:ok, "no installable fix; severity unchanged at #{live_severity}"]
   end
 
+  # Once a repository has a waiver registry it has opted into the policy, so a
+  # dismissed alert with no waiver is a dismissal that recorded no reason and
+  # carries no expiry -- invisible to the audit and unreadable a year from now.
+  # Report it against the registry rather than letting it accumulate silently.
+  def unwaived(alerts:, waivers:)
+    waived = waivers.map { |waiver| waiver["alert_number"] }
+    alerts.values.reject { |alert| waived.include?(alert["number"]) }.sort_by { |alert| alert["number"] }
+  end
+
   def summarize(results)
     {
       "schema_version" => "burin.dependabot_waiver_audit.v1",
@@ -158,6 +167,7 @@ module DependabotWaivers
       "reopened" => results.count { |r| r["verdict"] == "reopen" },
       "stale" => results.count { |r| r["verdict"] == "stale" },
       "overdue" => results.count { |r| r["verdict"] == "overdue" },
+      "unwaived" => results.count { |r| r["verdict"] == "unwaived" },
       "ok" => results.count { |r| r["verdict"] == "ok" },
       "results" => results
     }
@@ -236,6 +246,17 @@ module DependabotWaivers
       next if document.nil?
 
       alerts = dismissed_alerts(repository)
+      unwaived(alerts: alerts, waivers: document.fetch("waivers")).each do |alert|
+        results << {
+          "repository" => repository,
+          "alert_number" => alert["number"],
+          "ghsa_id" => alert.dig("security_advisory", "ghsa_id"),
+          "package" => alert.dig("security_vulnerability", "package", "name"),
+          "verdict" => "unwaived",
+          "detail" => "dismissed as #{alert["dismissed_reason"]} with no waiver recording why or when to revisit",
+          "reopened" => false
+        }
+      end
       document.fetch("waivers").each do |waiver|
         alert = alerts[waiver["alert_number"]]
         installable = alert && fix_installable?(
@@ -280,9 +301,9 @@ if $PROGRAM_NAME == __FILE__
     )
     puts JSON.pretty_generate(report)
     # A reopened alert is now visible in the alert queue, which is the whole
-    # point, so it is not also a job failure. Stale and overdue waivers are
-    # failures: they mean the registry has drifted from reality.
-    exit 1 if report["stale"].positive? || report["overdue"].positive?
+    # point, so it is not also a job failure. The rest are failures: they mean
+    # the registry has drifted from reality and no longer says what is parked.
+    exit 1 if %w[stale overdue unwaived].sum { |verdict| report.fetch(verdict) }.positive?
   else
     abort "usage: #{$PROGRAM_NAME} verify <waivers.json> [owner/repo] | audit --org <org> [--apply]"
   end

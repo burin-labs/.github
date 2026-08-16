@@ -132,6 +132,11 @@ now points at a different advisory. It fails the job when a waiver has gone
 stale or has passed its `review_by` date, so the registry cannot quietly become
 the new place noise accumulates.
 
+Checking in a registry opts the repository into the policy: from then on the
+audit also fails on a dismissed alert that has *no* waiver, since such a
+dismissal records no reason and never expires. Repositories without a registry
+are skipped entirely.
+
 Crucially, the audit checks whether a patched version is *installable*, not
 whether the advisory *claims* one. GitHub's `first_patched_version` is an
 advisory claim about a product release; `GHSA-x744-4wpc-v9h2` names Docker

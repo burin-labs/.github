@@ -113,10 +113,23 @@ abort "reopening must win over an expired review date" unless
 # --- reporting ------------------------------------------------------------
 
 summary = W.summarize([
-  {"verdict" => "ok"}, {"verdict" => "reopen"}, {"verdict" => "stale"}, {"verdict" => "overdue"}
+  {"verdict" => "ok"}, {"verdict" => "reopen"}, {"verdict" => "stale"},
+  {"verdict" => "overdue"}, {"verdict" => "unwaived"}
 ])
 abort "summary must count every verdict" unless
-  summary.values_at("checked", "ok", "reopened", "stale", "overdue") == [4, 1, 1, 1, 1]
+  summary.values_at("checked", "ok", "reopened", "stale", "overdue", "unwaived") == [5, 1, 1, 1, 1, 1]
+
+# --- unwaived dismissals --------------------------------------------------
+
+# Once a repo has a registry it has opted into the policy, so a dismissal made
+# outside the registry records no reason and never expires.
+alerts = {2 => alert, 7 => alert("number" => 7), 9 => alert("number" => 9)}
+abort "a dismissal outside the registry must be reported" unless
+  W.unwaived(alerts: alerts, waivers: [waiver]).map { |a| a["number"] } == [7, 9]
+abort "waived alerts must not be reported as unwaived" unless
+  W.unwaived(alerts: {2 => alert}, waivers: [waiver]).empty?
+abort "a repo with no dismissals has nothing unwaived" unless
+  W.unwaived(alerts: {}, waivers: [waiver]).empty?
 
 # --- registered waivers ---------------------------------------------------
 
