@@ -3,18 +3,23 @@
   "organization": "burin-labs",
   "probe_interval_seconds": 60,
   "expected_runners": [
-    "burin-mbp-01",
-    "burin-mbp-01-w2",
-    "burin-mbp-01-w3",
-    "burin-mbp-01-w4",
     "cattrick-w1",
     "cattrick-w2",
     "cattrick-w3",
-    "tornadough-w1",
-    "tornadough-w2",
-    "tornadough-w3",
-    "tornadough-w4",
-    "tornadough-w5",
-    "tornadough-w6"
-  ]
+    "cattrick-w4",
+    "cattrick-w5",
+    "cattrick-w6"
+  ],
+  "deliberately_offline": {
+    "burin-mbp-01": "Primary development Mac. The org variable CI_SELFHOSTED_DISABLED=macos retires the macOS self-hosted lane, so these are not expected online.",
+    "burin-mbp-01-w2": "See burin-mbp-01.",
+    "burin-mbp-01-w3": "See burin-mbp-01.",
+    "burin-mbp-01-w4": "See burin-mbp-01.",
+    "tornadough-w1": "Host reassigned to personal use 2026-08-15 and is not available to CI.",
+    "tornadough-w2": "See tornadough-w1.",
+    "tornadough-w3": "See tornadough-w1.",
+    "tornadough-w4": "See tornadough-w1.",
+    "tornadough-w5": "See tornadough-w1.",
+    "tornadough-w6": "See tornadough-w1."
+  }
 }

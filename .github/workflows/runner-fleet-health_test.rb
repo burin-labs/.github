@@ -27,7 +27,17 @@ policy = JSON.parse(File.read(File.join(root, ".github", "runner-fleet.json")))
 expected = policy.fetch("expected_runners")
 abort "runner policy must be versioned" unless policy.fetch("schema_version") == 1
 abort "runner policy must not contain duplicate names" unless expected.uniq == expected
-abort "runner policy must cover the current thirteen-runner fleet" unless expected.length == 13
+# Deliberately NOT a hardcoded count. The previous `== 13` had to be hand-edited
+# on every fleet change, so when ten of the thirteen hosts went offline for good
+# the policy stayed as written and the hourly alarm failed 100 runs straight --
+# an alarm that is always red cannot report a real outage. Assert the shape the
+# policy has to hold instead of the size it happened to be.
+offline = policy.fetch("deliberately_offline", {})
+abort "runner policy must expect at least one runner" if expected.empty?
+abort "deliberately_offline must map name to reason" unless offline.is_a?(Hash) &&
+  offline.values.all? { |reason| reason.is_a?(String) && !reason.empty? }
+abort "a runner cannot be both expected online and deliberately offline" unless
+  (offline.keys & expected).empty?
 
 script = File.join(root, "scripts", "runner-fleet-health.sh")
 Dir.mktmpdir do |tmp|
