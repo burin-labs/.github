@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "repository": "burin-labs/example-repository",
+  "waivers": [
+    {
+      "alert_number": 1,
+      "ghsa_id": "GHSA-0000-0000-0000",
+      "package": "example-package",
+      "ecosystem": "npm",
+      "dismissed_reason": "no_bandwidth",
+      "why": "Replace this with the specific reason the alert cannot be actioned today, including the evidence. 'Upstream has published no fixed version: the latest release is X, which is inside the affected range.' A reader a year from now must be able to check the claim without redoing the research.",
+      "review_by": "2027-01-01",
+      "observed": {
+        "severity": "high",
+        "fix_available": false,
+        "first_patched_version": null
+      }
+    }
+  ]
+}
