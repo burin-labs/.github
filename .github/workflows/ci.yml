@@ -33,10 +33,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # For check-commit-signatures below, which reads pulls/{n}/commits.
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Dogfooding: this repo is under the same org `required_signatures` rule
+      # as every repo that consumes the action, so it has the same silent-block
+      # exposure and should be the first place the gate is proven.
+      - name: Check commit signatures
+        uses: ./.github/actions/check-commit-signatures
+        with:
+          github-token: ${{ github.token }}
       - name: Check CI latency policy
         uses: ./.github/actions/ci-latency-policy
         with:
@@ -77,6 +86,7 @@ jobs:
           ruby .github/actions/require-successful-needs/require-successful-needs_test.rb
           ruby .github/actions/check-dependabot-config/check_dependabot_config_test.rb
           ruby .github/actions/ci-latency-policy/check_ci_latency_policy_test.rb
+          ruby .github/actions/check-commit-signatures/check_commit_signatures_test.rb
           ruby .github/workflows/ci_test.rb
           ruby .github/workflows/harn-package_test.rb
           ruby .github/workflows/register-package-release_test.rb

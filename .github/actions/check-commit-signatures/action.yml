@@ -1,0 +1,48 @@
+name: Check commit signatures
+description: >
+  Fail a pull request whose commits GitHub cannot verify. `required_signatures`
+  blocks such a PR at merge time WITHOUT producing a failing check, so without
+  this the symptom is a green board that will not merge and names no cause.
+
+inputs:
+  github-token:
+    description: Token with pull-requests:read on the repository under test.
+    required: true
+  pull-request:
+    description: >
+      Pull request number to inspect. Defaults to the number on the triggering
+      pull_request event; empty on any other event, where the check no-ops
+      because the commits have already been squashed by then.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  repository:
+    description: owner/repo whose pull request is being inspected.
+    required: false
+    default: ${{ github.repository }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check commit signatures
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PULL_REQUEST_NUMBER: ${{ inputs.pull-request }}
+        TARGET_REPOSITORY: ${{ inputs.repository }}
+      run: |
+        set -euo pipefail
+        if [ -z "${PULL_REQUEST_NUMBER}" ]; then
+          echo "Not a pull_request event; commit signatures are checked on the PR," \
+               "before the squash that replaces them. Nothing to do."
+          exit 0
+        fi
+        payload="${RUNNER_TEMP}/pr-commits.json"
+        # No `|| true` here on purpose. A failed fetch must surface as a failed
+        # step, and if it somehow writes a partial file the checker's shape guard
+        # rejects it rather than certifying an unread PR.
+        # No --jq: with --paginate, gh merges top-level arrays into one array,
+        # but a --jq filter is applied per page and would emit `[...][...]`.
+        gh api --paginate \
+          "/repos/${TARGET_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}/commits" \
+          > "${payload}"
+        COMMITS_PAYLOAD="${payload}" ruby "$GITHUB_ACTION_PATH/check_commit_signatures.rb"
