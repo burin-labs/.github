@@ -43,6 +43,7 @@ checkout_policy_globs = [
 policy_sources = Dir.glob(checkout_policy_globs).sort
 actual_policy_sources = policy_sources.map { |path| path.delete_prefix("#{repository_root}/") }
 expected_policy_sources = [
+  ".github/actions/check-commit-signatures/action.yml",
   ".github/actions/check-dependabot-config/action.yml",
   ".github/actions/ci-latency-policy/action.yml",
   ".github/actions/harn-package/action.yml",
