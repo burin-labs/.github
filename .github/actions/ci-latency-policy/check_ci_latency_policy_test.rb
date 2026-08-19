@@ -111,6 +111,103 @@ class CiLatencyPolicyTest < Minitest::Test
     end
   end
 
+  def receipt(observed_p90_ms: 700_000, sample_count: 10)
+    {
+      "sampled_at" => "2026-08-19T18:00:00Z",
+      "source" => "actions/workflows/ci.yml/runs?event=merge_group&status=completed",
+      "sample_count" => sample_count,
+      "observed_p90_ms" => observed_p90_ms
+    }
+  end
+
+  # 700_000 * 1.2 = 840_000, already on the 6000ms grid; warning floors to
+  # 756_000. hard_max stays above both, so ordering holds.
+  def regenerated_policy
+    candidate = policy
+    candidate["slo"]["p90_ms"] = 840_000
+    candidate["slo"]["warning_ms"] = 756_000
+    candidate["slo"]["regenerated"] = receipt
+    candidate
+  end
+
+  def test_accepts_slo_increase_that_matches_its_regeneration_receipt
+    with_files(candidate: regenerated_policy, baseline: policy) do |files|
+      result = CiLatencyPolicy.check(
+        policy_path: files[0].path,
+        workflow_path: files[1].path,
+        baseline_path: files[2].path
+      )
+      assert_equal 840_000, result.dig("slo", "p90_ms")
+      assert_equal 756_000, result.dig("slo", "warning_ms")
+    end
+  end
+
+  def test_rejects_slo_increase_that_is_not_the_receipt_derivation
+    candidate = regenerated_policy
+    candidate["slo"]["p90_ms"] = 850_000
+    with_files(candidate: candidate, baseline: policy) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path, baseline_path: files[2].path)
+      end
+      assert_includes error.message, "not the receipt's derivation 840000"
+    end
+  end
+
+  def test_rejects_slo_increase_without_a_receipt
+    candidate = regenerated_policy
+    candidate["slo"].delete("regenerated")
+    with_files(candidate: candidate, baseline: policy) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path, baseline_path: files[2].path)
+      end
+      assert_includes error.message, "without a slo.regenerated receipt"
+    end
+  end
+
+  def test_rejects_receipt_with_fewer_samples_than_the_contract_requires
+    candidate = regenerated_policy
+    candidate["slo"]["regenerated"] = receipt(sample_count: 3)
+    with_files(candidate: candidate) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path)
+      end
+      assert_includes error.message, "below slo.min_samples"
+    end
+  end
+
+  def test_rejects_receipt_sampled_before_the_topology_epoch
+    candidate = regenerated_policy
+    candidate["slo"]["regenerated"]["sampled_at"] = "2026-08-07T00:00:00Z"
+    with_files(candidate: candidate) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path)
+      end
+      assert_includes error.message, "predates topology_epoch"
+    end
+  end
+
+  def test_rejects_warning_increase_that_is_not_paired_with_the_p90_derivation
+    candidate = policy
+    candidate["slo"]["warning_ms"] = 560_000
+    with_files(candidate: candidate, baseline: policy) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path, baseline_path: files[2].path)
+      end
+      assert_includes error.message, "warning_ms may only decrease"
+    end
+  end
+
+  def test_hard_max_stays_downward_only_even_with_a_receipt
+    candidate = regenerated_policy
+    candidate["slo"]["hard_max_ms"] = 910_000
+    with_files(candidate: candidate, baseline: policy) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path, baseline_path: files[2].path)
+      end
+      assert_includes error.message, "hard_max_ms may only decrease"
+    end
+  end
+
   def test_rejects_inverted_slo_and_empty_sentinels
     candidate = policy
     candidate["slo"]["warning_ms"] = 610_000

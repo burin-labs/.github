@@ -1,5 +1,8 @@
 name: Check CI latency policy
-description: Reject undeclared required jobs, invalid SLOs, and upward budget drift.
+description: >-
+  Reject undeclared required jobs, invalid SLOs, and upward budget drift. An
+  SLO may rise only to the value its regeneration receipt derives from an
+  observed p90.
 
 inputs:
   policy:

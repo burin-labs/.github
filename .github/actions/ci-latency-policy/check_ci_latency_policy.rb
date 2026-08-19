@@ -8,12 +8,57 @@ require "yaml"
 module CiLatencyPolicy
   class Invalid < StandardError; end
 
+  # An SLO may rise only to the value a regeneration receipt derives:
+  # observed p90 times 1.2, rounded up to the 0.1-minute grid every declared
+  # duration in the policy already uses. The multiplier is owned here, not by
+  # the receipt, so a receipt cannot smuggle its own headroom.
+  SLO_HEADROOM_NUMERATOR = 12
+  SLO_HEADROOM_DENOMINATOR = 10
+  GRID_MS = 6000
+
   module_function
 
   def positive_integer(value, field)
     return value if value.is_a?(Integer) && value.positive?
 
     raise Invalid, "#{field} must be a positive integer"
+  end
+
+  def derived_p90_ms(observed_p90_ms)
+    scaled = observed_p90_ms * SLO_HEADROOM_NUMERATOR / SLO_HEADROOM_DENOMINATOR
+    ((scaled + GRID_MS - 1) / GRID_MS) * GRID_MS
+  end
+
+  # Floored to the grid so the derived warning line always sits strictly
+  # inside the derived SLO.
+  def derived_warning_ms(p90_ms)
+    p90_ms * 9 / 10 / GRID_MS * GRID_MS
+  end
+
+  # `slo.regenerated` is the receipt that justifies an SLO increase. Shape is
+  # validated whenever it is present; whether an increase is justified is
+  # decided against the baseline in `check`.
+  def parse_regeneration_receipt(raw)
+    receipt = raw.dig("slo", "regenerated")
+    return nil if receipt.nil?
+
+    %w[sampled_at source].each do |field|
+      value = receipt[field]
+      unless value.is_a?(String) && !value.empty?
+        raise Invalid, "slo.regenerated.#{field} must be a non-empty string"
+      end
+    end
+    positive_integer(receipt["sample_count"], "slo.regenerated.sample_count")
+    positive_integer(receipt["observed_p90_ms"], "slo.regenerated.observed_p90_ms")
+    sampled_at = Time.iso8601(receipt.fetch("sampled_at"))
+    epoch = Time.iso8601(raw.fetch("topology_epoch"))
+    raise Invalid, "slo.regenerated.sampled_at predates topology_epoch" if sampled_at < epoch
+
+    if receipt.fetch("sample_count") < raw.dig("slo", "min_samples")
+      raise Invalid, "slo.regenerated.sample_count is below slo.min_samples"
+    end
+
+    receipt
   end
 
   def parse_policy(path)
@@ -43,6 +88,7 @@ module CiLatencyPolicy
     window = positive_integer(slo["window_samples"], "slo.window_samples")
     raise Invalid, "SLO thresholds must satisfy warning_ms < p90_ms < hard_max_ms" unless warning < target && target < hard_max
     raise Invalid, "slo.min_samples cannot exceed slo.window_samples" if minimum > window
+    parse_regeneration_receipt(raw)
 
     required = raw.fetch("required")
     aggregate = required["aggregate_job"]
@@ -102,12 +148,34 @@ module CiLatencyPolicy
       unless policy.fetch("workflow") == baseline.fetch("workflow") && policy.fetch("event") == baseline.fetch("event")
         raise Invalid, "workflow or event changes require a new policy rather than weakening the existing contract"
       end
-      %w[warning_ms p90_ms hard_max_ms].each do |field|
-        old_value = baseline.dig("slo", field)
-        new_value = policy.dig("slo", field)
-        if new_value > old_value
-          raise Invalid, "slo.#{field} may only decrease (#{old_value} -> #{new_value})"
+      old_p90 = baseline.dig("slo", "p90_ms")
+      new_p90 = policy.dig("slo", "p90_ms")
+      receipt = policy.dig("slo", "regenerated")
+      p90_regenerated_up = false
+      if new_p90 > old_p90
+        if receipt.nil?
+          raise Invalid, "slo.p90_ms may only decrease (#{old_p90} -> #{new_p90}) without a slo.regenerated receipt"
         end
+        expected = derived_p90_ms(receipt.fetch("observed_p90_ms"))
+        if new_p90 != expected
+          raise Invalid, "slo.p90_ms #{new_p90} is not the receipt's derivation #{expected} " \
+                         "(observed_p90_ms #{receipt.fetch('observed_p90_ms')} x 1.2, rounded up to #{GRID_MS}ms)"
+        end
+        p90_regenerated_up = true
+      end
+      old_warning = baseline.dig("slo", "warning_ms")
+      new_warning = policy.dig("slo", "warning_ms")
+      if new_warning > old_warning
+        expected_warning = derived_warning_ms(new_p90)
+        unless p90_regenerated_up && new_warning == expected_warning
+          raise Invalid, "slo.warning_ms may only decrease (#{old_warning} -> #{new_warning}) " \
+                         "unless regenerated with p90_ms to exactly #{expected_warning}"
+        end
+      end
+      old_hard_max = baseline.dig("slo", "hard_max_ms")
+      new_hard_max = policy.dig("slo", "hard_max_ms")
+      if new_hard_max > old_hard_max
+        raise Invalid, "slo.hard_max_ms may only decrease (#{old_hard_max} -> #{new_hard_max})"
       end
       baseline_required = baseline.fetch("required")
       if required.fetch("critical_path_allowance_ms") > baseline_required.fetch("critical_path_allowance_ms")
