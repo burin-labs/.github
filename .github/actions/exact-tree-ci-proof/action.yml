@@ -15,6 +15,14 @@ inputs:
     description: '"true" keeps the jobs running so a cache-contract change can write.'
     required: false
     default: "false"
+  merge-group-writes-cache:
+    description: >-
+      "true" when merge_group jobs persist a cache (for example a sticky disk).
+      Then a cache-contract change keeps those jobs running. Default false:
+      merge groups that only restore can reuse an exact-tree proof even when
+      the cache contract changed, because a rebuild there produces nothing.
+    required: false
+    default: "false"
   event-name:
     description: GitHub event name.
     required: true
@@ -55,5 +63,6 @@ runs:
         WORKFLOW_FILE: ${{ inputs.workflow-file }}
         REQUIRED_JOBS: ${{ inputs.required-jobs }}
         CACHE_REFRESH_REQUIRED: ${{ inputs.cache-refresh-required }}
+        MERGE_GROUP_WRITES_CACHE: ${{ inputs.merge-group-writes-cache }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: bash "$GITHUB_ACTION_PATH/resolve.sh"

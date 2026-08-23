@@ -9,6 +9,7 @@ workflow_file=${WORKFLOW_FILE:-}
 commit_sha=${COMMIT_SHA:-}
 event_path=${EVENT_PATH:-}
 cache_refresh_required=${CACHE_REFRESH_REQUIRED:-false}
+merge_group_writes_cache=${MERGE_GROUP_WRITES_CACHE:-false}
 
 proven=false
 if [[ "$event_name" == "push" ]]; then
@@ -24,7 +25,7 @@ elif [[ "$event_name" == "merge_group" ]]; then
 fi
 [[ "$proven" == "true" ]] || proven=false
 
-reuse="$("$action_dir/gate.sh" "$event_name" "$proven" "$cache_refresh_required")"
+reuse="$("$action_dir/gate.sh" "$event_name" "$proven" "$cache_refresh_required" "$merge_group_writes_cache")"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "proven=$proven" >> "$GITHUB_OUTPUT"
