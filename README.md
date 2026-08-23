@@ -42,8 +42,11 @@ required jobs and a cache-contract refresh bit; they do not copy the GitHub API
 helpers.
 
 Source pull requests produce proof. Merge groups and `main` pushes consume it
-only when every named job concluded `success` (not `skipped`) and the cache
-contract is unchanged. Lookups fail closed.
+only when every named job concluded `success` (not `skipped`). A
+cache-contract change keeps the push writer running. Restore-only merge
+groups (the default) still reuse: a rebuild there produces nothing.
+Pass `merge-group-writes-cache: "true"` when the merge-group job persists a
+cache, such as a sticky disk. Lookups fail closed.
 
 ```yaml
 - id: rust-proof
@@ -53,6 +56,7 @@ contract is unchanged. Lookups fail closed.
     required-jobs: >-
       ["Rust TUI fast fmt, clippy & test","Rust TUI harn-linked clippy, test & build"]
     cache-refresh-required: ${{ steps.filter.outputs.rust_cache_contract }}
+    merge-group-writes-cache: "true"
     event-name: ${{ github.event_name }}
     commit-sha: ${{ github.sha }}
     event-path: ${{ github.event_path }}
