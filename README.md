@@ -232,6 +232,60 @@ Until then the job reports as skipped rather than running red every week, since
 a permanently failing alarm is the failure mode this whole mechanism exists to
 prevent.
 
+## Eval fixture repositories
+
+`burin-labs/burin-example-*` repositories are **eval fixtures**, not products.
+The Burin eval harness clones them to `~/projects/burin-examples/<lang>` and
+treats each tree as a fixed measurement input; a cleanliness gate fails a run
+when the fixture drifts. A dependency bump there does not improve a product, it
+moves the ruler.
+
+They are therefore excluded from the organization Dependabot posture described
+under *Organization defaults*:
+
+- **No `.github/dependabot.yml`.** The `templates/dependabot.yml` projection and
+  `check-dependabot-config` do not apply. The file's presence is the only switch
+  for version updates, so a fixture must not carry one.
+- **Dependabot automated security fixes disabled** at repository settings
+  (`DELETE /repos/{owner}/{repo}/automated-security-fixes`). This is what
+  produces Dependabot pull requests in a repository that has no config file at
+  all, and it is the setting most people miss.
+- **Dependabot alerts stay enabled.** The vulnerability signal is worth keeping;
+  it is only forbidden from opening a pull request by itself. A genuine advisory
+  becomes one deliberate change made between eval sprints, never unsolicited
+  weekly churn.
+
+Fixture dependencies are never fetched or executed during an eval — agent
+processes are OS-air-gapped with deny-before-spawn auditing, and the harness
+toolchain preflight treats "went to the network" as a failure class. The pinned
+versions are inert artifacts, so deferring a fix costs nothing operationally.
+
+New fixtures are born opted out: the organization's
+`dependabot_security_updates_enabled_for_new_repositories` and
+`dependabot_alerts_enabled_for_new_repositories` defaults are both off, so a
+newly created repository inherits silence and Dependabot has to be switched on
+deliberately. Do not switch it on for a fixture.
+
+Every fixture carries the topics `eval-fixture` and `no-dependabot`, which make
+the membership of this class one query rather than a naming guess:
+
+```sh
+gh repo list burin-labs --topic eval-fixture --limit 200 --json name
+```
+
+Auditing the posture, when you want to confirm it rather than trust it:
+
+```sh
+gh repo list burin-labs --topic eval-fixture --limit 200 \
+  --json name -q '.[].name' |
+while read -r r; do
+  fix=$(gh api "repos/burin-labs/$r/automated-security-fixes" --jq '.enabled')
+  cfg=$(gh api "repos/burin-labs/$r/contents/.github/dependabot.yml" \
+    --jq '.path' 2>/dev/null) || cfg=none
+  printf '%-26s autofix=%s config=%s\n' "$r" "$fix" "$cfg"
+done
+```
+
 ## CI latency policy
 
 `.github/actions/ci-latency-policy` checks a repository's
@@ -447,6 +501,9 @@ before any privileged action.
   that do not use that workflow should call the action from an always-on job.
   Fleet prose for schedule/grouping lives in `harn-bump-fleet`; Harn-local
   family membership stays in Harn.
+- Repositories carrying the `eval-fixture` topic are **excluded** from both the
+  projection and the automated-security-fix posture. See *Eval fixture
+  repositories* for why, and for the audit command.
 
 ```yaml
 - uses: burin-labs/.github/.github/actions/check-dependabot-config@<full-commit-sha>
