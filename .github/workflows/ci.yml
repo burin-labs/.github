@@ -74,6 +74,8 @@ jobs:
         run: actionlint
       - name: Test graph-derived Rust impact planning
         run: node --test .github/actions/rust-test-impact/plan.test.mjs
+      - name: Test exact-tree CI proof reuse
+        run: bash .github/actions/exact-tree-ci-proof/run-tests.sh
       - name: Require reusable package smoke
         env:
           PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
@@ -104,6 +106,12 @@ jobs:
           # syntax error in it would otherwise surface a day later, in a job
           # nobody is watching, as the absence of a report.
           bash -n .github/actions/harn-package/run-contract.sh
+          bash -n .github/actions/exact-tree-ci-proof/gate.sh
+          bash -n .github/actions/exact-tree-ci-proof/workflow-proof.sh
+          bash -n .github/actions/exact-tree-ci-proof/merge-group-proof.sh
+          bash -n .github/actions/exact-tree-ci-proof/pr-tree-proof.sh
+          bash -n .github/actions/exact-tree-ci-proof/resolve.sh
+          bash -n .github/actions/exact-tree-ci-proof/run-tests.sh
           bash -n scripts/ci-routing.sh
           bash -n scripts/runner-fleet-health.sh
           bash -n scripts/reusable-pin-drift.sh

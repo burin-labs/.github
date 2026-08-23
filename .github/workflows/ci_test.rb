@@ -46,6 +46,7 @@ expected_policy_sources = [
   ".github/actions/check-commit-signatures/action.yml",
   ".github/actions/check-dependabot-config/action.yml",
   ".github/actions/ci-latency-policy/action.yml",
+  ".github/actions/exact-tree-ci-proof/action.yml",
   ".github/actions/harn-package/action.yml",
   ".github/actions/harn-repo-policy/action.yml",
   ".github/actions/require-successful-needs/action.yml",
@@ -136,6 +137,11 @@ end
 impact_tests = steps.find { |step| step["name"] == "Test graph-derived Rust impact planning" }
 unless impact_tests&.fetch("run") == "node --test .github/actions/rust-test-impact/plan.test.mjs"
   abort "CI must execute the shared Rust impact planner tests"
+end
+
+proof_tests = steps.find { |step| step["name"] == "Test exact-tree CI proof reuse" }
+unless proof_tests&.fetch("run") == "bash .github/actions/exact-tree-ci-proof/run-tests.sh"
+  abort "CI must execute the shared exact-tree CI proof tests"
 end
 
 policy_tests = steps.find { |step| step["name"] == "Test package workflow policy" }

@@ -1,0 +1,59 @@
+name: Reuse an exact-tree CI proof
+description: >-
+  Fail-closed reuse of named required jobs when a merge group or landing push
+  has the same git tree as an already-green source pull request. Callers keep
+  writing cache on cache-contract changes.
+
+inputs:
+  workflow-file:
+    description: Workflow filename under .github/workflows (for example ci.yml).
+    required: true
+  required-jobs:
+    description: JSON array of job names that constitute proof.
+    required: true
+  cache-refresh-required:
+    description: '"true" keeps the jobs running so a cache-contract change can write.'
+    required: false
+    default: "false"
+  event-name:
+    description: GitHub event name.
+    required: true
+  commit-sha:
+    description: Full 40-character commit SHA for this run.
+    required: true
+  event-path:
+    description: Path to the GitHub event payload (github.event_path).
+    required: false
+    default: ""
+  repository:
+    description: owner/name. Defaults to github.repository.
+    required: false
+    default: ${{ github.repository }}
+  github-token:
+    description: Token with actions:read for workflow-run lookup.
+    required: true
+
+outputs:
+  proven:
+    description: '"true" when an exact-tree source proof exists.'
+    value: ${{ steps.resolve.outputs.proven }}
+  reuse:
+    description: '"true" when callers should skip the proven jobs.'
+    value: ${{ steps.resolve.outputs.reuse }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve exact-tree CI proof reuse
+      id: resolve
+      shell: bash
+      env:
+        EVENT_NAME: ${{ inputs.event-name }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        EVENT_PATH: ${{ inputs.event-path }}
+        REPOSITORY: ${{ inputs.repository }}
+        WORKFLOW_FILE: ${{ inputs.workflow-file }}
+        REQUIRED_JOBS: ${{ inputs.required-jobs }}
+        CACHE_REFRESH_REQUIRED: ${{ inputs.cache-refresh-required }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: bash "$GITHUB_ACTION_PATH/resolve.sh"

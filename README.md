@@ -33,6 +33,32 @@ the pull request; this keeps shallow checkouts fast without weakening coverage.
 - run: cargo nextest run ${{ steps.rust-impact.outputs.package-args }}
 ```
 
+## Exact-tree CI proof reuse
+
+`burin-labs/.github/.github/actions/exact-tree-ci-proof` is the organization-owned
+fail-closed adapter for skipping already-proven jobs on a merge group or landing
+push when the git tree matches the source pull request. Repositories name the
+required jobs and a cache-contract refresh bit; they do not copy the GitHub API
+helpers.
+
+Source pull requests produce proof. Merge groups and `main` pushes consume it
+only when every named job concluded `success` (not `skipped`) and the cache
+contract is unchanged. Lookups fail closed.
+
+```yaml
+- id: rust-proof
+  uses: burin-labs/.github/.github/actions/exact-tree-ci-proof@<full-commit-sha>
+  with:
+    workflow-file: ci.yml
+    required-jobs: >-
+      ["Rust TUI fast fmt, clippy & test","Rust TUI harn-linked clippy, test & build"]
+    cache-refresh-required: ${{ steps.filter.outputs.rust_cache_contract }}
+    event-name: ${{ github.event_name }}
+    commit-sha: ${{ github.sha }}
+    event-path: ${{ github.event_path }}
+    github-token: ${{ github.token }}
+```
+
 ## Reusable workflows
 
 - `.github/workflows/runner-availability.yml` detects idle self-hosted Linux,
