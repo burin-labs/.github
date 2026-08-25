@@ -461,9 +461,16 @@ workflow rejects non-admins and fork pull requests, then acts with the
   stop a run within two minutes, the override fails closed instead of racing
   that run's final status.
 - `bypass-merge-queue`: squash-merge immediately when `CI status` is already
-  green. Skips the merge queue.
+  green. Skips the merge queue but does not override CI. An in-flight check is
+  reported as in flight, not missing.
 - `force-merge`: publish successful `CI status`, then squash-merge immediately.
   Skips CI proof and the merge queue.
+
+Override attempts are serialized per pull request. If several labels are
+attached before an attempt starts, the workflow consumes them together and
+selects the strongest request: `force-merge`, then `bypass-merge-queue`, then
+`bypass-ci`. Its cancellation sweep excludes every run of the override
+dispatcher, so concurrent label events cannot cancel one another.
 
 ### When to use an override
 
@@ -483,11 +490,14 @@ workflow rejects non-admins and fork pull requests, then acts with the
 ### How to apply
 
 1. Confirm you are an organization owner/admin or repository admin.
-2. On a same-repo PR, add exactly one override label.
-3. Read the audit comment the workflow posts. For `force-merge` /
-   `bypass-merge-queue`, confirm the PR merged.
-4. Remove the label after the land if you want a clean label set; the audit
-   comment remains.
+2. On a same-repo PR, add the label whose meaning matches the intended action.
+3. Read the terminal audit comment. It records the selected request, every
+   consumed label, the re-checked actors, the actions taken, and whether the
+   attempt was applied, refused, or errored.
+4. The workflow removes each consumed label on every terminal path. A label
+   that remains attached therefore represents a pending or active attempt. For
+   a refusal or error, follow the audit comment's reason and re-apply the named
+   label to retry.
 
 Organization admins can also use GitHub’s “Bypass rules and merge” UI: the
 org-wide `main protection` ruleset grants `OrganizationAdmin` bypass in
@@ -498,7 +508,9 @@ org-wide `main protection` ruleset grants `OrganizationAdmin` bypass in
 Copy `templates/merge-override-dispatch.yml` to
 `.github/workflows/merge-override-dispatch.yml` and pin the reusable workflow
 to the full commit SHA of this repository that introduced or last changed
-`merge-override.yml`. Create the three labels once:
+`merge-override.yml`. Keep its `issues: write` permission: the reusable workflow
+uses the issue event history to re-check who applied every coalesced label and
+removes those labels at terminal completion. Create the three labels once:
 
 ```bash
 for name in bypass-ci bypass-merge-queue force-merge; do
