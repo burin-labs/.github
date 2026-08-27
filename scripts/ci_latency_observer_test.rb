@@ -14,10 +14,29 @@ class CiLatencyObserverTest < Minitest::Test
 
     def retry_capture(*args, accept:)
       response = @responses.fetch(args.last)
-      result = [JSON.generate(response), "", true]
+      result = CiLatencyObserver::CommandResult.new(
+        stdout: JSON.generate(response),
+        stderr: "",
+        process_ok: true,
+        accepted: false
+      )
       raise "fixture response was rejected" unless accept.call(result)
 
+      result.accepted = true
       result
+    end
+  end
+
+  class CaptureRunner < CiLatencyObserver::Runner
+    def initialize(result)
+      @result = result
+      @retry_delay = 0
+    end
+
+    private
+
+    def capture(*)
+      @result
     end
   end
 
@@ -49,6 +68,31 @@ class CiLatencyObserverTest < Minitest::Test
 
   def expected_run(id: 101)
     {"id" => id, "created_at" => "2026-08-27T06:00:00Z"}
+  end
+
+  def test_valid_policy_breach_report_is_accepted_despite_process_failure
+    report = healthy_report
+    report["evaluation"]["status"] = "hard_max_breach"
+    report["evaluation"]["ok"] = false
+    result = CiLatencyObserver::CommandResult.new(
+      stdout: JSON.generate(report),
+      stderr: "policy threshold exceeded",
+      process_ok: false,
+      accepted: false
+    )
+
+    captured = CaptureRunner.new(result).send(
+      :retry_capture,
+      "harn",
+      accept: lambda do |command_result|
+        parsed = JSON.parse(command_result.stdout)
+        CiLatencyObserver.report_error(parsed).nil?
+      end
+    )
+
+    refute captured.process_ok
+    assert captured.accepted
+    assert_equal "hard_max_breach", JSON.parse(captured.stdout).dig("evaluation", "status")
   end
 
   def test_fresh_healthy_report_is_the_only_terminal_success
