@@ -8,6 +8,14 @@ require "time"
 
 module CiLatencyObserver
   REPOSITORIES = [".github", "harn", "burin-code", "harn-cloud"].freeze
+  PRODUCER_STATUS_OK = {
+    "healthy" => true,
+    "warning" => true,
+    "single_window_p90_breach" => true,
+    "sustained_p90_breach" => false,
+    "hard_max_breach" => false,
+    "insufficient_samples" => false
+  }.freeze
   RETRIES = 3
 
   module_function
@@ -18,13 +26,35 @@ module CiLatencyObserver
     return "policy.repository must be a non-empty string" unless report.dig("policy", "repository").is_a?(String) && !report.dig("policy", "repository").empty?
     return "qualifying_runs must be a list" unless report["qualifying_runs"].is_a?(Array)
     return "wall.count must be an integer" unless report.dig("wall", "count").is_a?(Integer)
-    return "evaluation.status must be a non-empty string" unless report.dig("evaluation", "status").is_a?(String) && !report.dig("evaluation", "status").empty?
+    status = report.dig("evaluation", "status")
+    return "evaluation.status is not a recognized producer status" unless PRODUCER_STATUS_OK.key?(status)
     return "evaluation.ok must be boolean" unless [true, false].include?(report.dig("evaluation", "ok"))
+    return "evaluation.ok contradicts evaluation.status #{status}" unless report.dig("evaluation", "ok") == PRODUCER_STATUS_OK.fetch(status)
     return "evaluation.current must be an object" unless report.dig("evaluation", "current").is_a?(Hash)
     return "evaluation.previous must be an object" unless report.dig("evaluation", "previous").is_a?(Hash)
     return "policy.slo must be an object" unless report.dig("policy", "slo").is_a?(Hash)
+    unless report.fetch("qualifying_runs").all? { |run| valid_qualifying_run?(run) }
+      return "qualifying_runs entries require an integer id and ISO-8601 created_at"
+    end
 
     nil
+  end
+
+  def valid_qualifying_run?(run)
+    return false unless run.is_a?(Hash) && run["id"].is_a?(Integer) && run["created_at"].is_a?(String)
+
+    Time.iso8601(run.fetch("created_at"))
+    true
+  rescue ArgumentError
+    false
+  end
+
+  def run_order_key(run)
+    [Time.iso8601(run.fetch("created_at")), run.fetch("id")]
+  end
+
+  def newest_run(runs)
+    runs.sort_by { |run| run_order_key(run) }.reverse.first
   end
 
   def observer_error(repository, message)
@@ -57,7 +87,7 @@ module CiLatencyObserver
     if qualifying_runs.empty? && evaluation.fetch("status") != "insufficient_samples"
       return observer_error(repository, "zero qualifying runs cannot carry a non-pending evaluation")
     end
-    observed_run = qualifying_runs.first
+    observed_run = newest_run(qualifying_runs)
     freshness = {
       "status" => observed_run ? "current" : "absent",
       "expected_run_id" => expected_run&.fetch("id", nil),
@@ -328,6 +358,8 @@ module CiLatencyObserver
         .select do |run|
           run["conclusion"] == "success" && Time.iso8601(run.fetch("created_at")) >= epoch
         end
+        .sort_by { |run| CiLatencyObserver.run_order_key(run) }
+        .reverse
       runs.each do |run|
         jobs_stdout, jobs_stderr, jobs_ok = retry_capture(
           "gh", "api", "/repos/#{repository}/actions/runs/#{run.fetch("id")}/jobs?per_page=100",

@@ -5,6 +5,22 @@ require "minitest/autorun"
 require_relative "ci_latency_observer"
 
 class CiLatencyObserverTest < Minitest::Test
+  class FakeRunner < CiLatencyObserver::Runner
+    def initialize(responses)
+      @responses = responses
+    end
+
+    private
+
+    def retry_capture(*args, accept:)
+      response = @responses.fetch(args.last)
+      result = [JSON.generate(response), "", true]
+      raise "fixture response was rejected" unless accept.call(result)
+
+      result
+    end
+  end
+
   def healthy_report(repository: "burin-labs/harn", run_id: 101)
     {
       "schema_version" => 2,
@@ -42,6 +58,82 @@ class CiLatencyObserverTest < Minitest::Test
     assert_equal 0, CiLatencyObserver.exit_status([receipt])
     assert_equal 101, receipt.dig("freshness", "expected_run_id")
     assert_equal 101, receipt.dig("freshness", "observed_run_id")
+  end
+
+  def test_shuffled_report_runs_select_newest_by_time_then_id
+    report = healthy_report
+    report["qualifying_runs"][0] = {
+      "id" => 109,
+      "created_at" => "2026-08-27T07:00:00Z",
+      "duration_ms" => 580_000
+    }
+    report["qualifying_runs"][7] = {
+      "id" => 110,
+      "created_at" => "2026-08-27T07:00:00Z",
+      "duration_ms" => 580_000
+    }
+
+    receipt = CiLatencyObserver.classify(
+      report,
+      expected_run: {"id" => 110, "created_at" => "2026-08-27T07:00:00Z"}
+    )
+
+    assert_equal "pass", receipt.fetch("status")
+    assert_equal 110, receipt.dig("freshness", "observed_run_id")
+  end
+
+  def test_shuffled_api_runs_select_newest_full_coverage_identity
+    policy = {
+      "repository" => "burin-labs/harn",
+      "workflow" => "ci.yml",
+      "event" => "pull_request",
+      "topology_epoch" => "2026-08-27T00:00:00Z",
+      "full_run_jobs" => [{"name" => "CI status", "match" => "exact"}]
+    }
+    runs_path = "/repos/burin-labs/harn/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=20"
+    jobs = {"jobs" => [{"name" => "CI status", "conclusion" => "success"}]}
+    responses = {
+      runs_path => {
+        "workflow_runs" => [
+          {"id" => 101, "created_at" => "2026-08-27T05:00:00Z", "conclusion" => "success"},
+          {"id" => 103, "created_at" => "2026-08-27T07:00:00Z", "conclusion" => "success"},
+          {"id" => 104, "created_at" => "2026-08-27T07:00:00Z", "conclusion" => "success"},
+          {"id" => 102, "created_at" => "2026-08-27T06:00:00Z", "conclusion" => "success"}
+        ]
+      },
+      "/repos/burin-labs/harn/actions/runs/101/jobs?per_page=100" => jobs,
+      "/repos/burin-labs/harn/actions/runs/102/jobs?per_page=100" => jobs,
+      "/repos/burin-labs/harn/actions/runs/103/jobs?per_page=100" => jobs,
+      "/repos/burin-labs/harn/actions/runs/104/jobs?per_page=100" => jobs
+    }
+
+    run, error = FakeRunner.new(responses).send(:latest_full_success, policy)
+
+    assert_nil error
+    assert_equal 104, run.fetch("id")
+    assert_equal "2026-08-27T07:00:00Z", run.fetch("created_at")
+  end
+
+  def test_unknown_producer_status_fails_closed
+    report = healthy_report
+    report["evaluation"]["status"] = "typo"
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+
+    assert_equal "observer_error", receipt.fetch("status")
+    assert_match(/recognized producer status/, receipt.fetch("error"))
+    assert_equal 1, CiLatencyObserver.exit_status([receipt])
+  end
+
+  def test_contradictory_producer_status_and_ok_fail_closed
+    report = healthy_report
+    report["evaluation"]["ok"] = false
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+
+    assert_equal "observer_error", receipt.fetch("status")
+    assert_match(/contradicts/, receipt.fetch("error"))
+    assert_equal 1, CiLatencyObserver.exit_status([receipt])
   end
 
   def test_fresh_policy_breach_remains_enforcing_and_names_each_metric
