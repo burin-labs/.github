@@ -65,89 +65,16 @@ jobs:
           # that boundary instead of widening it.
           policies="$GITHUB_WORKSPACE/.harn/ci-latency-policies"
           mkdir -p "$reports" "$policies"
-          failed=0
-
-          for repository in .github harn burin-code harn-cloud; do
-            # Strip the leading dot from the org repository name. Upload-artifact
-            # excludes hidden files by default, so `.github.json` would silently
-            # drop one of the four governed reports from the evidence bundle.
-            report="$reports/${repository#.}.json"
-            policy_ok=false
-            for attempt in 1 2 3; do
-              if gh api \
-                  -H "Accept: application/vnd.github.raw+json" \
-                  "/repos/burin-labs/${repository}/contents/.github/ci-latency.json?ref=main" \
-                  > "$policies/${repository}.json"; then
-                policy_ok=true
-                break
-              fi
-              if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 5))"; fi
-            done
-
-            report_ok=false
-            if [ "$policy_ok" = true ]; then
-              for attempt in 1 2 3; do
-                set +e
-                # This trusted, SHA-pinned audit intentionally shells out to
-                # gh for read-only Actions metadata. Harn's default sandbox
-                # denies network/process authority, so the capability escape
-                # is explicit at the one call site that needs it.
-                harn run --no-sandbox .harn/ci-latency-harn/scripts/ci_walltime_report.harn -- \
-                  --policy "$policies/${repository}.json" \
-                  --limit 100 \
-                  --json \
-                  --check \
-                  > "$report"
-                set -e
-                # A policy breach intentionally exits non-zero but still emits
-                # its complete report. Retry only transport/tool failures that
-                # did not produce a valid evaluation.
-                if jq -e '.schema_version == 2 and (.evaluation.ok | type == "boolean")' \
-                    "$report" >/dev/null 2>&1; then
-                  report_ok=true
-                  break
-                fi
-                if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 5))"; fi
-              done
-            fi
-
-            if [ "$report_ok" = true ]; then
-              result="$(jq -r 'if .evaluation.ok then "pass" else "fail" end' "$report")"
-            else
-              result=fail
-              jq -n --arg repository "burin-labs/${repository}" \
-                '{schema_version: 2, policy: {repository: $repository}, evaluation: {status: "observer_error", ok: false}, wall: {count: 0, p50_ms: 0, p90_ms: 0, max_ms: 0}}' \
-                > "$report"
-            fi
-            if [ "$result" = fail ]; then
-              failed=1
-            fi
-            jq --arg result "$result" '. + {observer_result: $result}' \
-              "$report" > "$report.tmp"
-            mv "$report.tmp" "$report"
-          done
-
-          {
-            echo "## End-to-end CI latency"
-            echo
-            echo "Only successful full-coverage runs after each repository's topology epoch are included."
-            echo
-            echo "| Repository | Result | Samples | p50 | p90 | Max |"
-            echo "| --- | --- | ---: | ---: | ---: | ---: |"
-            for report in "$reports"/*.json; do
-              jq -r '
-                def seconds: ((. / 1000 * 10 | round) / 10 | tostring) + "s";
-                "| `" + .policy.repository + "` | " + .observer_result
-                  + " (`" + .evaluation.status + "`) | " + (.wall.count | tostring)
-                  + " | " + (.wall.p50_ms | seconds)
-                  + " | " + (.wall.p90_ms | seconds)
-                  + " | " + (.wall.max_ms | seconds) + " |"
-              ' "$report"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          set +e
+          ruby scripts/ci_latency_observer.rb \
+            --reports "$reports" \
+            --policies "$policies" \
+            --harn-script .harn/ci-latency-harn/scripts/ci_walltime_report.harn \
+            --summary-path "$GITHUB_STEP_SUMMARY"
+          observer_status=$?
+          set -e
           echo "reports=$reports" >> "$GITHUB_OUTPUT"
-          exit "$failed"
+          exit "$observer_status"
 
       - name: Upload compact reports
         if: always() && steps.observe.outputs.reports != ''
