@@ -17,6 +17,7 @@ module CiLatencyObserver
     "insufficient_samples" => false
   }.freeze
   RETRIES = 3
+  CommandResult = Struct.new(:stdout, :stderr, :process_ok, :accepted, keyword_init: true)
 
   module_function
 
@@ -277,14 +278,25 @@ module CiLatencyObserver
 
     def capture(*args)
       stdout, stderr, status = Open3.capture3(*args)
-      [stdout, stderr, status.success?]
+      CommandResult.new(
+        stdout: stdout,
+        stderr: stderr,
+        process_ok: status.success?,
+        accepted: false
+      )
     end
 
     def retry_capture(*args, accept:)
-      last = ["", "command did not run", false]
+      last = CommandResult.new(
+        stdout: "",
+        stderr: "command did not run",
+        process_ok: false,
+        accepted: false
+      )
       RETRIES.times do |attempt|
         last = capture(*args)
-        return last if accept.call(last)
+        last.accepted = accept.call(last)
+        return last if last.accepted
         sleep(@retry_delay * (attempt + 1)) if attempt < RETRIES - 1 && @retry_delay.positive?
       end
       last
@@ -294,38 +306,38 @@ module CiLatencyObserver
       full_name = "burin-labs/#{repository}"
       policy_path = File.join(@policies, "#{repository}.json")
       report_path = File.join(@reports, "#{repository.delete_prefix(".")}.json")
-      policy_stdout, policy_stderr, policy_ok = retry_capture(
+      policy_result = retry_capture(
         "gh", "api", "-H", "Accept: application/vnd.github.raw+json",
         "/repos/#{full_name}/contents/.github/ci-latency.json?ref=main",
-        accept: ->((stdout, _stderr, success)) { success && valid_json?(stdout) }
+        accept: ->(result) { result.process_ok && valid_json?(result.stdout) }
       )
-      unless policy_ok
-        return write_error_report(report_path, full_name, "policy read failed: #{compact_error(policy_stderr)}")
+      unless policy_result.accepted
+        return write_error_report(report_path, full_name, "policy read failed: #{compact_error(policy_result.stderr)}")
       end
-      File.write(policy_path, policy_stdout)
-      policy = JSON.parse(policy_stdout)
+      File.write(policy_path, policy_result.stdout)
+      policy = JSON.parse(policy_result.stdout)
       expected_run, freshness_error = latest_full_success(policy)
       if freshness_error
         return write_error_report(report_path, full_name, freshness_error)
       end
 
-      report_stdout, report_stderr, report_ok = retry_capture(
+      report_result = retry_capture(
         "harn", "run", "--no-sandbox", @harn_script, "--",
         "--policy", policy_path, "--limit", "100", "--json", "--check",
-        accept: lambda do |(stdout, _stderr, _success)|
-          parsed = parse_json(stdout)
+        accept: lambda do |result|
+          parsed = parse_json(result.stdout)
           parsed && CiLatencyObserver.report_error(parsed).nil?
         end
       )
-      unless report_ok
+      unless report_result.accepted
         return write_error_report(
           report_path,
           full_name,
-          "measurement returned no valid report: #{compact_command_error(report_stdout, report_stderr)}"
+          "measurement returned no valid report: #{compact_command_error(report_result.stdout, report_result.stderr)}"
         )
       end
 
-      parsed = JSON.parse(report_stdout)
+      parsed = JSON.parse(report_result.stdout)
       receipt = CiLatencyObserver.classify(parsed, expected_run: expected_run)
       parsed["observer"] = receipt
       parsed["observer_result"] = %w[stale observer_error].include?(receipt.fetch("status")) ? "fail" : "pass"
@@ -347,26 +359,26 @@ module CiLatencyObserver
       workflow = policy.fetch("workflow")
       event = policy.fetch("event")
       epoch = Time.iso8601(policy.fetch("topology_epoch"))
-      runs_stdout, runs_stderr, runs_ok = retry_capture(
+      runs_result = retry_capture(
         "gh", "api",
         "/repos/#{repository}/actions/workflows/#{workflow}/runs?event=#{event}&status=completed&per_page=20",
-        accept: ->((stdout, _stderr, success)) { success && valid_json?(stdout) }
+        accept: ->(result) { result.process_ok && valid_json?(result.stdout) }
       )
-      return [nil, "freshness read failed: #{compact_error(runs_stderr)}"] unless runs_ok
+      return [nil, "freshness read failed: #{compact_error(runs_result.stderr)}"] unless runs_result.accepted
 
-      runs = JSON.parse(runs_stdout).fetch("workflow_runs", [])
+      runs = JSON.parse(runs_result.stdout).fetch("workflow_runs", [])
         .select do |run|
           run["conclusion"] == "success" && Time.iso8601(run.fetch("created_at")) >= epoch
         end
         .sort_by { |run| CiLatencyObserver.run_order_key(run) }
         .reverse
       runs.each do |run|
-        jobs_stdout, jobs_stderr, jobs_ok = retry_capture(
+        jobs_result = retry_capture(
           "gh", "api", "/repos/#{repository}/actions/runs/#{run.fetch("id")}/jobs?per_page=100",
-          accept: ->((stdout, _stderr, success)) { success && valid_json?(stdout) }
+          accept: ->(result) { result.process_ok && valid_json?(result.stdout) }
         )
-        return [nil, "freshness job read failed: #{compact_error(jobs_stderr)}"] unless jobs_ok
-        jobs = JSON.parse(jobs_stdout).fetch("jobs", [])
+        return [nil, "freshness job read failed: #{compact_error(jobs_result.stderr)}"] unless jobs_result.accepted
+        jobs = JSON.parse(jobs_result.stdout).fetch("jobs", [])
         if full_coverage?(jobs, policy.fetch("full_run_jobs"))
           return [{"id" => run.fetch("id"), "created_at" => run.fetch("created_at")}, nil]
         end
