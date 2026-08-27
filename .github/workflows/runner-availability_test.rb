@@ -21,6 +21,10 @@ abort "#{path}: workflow_call outputs #{declared} must match job outputs #{expos
 
 script = job.fetch("steps").find { |step| step["id"] == "detect" }.fetch("run")
 
+inputs = triggers.fetch("workflow_call").fetch("inputs")
+probe_input = inputs.fetch("linux_probe_runner_tag")
+abort "#{path}: Linux probe input must default to empty" unless probe_input.fetch("default") == ""
+
 # `selfhosted_disabled` is deliberately published once, before any exit path,
 # precisely so the early exits do not each have to remember it. Every other
 # output has to be written by the shared no-capacity reporter.
@@ -34,6 +38,18 @@ abort "#{path}: detector must funnel no-capacity exits through report_unmeasured
 
   abort "#{path}: report_unmeasured must publish #{output}, or an early exit ships a partial output set"
 end
+
+# The optional probe must preserve the distinction between no requested
+# measurement and a measured pool with zero online runners. The former belongs
+# in the shared unmeasured receipt; the latter must flow through the same label
+# matcher as every other capacity lane.
+abort "#{path}: unmeasured capacity must include linux_probe" unless reporter.include?('"linux_probe"')
+abort "#{path}: absent Linux probe must be recorded as unmeasured" unless script.include?(
+  'record_capacity linux_probe 0 0 false'
+)
+abort "#{path}: requested Linux probe must use the shared label matcher" unless script.include?(
+  'probe_online="$(count_matching Linux "$LINUX_PROBE_TAG" any)"'
+)
 
 # GITHUB_OUTPUT is append-only and read once when the step ends, so an exit path
 # that skips the reporter cannot fail loudly - it silently emits fewer keys than

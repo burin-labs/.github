@@ -81,6 +81,14 @@ on:
         type: string
         default: harn-fetch-ok
         required: false
+      linux_probe_runner_tag:
+        description: >-
+          Optional Linux label for a caller-owned pool or host whose online
+          state must be distinguished from the shared capability lanes. When
+          empty, linux_probe is explicitly unmeasured.
+        type: string
+        default: ""
+        required: false
       macos_runner_tag:
         description: "macOS-specific self-hosted runner label"
         type: string
@@ -115,6 +123,12 @@ on:
           the health tag, even if `linux` is true — that is how a degraded box
           is suppressed without naming it in the caller.
         value: ${{ jobs.detect.outputs.linux_fetch }}
+      linux_probe:
+        description: >-
+          true when an idle Linux runner carries linux_probe_runner_tag. Read
+          capacity.linux_probe.online when a caller wants to queue behind a
+          busy matching runner instead of requiring one to be idle.
+        value: ${{ jobs.detect.outputs.linux_probe }}
       windows:
         description: "true when an idle matching self-hosted Windows runner exists"
         value: ${{ jobs.detect.outputs.windows }}
@@ -135,7 +149,8 @@ on:
       capacity:
         description: >-
           JSON object of the measured fleet, keyed by lane (linux, linux_big,
-          linux_fetch, macos, windows), each `{online, idle, measured}`.
+          linux_fetch, linux_probe, macos, windows), each
+          `{online, idle, measured}`.
           Consume with `fromJSON(...).linux.idle`.
 
           The per-lane booleans above answer one question - "can a job land
@@ -179,6 +194,7 @@ jobs:
       linux: ${{ steps.detect.outputs.linux }}
       linux_big: ${{ steps.detect.outputs.linux_big }}
       linux_fetch: ${{ steps.detect.outputs.linux_fetch }}
+      linux_probe: ${{ steps.detect.outputs.linux_probe }}
       windows: ${{ steps.detect.outputs.windows }}
       macos: ${{ steps.detect.outputs.macos }}
       selfhosted_disabled: ${{ steps.detect.outputs.selfhosted_disabled }}
@@ -205,6 +221,7 @@ jobs:
           LINUX_TAG: ${{ inputs.linux_runner_tag }}
           LINUX_BIG_TAG: ${{ inputs.linux_big_runner_tag }}
           LINUX_FETCH_TAG: ${{ inputs.linux_fetch_runner_tag }}
+          LINUX_PROBE_TAG: ${{ inputs.linux_probe_runner_tag }}
           MACOS_TAG: ${{ inputs.macos_runner_tag }}
           WINDOWS_TAG: ${{ inputs.windows_runner_tag }}
           RUNNER_GROUPS: ${{ inputs.runner_groups }}
@@ -257,9 +274,10 @@ jobs:
               echo "linux=false"
               echo "linux_big=false"
               echo "linux_fetch=false"
+              echo "linux_probe=false"
               echo "windows=false"
               echo "macos=false"
-              echo "capacity=$(jq -c -n '["linux", "linux_big", "linux_fetch", "macos", "windows"]
+              echo "capacity=$(jq -c -n '["linux", "linux_big", "linux_fetch", "linux_probe", "macos", "windows"]
                 | map({key: ., value: {online: 0, idle: 0, measured: false}})
                 | from_entries')"
             } >> "$GITHUB_OUTPUT"
@@ -494,6 +512,31 @@ jobs:
             fi
             record_capacity linux_fetch "$fetch_online" "$fetch_count" true
             echo "::notice::runner-availability linux_fetch=$([ "$fetch_count" -gt 0 ] && echo true || echo false) (${fetch_count} idle of ${fetch_online} online Linux ${LINUX_TAG}+${LINUX_FETCH_TAG} runner(s))"
+          fi
+
+          # Some health checks target one physical pool rather than a shared
+          # capability. Keep that optional label inside this detector so
+          # callers do not fork the group-resolution and fail-closed logic.
+          # A missing input is not a measured zero: publish the absent probe
+          # explicitly as unmeasured.
+          if [ -z "$LINUX_PROBE_TAG" ] || is_disabled linux; then
+            echo "linux_probe=false" >> "$GITHUB_OUTPUT"
+            record_capacity linux_probe 0 0 false
+            if [ -z "$LINUX_PROBE_TAG" ]; then
+              echo "::notice::runner-availability linux_probe=false (no linux_probe_runner_tag requested; capacity not measured)"
+            else
+              echo "::notice::runner-availability linux_probe=false (Linux pinned to GitHub-hosted by CI_SELFHOSTED_DISABLED; capacity not measured)"
+            fi
+          else
+            probe_count="$(count_matching Linux "$LINUX_PROBE_TAG" idle)"
+            probe_online="$(count_matching Linux "$LINUX_PROBE_TAG" any)"
+            if [ "$probe_count" -gt 0 ]; then
+              echo "linux_probe=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "linux_probe=false" >> "$GITHUB_OUTPUT"
+            fi
+            record_capacity linux_probe "$probe_online" "$probe_count" true
+            echo "::notice::runner-availability linux_probe=$([ "$probe_count" -gt 0 ] && echo true || echo false) (${probe_count} idle of ${probe_online} online Linux ${LINUX_PROBE_TAG} runner(s))"
           fi
 
           echo "capacity=${capacity}" >> "$GITHUB_OUTPUT"
