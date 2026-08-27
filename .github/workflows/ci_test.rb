@@ -100,9 +100,16 @@ unless app_step&.fetch("with")&.slice(*expected_app_permissions.keys) == expecte
   abort "latency observer release-app token must remain read-only"
 end
 run_step = observe_job.fetch("steps").find { |step| step["name"] == "Observe full CI runs" }
-abort "latency observer must check every governed repository" unless run_step&.fetch("run")&.include?("for repository in .github harn burin-code harn-cloud")
-abort "latency observer must enforce the policy" unless run_step.fetch("run").include?("--check")
-abort "latency observer must publish the org report as a visible artifact file" unless run_step.fetch("run").include?('report="$reports/${repository#.}.json"')
+runner_path = File.expand_path("../../scripts/ci_latency_observer.rb", __dir__)
+runner = File.read(runner_path)
+abort "latency observer must run its tested boundary" unless run_step&.fetch("run")&.include?("ruby scripts/ci_latency_observer.rb")
+abort "latency observer workflow must enforce the runner verdict" unless run_step.fetch("run").include?('exit "$observer_status"')
+abort "latency observer must check every governed repository" unless runner.include?('REPOSITORIES = [".github", "harn", "burin-code", "harn-cloud"].freeze')
+abort "latency observer must preserve policy enforcement" unless runner.include?('"--json", "--check"')
+abort "latency observer must compare against completed-run freshness" unless runner.include?("status=completed&per_page=20")
+abort "latency observer must publish named failing repositories" unless runner.include?('"breaching_repositories"')
+abort "latency observer must publish named pending repositories" unless runner.include?('"pending_repositories"')
+abort "latency observer must publish the org report as a visible artifact file" unless runner.include?('File.join(@reports, "org-summary.json")')
 
 markdown = steps.find { |step| step["name"] == "Markdown lint" }
 expected_markdown = "DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff"
