@@ -268,6 +268,8 @@ class CiLatencyObserverTest < Minitest::Test
       }
     ], receipt.fetch("target_debt")
     assert_equal 1_173_700, receipt.dig("observed_baseline", "p90_regression_limit_ms")
+    assert_equal "warming", receipt.dig("regression_window", "p90_status")
+    assert_equal 0, receipt.dig("regression_window", "post_baseline_sample_count")
   end
 
   def test_fetched_policy_supplies_baseline_dropped_by_the_typed_measurement_projection
@@ -306,6 +308,9 @@ class CiLatencyObserverTest < Minitest::Test
 
   def test_sustained_p90_or_immediate_max_regression_still_fails
     report = attach_baseline(healthy_report)
+    report["qualifying_runs"].each do |run|
+      run["created_at"] = "2026-08-28T06:00:00Z"
+    end
     report["evaluation"] = {
       "status" => "hard_max_breach",
       "ok" => false,
@@ -313,7 +318,10 @@ class CiLatencyObserverTest < Minitest::Test
       "previous" => {"count" => 5, "p90_ms" => 1_250_000, "max_ms" => 1_260_000}
     }
 
-    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+    receipt = CiLatencyObserver.classify(
+      report,
+      expected_run: {"id" => 101, "created_at" => "2026-08-28T06:00:00Z"}
+    )
 
     assert_equal "policy_breach", receipt.fetch("status")
     assert_equal 1, CiLatencyObserver.exit_status([receipt])
@@ -323,6 +331,39 @@ class CiLatencyObserverTest < Minitest::Test
       "evaluation.current.max_ms"
     ], receipt.fetch("breaches").map { |breach| breach.fetch("metric") }
     assert receipt.fetch("breaches").all? { |breach| breach.fetch("threshold_ms") == 1_173_700 }
+    assert_equal "enforcing", receipt.dig("regression_window", "p90_status")
+  end
+
+  def test_pre_baseline_history_cannot_supply_half_of_a_sustained_regression
+    report = attach_baseline(healthy_report)
+    report["evaluation"] = {
+      "status" => "sustained_p90_breach",
+      "ok" => false,
+      "current" => {"count" => 5, "p90_ms" => 1_300_000, "max_ms" => 1_100_000},
+      "previous" => {"count" => 5, "p90_ms" => 1_250_000, "max_ms" => 1_100_000}
+    }
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+
+    assert_equal "target_debt", receipt.fetch("status")
+    assert_empty receipt.fetch("breaches")
+    assert_equal "warming", receipt.dig("regression_window", "p90_status")
+  end
+
+  def test_max_regression_is_immediate_while_p90_window_is_warming
+    report = attach_baseline(healthy_report)
+    report["evaluation"] = {
+      "status" => "hard_max_breach",
+      "ok" => false,
+      "current" => {"count" => 5, "p90_ms" => 1_064_600, "max_ms" => 1_300_000},
+      "previous" => {"count" => 5, "p90_ms" => 1_499_400, "max_ms" => 1_515_000}
+    }
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+
+    assert_equal "policy_breach", receipt.fetch("status")
+    assert_equal ["evaluation.current.max_ms"], receipt.fetch("breaches").map { |breach| breach.fetch("metric") }
+    assert_equal "warming", receipt.dig("regression_window", "p90_status")
   end
 
   def test_invalid_or_empty_baseline_evidence_fails_closed

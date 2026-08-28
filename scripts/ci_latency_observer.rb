@@ -93,10 +93,16 @@ module CiLatencyObserver
     end
   end
 
-  def regression_breaches(current, previous, baseline)
+  def regression_breaches(current, previous, baseline, qualifying_runs, window_samples)
     breaches = []
+    sampled_at = Time.iso8601(baseline.fetch("sampled_at"))
+    post_baseline_count = qualifying_runs.count do |run|
+      Time.iso8601(run.fetch("created_at")) > sampled_at
+    end
+    required_post_baseline = window_samples * 2
     p90_limit = baseline.fetch("p90_regression_limit_ms")
-    if current.fetch("p90_ms") >= p90_limit && previous.fetch("p90_ms") >= p90_limit
+    if post_baseline_count >= required_post_baseline &&
+        current.fetch("p90_ms") >= p90_limit && previous.fetch("p90_ms") >= p90_limit
       [current, previous].each_with_index do |window, index|
         breaches << {
           "metric" => "evaluation.#{index.zero? ? 'current' : 'previous'}.p90_ms",
@@ -116,7 +122,14 @@ module CiLatencyObserver
         "sample_count" => current.fetch("count", 0)
       }
     end
-    breaches
+    [
+      breaches,
+      {
+        "post_baseline_sample_count" => post_baseline_count,
+        "required_sample_count" => required_post_baseline,
+        "p90_status" => post_baseline_count >= required_post_baseline ? "enforcing" : "warming"
+      }
+    ]
   end
 
   def observer_error(repository, message)
@@ -210,9 +223,16 @@ module CiLatencyObserver
 
     debt = []
     breaches = []
+    regression_window = nil
     if baseline
       debt = target_debts(current, slo)
-      breaches = regression_breaches(current, previous, baseline)
+      breaches, regression_window = regression_breaches(
+        current,
+        previous,
+        baseline,
+        qualifying_runs,
+        slo.fetch("window_samples")
+      )
       status = if evaluation.fetch("status") == "insufficient_samples"
         "insufficient_samples"
       elsif breaches.any?
@@ -276,6 +296,7 @@ module CiLatencyObserver
       "previous_window" => previous,
       "thresholds" => slo,
       "observed_baseline" => baseline,
+      "regression_window" => regression_window,
       "breaches" => breaches,
       "target_debt" => debt,
       "freshness" => freshness

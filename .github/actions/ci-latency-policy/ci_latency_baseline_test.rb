@@ -56,6 +56,16 @@ class CiLatencyBaselineTest < Minitest::Test
     assert_match(/not the generated projection/, error.message)
   end
 
+  def test_failed_run_cannot_mint_a_regression_baseline
+    evidence = runs([957_000, 1_052_000, 1_067_000, 760_000, 1_061_000])
+    evidence[2]["conclusion"] = "failure"
+
+    error = assert_raises(CiLatencyBaseline::Invalid) do
+      CiLatencyBaseline.derive(policy, evidence)
+    end
+    assert_match(/not a successful qualifying run/, error.message)
+  end
+
   def test_same_topology_ratchet_can_only_tighten
     current = CiLatencyBaseline.ratchet(policy, runs([957_000, 1_052_000, 1_067_000, 760_000, 1_061_000]))
     faster = runs([700_000, 720_000, 740_000, 760_000, 780_000])

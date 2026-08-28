@@ -59,9 +59,7 @@ module CiLatencyBaseline
       completed_at = parse_time(run, "completed_at")
       head_sha = run.fetch("head_sha")
       raise Invalid, "baseline run #{id} does not match policy event" unless event == policy.fetch("event")
-      unless %w[success failure].include?(conclusion)
-        raise Invalid, "baseline run #{id} is not a qualifying completed run"
-      end
+      raise Invalid, "baseline run #{id} is not a successful qualifying run" unless conclusion == "success"
       raise Invalid, "baseline run #{id} predates topology_epoch" if started_at < topology_epoch
       raise Invalid, "baseline run #{id} completed before it started" unless completed_at > started_at
       unless head_sha.is_a?(String) && head_sha.match?(/\A[0-9a-f]{40}\z/)
@@ -157,7 +155,8 @@ module CiLatencyBaseline
       "baseline_p90_ms" => baseline.dig("wall", "p90_ms"),
       "baseline_max_ms" => baseline.dig("wall", "max_ms"),
       "p90_regression_limit_ms" => baseline.dig("wall", "p90_regression_limit_ms"),
-      "max_regression_limit_ms" => baseline.dig("wall", "max_regression_limit_ms")
+      "max_regression_limit_ms" => baseline.dig("wall", "max_regression_limit_ms"),
+      "sampled_at" => baseline.fetch("runs").map { |run| run.fetch("completed_at") }.max
     }
   end
 
@@ -198,7 +197,8 @@ module CiLatencyBaseline
       "baseline_p90_ms" => wall.fetch("p90_ms"),
       "baseline_max_ms" => wall.fetch("max_ms"),
       "p90_regression_limit_ms" => wall.fetch("regression_limit_ms"),
-      "max_regression_limit_ms" => regression_limit(wall.fetch("max_ms"))
+      "max_regression_limit_ms" => regression_limit(wall.fetch("max_ms")),
+      "sampled_at" => runs.map { |run| run.fetch("completed_at") }.max
     }
   end
 
