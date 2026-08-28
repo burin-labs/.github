@@ -5,6 +5,7 @@ require "json"
 require "open3"
 require "optparse"
 require "time"
+require_relative "../.github/actions/ci-latency-policy/ci_latency_baseline"
 
 module CiLatencyObserver
   REPOSITORIES = [".github", "harn", "burin-code", "harn-cloud"].freeze
@@ -34,6 +35,21 @@ module CiLatencyObserver
     return "evaluation.current must be an object" unless report.dig("evaluation", "current").is_a?(Hash)
     return "evaluation.previous must be an object" unless report.dig("evaluation", "previous").is_a?(Hash)
     return "policy.slo must be an object" unless report.dig("policy", "slo").is_a?(Hash)
+    %w[current previous].each do |window|
+      %w[count p90_ms max_ms].each do |field|
+        value = report.dig("evaluation", window, field)
+        return "evaluation.#{window}.#{field} must be a non-negative integer" unless value.is_a?(Integer) && value >= 0
+      end
+    end
+    %w[warning_ms p90_ms hard_max_ms min_samples window_samples].each do |field|
+      value = report.dig("policy", "slo", field)
+      return "policy.slo.#{field} must be a positive integer" unless value.is_a?(Integer) && value.positive?
+    end
+    slo = report.dig("policy", "slo")
+    unless slo.fetch("warning_ms") < slo.fetch("p90_ms") && slo.fetch("p90_ms") < slo.fetch("hard_max_ms")
+      return "policy.slo thresholds are not ordered"
+    end
+    return "policy.slo.min_samples exceeds window_samples" if slo.fetch("min_samples") > slo.fetch("window_samples")
     unless report.fetch("qualifying_runs").all? { |run| valid_qualifying_run?(run) }
       return "qualifying_runs entries require an integer id and ISO-8601 created_at"
     end
@@ -58,6 +74,51 @@ module CiLatencyObserver
     runs.sort_by { |run| run_order_key(run) }.reverse.first
   end
 
+  def target_debts(current, slo)
+    [
+      ["evaluation.current.p90_ms", "p90_ms"],
+      ["evaluation.current.max_ms", "hard_max_ms"]
+    ].each_with_object([]) do |(metric, threshold), debts|
+      observed_ms = current.fetch(metric.split(".").last)
+      target_ms = slo.fetch(threshold)
+      next if observed_ms < target_ms
+
+      debts << {
+        "metric" => metric,
+        "observed_ms" => observed_ms,
+        "target_ms" => target_ms,
+        "gap_ms" => observed_ms - target_ms,
+        "sample_count" => current.fetch("count", 0)
+      }
+    end
+  end
+
+  def regression_breaches(current, previous, baseline)
+    breaches = []
+    p90_limit = baseline.fetch("p90_regression_limit_ms")
+    if current.fetch("p90_ms") >= p90_limit && previous.fetch("p90_ms") >= p90_limit
+      [current, previous].each_with_index do |window, index|
+        breaches << {
+          "metric" => "evaluation.#{index.zero? ? 'current' : 'previous'}.p90_ms",
+          "observed_ms" => window.fetch("p90_ms"),
+          "threshold_ms" => p90_limit,
+          "sample_count" => window.fetch("count", 0)
+        }
+      end
+    end
+
+    max_limit = baseline.fetch("max_regression_limit_ms")
+    if current.fetch("max_ms") >= max_limit
+      breaches << {
+        "metric" => "evaluation.current.max_ms",
+        "observed_ms" => current.fetch("max_ms"),
+        "threshold_ms" => max_limit,
+        "sample_count" => current.fetch("count", 0)
+      }
+    end
+    breaches
+  end
+
   def observer_error(repository, message)
     {
       "repository" => repository || "unknown",
@@ -70,17 +131,23 @@ module CiLatencyObserver
     }
   end
 
-  def classify(report, expected_run:, error: nil)
+  def classify(report, expected_run:, policy: nil, error: nil)
     repository = report.is_a?(Hash) ? report.dig("policy", "repository") : nil
     return observer_error(repository, error) if error
 
     invalid = report_error(report)
     return observer_error(repository, invalid) if invalid
 
+    authoritative_policy = policy || report.fetch("policy")
+    policy_mismatch = policy && %w[repository workflow event topology_epoch slo full_run_jobs].any? do |field|
+      report.dig("policy", field) != policy[field]
+    end
+    return observer_error(repository, "measurement policy projection does not match the fetched policy") if policy_mismatch
+
     evaluation = report.fetch("evaluation")
     current = evaluation.fetch("current")
     previous = evaluation.fetch("previous")
-    slo = report.dig("policy", "slo")
+    slo = authoritative_policy.fetch("slo")
     qualifying_runs = report.fetch("qualifying_runs")
     if report.dig("wall", "count") != qualifying_runs.count
       return observer_error(repository, "wall.count does not match qualifying run count")
@@ -129,16 +196,45 @@ module CiLatencyObserver
       }
     end
 
-    status = if evaluation.fetch("status") == "insufficient_samples"
-      "insufficient_samples"
-    elsif evaluation.fetch("ok")
-      %w[warning single_window_p90_breach].include?(evaluation.fetch("status")) ? "policy_warning" : "pass"
-    else
-      "policy_breach"
+    baseline = nil
+    if authoritative_policy.key?("observed_baseline")
+      begin
+        baseline = CiLatencyBaseline.validate(authoritative_policy)
+      rescue CiLatencyBaseline::Invalid => e
+        receipt = observer_error(repository, "observed baseline is invalid: #{e.message}")
+        receipt["sample_count"] = report.dig("wall", "count")
+        receipt["freshness"] = freshness
+        return receipt
+      end
     end
 
+    debt = []
     breaches = []
-    if status == "policy_breach"
+    if baseline
+      debt = target_debts(current, slo)
+      breaches = regression_breaches(current, previous, baseline)
+      status = if evaluation.fetch("status") == "insufficient_samples"
+        "insufficient_samples"
+      elsif breaches.any?
+        "policy_breach"
+      elsif debt.any?
+        "target_debt"
+      elsif %w[warning single_window_p90_breach].include?(evaluation.fetch("status"))
+        "policy_warning"
+      else
+        "pass"
+      end
+    else
+      status = if evaluation.fetch("status") == "insufficient_samples"
+        "insufficient_samples"
+      elsif evaluation.fetch("ok")
+        %w[warning single_window_p90_breach].include?(evaluation.fetch("status")) ? "policy_warning" : "pass"
+      else
+        "policy_breach"
+      end
+    end
+
+    if status == "policy_breach" && baseline.nil?
       p90_threshold = slo.fetch("p90_ms")
       hard_max_threshold = slo.fetch("hard_max_ms")
       current_count = current.fetch("count", 0)
@@ -179,13 +275,15 @@ module CiLatencyObserver
       "current_window" => current,
       "previous_window" => previous,
       "thresholds" => slo,
+      "observed_baseline" => baseline,
       "breaches" => breaches,
+      "target_debt" => debt,
       "freshness" => freshness
     }
   end
 
   def exit_status(receipts)
-    receipts.all? { |receipt| %w[pass policy_warning].include?(receipt.fetch("status")) } ? 0 : 1
+    receipts.all? { |receipt| %w[pass policy_warning target_debt].include?(receipt.fetch("status")) } ? 0 : 1
   end
 
   def summary(receipts)
@@ -195,20 +293,23 @@ module CiLatencyObserver
         .sort
     end
     warning_repositories = names_for.call("policy_warning")
+    target_debt_repositories = names_for.call("target_debt")
     breaching_repositories = names_for.call("policy_breach")
     pending_repositories = names_for.call("insufficient_samples")
     stale_repositories = names_for.call("stale")
     observer_error_repositories = names_for.call("observer_error")
     {
-      "schema_version" => 1,
+      "schema_version" => 2,
       "repository_count" => receipts.count,
       "passing_count" => receipts.count { |receipt| receipt.fetch("status") == "pass" },
       "warning_count" => warning_repositories.count,
+      "target_debt_count" => target_debt_repositories.count,
       "breach_count" => breaching_repositories.count,
       "pending_count" => pending_repositories.count,
       "stale_count" => stale_repositories.count,
       "observer_error_count" => observer_error_repositories.count,
       "warning_repositories" => warning_repositories,
+      "target_debt_repositories" => target_debt_repositories,
       "breaching_repositories" => breaching_repositories,
       "pending_repositories" => pending_repositories,
       "stale_repositories" => stale_repositories,
@@ -231,6 +332,10 @@ module CiLatencyObserver
         receipt.fetch("breaches").map do |breach|
           "#{breach.fetch("metric")}=#{breach.fetch("observed_ms")}ms >= #{breach.fetch("threshold_ms")}ms (n=#{breach.fetch("sample_count")})"
         end.join("; ")
+      elsif receipt.fetch("target_debt", []).any?
+        receipt.fetch("target_debt").map do |debt|
+          "#{debt.fetch("metric")}=#{debt.fetch("observed_ms")}ms, target #{debt.fetch("target_ms")}ms, gap +#{debt.fetch("gap_ms")}ms (n=#{debt.fetch("sample_count")})"
+        end.join("; ")
       elsif receipt.fetch("status") == "stale"
         "expected run #{receipt.dig("freshness", "expected_run_id")}, observed #{receipt.dig("freshness", "observed_run_id") || "none"}"
       elsif receipt["error"]
@@ -242,6 +347,7 @@ module CiLatencyObserver
       lines << "| `#{receipt.fetch("repository")}` | `#{receipt.fetch("status")}` | #{receipt.fetch("sample_count")} | #{safe_evidence} |"
     end
     lines << ""
+    lines << "Target debt: #{summary_report.fetch("target_debt_repositories").join(", ").then { |value| value.empty? ? "none" : value }}"
     lines << "Failing: #{summary_report.fetch("breaching_repositories").join(", ").then { |value| value.empty? ? "none" : value }}"
     lines << "Pending: #{summary_report.fetch("pending_repositories").join(", ").then { |value| value.empty? ? "none" : value }}"
     lines << "Stale: #{summary_report.fetch("stale_repositories").join(", ").then { |value| value.empty? ? "none" : value }}"
@@ -338,12 +444,13 @@ module CiLatencyObserver
       end
 
       parsed = JSON.parse(report_result.stdout)
-      receipt = CiLatencyObserver.classify(parsed, expected_run: expected_run)
+      receipt = CiLatencyObserver.classify(parsed, expected_run: expected_run, policy: policy)
       parsed["observer"] = receipt
       parsed["observer_result"] = %w[stale observer_error].include?(receipt.fetch("status")) ? "fail" : "pass"
       parsed["policy_result"] = case receipt.fetch("status")
       when "pass" then "pass"
       when "policy_warning" then "warning"
+      when "target_debt" then "target_debt"
       when "policy_breach" then "breach"
       when "insufficient_samples" then "pending"
       else "unknown"
@@ -439,6 +546,14 @@ module CiLatencyObserver
     def annotate(report)
       report.fetch("repositories").each do |receipt|
         next if %w[pass policy_warning].include?(receipt.fetch("status"))
+        if receipt.fetch("status") == "target_debt"
+          evidence = receipt.fetch("target_debt").map do |debt|
+            "#{debt.fetch("metric")}=#{debt.fetch("observed_ms")}ms target=#{debt.fetch("target_ms")}ms gap=+#{debt.fetch("gap_ms")}ms n=#{debt.fetch("sample_count")}"
+          end.join("; ")
+          message = evidence.gsub("%", "%25").gsub("\r", "%0D").gsub("\n", "%0A")
+          puts "::warning title=CI latency target debt #{receipt.fetch("repository")}::#{message}"
+          next
+        end
         evidence = receipt.fetch("breaches").map do |breach|
           "#{breach.fetch("metric")}=#{breach.fetch("observed_ms")}ms threshold=#{breach.fetch("threshold_ms")}ms n=#{breach.fetch("sample_count")}"
         end.join("; ")

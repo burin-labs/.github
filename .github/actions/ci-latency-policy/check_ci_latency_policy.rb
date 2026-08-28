@@ -4,6 +4,7 @@ require "json"
 require "optparse"
 require "time"
 require "yaml"
+require_relative "ci_latency_baseline"
 
 module CiLatencyPolicy
   class Invalid < StandardError; end
@@ -33,6 +34,12 @@ module CiLatencyPolicy
   # inside the derived SLO.
   def derived_warning_ms(p90_ms)
     p90_ms * 9 / 10 / GRID_MS * GRID_MS
+  end
+
+  def observed_baseline_limits(policy)
+    CiLatencyBaseline.validate(policy)
+  rescue CiLatencyBaseline::Invalid => e
+    raise Invalid, e.message
   end
 
   # `slo.regenerated` is the receipt that justifies an SLO increase. Shape is
@@ -89,6 +96,7 @@ module CiLatencyPolicy
     raise Invalid, "SLO thresholds must satisfy warning_ms < p90_ms < hard_max_ms" unless warning < target && target < hard_max
     raise Invalid, "slo.min_samples cannot exceed slo.window_samples" if minimum > window
     parse_regeneration_receipt(raw)
+    observed_baseline_limits(raw) if raw.key?("observed_baseline")
 
     required = raw.fetch("required")
     aggregate = required["aggregate_job"]
@@ -106,7 +114,7 @@ module CiLatencyPolicy
     end
 
     raw
-  rescue JSON::ParserError, KeyError, TypeError, ArgumentError => e
+  rescue JSON::ParserError, KeyError, TypeError, ArgumentError, CiLatencyBaseline::Invalid => e
     raise Invalid, e.message
   end
 
@@ -177,6 +185,25 @@ module CiLatencyPolicy
       if new_hard_max > old_hard_max
         raise Invalid, "slo.hard_max_ms may only decrease (#{old_hard_max} -> #{new_hard_max})"
       end
+      old_observed = baseline["observed_baseline"]
+      new_observed = policy["observed_baseline"]
+      if old_observed && !new_observed
+        raise Invalid, "observed_baseline cannot be removed"
+      end
+      if old_observed && new_observed && policy.fetch("topology_epoch") == baseline.fetch("topology_epoch")
+        old_limits = observed_baseline_limits(baseline)
+        new_limits = observed_baseline_limits(policy)
+        %w[p50_ms p90_ms max_ms].each do |metric|
+          next unless new_observed.dig("wall", metric) > old_observed.dig("wall", metric)
+
+          raise Invalid, "observed_baseline may only tighten: #{metric} moved upward"
+        end
+        %w[p90_regression_limit_ms max_regression_limit_ms].each do |metric|
+          next unless new_limits.fetch(metric) > old_limits.fetch(metric)
+
+          raise Invalid, "observed_baseline may only tighten: #{metric} moved upward"
+        end
+      end
       baseline_required = baseline.fetch("required")
       if required.fetch("critical_path_allowance_ms") > baseline_required.fetch("critical_path_allowance_ms")
         raise Invalid, "critical-path allowance may only decrease (#{baseline_required.fetch('critical_path_allowance_ms')} -> #{required.fetch('critical_path_allowance_ms')})"
@@ -204,7 +231,7 @@ if $PROGRAM_NAME == __FILE__
   begin
     policy = CiLatencyPolicy.check(**options)
     puts "CI latency policy: OK (#{policy.dig('required', 'jobs').length} required jobs, #{policy.dig('required', 'critical_path_allowance_ms')}ms allowance)"
-  rescue CiLatencyPolicy::Invalid => e
+  rescue CiLatencyPolicy::Invalid, CiLatencyBaseline::Invalid => e
     warn "CI latency policy: #{e.message}"
     exit 1
   end

@@ -70,6 +70,28 @@ class CiLatencyObserverTest < Minitest::Test
     {"id" => id, "created_at" => "2026-08-27T06:00:00Z"}
   end
 
+  def baseline_runs(values)
+    values.each_with_index.map do |wall_ms, index|
+      started = Time.iso8601("2026-08-27T06:00:00Z") - index * 3600
+      {
+        "id" => 201 - index,
+        "wall_ms" => wall_ms,
+        "event" => "merge_group",
+        "conclusion" => "success",
+        "started_at" => started.iso8601,
+        "completed_at" => (started + wall_ms / 1000).iso8601,
+        "head_sha" => format("%040x", index + 1)
+      }
+    end
+  end
+
+  def attach_baseline(report, values: [957_000, 1_052_000, 1_067_000, 760_000, 1_061_000])
+    report["policy"]["event"] = "merge_group"
+    report["policy"]["topology_epoch"] = "2026-08-20T00:00:00Z"
+    report["policy"] = CiLatencyBaseline.ratchet(report.fetch("policy"), baseline_runs(values))
+    report
+  end
+
   def test_valid_policy_breach_report_is_accepted_despite_process_failure
     report = healthy_report
     report["evaluation"]["status"] = "hard_max_breach"
@@ -215,6 +237,105 @@ class CiLatencyObserverTest < Minitest::Test
     ], receipt.fetch("breaches")
   end
 
+  def test_measured_target_debt_is_first_class_without_making_the_schedule_red
+    report = attach_baseline(healthy_report)
+    report["evaluation"] = {
+      "status" => "hard_max_breach",
+      "ok" => false,
+      "current" => {"count" => 5, "p90_ms" => 1_064_600, "max_ms" => 1_067_000},
+      "previous" => {"count" => 5, "p90_ms" => 1_499_400, "max_ms" => 1_515_000}
+    }
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+
+    assert_equal "target_debt", receipt.fetch("status")
+    assert_equal 0, CiLatencyObserver.exit_status([receipt])
+    assert_empty receipt.fetch("breaches")
+    assert_equal [
+      {
+        "metric" => "evaluation.current.p90_ms",
+        "observed_ms" => 1_064_600,
+        "target_ms" => 600_000,
+        "gap_ms" => 464_600,
+        "sample_count" => 5
+      },
+      {
+        "metric" => "evaluation.current.max_ms",
+        "observed_ms" => 1_067_000,
+        "target_ms" => 900_000,
+        "gap_ms" => 167_000,
+        "sample_count" => 5
+      }
+    ], receipt.fetch("target_debt")
+    assert_equal 1_173_700, receipt.dig("observed_baseline", "p90_regression_limit_ms")
+  end
+
+  def test_fetched_policy_supplies_baseline_dropped_by_the_typed_measurement_projection
+    full_report = attach_baseline(healthy_report)
+    full_report["evaluation"] = {
+      "status" => "hard_max_breach",
+      "ok" => false,
+      "current" => {"count" => 5, "p90_ms" => 1_064_600, "max_ms" => 1_067_000},
+      "previous" => {"count" => 5, "p90_ms" => 1_499_400, "max_ms" => 1_515_000}
+    }
+    fetched_policy = full_report.fetch("policy")
+    producer_report = Marshal.load(Marshal.dump(full_report))
+    producer_report["policy"].delete("observed_baseline")
+
+    receipt = CiLatencyObserver.classify(
+      producer_report,
+      expected_run: expected_run,
+      policy: fetched_policy
+    )
+
+    assert_equal "target_debt", receipt.fetch("status")
+    assert_equal 0, CiLatencyObserver.exit_status([receipt])
+  end
+
+  def test_measurement_policy_projection_mismatch_fails_closed
+    report = healthy_report
+    fetched_policy = Marshal.load(Marshal.dump(report.fetch("policy")))
+    fetched_policy["slo"]["p90_ms"] = 700_000
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run, policy: fetched_policy)
+
+    assert_equal "observer_error", receipt.fetch("status")
+    assert_match(/does not match/, receipt.fetch("error"))
+    assert_equal 1, CiLatencyObserver.exit_status([receipt])
+  end
+
+  def test_sustained_p90_or_immediate_max_regression_still_fails
+    report = attach_baseline(healthy_report)
+    report["evaluation"] = {
+      "status" => "hard_max_breach",
+      "ok" => false,
+      "current" => {"count" => 5, "p90_ms" => 1_300_000, "max_ms" => 1_350_000},
+      "previous" => {"count" => 5, "p90_ms" => 1_250_000, "max_ms" => 1_260_000}
+    }
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+
+    assert_equal "policy_breach", receipt.fetch("status")
+    assert_equal 1, CiLatencyObserver.exit_status([receipt])
+    assert_equal [
+      "evaluation.current.p90_ms",
+      "evaluation.previous.p90_ms",
+      "evaluation.current.max_ms"
+    ], receipt.fetch("breaches").map { |breach| breach.fetch("metric") }
+    assert receipt.fetch("breaches").all? { |breach| breach.fetch("threshold_ms") == 1_173_700 }
+  end
+
+  def test_invalid_or_empty_baseline_evidence_fails_closed
+    report = attach_baseline(healthy_report)
+    report["policy"]["observed_baseline"]["wall"]["p90_ms"] = 600_000
+
+    receipt = CiLatencyObserver.classify(report, expected_run: expected_run)
+
+    assert_equal "observer_error", receipt.fetch("status")
+    assert_match(/observed baseline is invalid/, receipt.fetch("error"))
+    assert_equal 1, CiLatencyObserver.exit_status([receipt])
+  end
+
   def test_stale_success_window_is_an_observer_error_not_a_policy_breach
     receipt = CiLatencyObserver.classify(healthy_report(run_id: 100), expected_run: expected_run)
 
@@ -290,17 +411,20 @@ class CiLatencyObserverTest < Minitest::Test
     pending_report["wall"]["count"] = 0
     pending_report["evaluation"] = {
       "status" => "insufficient_samples", "ok" => false,
-      "current" => {"count" => 0}, "previous" => {"count" => 0}
+      "current" => {"count" => 0, "p90_ms" => 0, "max_ms" => 0},
+      "previous" => {"count" => 0, "p90_ms" => 0, "max_ms" => 0}
     }
     pending = CiLatencyObserver.classify(pending_report, expected_run: nil)
 
     summary = CiLatencyObserver.summary([healthy, stale, pending])
 
+    assert_equal 2, summary.fetch("schema_version")
     assert_equal 3, summary.fetch("repository_count")
     assert_equal 1, summary.fetch("passing_count")
     assert_equal 1, summary.fetch("stale_count")
     assert_equal 1, summary.fetch("pending_count")
     assert_equal 0, summary.fetch("breach_count")
+    assert_equal 0, summary.fetch("target_debt_count")
     assert_equal 0, summary.fetch("observer_error_count")
     assert_equal 5, summary.fetch("repositories").first.dig("current_window", "count")
     assert_equal 5, summary.fetch("repositories").first.dig("previous_window", "count")
@@ -309,6 +433,7 @@ class CiLatencyObserverTest < Minitest::Test
     assert_equal ["burin-labs/burin-code"], summary.fetch("stale_repositories")
     assert_equal ["burin-labs/harn-cloud"], summary.fetch("pending_repositories")
     assert_equal [], summary.fetch("breaching_repositories")
+    assert_equal [], summary.fetch("target_debt_repositories")
     assert_equal [], summary.fetch("observer_error_repositories")
   end
 end
