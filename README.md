@@ -340,7 +340,8 @@ runner:
 The token needs `contents: read` only. When `baseline-sha` is present, the
 action reads the policy at that commit and rejects increases to the
 critical-path allowance or an existing job budget. It also rejects missing or
-stale required-job entries, empty sentinel sets, and invalid SLO ordering.
+stale required-job entries, empty sentinel sets, invalid SLO ordering, and a
+same-topology observed baseline that is removed, tampered with, or loosened.
 
 Runtime measurement belongs off the pull-request path. The organization-level
 observer runs every six hours and on demand. It uses Harn's
@@ -349,9 +350,11 @@ installation token with `actions: read` and `contents: read`. It runs on this
 public repository's standard Linux runner, so observing private repositories
 does not consume their hosted-runner minutes. The observer executes no code or
 artifacts from measured workflow runs. It emits a job summary, retains compact
-JSON reports for seven days, and fails on a sustained p90 breach or one run past
-the hard maximum. A single p90 window warns without paging, which keeps one-off
-runner contention visible without creating alert churn.
+JSON reports for seven days. Product-target misses are first-class target-debt
+receipts and remain visible without making every schedule red. The observer
+fails on a sustained p90 regression past the reproducible observed baseline or
+one run past its max-latency regression fuse. Missing, stale, invalid, or empty
+evidence also fails closed. A same-topology baseline may only tighten.
 
 Package repositories should keep the exact release in `.harn-version`.
 Their complete CI adapter delegates package verification and rolls every

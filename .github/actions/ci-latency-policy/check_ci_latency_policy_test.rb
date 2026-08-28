@@ -120,6 +120,59 @@ class CiLatencyPolicyTest < Minitest::Test
     }
   end
 
+  def baseline_runs(values)
+    values.each_with_index.map do |wall_ms, index|
+      started = Time.iso8601("2026-08-19T18:00:00Z") - index * 3600
+      {
+        "id" => 100 - index,
+        "wall_ms" => wall_ms,
+        "event" => "merge_group",
+        "conclusion" => "success",
+        "started_at" => started.iso8601,
+        "completed_at" => (started + wall_ms / 1000).iso8601,
+        "head_sha" => format("%040x", index + 1)
+      }
+    end
+  end
+
+  def with_observed_baseline(candidate, values)
+    CiLatencyBaseline.ratchet(candidate, baseline_runs(values))
+  end
+
+  def test_accepts_initial_observed_baseline_and_rejects_tampering
+    candidate = with_observed_baseline(policy, [500_000, 510_000, 520_000, 530_000, 540_000])
+    with_files(candidate: candidate) do |files|
+      result = CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path)
+      assert_equal 600_000, result.dig("observed_baseline", "wall", "p90_regression_limit_ms")
+    end
+
+    candidate["observed_baseline"]["wall"]["p90_ms"] = 1
+    with_files(candidate: candidate) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path)
+      end
+      assert_match(/not the generated projection/, error.message)
+    end
+  end
+
+  def test_observed_baseline_cannot_be_removed_or_loosened_within_a_topology
+    baseline = with_observed_baseline(policy, [500_000, 510_000, 520_000, 530_000, 540_000])
+    with_files(candidate: policy, baseline: baseline) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path, baseline_path: files[2].path)
+      end
+      assert_match(/cannot be removed/, error.message)
+    end
+
+    slower = with_observed_baseline(policy, [510_000, 520_000, 530_000, 540_000, 550_000])
+    with_files(candidate: slower, baseline: baseline) do |files|
+      error = assert_raises(CiLatencyPolicy::Invalid) do
+        CiLatencyPolicy.check(policy_path: files[0].path, workflow_path: files[1].path, baseline_path: files[2].path)
+      end
+      assert_match(/may only tighten/, error.message)
+    end
+  end
+
   # 700_000 * 1.2 = 840_000, already on the 6000ms grid; warning floors to
   # 756_000. hard_max stays above both, so ordering holds.
   def regenerated_policy
