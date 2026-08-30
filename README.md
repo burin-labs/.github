@@ -560,3 +560,16 @@ before any privileged action.
     require-lockfiles: "true"
     require-overrides: "true"
 ```
+
+## Organization skills
+
+`skills/` holds skills that apply across every Burin Labs repository. There was
+no skills directory here before; this one follows the packaging convention Harn
+already uses (`SKILL.md` with `name`, `short`, `description`, and `when-to-use`
+frontmatter) rather than inventing a second shape.
+
+- [`skills/house-style`](skills/README.md) is the documentation style contract
+  for every page we publish. It states rules only; the rationale and the
+  per-repository paths live in
+  [burin-code `docs/style-guide.md`](https://github.com/burin-labs/burin-code/blob/main/docs/style-guide.md),
+  which the skill links to.
