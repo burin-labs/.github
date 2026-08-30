@@ -2,7 +2,7 @@
 name: house-style
 short: Write Burin Labs documentation to house style.
 description: Reading level, Diátaxis mode, voice, headings, claims, and generated-page rules for every page published from a Burin Labs repository.
-when-to-use: Use when writing or reviewing any documentation page, README, help-centre article, migration note, or changelog entry in burin-code, harn, or harn-cloud.
+when-to-use: Use when writing or reviewing any documentation page, README, help-center article, migration note, or changelog entry in burin-code, harn, or harn-cloud.
 ---
 
 # Write to Burin Labs house style
@@ -20,7 +20,7 @@ For Harn-specific authoring, also load `harn-docs` (`harn skill get harn-docs
 - Pick one Diátaxis mode for the page: tutorial, how-to, reference, or
   explanation. If you cannot pick one, split the page.
 - Name the reader and the one task they arrived with.
-- Read the source that owns the behaviour before you describe it.
+- Read the source that owns the behavior before you describe it.
 
 ## Reading level
 
@@ -39,6 +39,9 @@ For Harn-specific authoring, also load `harn-docs` (`harn skill get harn-docs
 - Define a moving part the first time you use it.
 - Say what breaks for a person before you explain the mechanism.
 - Use they and them for a person whose pronouns you do not know.
+- Use American spelling: color, behavior, center, canceled, labeled, organize,
+  analyze, catalog, defense, and license as both noun and verb. Leave an
+  identifier spelled the way the code spells it.
 
 ## Headings and prose
 
