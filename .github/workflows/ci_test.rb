@@ -49,6 +49,7 @@ expected_policy_sources = [
   ".github/actions/exact-tree-ci-proof/action.yml",
   ".github/actions/harn-package/action.yml",
   ".github/actions/harn-repo-policy/action.yml",
+  ".github/actions/pr-title-check/action.yml",
   ".github/actions/require-successful-needs/action.yml",
   ".github/actions/rust-test-impact/action.yml",
   ".github/workflows/ci-latency-observer.yml",
@@ -149,6 +150,56 @@ end
 proof_tests = steps.find { |step| step["name"] == "Test exact-tree CI proof reuse" }
 unless proof_tests&.fetch("run") == "bash .github/actions/exact-tree-ci-proof/run-tests.sh"
   abort "CI must execute the shared exact-tree CI proof tests"
+end
+
+# Every `*_test.sh` in the repository must actually run in CI, whether the job
+# invokes it directly or through an aggregator script. A census by file name
+# alone would pass while a test sat unreferenced, so resolve reachability
+# through the runner scripts the job names.
+expected_shell_tests = Dir.glob(
+  [
+    File.join(repository_root, ".github", "**", "*_test.sh"),
+    File.join(repository_root, "scripts", "**", "*_test.sh"),
+  ],
+).map { |test| test.delete_prefix("#{repository_root}/") }.sort
+abort "shell test census must not be vacuous" if expected_shell_tests.empty?
+
+shell_steps = steps.select do |step|
+  step["run"].is_a?(String) && step["run"].lines.any? { |line| line.strip.start_with?("bash .github/", "bash scripts/") }
+end
+abort "CI must run shell tests" if shell_steps.empty?
+
+reachable_shell_tests = shell_steps.flat_map do |step|
+  step.fetch("run").lines.filter_map do |line|
+    command = line.strip
+    next unless command.start_with?("bash ")
+    command.delete_prefix("bash ").split.first
+  end
+end.flat_map do |path|
+  if path.end_with?("_test.sh")
+    [path]
+  else
+    runner = File.join(repository_root, path)
+    next [] unless File.file?(runner)
+    dir = File.dirname(path)
+    File.read(runner).scan(/[A-Za-z0-9_.\-]+_test\.sh/).map { |name| File.join(dir, name) }
+  end
+end.uniq.sort
+
+unless reachable_shell_tests == expected_shell_tests
+  abort "CI shell test census drifted: reachable #{reachable_shell_tests.inspect}, " \
+        "expected #{expected_shell_tests.inspect}"
+end
+
+title_check = steps.find { |step| step["name"] == "Check PR title and description" }
+abort "CI must dogfood the PR title check it publishes" unless title_check
+unless title_check.fetch("uses") == "./.github/actions/pr-title-check"
+  abort "CI PR title check must use the local composite action"
+end
+# On merge_group and push there is no pull request number to read, so an
+# ungated step would either skip silently or hard-fail the merge queue.
+unless title_check.fetch("if").include?("github.event_name == 'pull_request'")
+  abort "CI PR title check must be gated on the pull_request event"
 end
 
 policy_tests = steps.find { |step| step["name"] == "Test package workflow policy" }

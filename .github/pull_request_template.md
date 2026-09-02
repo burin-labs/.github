@@ -1,22 +1,15 @@
 <!--
-Title: [Area] Sentence case description, for example "[CI] Fix flaky release runner probe".
-Area is this repository's own directory-map tag; see AGENTS.md.
+Title this pull request `[Area] Sentence case summary`, for example
+`[CI] Fix the flaky release runner probe`. `Area` is one of this
+repository's own area tags. Its AGENTS.md lists them.
 
-Body: 3-5 sentences, total. What changed, why, the one risk, how it was
-verified — at the claim level, not a list of test commands (the Files and
-Checks tabs already show those). One excellent short paragraph beats a long
-checklist.
+Replace this comment with three to five sentences: what changed, why, the one
+risk, and how you verified it. Write at the claim level. Do not list test
+commands and do not restate what the diff already shows. The Files and Checks
+tabs cover both.
+
+A worked example is in CONTRIBUTING.md, under "Write the description".
+
+Link the issue on its own line: `Closes #123 items: 1, 2`, or
+`Single-ask: #123` when the issue is not a numbered list.
 -->
-
-Fixes the release runner health check reporting `unknown` for any runner that
-finished a job in the last 60 seconds, because the liveness probe used a
-stale cache entry instead of re-querying the runner. Fleet dashboards showed
-false "down" flaps during every deploy window. The risk is a runner that is
-genuinely down now reads as live for one cache TTL (30s) before the next
-probe corrects it. Verified by replaying the last week's flap incidents
-against the fixed probe and confirming zero remained, plus the runner-fleet
-integration test.
-
-Closes #123 items: 1, 2 | Single-ask: #123
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)

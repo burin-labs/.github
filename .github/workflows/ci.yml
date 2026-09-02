@@ -76,6 +76,8 @@ jobs:
         run: node --test .github/actions/rust-test-impact/plan.test.mjs
       - name: Test exact-tree CI proof reuse
         run: bash .github/actions/exact-tree-ci-proof/run-tests.sh
+      - name: Test shell actions
+        run: bash .github/actions/pr-title-check/check_test.sh
       - name: Require reusable package smoke
         env:
           PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
@@ -102,12 +104,21 @@ jobs:
           ruby scripts/reusable_pin_drift_test.rb
       - name: Check Dependabot config
         uses: ./.github/actions/check-dependabot-config
+      # Dogfooding: every repo that wires this action inherits whatever this
+      # repo proves about it. Gated on the pull_request event because
+      # merge_group and push carry no pull request number.
+      - name: Check PR title and description
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: ./.github/actions/pr-title-check
+        with:
+          areas: "CI|Actions|Labels|Templates|Docs|Skills"
       - name: Shell syntax
         run: |
           # The drift checker is only ever executed by a scheduled run, so a
           # syntax error in it would otherwise surface a day later, in a job
           # nobody is watching, as the absence of a report.
           bash -n .github/actions/harn-package/run-contract.sh
+          bash -n .github/actions/pr-title-check/check.sh
           bash -n .github/actions/exact-tree-ci-proof/gate.sh
           bash -n .github/actions/exact-tree-ci-proof/workflow-proof.sh
           bash -n .github/actions/exact-tree-ci-proof/merge-group-proof.sh
