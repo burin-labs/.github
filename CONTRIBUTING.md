@@ -44,9 +44,12 @@ Four sentences. A reader learns the symptom, the cause, what it costs them if
 the fix is wrong, and what evidence stands behind it. No file list, no test
 commands, no checklist.
 
-Link the issue on its own line. Use `Closes #123 items: 1, 2` when the issue
-is a numbered list of asks and this pull request closes some of them, or
-`Single-ask: #123` when it is not.
+Link the issue on its own line. Use `Closes #123` only when this pull request
+lands every numbered ask in the issue. Use `Partial: #123 items: 1, 2` or
+`Refs #123` when work remains; adding an item suffix after `Closes #123`
+does not stop GitHub from closing the whole issue. Use `Single-ask: #123`
+only when the issue has no numbered sub-asks and this pull request resolves it
+completely.
 
 ## Documentation
 

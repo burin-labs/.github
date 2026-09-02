@@ -10,6 +10,9 @@ tabs cover both.
 
 A worked example is in CONTRIBUTING.md, under "Write the description".
 
-Link the issue on its own line: `Closes #123 items: 1, 2`, or
-`Single-ask: #123` when the issue is not a numbered list.
+Link the issue on its own line. Use `Closes #123` only when every numbered
+ask lands in this pull request. For partial work use
+`Partial: #123 items: 1, 2` or `Refs #123`; an item suffix after
+`Closes #123` still closes the whole issue. Use `Single-ask: #123` only
+when an unnumbered issue is resolved completely.
 -->
