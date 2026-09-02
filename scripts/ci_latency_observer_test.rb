@@ -491,6 +491,20 @@ class CiLatencyObserverTest < Minitest::Test
     assert_match(/freshness probe/, receipt.fetch("error"))
   end
 
+  def test_failed_probe_is_preserved_without_spending_semantic_retries
+    measured = expected_run(id: 103)
+    failed = freshness_probe(run: nil, error: "freshness read failed: timeout")
+    runner = SequenceProbeRunner.new([])
+
+    selected, probes, error = runner.send(:reconcile_freshness, healthy_report.fetch("policy"), measured, failed)
+    receipt = CiLatencyObserver.classify(healthy_report(run_id: 103), expected_run: selected, error: error)
+
+    assert_nil selected
+    assert_equal [failed], probes
+    assert_equal "freshness read failed: timeout", error
+    assert_equal "observer_error", receipt.fetch("status")
+  end
+
   def test_missing_independent_freshness_receipt_cannot_make_old_samples_pass
     receipt = CiLatencyObserver.classify(healthy_report, expected_run: nil)
 
