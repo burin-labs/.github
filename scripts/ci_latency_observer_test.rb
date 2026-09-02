@@ -40,6 +40,25 @@ class CiLatencyObserverTest < Minitest::Test
     end
   end
 
+  class SequenceProbeRunner < CiLatencyObserver::Runner
+    def initialize(probes)
+      super(
+        reports: "/unused/reports",
+        policies: "/unused/policies",
+        harn_script: "/unused/measure.harn",
+        summary_path: "/unused/summary",
+        retry_delay: 0
+      )
+      @probes = probes
+    end
+
+    private
+
+    def probe_full_success(*)
+      @probes.shift || raise("probe fixture exhausted")
+    end
+  end
+
   def healthy_report(repository: "burin-labs/harn", run_id: 101)
     {
       "schema_version" => 2,
@@ -68,6 +87,20 @@ class CiLatencyObserverTest < Minitest::Test
 
   def expected_run(id: 101)
     {"id" => id, "created_at" => "2026-08-27T06:00:00Z"}
+  end
+
+  def freshness_probe(run: expected_run, error: nil)
+    {
+      "query" => "/fixture",
+      "candidate_limit" => 100,
+      "candidate_count" => run ? 1 : 0,
+      "eligible_candidate_count" => run ? 1 : 0,
+      "inspected_count" => run ? 1 : 0,
+      "truncated" => false,
+      "selected_run" => run,
+      "inspected_candidates" => [],
+      "error" => error
+    }
   end
 
   def baseline_runs(values)
@@ -156,7 +189,7 @@ class CiLatencyObserverTest < Minitest::Test
       "topology_epoch" => "2026-08-27T00:00:00Z",
       "full_run_jobs" => [{"name" => "CI status", "match" => "exact"}]
     }
-    runs_path = "/repos/burin-labs/harn/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=20"
+    runs_path = "/repos/burin-labs/harn/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100"
     jobs = {"jobs" => [{"name" => "CI status", "conclusion" => "success"}]}
     responses = {
       runs_path => {
@@ -178,6 +211,33 @@ class CiLatencyObserverTest < Minitest::Test
     assert_nil error
     assert_equal 104, run.fetch("id")
     assert_equal "2026-08-27T07:00:00Z", run.fetch("created_at")
+  end
+
+  def test_exhausted_candidate_window_is_unknown_not_absent
+    policy = {
+      "repository" => "burin-labs/harn",
+      "workflow" => "ci.yml",
+      "event" => "pull_request",
+      "topology_epoch" => "2026-08-27T00:00:00Z",
+      "full_run_jobs" => [{"name" => "CI status", "match" => "exact"}]
+    }
+    runs_path = "/repos/burin-labs/harn/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100"
+    responses = {
+      runs_path => {
+        "workflow_runs" => 100.times.map do |index|
+          {
+            "id" => index + 1,
+            "created_at" => "2026-08-27T06:00:00Z",
+            "conclusion" => "failure"
+          }
+        end
+      }
+    }
+
+    run, error = FakeRunner.new(responses).send(:latest_full_success, policy)
+
+    assert_nil run
+    assert_match(/candidate window exhausted/, error)
   end
 
   def test_unknown_producer_status_fails_closed
@@ -385,6 +445,50 @@ class CiLatencyObserverTest < Minitest::Test
     assert_equal 101, receipt.dig("freshness", "expected_run_id")
     assert_equal 100, receipt.dig("freshness", "observed_run_id")
     assert_equal 1, CiLatencyObserver.exit_status([receipt])
+  end
+
+  def test_transient_freshness_disagreement_requires_two_matching_semantic_retries
+    measured = expected_run(id: 103)
+    initial = freshness_probe(run: expected_run(id: 101))
+    runner = SequenceProbeRunner.new([
+      freshness_probe(run: measured),
+      freshness_probe(run: measured)
+    ])
+
+    selected, probes, error = runner.send(:reconcile_freshness, healthy_report.fetch("policy"), measured, initial)
+
+    assert_nil error
+    assert_equal 103, selected.fetch("id")
+    assert_equal [101, 103, 103], probes.map { |probe| probe.dig("selected_run", "id") }
+  end
+
+  def test_stable_freshness_disagreement_remains_fail_closed
+    measured = expected_run(id: 103)
+    stale = freshness_probe(run: expected_run(id: 101))
+    runner = SequenceProbeRunner.new([stale, stale])
+
+    selected, probes, error = runner.send(:reconcile_freshness, healthy_report.fetch("policy"), measured, stale)
+    receipt = CiLatencyObserver.classify(healthy_report(run_id: 103), expected_run: selected, error: error)
+
+    assert_nil error
+    assert_equal 101, selected.fetch("id")
+    assert_equal 3, probes.count
+    assert_equal "stale", receipt.fetch("status")
+  end
+
+  def test_absent_probe_cannot_confirm_a_non_null_measurement
+    measured = expected_run(id: 103)
+    absent = freshness_probe(run: nil)
+    runner = SequenceProbeRunner.new([absent, absent])
+
+    selected, probes, error = runner.send(:reconcile_freshness, healthy_report.fetch("policy"), measured, absent)
+    receipt = CiLatencyObserver.classify(healthy_report(run_id: 103), expected_run: selected, error: error)
+
+    assert_nil error
+    assert_nil selected
+    assert_equal 3, probes.count
+    assert_equal "observer_error", receipt.fetch("status")
+    assert_match(/freshness probe/, receipt.fetch("error"))
   end
 
   def test_missing_independent_freshness_receipt_cannot_make_old_samples_pass

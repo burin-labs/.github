@@ -18,6 +18,8 @@ module CiLatencyObserver
     "insufficient_samples" => false
   }.freeze
   RETRIES = 3
+  FULL_RUN_CANDIDATE_LIMIT = 100
+  SEMANTIC_FRESHNESS_RETRIES = 2
   CommandResult = Struct.new(:stdout, :stderr, :process_ok, :accepted, keyword_init: true)
 
   module_function
@@ -443,10 +445,7 @@ module CiLatencyObserver
       end
       File.write(policy_path, policy_result.stdout)
       policy = JSON.parse(policy_result.stdout)
-      expected_run, freshness_error = latest_full_success(policy)
-      if freshness_error
-        return write_error_report(report_path, full_name, freshness_error)
-      end
+      initial_probe = probe_full_success(policy)
 
       report_result = retry_capture(
         "harn", "run", "--no-sandbox", @harn_script, "--",
@@ -465,7 +464,15 @@ module CiLatencyObserver
       end
 
       parsed = JSON.parse(report_result.stdout)
-      receipt = CiLatencyObserver.classify(parsed, expected_run: expected_run, policy: policy)
+      measured_run = CiLatencyObserver.newest_run(parsed.fetch("qualifying_runs"))
+      expected_run, probes, freshness_error = reconcile_freshness(policy, measured_run, initial_probe)
+      parsed["freshness_probes"] = probes
+      receipt = CiLatencyObserver.classify(
+        parsed,
+        expected_run: expected_run,
+        policy: policy,
+        error: freshness_error
+      )
       parsed["observer"] = receipt
       parsed["observer_result"] = %w[stale observer_error].include?(receipt.fetch("status")) ? "fail" : "pass"
       parsed["policy_result"] = case receipt.fetch("status")
@@ -483,46 +490,142 @@ module CiLatencyObserver
     end
 
     def latest_full_success(policy)
+      probe = probe_full_success(policy)
+      [probe["selected_run"], probe["error"]]
+    end
+
+    def probe_full_success(policy)
       repository = policy.fetch("repository")
       workflow = policy.fetch("workflow")
       event = policy.fetch("event")
       epoch = Time.iso8601(policy.fetch("topology_epoch"))
+      query = "/repos/#{repository}/actions/workflows/#{workflow}/runs?event=#{event}&status=completed&per_page=#{FULL_RUN_CANDIDATE_LIMIT}"
       runs_result = retry_capture(
         "gh", "api",
-        "/repos/#{repository}/actions/workflows/#{workflow}/runs?event=#{event}&status=completed&per_page=20",
+        query,
         accept: ->(result) { result.process_ok && valid_json?(result.stdout) }
       )
-      return [nil, "freshness read failed: #{compact_error(runs_result.stderr)}"] unless runs_result.accepted
+      unless runs_result.accepted
+        return probe_error(query, "freshness read failed: #{compact_error(runs_result.stderr)}")
+      end
 
-      runs = JSON.parse(runs_result.stdout).fetch("workflow_runs", [])
+      raw_runs = JSON.parse(runs_result.stdout).fetch("workflow_runs", [])
+      runs = raw_runs
         .select do |run|
           run["conclusion"] == "success" && Time.iso8601(run.fetch("created_at")) >= epoch
         end
         .sort_by { |run| CiLatencyObserver.run_order_key(run) }
         .reverse
+      inspected = []
       runs.each do |run|
         jobs_result = retry_capture(
           "gh", "api", "/repos/#{repository}/actions/runs/#{run.fetch("id")}/jobs?per_page=100",
           accept: ->(result) { result.process_ok && valid_json?(result.stdout) }
         )
-        return [nil, "freshness job read failed: #{compact_error(jobs_result.stderr)}"] unless jobs_result.accepted
-        jobs = JSON.parse(jobs_result.stdout).fetch("jobs", [])
-        if full_coverage?(jobs, policy.fetch("full_run_jobs"))
-          return [{"id" => run.fetch("id"), "created_at" => run.fetch("created_at")}, nil]
+        unless jobs_result.accepted
+          return probe_error(
+            query,
+            "freshness job read failed for run #{run.fetch('id')}: #{compact_error(jobs_result.stderr)}",
+            candidate_count: raw_runs.count,
+            eligible_candidate_count: runs.count,
+            inspected: inspected
+          )
         end
+        jobs = JSON.parse(jobs_result.stdout).fetch("jobs", [])
+        missing = missing_sentinels(jobs, policy.fetch("full_run_jobs"))
+        candidate = {
+          "id" => run.fetch("id"),
+          "created_at" => run.fetch("created_at"),
+          "missing_sentinels" => missing
+        }
+        inspected << candidate
+        next unless missing.empty?
+
+        return probe_receipt(
+          query,
+          raw_runs.count,
+          runs.count,
+          inspected,
+          candidate.slice("id", "created_at"),
+          truncated: raw_runs.count >= FULL_RUN_CANDIDATE_LIMIT
+        )
       end
-      [nil, nil]
+
+      truncated = raw_runs.count >= FULL_RUN_CANDIDATE_LIMIT
+      error = if truncated
+        "freshness candidate window exhausted before a full-coverage success"
+      end
+      probe_receipt(query, raw_runs.count, runs.count, inspected, nil, error: error, truncated: truncated)
     rescue JSON::ParserError, KeyError, ArgumentError => error
-      [nil, "freshness receipt invalid: #{error.message}"]
+      probe_error(query, "freshness receipt invalid: #{error.message}")
     end
 
-    def full_coverage?(jobs, sentinels)
-      sentinels.all? do |sentinel|
+    def missing_sentinels(jobs, sentinels)
+      sentinels.reject do |sentinel|
         jobs.any? do |job|
           next false unless job["conclusion"] == "success"
           sentinel.fetch("match") == "prefix" ? job.fetch("name", "").start_with?(sentinel.fetch("name")) : job["name"] == sentinel.fetch("name")
         end
+      end.map { |sentinel| "#{sentinel.fetch('match')}:#{sentinel.fetch('name')}" }
+    end
+
+    def reconcile_freshness(policy, measured_run, initial_probe)
+      probes = [initial_probe]
+      return [initial_probe["selected_run"], probes, nil] if probe_matches?(initial_probe, measured_run)
+      return [nil, probes, initial_probe["error"]] if initial_probe["error"]
+
+      SEMANTIC_FRESHNESS_RETRIES.times do |attempt|
+        sleep(@retry_delay * (attempt + 1)) if @retry_delay.positive?
+        probes << probe_full_success(policy)
       end
+      retries = probes.last(SEMANTIC_FRESHNESS_RETRIES)
+      if retries.all? { |probe| probe_matches?(probe, measured_run) }
+        return [measured_run, probes, nil]
+      end
+
+      retry_identities = retries.map { |probe| probe.dig("selected_run", "id") }
+      retry_errors = retries.map { |probe| probe["error"] }
+      if retry_errors.all?(&:nil?) && retry_identities.uniq.length == 1
+        return [retries.last["selected_run"], probes, nil]
+      end
+
+      [
+        nil,
+        probes,
+        "independent freshness probe did not stabilize after #{probes.count} semantic reads"
+      ]
+    end
+
+    def probe_matches?(probe, measured_run)
+      return false if probe["error"]
+
+      probe.dig("selected_run", "id") == measured_run&.fetch("id", nil)
+    end
+
+    def probe_receipt(query, candidate_count, eligible_candidate_count, inspected, selected_run, error: nil, truncated: false)
+      {
+        "observed_at" => Time.now.utc.iso8601,
+        "query" => query,
+        "candidate_limit" => FULL_RUN_CANDIDATE_LIMIT,
+        "candidate_count" => candidate_count,
+        "eligible_candidate_count" => eligible_candidate_count,
+        "inspected_count" => inspected.count,
+        "truncated" => truncated,
+        "selected_run" => selected_run,
+        "inspected_candidates" => inspected,
+        "error" => error
+      }
+    end
+
+    def probe_error(query, error, candidate_count: 0, eligible_candidate_count: 0, inspected: [])
+      probe_receipt(
+        query,
+        candidate_count,
+        eligible_candidate_count,
+        inspected,
+        nil,
+        error: error
+      )
     end
 
     def write_error_report(path, repository, message)

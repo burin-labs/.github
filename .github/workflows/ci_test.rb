@@ -106,7 +106,10 @@ abort "latency observer must run its tested boundary" unless run_step&.fetch("ru
 abort "latency observer workflow must enforce the runner verdict" unless run_step.fetch("run").include?('exit "$observer_status"')
 abort "latency observer must check every governed repository" unless runner.include?('REPOSITORIES = [".github", "harn", "burin-code", "harn-cloud"].freeze')
 abort "latency observer must preserve policy enforcement" unless runner.include?('"--json", "--check"')
-abort "latency observer must compare against completed-run freshness" unless runner.include?("status=completed&per_page=20")
+unless runner.include?('status=completed&per_page=#{FULL_RUN_CANDIDATE_LIMIT}') &&
+    runner.include?("FULL_RUN_CANDIDATE_LIMIT = 100")
+  abort "latency observer must compare against a full measured window of completed-run freshness"
+end
 abort "latency observer must publish named failing repositories" unless runner.include?('"breaching_repositories"')
 abort "latency observer must publish named pending repositories" unless runner.include?('"pending_repositories"')
 abort "latency observer must publish the org report as a visible artifact file" unless runner.include?('File.join(@reports, "org-summary.json")')
