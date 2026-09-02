@@ -1,0 +1,71 @@
+# Burin Labs label taxonomy (canonical source)
+#
+# Every repository copies the categories it needs from this file into its own
+# `.github/labels.yml` and keeps the vocabulary below. `area/*` is
+# repository-specific: derive it from that repository's own directory map or
+# AGENTS.md, not from this list. The other four categories travel unchanged.
+#
+# Rules:
+#   - Additive only. Never delete a label a repository already has. Renaming
+#     an existing label (for example `area:foo` -> `area/foo`) keeps every
+#     issue and PR attached to it, so prefer a rename over delete-and-recreate
+#     when a repository already has an equivalent label under an old name.
+#   - `type/*` is intentionally NOT a new prefix. GitHub's own defaults (bug,
+#     enhancement, documentation, duplicate, question, wontfix) already cover
+#     it. Adding `type/bug` next to `bug` would just be two labels for one
+#     fact. Keep using the unprefixed defaults for type.
+#   - production-readiness and epic are unprefixed by the same logic: they are
+#     single well-known facts, not a category with siblings.
+
+priority:
+  - name: priority/p0
+    color: "b60205"
+    description: Must have, ships before anything else in flight
+  - name: priority/p1
+    color: "d93f0b"
+    description: High priority
+  - name: priority/p2
+    color: "fbca04"
+    description: Medium priority
+  - name: priority/p3
+    color: "0e8a16"
+    description: Lower priority
+
+status:
+  - name: status/blocked
+    color: "d93f0b"
+    description: Cannot proceed until a named dependency clears
+  - name: status/in-progress
+    color: "0e8a16"
+    description: An agent or engineer is actively working this
+  - name: status/needs-decision
+    color: "fbca04"
+    description: Needs a founder or code-owner ruling before work continues
+  - name: status/ready
+    color: "0e8a16"
+    description: Scoped and unblocked, ready to pick up
+
+effort:
+  - name: effort/small
+    color: "c2e0c6"
+    description: Hours
+  - name: effort/medium
+    color: "fbca04"
+    description: A day or two
+  - name: effort/large
+    color: "d93f0b"
+    description: Multi-day or multi-PR
+
+reused-unprefixed:
+  # Already exist as GitHub defaults or prior art in harn/burin-code. Reuse
+  # these instead of inventing a type/* or size/* prefix for them.
+  - bug
+  - enhancement
+  - documentation
+  - duplicate
+  - question
+  - wontfix
+  - good first issue
+  - help wanted
+  - epic
+  - production-readiness

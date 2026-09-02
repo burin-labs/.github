@@ -561,6 +561,45 @@ before any privileged action.
     require-overrides: "true"
 ```
 
+## Pull request title and description convention
+
+Every Burin Labs repository titles a pull request `[Area] Sentence case
+description`, where `Area` is that repository's own directory-map tag (see
+its `AGENTS.md`), and keeps the description to 3-5 sentences: what changed,
+why, the one risk, and how it was verified at the claim level. Do not list
+individual test commands or restate what the diff already shows.
+`.github/pull_request_template.md` in this repository is the organization
+default template every repository inherits unless it commits its own; keep a
+repository-specific template only when its area list or footer needs differ
+from the default.
+
+`.github/actions/pr-title-check` enforces the shape in CI. It reads only the
+pull request's own title and body (via `gh pr view`), so it cannot pass
+vacuously on an unrelated green build. A repository wires it into its own
+`pull_request` workflow with its area list:
+
+```yaml
+- uses: burin-labs/.github/.github/actions/pr-title-check@<full-commit-sha>
+  with:
+    areas: "TUI|IDE|Harn bridge|Evals|Server|Site|CI"
+```
+
+A draft PR titled `WIP (recovered):` is exempt — that prefix marks a
+crash-recovered draft that was never meant to carry a real title yet.
+
+## Label taxonomy
+
+`.github/labels.yml` in this repository is the canonical source for the
+`priority/*`, `status/*`, and `effort/*` label categories every repository
+shares, plus the unprefixed labels (`bug`, `enhancement`, `epic`,
+`production-readiness`, and GitHub's own defaults) that already cover the
+`type/*` role and should not be duplicated under a new prefix. `area/*` stays
+repository-specific: each repository derives its own area labels from its
+directory map. Copy the shared categories into a repository's own
+`.github/labels.yml` rather than re-deriving them, and rename an existing
+label (for example `area:foo` to `area/foo`) instead of deleting and
+recreating it, so every issue and PR already carrying it stays labeled.
+
 ## Organization skills
 
 `skills/` holds skills that apply across every Burin Labs repository. There was
