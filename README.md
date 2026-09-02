@@ -561,6 +561,97 @@ before any privileged action.
     require-overrides: "true"
 ```
 
+## Pull request title and description convention
+
+Every Burin Labs repository titles a pull request `[Area] Sentence case
+summary`, where `Area` is that repository's own area tag. Each repository's
+`AGENTS.md` lists its tags. The description is three to five sentences: what
+changed, why, the one risk, and how it was verified. Do not list test commands
+and do not restate the diff.
+
+`.github/pull_request_template.md` here is the organization default template.
+A repository inherits it only when it has no template of its own. The file is
+entirely an HTML comment, so a new pull request opens with an empty body and
+the author has to write something. Keep a repository-specific template only
+when its area list or its own gates need saying.
+
+`CONTRIBUTING.md` in this repository carries the one worked example. The
+example lives there rather than in the template because template text is
+prefilled into the body, and a prefilled example ships as the author's own
+description when nobody edits it.
+
+### Wiring the check into a repository
+
+`.github/actions/pr-title-check` enforces the shape in CI. It reads only the
+pull request's own title and body through `gh pr view`, so it cannot pass on
+an unrelated green build. This repository runs the check on itself, so every
+consumer inherits a version that has been exercised.
+
+```yaml
+jobs:
+  pr-shape:
+    runs-on: ubuntu-latest
+    # `gh pr view` reads the pull request through the job's token.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Skip the merge queue and pushes, which carry no pull request number.
+      - if: ${{ github.event_name == 'pull_request' }}
+        uses: burin-labs/.github/.github/actions/pr-title-check@<full-commit-sha>
+        with:
+          areas: "TUI|IDE|Harn bridge|Evals|Server|Site|CI"
+```
+
+Derive the `areas` list from the repository's own `AGENTS.md`, and keep the
+two in step. A tag that is in one and not the other is the failure mode this
+check produces: a correct pull request blocked by a stale list.
+
+### What the check accepts and rejects
+
+The title must be a bracketed area tag, then a space, then a capital letter
+or digit. It must not end with a period. Three title shapes are exempt,
+because automation outside this check produces or matches them:
+
+- A draft titled `WIP (recovered):`, which marks a crash-recovered draft that
+  was never meant to carry a real title yet.
+- `Release vX.Y.Z` exactly, which release workflows match verbatim as a commit
+  subject before they tag and publish.
+- Dependabot's own titles, `chore(deps...)` and `build(deps...)`, which
+  Dependabot writes without reading repository rules.
+
+The description must carry at least twenty words the author wrote. Headings,
+checklists, block quotes, fenced code, issue links, and generated footers are
+stripped before the count. That is deliberate: a body made only of template
+scaffolding is an unfilled template, and an earlier version of this check
+counted the scaffolding and passed it.
+
+`.github/actions/pr-title-check/check_test.sh` covers every branch above,
+including the unfilled-template case and the absent-pull-request-number case,
+against a stubbed `gh`. CI runs it, and `ci_test.rb` fails if any `*_test.sh`
+in the repository stops being reachable from a CI step.
+
+## Label taxonomy
+
+`.github/labels.yml` in this repository is the canonical source for the
+`priority/*`, `status/*`, and `effort/*` label categories every repository
+shares, plus the unprefixed labels (`bug`, `enhancement`, `epic`,
+`production-readiness`, and GitHub's own defaults) that already cover the
+`type/*` role and should not be duplicated under a new prefix. `area/*` stays
+repository-specific: each repository derives its own area labels from its
+directory map.
+
+Nothing syncs this file. GitHub does not inherit labels from an organization's
+`.github` repository, and no workflow here writes labels to other
+repositories. The file is reference that a person or an agent applies by hand.
+Copy the shared categories into a repository's own `.github/labels.yml` rather
+than re-deriving them, and rename an existing label (`area:foo` to
+`area/foo`) instead of deleting and recreating it, so every issue and pull
+request already carrying it stays labeled.
+
+`docs/decisions/pr-and-label-conventions.md` records why these conventions
+look the way they do, and which alternatives were rejected.
+
 ## Organization skills
 
 `skills/` holds skills that apply across every Burin Labs repository. There was

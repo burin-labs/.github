@@ -1,0 +1,30 @@
+name: Check PR title and description shape
+description: >
+  Fail-closed check that a pull request title matches `[Area] Sentence case`
+  and the description template's sections are filled in, not left as
+  placeholders.
+
+inputs:
+  areas:
+    description: >
+      Pipe-separated list of allowed bracket tags, exactly as they should
+      appear at the start of the title, for example `TUI|IDE|Harn bridge|CI`.
+    required: true
+  token:
+    description: Token used to read the pull request title and body.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check title and body shape
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        AREAS: ${{ inputs.areas }}
+      run: |
+        set -euo pipefail
+        bash "$GITHUB_ACTION_PATH/check.sh"

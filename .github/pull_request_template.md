@@ -1,23 +1,15 @@
-# Pull request
-
-## Description
-
 <!--
-Plain language, bullet points, succinct. Describe what this PR does
-END-TO-END: the behavior change an agent, user, or downstream repo actually
-sees—not a list of files or tests (the Files tab already shows those). If the
-flow or data path is non-obvious, add a small Mermaid diagram.
--->
+Title this pull request `[Area] Sentence case summary`, for example
+`[CI] Fix the flaky release runner probe`. `Area` is one of this
+repository's own area tags. Its AGENTS.md lists them.
 
-## Test plan
+Replace this comment with three to five sentences: what changed, why, the one
+risk, and how you verified it. Write at the claim level. Do not list test
+commands and do not restate what the diff already shows. The Files and Checks
+tabs cover both.
 
-<!--
-Make the intuitive, evidence-backed case for why this change is correct:
+A worked example is in CONTRIBUTING.md, under "Write the description".
 
-- What you verified empirically and what actually happened.
-- Which load-bearing parts you are confident about, and why.
-- The honest blind spots: what remains unvalidated, and how it will be.
-
-Use manual checks, automated checks, or both—whatever genuinely demonstrates
-the end-to-end claim.
+Link the issue on its own line: `Closes #123 items: 1, 2`, or
+`Single-ask: #123` when the issue is not a numbered list.
 -->
