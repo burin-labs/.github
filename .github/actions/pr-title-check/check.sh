@@ -18,6 +18,19 @@ if [[ "$is_draft" == "true" ]] && [[ "$title" == WIP\ \(recovered\):* ]]; then
   exit 0
 fi
 
+# Two title shapes are load-bearing for automation outside this check's
+# control and must never be blocked by it:
+#   - `Release vX.Y.Z` is matched verbatim by release-tagging workflows
+#     (for example harn's publish-release.yml) before they tag and publish.
+#   - Dependabot always opens PRs with a conventional-commit title
+#     (`chore(deps...): ...` / `chore(deps-dev...): ...`, case-insensitive on
+#     the leading word), and does not read repository-specific title rules.
+if [[ "$title" =~ ^Release\ v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || [[ "$title" =~ ^[Cc]hore\(deps(-dev)?[^\)]*\): ]]; then
+  echo "Exempt automation title, skipping title/body shape check: ${title}"
+  exit 0
+fi
+
 # Build an alternation from the pipe-separated area list, escaping regex
 # metacharacters in each area name.
 IFS='|' read -ra area_list <<<"$AREAS"

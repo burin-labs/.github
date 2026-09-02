@@ -585,7 +585,13 @@ vacuously on an unrelated green build. A repository wires it into its own
 ```
 
 A draft PR titled `WIP (recovered):` is exempt — that prefix marks a
-crash-recovered draft that was never meant to carry a real title yet.
+crash-recovered draft that was never meant to carry a real title yet. A
+release-tagging PR titled exactly `Release vX.Y.Z` and any Dependabot PR
+(`chore(deps...): ...` / `chore(deps-dev...): ...`) are also exempt: both
+titles are produced and matched by automation outside this check's control
+(for example a release workflow that tags on that exact commit subject), so
+enforcing the `[Area]` shape on them would break that automation instead of
+improving hygiene.
 
 ## Label taxonomy
 
