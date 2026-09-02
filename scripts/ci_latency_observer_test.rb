@@ -206,11 +206,16 @@ class CiLatencyObserverTest < Minitest::Test
       "/repos/burin-labs/harn/actions/runs/104/jobs?per_page=100" => jobs
     }
 
-    run, error = FakeRunner.new(responses).send(:latest_full_success, policy)
+    probe = FakeRunner.new(responses).send(:probe_full_success, policy)
+    run = probe.fetch("selected_run")
 
-    assert_nil error
+    assert_nil probe.fetch("error")
     assert_equal 104, run.fetch("id")
     assert_equal "2026-08-27T07:00:00Z", run.fetch("created_at")
+    assert_equal 100, probe.fetch("candidate_limit")
+    assert_equal 4, probe.fetch("candidate_count")
+    assert_equal 1, probe.fetch("inspected_count")
+    assert_equal [], probe.dig("inspected_candidates", 0, "missing_sentinels")
   end
 
   def test_exhausted_candidate_window_is_unknown_not_absent
@@ -234,10 +239,12 @@ class CiLatencyObserverTest < Minitest::Test
       }
     }
 
-    run, error = FakeRunner.new(responses).send(:latest_full_success, policy)
+    probe = FakeRunner.new(responses).send(:probe_full_success, policy)
 
-    assert_nil run
-    assert_match(/candidate window exhausted/, error)
+    assert_nil probe.fetch("selected_run")
+    assert probe.fetch("truncated")
+    assert_equal 100, probe.fetch("candidate_count")
+    assert_match(/candidate window exhausted/, probe.fetch("error"))
   end
 
   def test_unknown_producer_status_fails_closed

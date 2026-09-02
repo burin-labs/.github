@@ -489,11 +489,6 @@ module CiLatencyObserver
       write_error_report(report_path, full_name, "observer exception: #{error.message}")
     end
 
-    def latest_full_success(policy)
-      probe = probe_full_success(policy)
-      [probe["selected_run"], probe["error"]]
-    end
-
     def probe_full_success(policy)
       repository = policy.fetch("repository")
       workflow = policy.fetch("workflow")
