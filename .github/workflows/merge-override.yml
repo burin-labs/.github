@@ -83,13 +83,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          attached_labels="$(gh api "repos/${REPO}/issues/${PR}" --jq '[.labels[].name]')"
-          event_pages="$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/events?per_page=100")"
-          request="$(jq -cn \
-            --argjson attached_labels "$attached_labels" \
-            --argjson event_pages "$event_pages" \
-            '{attached_labels: $attached_labels, events: ($event_pages | flatten)}' \
-            | ruby scripts/merge_override.rb resolve-request)"
+          labels_file="$(mktemp)"
+          event_pages_file="$(mktemp)"
+          chmod 600 "$labels_file" "$event_pages_file"
+          trap 'rm -f "$labels_file" "$event_pages_file"' EXIT
+          if ! gh api "repos/${REPO}/issues/${PR}" --jq '[.labels[].name]' > "$labels_file"; then
+            echo "::error::could not read attached override labels"
+            exit 1
+          fi
+          if ! gh api --paginate --slurp \
+            "repos/${REPO}/issues/${PR}/events?per_page=100" > "$event_pages_file"; then
+            echo "::error::could not read override label events"
+            exit 1
+          fi
+          if ! request="$(ruby scripts/merge_override.rb resolve-request \
+            "$labels_file" "$event_pages_file")"; then
+            echo "::error::could not resolve an override request from the measured labels and events"
+            exit 1
+          fi
           label="$(jq -r '.label // ""' <<< "$request")"
           {
             echo "active=$([[ -n "$label" ]] && echo true || echo false)"
@@ -163,17 +174,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          run_pages="$(gh api --paginate --slurp \
-            "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100")"
-          workflow_runs="$(jq '[.[].workflow_runs] | add' <<< "$run_pages")"
-          selection="$(jq -cn \
-            --argjson current_run_id "$THIS_RUN" \
-            --argjson workflow_runs "$workflow_runs" \
-            '{current_run_id: $current_run_id, workflow_runs: $workflow_runs}' \
-            | ruby scripts/merge_override.rb select-runs)"
+          echo "pending_count=unmeasured" >> "$GITHUB_OUTPUT"
+          echo "Competing pending runs: unmeasured"
+          run_pages_dir="$(mktemp -d)"
+          chmod 700 "$run_pages_dir"
+          trap 'rm -rf "$run_pages_dir"' EXIT
+          if ! current_workflow_id="$(gh api \
+            "repos/${REPO}/actions/runs/${THIS_RUN}" --jq '.workflow_id')"; then
+            echo "::error::could not read the current override workflow identity"
+            exit 1
+          fi
+          if [[ ! "$current_workflow_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::current override workflow identity was not a positive integer"
+            exit 1
+          fi
+          for status in requested queued in_progress waiting pending; do
+            if ! gh api --paginate --slurp \
+              "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&status=${status}&per_page=100" \
+              > "$run_pages_dir/${status}.json"; then
+              echo "::error::could not read ${status} workflow runs for the pull-request head"
+              exit 1
+            fi
+          done
+          if ! selection="$(ruby scripts/merge_override.rb select-runs \
+            "$THIS_RUN" "$current_workflow_id" "$run_pages_dir")"; then
+            echo "::error::could not select competing workflow runs from the measured pages"
+            exit 1
+          fi
           pending_count="$(jq -r '.pending_count' <<< "$selection")"
           echo "pending_count=${pending_count}" >> "$GITHUB_OUTPUT"
           echo "Competing pending runs: ${pending_count}"
+          echo "Measured workflow runs: $(jq -r '.measured_run_count' <<< "$selection")"
+          echo "Active-status queries: $(jq -r '.query_count' <<< "$selection")"
           echo "Excluded sibling override runs: $(jq -c '.override_run_ids' <<< "$selection")"
           echo "Competing run IDs: $(jq -c '.competing_run_ids' <<< "$selection")"
           mapfile -t run_ids < <(jq -r '.competing_run_ids[]' <<< "$selection")
@@ -317,13 +349,24 @@ jobs:
             echo 'removed_labels=[]' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          attached_labels="$(gh api "repos/${REPO}/issues/${PR}" --jq '[.labels[].name]')"
-          event_pages="$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/events?per_page=100")"
-          current="$(jq -cn \
-            --argjson attached_labels "$attached_labels" \
-            --argjson event_pages "$event_pages" \
-            '{attached_labels: $attached_labels, events: ($event_pages | flatten)}' \
-            | ruby scripts/merge_override.rb resolve-request)"
+          labels_file="$(mktemp)"
+          event_pages_file="$(mktemp)"
+          chmod 600 "$labels_file" "$event_pages_file"
+          trap 'rm -f "$labels_file" "$event_pages_file"' EXIT
+          if ! gh api "repos/${REPO}/issues/${PR}" --jq '[.labels[].name]' > "$labels_file"; then
+            echo "::error::could not re-read attached override labels before cleanup"
+            exit 1
+          fi
+          if ! gh api --paginate --slurp \
+            "repos/${REPO}/issues/${PR}/events?per_page=100" > "$event_pages_file"; then
+            echo "::error::could not re-read override label events before cleanup"
+            exit 1
+          fi
+          if ! current="$(ruby scripts/merge_override.rb resolve-request \
+            "$labels_file" "$event_pages_file")"; then
+            echo "::error::could not resolve the current override request before cleanup"
+            exit 1
+          fi
           removed='[]'
           mapfile -t labels < <(jq -r '.[]' <<< "$LABELS_JSON")
           for label in "${labels[@]}"; do

@@ -9,7 +9,7 @@
 module MergeOverride
   LABELS = %w[bypass-ci bypass-merge-queue force-merge].freeze
   LABEL_PRECEDENCE = %w[force-merge bypass-merge-queue bypass-ci].freeze
-  ACTIVE_RUN_STATUSES = %w[queued in_progress waiting pending].freeze
+  ACTIVE_RUN_STATUSES = %w[requested queued in_progress waiting pending].freeze
   REQUIRED_CHECK = "CI status"
 
   module_function
@@ -46,24 +46,128 @@ module MergeOverride
     }
   end
 
+  def issue_events_from_pages(event_pages:)
+    unless event_pages.is_a?(Array) && !event_pages.empty?
+      raise RequestError, "issue-event census must contain at least one page"
+    end
+    events = event_pages.flat_map.with_index do |page, index|
+      unless page.is_a?(Array)
+        raise RequestError, "issue-event census page #{index + 1} was not an array"
+      end
+      page
+    end
+    ids = events.map.with_index do |event, index|
+      unless event.is_a?(Hash) && event["id"].is_a?(Integer) && event["id"].positive?
+        raise RequestError, "issue-event census item #{index + 1} omitted a positive event id"
+      end
+      event.fetch("id")
+    end
+    if ids.uniq.length != ids.length
+      raise RequestError, "issue-event census contained a duplicate event id"
+    end
+    events
+  end
+
   def cancellation_required?(label)
     raise ArgumentError, "unknown override label: #{label.inspect}" unless known_label?(label)
 
     label == "bypass-ci" || label == "force-merge"
   end
 
-  # The actions API is filtered by head SHA before this boundary. Measure the
-  # current run's workflow_id through the same response, then exclude every run
-  # of that dispatcher workflow. This keeps sibling override attempts alive.
-  def select_competing_runs(current_run_id:, workflow_runs:)
-    current = workflow_runs.find { |run| run.fetch("id") == current_run_id }
-    raise RunSelectionError, "current run #{current_run_id} was absent from the measured run census" unless current
+  # GitHub's paginated --slurp response is an array of page envelopes. Keep
+  # that transport shape behind this seam so the workflow can stream the whole
+  # response over stdin instead of encoding an unbounded document in argv.
+  def workflow_run_census_from_pages(run_pages:)
+    unless run_pages.is_a?(Array) && !run_pages.empty?
+      raise RunSelectionError, "workflow-run census must contain at least one page envelope"
+    end
 
-    workflow_id = current.fetch("workflow_id")
-    active = workflow_runs.select { |run| ACTIVE_RUN_STATUSES.include?(run.fetch("status")) }
-    override_runs, competing_runs = active.partition { |run| run.fetch("workflow_id") == workflow_id }
+    reported_totals = []
+    workflow_runs = run_pages.flat_map.with_index do |page, index|
+      unless page.is_a?(Hash) && page["workflow_runs"].is_a?(Array)
+        raise RunSelectionError, "workflow-run census page #{index + 1} omitted workflow_runs"
+      end
+      reported_total = page["total_count"]
+      unless reported_total.is_a?(Integer) && reported_total >= 0
+        raise RunSelectionError, "workflow-run census page #{index + 1} omitted a non-negative total_count"
+      end
+      reported_totals << reported_total
+      page.fetch("workflow_runs")
+    end
+    if reported_totals.uniq.length != 1
+      raise RunSelectionError, "workflow-run census total_count changed during pagination"
+    end
+    reported_total = reported_totals.fetch(0)
+    if workflow_runs.length != reported_total
+      raise RunSelectionError,
+            "workflow-run census measured #{workflow_runs.length} of #{reported_total} reported runs"
+    end
+    ids = workflow_runs.map { |run| run.is_a?(Hash) ? run["id"] : nil }
+    unless ids.all? { |id| id.is_a?(Integer) && id.positive? }
+      raise RunSelectionError, "workflow-run census contained a non-positive run id"
+    end
+    if ids.uniq.length != ids.length
+      raise RunSelectionError, "workflow-run census contained a duplicate run id within one status query"
+    end
     {
-      current_workflow_id: workflow_id,
+      workflow_runs: workflow_runs,
+      page_count: run_pages.length,
+      reported_total: reported_total
+    }
+  end
+
+  # GitHub caps a head-SHA workflow-run query at 1,000 results. Querying each
+  # active status separately prevents completed history from permanently
+  # crowding live runs out of the cancellation census.
+  def active_workflow_run_census_from_queries(status_pages:)
+    unless status_pages.is_a?(Hash) && status_pages.keys.sort == ACTIVE_RUN_STATUSES.sort
+      raise RunSelectionError, "active workflow-run census must measure every active status"
+    end
+
+    runs = ACTIVE_RUN_STATUSES.flat_map do |status|
+      census = workflow_run_census_from_pages(run_pages: status_pages.fetch(status))
+      census.fetch(:workflow_runs).each do |run|
+        unless run.is_a?(Hash) && run["status"] == status
+          raise RunSelectionError, "#{status} workflow-run census contained a different status"
+        end
+        unless run["workflow_id"].is_a?(Integer) && run["workflow_id"].positive?
+          raise RunSelectionError, "#{status} workflow-run census omitted a positive workflow id"
+        end
+      end
+      census.fetch(:workflow_runs)
+    end
+    runs_by_id = {}
+    runs.each do |run|
+      prior = runs_by_id[run.fetch("id")]
+      if prior && prior.fetch("workflow_id") != run.fetch("workflow_id")
+        raise RunSelectionError, "active workflow-run identity changed across status queries"
+      end
+      # A run can advance between sequential status queries. The later query is
+      # the fresher observation; cancellation needs one stable id, not a false
+      # corruption verdict for a legitimate requested -> queued transition.
+      runs_by_id[run.fetch("id")] = run
+    end
+    {workflow_runs: runs_by_id.values, query_count: ACTIVE_RUN_STATUSES.length}
+  end
+
+  # The current run identity comes from its dedicated Actions endpoint. The
+  # head-SHA census may legitimately be empty or may not yet contain the
+  # current run, so deriving workflow_id from that eventually consistent list
+  # makes absence indistinguishable from failure.
+  def select_competing_runs(current_run_id:, current_workflow_id:, workflow_runs:)
+    unless current_run_id.is_a?(Integer) && current_run_id.positive?
+      raise RunSelectionError, "current run id must be a positive integer"
+    end
+    unless current_workflow_id.is_a?(Integer) && current_workflow_id.positive?
+      raise RunSelectionError, "current workflow id must be a positive integer"
+    end
+
+    active = workflow_runs.select { |run| ACTIVE_RUN_STATUSES.include?(run.fetch("status")) }
+    override_runs, competing_runs = active.partition do |run|
+      run.fetch("workflow_id") == current_workflow_id
+    end
+    {
+      current_workflow_id: current_workflow_id,
       pending_count: competing_runs.length,
       override_run_ids: override_runs.map { |run| run.fetch("id") }.reject { |id| id == current_run_id },
       competing_run_ids: competing_runs.map { |run| run.fetch("id") }
@@ -205,16 +309,28 @@ if $PROGRAM_NAME == __FILE__
     )
     puts JSON.generate(plan)
   when "resolve-request"
-    payload = JSON.parse(STDIN.read)
+    attached_labels = JSON.parse(File.read(ARGV.fetch(1)))
+    event_pages = JSON.parse(File.read(ARGV.fetch(2)))
     puts JSON.generate(MergeOverride.resolve_request(
-      attached_labels: payload.fetch("attached_labels"),
-      events: payload.fetch("events")
+      attached_labels: attached_labels,
+      events: MergeOverride.issue_events_from_pages(event_pages: event_pages)
     ))
   when "select-runs"
-    payload = JSON.parse(STDIN.read)
-    puts JSON.generate(MergeOverride.select_competing_runs(
-      current_run_id: payload.fetch("current_run_id"),
-      workflow_runs: payload.fetch("workflow_runs")
+    current_run_id = Integer(ARGV.fetch(1), 10)
+    current_workflow_id = Integer(ARGV.fetch(2), 10)
+    run_pages_dir = ARGV.fetch(3)
+    status_pages = MergeOverride::ACTIVE_RUN_STATUSES.to_h do |status|
+      [status, JSON.parse(File.read(File.join(run_pages_dir, "#{status}.json")))]
+    end
+    census = MergeOverride.active_workflow_run_census_from_queries(status_pages: status_pages)
+    selection = MergeOverride.select_competing_runs(
+      current_run_id: current_run_id,
+      current_workflow_id: current_workflow_id,
+      workflow_runs: census.fetch(:workflow_runs)
+    )
+    puts JSON.generate(selection.merge(
+      measured_run_count: census.fetch(:workflow_runs).length,
+      query_count: census.fetch(:query_count)
     ))
   when "ci-state"
     payload = JSON.parse(STDIN.read)
