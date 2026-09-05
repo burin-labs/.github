@@ -103,7 +103,8 @@ Dir.mktmpdir("runner-availability-test") do |dir|
            "OWNER" => "fixture", "RUNNER_GROUPS" => "Default", "DEFAULT_TAG" => "stable",
            "LINUX_TAG" => "stable", "LINUX_BIG_TAG" => "big", "LINUX_FETCH_TAG" => "fetch",
            "LINUX_PROBE_TAG" => "identity", "MACOS_TAG" => "stable", "WINDOWS_TAG" => "stable",
-           "MINIMUM_ONLINE" => "3", "SELFHOSTED_DISABLED" => "", "RUNNER_FIXTURE" => fixture,
+           "MINIMUM_ONLINE" => "3", "MINIMUM_ONLINE_BY_POOL" => "{}",
+           "SELFHOSTED_DISABLED" => "", "RUNNER_FIXTURE" => fixture,
            "GITHUB_OUTPUT" => output, "TMPDIR" => dir}
     stdout, stderr, status = Open3.capture3(env, "bash", "-c", script)
     abort "#{name}: detector failed: #{stdout} #{stderr}" unless status.success?
@@ -117,6 +118,24 @@ Dir.mktmpdir("runner-availability-test") do |dir|
       abort "independent big pool should remain available" unless values.fetch("linux_big") == "true"
       abort "starvation must be named" unless stdout.include?("FLEET_RUNNER_LABEL_STARVED")
     end
+    next unless name == "minimum met"
+
+    macs = (4..5).map { |id| runner.call(id, "online", false, ["self-hosted", "macOS", "stable"]) }
+    File.write(fixture, JSON.generate([{runners: runners + macs}]))
+    [2, 3].each do |minimum|
+      File.write(output, "")
+      stdout, stderr, status = Open3.capture3(env.merge("MINIMUM_ONLINE_BY_POOL" => JSON.generate(macos: minimum)), "bash", "-c", script)
+      abort "pool override failed: #{stdout} #{stderr}" unless status.success?
+      values = File.readlines(output).map { |line| line.strip.split("=", 2) }.to_h
+      expected = minimum == 2
+      abort "macOS override did not control routing" unless values.fetch("macos") == expected.to_s &&
+        JSON.parse(values.fetch("capacity")).fetch("macos").fetch("eligible") == expected
+      abort "macOS override changed Linux routing" unless values.fetch("linux") == "true"
+    end
+    ['{"macos":0}', '{"macos":1.5}', '{"typo":2}', '[]', '{"macos":"2"}'].each do |invalid|
+      _, _, status = Open3.capture3(env.merge("MINIMUM_ONLINE_BY_POOL" => invalid), "bash", "-c", script)
+      abort "invalid pool policy was accepted: #{invalid}" if status.success?
+    end
   end
 end
-puts "runner-availability decisions: 5 fixture cases passed"
+puts "runner-availability decisions: shared, per-pool, and invalid-policy fixtures passed"
