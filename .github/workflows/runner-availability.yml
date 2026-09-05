@@ -47,6 +47,11 @@ name: runner-availability (reusable)
 on:
   workflow_call:
     inputs:
+      minimum_online:
+        description: "Minimum online runners in a shared pool before offering self-hosted capacity"
+        type: number
+        default: 1
+        required: false
       runner_tag:
         description: "Default label required on self-hosted runners"
         type: string
@@ -150,7 +155,8 @@ on:
         description: >-
           JSON object of the measured fleet, keyed by lane (linux, linux_big,
           linux_fetch, linux_probe, macos, windows), each
-          `{online, idle, measured}`.
+          `{online, idle, measured, eligible}`. `eligible` requires the online
+          minimum, regardless of idle capacity; use it for deliberate queueing.
           Consume with `fromJSON(...).linux.idle`.
 
           The per-lane booleans above answer one question - "can a job land
@@ -226,8 +232,13 @@ jobs:
           WINDOWS_TAG: ${{ inputs.windows_runner_tag }}
           RUNNER_GROUPS: ${{ inputs.runner_groups }}
           SELFHOSTED_DISABLED: ${{ vars.CI_SELFHOSTED_DISABLED }}
+          MINIMUM_ONLINE: ${{ inputs.minimum_online }}
         run: |
           set -euo pipefail
+          if ! [[ "$MINIMUM_ONLINE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::minimum_online must be a positive integer"
+            exit 1
+          fi
 
           # Resolve the kill switch before probing anything. Accepted values:
           #
@@ -278,7 +289,7 @@ jobs:
               echo "windows=false"
               echo "macos=false"
               echo "capacity=$(jq -c -n '["linux", "linux_big", "linux_fetch", "linux_probe", "macos", "windows"]
-                | map({key: ., value: {online: 0, idle: 0, measured: false}})
+                | map({key: ., value: {online: 0, idle: 0, measured: false, eligible: false}})
                 | from_entries')"
             } >> "$GITHUB_OUTPUT"
           }
@@ -433,11 +444,21 @@ jobs:
           }
 
           capacity='{}'
+          pool_eligible() {
+            local minimum="$MINIMUM_ONLINE"
+            # The optional probe addresses one identity, rather than shared capacity.
+            [[ "$1" != linux_probe ]] || minimum=1
+            [[ "$3" == true && "$2" -ge "$minimum" ]]
+          }
           record_capacity() {
             # $1 lane, $2 online, $3 idle, $4 measured
             capacity="$(jq -c -n --argjson acc "$capacity" --arg lane "$1" \
               --argjson online "$2" --argjson idle "$3" --argjson measured "$4" \
-              '$acc + {($lane): {online: $online, idle: $idle, measured: $measured}}')"
+              --argjson eligible "$(pool_eligible "$1" "$2" "$4" && echo true || echo false)" \
+              '$acc + {($lane): {online: $online, idle: $idle, measured: $measured, eligible: $eligible}}')"
+            if [[ "$4" == true ]] && ! pool_eligible "$1" "$2" "$4"; then
+              echo "::warning::FLEET_RUNNER_LABEL_STARVED lane=$1 online=$2 required=$MINIMUM_ONLINE; using hosted capacity"
+            fi
           }
 
           for os_label in Linux Windows macOS; do
@@ -456,7 +477,7 @@ jobs:
             fi
             count="$(count_matching "$os_label" "$tag" idle)"
             online="$(count_matching "$os_label" "$tag" any)"
-            if [ "$count" -gt 0 ]; then
+            if [ "$count" -gt 0 ] && pool_eligible "$key" "$online" true; then
               available=true
             else
               available=false
@@ -482,13 +503,14 @@ jobs:
           else
             big_count="$(count_matching Linux "$LINUX_BIG_TAG" idle)"
             big_online="$(count_matching Linux "$LINUX_BIG_TAG" any)"
-            if [ "$big_count" -gt 0 ]; then
-              echo "linux_big=true" >> "$GITHUB_OUTPUT"
+            if [ "$big_count" -gt 0 ] && pool_eligible linux_big "$big_online" true; then
+              big_available=true
             else
-              echo "linux_big=false" >> "$GITHUB_OUTPUT"
+              big_available=false
             fi
+            echo "linux_big=$big_available" >> "$GITHUB_OUTPUT"
             record_capacity linux_big "$big_online" "$big_count" true
-            echo "::notice::runner-availability linux_big=$([ "$big_count" -gt 0 ] && echo true || echo false) (${big_count} idle of ${big_online} online Linux ${LINUX_BIG_TAG} runner(s))"
+            echo "::notice::runner-availability linux_big=$big_available (${big_count} idle of ${big_online} online Linux ${LINUX_BIG_TAG} runner(s))"
           fi
 
           # Fetch-healthy Linux capacity is also a strict subset: the runner
@@ -505,13 +527,14 @@ jobs:
           else
             fetch_count="$(count_matching Linux "$LINUX_TAG" idle "$LINUX_FETCH_TAG")"
             fetch_online="$(count_matching Linux "$LINUX_TAG" any "$LINUX_FETCH_TAG")"
-            if [ "$fetch_count" -gt 0 ]; then
-              echo "linux_fetch=true" >> "$GITHUB_OUTPUT"
+            if [ "$fetch_count" -gt 0 ] && pool_eligible linux_fetch "$fetch_online" true; then
+              fetch_available=true
             else
-              echo "linux_fetch=false" >> "$GITHUB_OUTPUT"
+              fetch_available=false
             fi
+            echo "linux_fetch=$fetch_available" >> "$GITHUB_OUTPUT"
             record_capacity linux_fetch "$fetch_online" "$fetch_count" true
-            echo "::notice::runner-availability linux_fetch=$([ "$fetch_count" -gt 0 ] && echo true || echo false) (${fetch_count} idle of ${fetch_online} online Linux ${LINUX_TAG}+${LINUX_FETCH_TAG} runner(s))"
+            echo "::notice::runner-availability linux_fetch=$fetch_available (${fetch_count} idle of ${fetch_online} online Linux ${LINUX_TAG}+${LINUX_FETCH_TAG} runner(s))"
           fi
 
           # Some health checks target one physical pool rather than a shared

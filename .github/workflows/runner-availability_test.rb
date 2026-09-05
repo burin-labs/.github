@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
 require "yaml"
+require "json"
+require "tmpdir"
+require "open3"
 
 path = File.join(__dir__, "runner-availability.yml")
 document = YAML.safe_load(File.read(path), aliases: true)
@@ -65,3 +68,55 @@ lines.each_with_index do |line, index|
 end
 
 puts "runner-availability policy: ok"
+
+# Exercise the actual workflow script with API-shaped fixtures, including the
+# decision consumed by runs-on. Counting matching text cannot prove fallback.
+Dir.mktmpdir("runner-availability-test") do |dir|
+  File.write(File.join(dir, "gh"), <<~SH)
+    #!/usr/bin/env bash
+    case "$*" in
+      *runner-groups/1/runners*) cat "$RUNNER_FIXTURE" ;;
+      *runner-groups*) echo '[{"runner_groups":[{"name":"Default","id":1}]}]' ;;
+      *) exit 91 ;;
+    esac
+  SH
+  File.chmod(0755, File.join(dir, "gh"))
+  runner = lambda do |id, status, busy, labels|
+    {id: id, name: "worker-#{id}", status: status, busy: busy,
+     labels: labels.map { |label| {name: label} }}
+  end
+  labels = ["self-hosted", "Linux", "X64", "stable", "big", "fetch", "identity"]
+  healthy = (1..3).map { |id| runner.call(id, "online", false, labels) }
+  cases = {
+    "minimum met" => [healthy, "true", true, 3, true],
+    "label removed" => [healthy.map { |r| r[:id] == 3 ? runner.call(3, "online", false, labels - ["stable"]) : r }, "false", false, 2, true],
+    "offline" => [healthy.map { |r| r[:id] == 3 ? runner.call(3, "offline", false, labels) : r }, "false", false, 2, true],
+    "busy but eligible" => [healthy.map { |r| r.merge(busy: true) }, "false", true, 3, true],
+    "empty inventory" => [[], "false", false, 0, false]
+  }
+  cases.each do |name, (runners, available, eligible, online, measured)|
+    fixture = File.join(dir, "runners.json")
+    output = File.join(dir, "output")
+    File.write(fixture, JSON.generate([{runners: runners}]))
+    File.write(output, "")
+    env = {"PATH" => "#{dir}:#{ENV.fetch('PATH')}", "GH_TOKEN" => "fixture",
+           "OWNER" => "fixture", "RUNNER_GROUPS" => "Default", "DEFAULT_TAG" => "stable",
+           "LINUX_TAG" => "stable", "LINUX_BIG_TAG" => "big", "LINUX_FETCH_TAG" => "fetch",
+           "LINUX_PROBE_TAG" => "identity", "MACOS_TAG" => "stable", "WINDOWS_TAG" => "stable",
+           "MINIMUM_ONLINE" => "3", "SELFHOSTED_DISABLED" => "", "RUNNER_FIXTURE" => fixture,
+           "GITHUB_OUTPUT" => output, "TMPDIR" => dir}
+    stdout, stderr, status = Open3.capture3(env, "bash", "-c", script)
+    abort "#{name}: detector failed: #{stdout} #{stderr}" unless status.success?
+    values = File.readlines(output).map { |line| line.strip.split("=", 2) }.to_h
+    capacity = JSON.parse(values.fetch("capacity")).fetch("linux")
+    abort "#{name}: wrong routing #{values}" unless values.fetch("linux") == available &&
+      capacity.fetch("eligible") == eligible && capacity.fetch("online") == online &&
+      capacity.fetch("measured") == measured
+    if name == "label removed"
+      abort "fetch subset must also refuse starvation" unless values.fetch("linux_fetch") == "false"
+      abort "independent big pool should remain available" unless values.fetch("linux_big") == "true"
+      abort "starvation must be named" unless stdout.include?("FLEET_RUNNER_LABEL_STARVED")
+    end
+  end
+end
+puts "runner-availability decisions: 5 fixture cases passed"
