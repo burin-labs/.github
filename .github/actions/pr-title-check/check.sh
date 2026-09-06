@@ -51,10 +51,42 @@ for area in "${area_list[@]}"; do
 done
 alternation="$(IFS='|'; echo "${escaped[*]}")"
 
+# A repository's coarse title vocabulary does not necessarily use the words a
+# contributor knows from another Burin repository. Keep those semantic hints
+# beside that repository's accepted list instead of guessing from spelling.
+suggestion_list=()
+if [[ -n "${AREA_SUGGESTIONS:-}" ]]; then
+  IFS='|' read -ra suggestion_list <<<"$AREA_SUGGESTIONS"
+  for mapping in "${suggestion_list[@]}"; do
+    rejected="${mapping%%=*}"
+    accepted="${mapping#*=}"
+    if [[ "$mapping" != *=* || -z "$rejected" || -z "$accepted" ]]; then
+      echo "::error::Invalid area suggestion '${mapping}'; expected Rejected=Accepted where Accepted is in ${AREAS}"
+      exit 1
+    fi
+    case "|${AREAS}|" in
+      *"|${accepted}|"*) ;;
+      *)
+        echo "::error::Invalid area suggestion '${mapping}'; expected Rejected=Accepted where Accepted is in ${AREAS}"
+        exit 1
+        ;;
+    esac
+  done
+fi
+
 title_pattern="^\[(${alternation})\] [A-Z0-9].*[^.]$"
 if [[ ! "$title" =~ $title_pattern ]]; then
   echo "::error::PR title must match '[Area] Sentence case summary', where Area is one of: ${AREAS}"
   echo "::error::Got: ${title}"
+  if [[ "$title" =~ ^\[([^]]+)\] ]]; then
+    rejected_area="${BASH_REMATCH[1]}"
+    for mapping in "${suggestion_list[@]}"; do
+      if [[ "${mapping%%=*}" == "$rejected_area" ]]; then
+        echo "::error::For [${rejected_area}], use [${mapping#*=}]."
+        break
+      fi
+    done
+  fi
   echo "See .github/pull_request_template.md and AGENTS.md for the convention."
   exit 1
 fi
