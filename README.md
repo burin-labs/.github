@@ -559,12 +559,14 @@ Use `--public` instead for a repository that ships to users.
 This is the step that catches a silently refused creation. Never skip it.
 
 ```bash
-gh api repos/burin-labs/<name>/commits/main --jq .sha
+until gh api repos/burin-labs/<name>/commits/main --jq .sha; do sleep 3; done
 ```
 
-A commit SHA means the repository is populated and protected. `HTTP 409 Git
-Repository is empty` means creation was refused by the ruleset; stop and fix
-that rather than working around it by repointing the default branch.
+Generation is briefly asynchronous, so the first read usually returns
+`HTTP 409 Git Repository is empty` and the next one returns the commit SHA.
+A SHA means the repository is populated and protected. A 409 that never
+clears means creation was refused by the ruleset; stop and fix that rather
+than working around it by repointing the default branch.
 
 ### Match the organization merge settings
 
