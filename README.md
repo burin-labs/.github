@@ -528,6 +528,114 @@ Public repositories stay in scope: applying a label still requires triage or
 higher, and the workflow re-checks organization or repository admin permission
 before any privileged action.
 
+## Create a new repository
+
+The organization ruleset requires a passing status check named `CI status` on
+every repository's default branch. A repository whose default branch does not
+exist yet cannot satisfy that, and GitHub applies the rule to repository
+*creation* as well as to pushes. `gh repo create --add-readme`, the REST
+`auto_init` flag, and template generation all return `201 Created` and leave
+the repository **empty**, with no error anywhere. Do not read a successful
+`gh repo create` as a populated repository.
+
+`burin-labs/repo-template` exists so that the first commit arrives with the
+repository and every later change arrives by pull request, under the ruleset,
+with nothing bypassed. It carries the `CI status` job, the Dependabot
+projection, the pull request template, and a `.gitignore`.
+
+### Create the repository
+
+```bash
+gh repo create burin-labs/<name> \
+  --template burin-labs/repo-template \
+  --private \
+  --clone
+```
+
+Use `--public` instead for a repository that ships to users.
+
+### Confirm the default branch landed
+
+This is the step that catches a silently refused creation. Never skip it.
+
+```bash
+gh api repos/burin-labs/<name>/commits/main --jq .sha
+```
+
+A commit SHA means the repository is populated and protected. `HTTP 409 Git
+Repository is empty` means creation was refused by the ruleset; stop and fix
+that rather than working around it by repointing the default branch.
+
+### Match the organization merge settings
+
+The ruleset already forbids merge commits, but the repository settings should
+agree with it so the merge button offers only what is allowed.
+
+```bash
+gh api -X PATCH repos/burin-labs/<name> \
+  -F allow_merge_commit=false \
+  -F allow_squash_merge=true \
+  -F allow_rebase_merge=true \
+  -F delete_branch_on_merge=true
+```
+
+### Add the real work in the first pull request
+
+The template lints Markdown and workflows and reports `CI status`. It builds
+and tests nothing, because it does not know the language you are about to
+write. One pull request adds all of it:
+
+1. Add a build and test job to `.github/workflows/ci.yml`.
+2. Add that job's id to the `needs` list of the `ci-status` job. The ruleset
+   names one required check for every repository, so repositories extend
+   `needs` rather than renaming or replacing the check.
+3. Add the matching ecosystem to `.github/dependabot.yml`, keeping the
+   `templates/dependabot.yml` projection first.
+4. Replace the template README and add an `AGENTS.md` naming the repository's
+   area tags.
+
+For a Harn package, the build job is one call to `harn-package.yml`. See
+*Reusable workflows* above.
+
+### Import a repository that already has history
+
+Two constraints shape this. The ruleset forbids merge commits, and a branch
+with unrelated history has no merge base, so GitHub will not open it as a
+pull request. Replay the imported history onto the new repository's initial
+commit instead:
+
+```bash
+gh repo create burin-labs/<name> --template burin-labs/repo-template --private
+git clone https://github.com/burin-labs/<name>.git
+cd <name>
+git remote add imported <path-or-url>
+git fetch imported
+git checkout -b import imported/<branch>
+git rebase --onto main --root
+git push -u origin import
+```
+
+Open a pull request from `import` and merge it with **rebase**, so every
+commit lands individually. The rebase rewrites each commit, so it also
+re-signs them when `commit.gpgsign` is set, which the `required_signatures`
+rule needs. Commit SHAs change; the commits, authors, dates and messages do
+not.
+
+When the original SHAs have to survive, stage the repository under a personal
+account, push the full history there, and transfer it into the organization.
+A transfer is not a ref update, so the ruleset does not see it:
+
+```bash
+gh api -X POST repos/<you>/<name>/transfer -f new_owner=burin-labs
+```
+
+Wait for the staged repository's first Actions run to appear before you
+transfer. A repository transferred within a second or two of its first push
+has arrived with GitHub Actions inert: the workflow is listed as active, no
+check suite is ever created, and no later push, pull request, or reopen
+recovers it. The required check then never reports and the first pull request
+is blocked with nothing to look at.
+
 ## Organization defaults
 
 - `.github/pull_request_template.md` is inherited by repositories that do not
