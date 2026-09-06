@@ -10,6 +10,12 @@ inputs:
       Pipe-separated list of allowed bracket tags, exactly as they should
       appear at the start of the title, for example `TUI|IDE|Harn bridge|CI`.
     required: true
+  area-suggestions:
+    description: >
+      Optional pipe-separated rejected-to-accepted mappings used in refusal
+      guidance, for example `Build=CI|Lint=CI`.
+    required: false
+    default: ""
   token:
     description: Token used to read the pull request title and body.
     required: false
@@ -25,6 +31,7 @@ runs:
         REPO: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         AREAS: ${{ inputs.areas }}
+        AREA_SUGGESTIONS: ${{ inputs.area-suggestions }}
       run: |
         set -euo pipefail
         bash "$GITHUB_ACTION_PATH/check.sh"

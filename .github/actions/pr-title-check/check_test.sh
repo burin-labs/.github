@@ -22,11 +22,12 @@ pass_count=0
 run_case() {
   local name="$1" expected="$2" title="$3" draft="$4" body="$5"
   local pr_number="${6-42}"
+  local area_suggestions="${7-}"
   STUB_PR_JSON="$(jq -n --arg t "$title" --arg b "$body" --argjson d "$draft" \
     '{title:$t, body:$b, isDraft:$d}')"
   export STUB_PR_JSON
   local out status
-  out="$(REPO=burin-labs/example PR_NUMBER="$pr_number" AREAS='CI|Actions|Docs|Harn bridge' \
+  out="$(REPO=burin-labs/example PR_NUMBER="$pr_number" AREAS='CI|Actions|Docs|Harn bridge' AREA_SUGGESTIONS="$area_suggestions" \
     bash "$here/check.sh" 2>&1)"
   status=$?
   if [[ "$status" -eq "$expected" ]]; then
@@ -59,6 +60,7 @@ run_case "well-formed title and body passes" 0 '[CI] Fix the flaky release runne
 run_case "multi-word area passes" 0 '[Harn bridge] Recover the settling response' false "$good_body"
 run_case "missing bracket tag fails" 1 'Fix the flaky release runner probe' false "$good_body"
 run_case "unlisted area fails" 1 '[Kitchen] Fix the flaky release runner probe' false "$good_body"
+run_case "repository suggestion still fails" 1 '[Build] Fix the flaky release runner probe' false "$good_body" 42 'Build=CI|Lint=CI'
 run_case "lowercase first word fails" 1 '[CI] fix the flaky release runner probe' false "$good_body"
 run_case "trailing period fails" 1 '[CI] Fix the flaky release runner probe.' false "$good_body"
 run_case "release title is exempt" 0 'Release v0.10.126' false ''
@@ -75,6 +77,28 @@ run_case "headings and checklist only fails" 1 '[CI] Fix the flaky release runne
 # A merge queue or push event carries no PR number. Skipping there is what
 # keeps this check from deadlocking a queue it was never meant to gate.
 run_case "absent PR number skips instead of failing" 0 '[CI] Fix the flaky release runner probe' false "$good_body" ''
+
+# The failure must make the correction actionable, while a malformed mapping
+# must fail closed rather than recommend an area the repository rejects.
+suggestion_out="$(REPO=burin-labs/example PR_NUMBER=42 AREAS='CI|Actions|Docs|Harn bridge' \
+  AREA_SUGGESTIONS='Build=CI|Lint=CI' STUB_PR_JSON="$(jq -n --arg t '[Build] Fix the build' --arg b "$good_body" '{title:$t, body:$b, isDraft:false}')" \
+  bash "$here/check.sh" 2>&1 || true)"
+if [[ "$suggestion_out" == *'For [Build], use [CI].'* ]]; then
+  pass_count=$((pass_count + 1))
+else
+  failures=$((failures + 1))
+  echo "FAIL: mapped rejection names the accepted area"
+  echo "  output: ${suggestion_out}"
+fi
+
+if REPO=burin-labs/example PR_NUMBER=42 AREAS='CI|Actions|Docs|Harn bridge' \
+  AREA_SUGGESTIONS='Build=Kitchen' STUB_PR_JSON="$(jq -n --arg t '[Build] Fix the build' --arg b "$good_body" '{title:$t, body:$b, isDraft:false}')" \
+  bash "$here/check.sh" >/dev/null 2>&1; then
+  failures=$((failures + 1))
+  echo "FAIL: suggestion to an unaccepted area passed"
+else
+  pass_count=$((pass_count + 1))
+fi
 
 echo
 if [[ "$failures" -eq 0 ]]; then
