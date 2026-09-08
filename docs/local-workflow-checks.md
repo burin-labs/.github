@@ -23,7 +23,8 @@ Each command inherits only the host's runtime essentials, including `PATH`,
 home, temporary-directory, operating-system, and locale variables. Workflow
 and policy environment values override that base. Other ambient variables are
 not forwarded, so a credential reaches a check only when its contract declares
-it.
+it. The runner supplies absolute `GITHUB_WORKSPACE` and `RUNNER_TEMP` values
+from its normalized root and private run directory.
 
 Consumer packages can expose the same CLI without copying its boundary:
 

@@ -140,7 +140,13 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
               cwd: path_join(options.root, check.directory),
               env: runtime_environment(harness.env)
                 + check.environment
-                + {GIT_CONFIG_GLOBAL: global_config, GIT_CONFIG_NOSYSTEM: "1", CI: "true"},
+                + {
+                  GITHUB_WORKSPACE: options.root,
+                  RUNNER_TEMP: temporary,
+                  GIT_CONFIG_GLOBAL: global_config,
+                  GIT_CONFIG_NOSYSTEM: "1",
+                  CI: "true",
+                },
               timeout_ms: check.timeout_ms,
             },
           )

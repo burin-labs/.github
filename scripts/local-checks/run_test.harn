@@ -91,6 +91,34 @@ pipeline test_runner_preserves_runtime_path_and_home(harness: Harness) {
   assert(result.ok)
 }
 
+pipeline test_runner_supplies_absolute_workspace_and_temporary_roots(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("runner-root-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Runner roots
+        run: printf '%s\n%s\n' "$GITHUB_WORKSPACE" "$RUNNER_TEMP" > runner-roots.txt
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  const roots = harness.fs.read_text(path_join(root, "runner-roots.txt")).trim().split("\n")
+  assert_eq(roots[0], root)
+  assert(path_is_absolute(roots[0] ?? ""))
+  assert(path_is_absolute(roots[1] ?? ""))
+  assert(harness.fs.exists(roots[1] ?? ""))
+  assert(result.ok)
+}
+
 pipeline test_unavailable_platform_is_named_and_pending(harness: Harness) {
   const root = harness.fs.mkdtemp_in_workspace("platform-control-")
   const plan = plan_checks(
