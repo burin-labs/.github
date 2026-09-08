@@ -312,9 +312,18 @@ pipeline test_executed_job_inverted_timestamps_fail() {
 }
 
 pipeline test_conflicting_cache_outcomes_fail() {
+  const timed_out_restore = parse_cache_observations(
+    {test: "Cache hit for: shared-key\nCache not found for input keys: shared-key\n"},
+    10,
+    ["test"],
+  )
+  assert_eq(
+    timed_out_restore,
+    [{job: "test", key: "shared-key", outcome: "miss", source: "github-actions-log"}],
+  )
   assert_error_contains(
     fn() { parse_cache_observations(
-      {test: "Cache hit for: shared-key\nCache not found for input keys: shared-key\n"},
+      {test: "Cache restored from key: shared-key\nCache not found for input keys: shared-key\n"},
       10,
       ["test"],
     ) },

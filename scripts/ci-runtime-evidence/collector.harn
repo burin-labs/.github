@@ -320,7 +320,6 @@ fn normalize_job(run_id: int, raw: unknown) -> dict {
 fn cache_match(message: string) -> dict? {
   for candidate in [
     {pattern: "(?i)Cache restored from key:\\s*(\\S+)", outcome: "hit"},
-    {pattern: "(?i)Cache hit for:\\s*(\\S+)", outcome: "hit"},
     {pattern: "(?i)Cache not found for input keys:\\s*([^ ,]+)", outcome: "miss"},
   ] {
     const matches = regex_captures(candidate.pattern, message) ?? []
@@ -331,7 +330,7 @@ fn cache_match(message: string) -> dict? {
   return nil
 }
 
-/** Extract one stable cache observation per job and key from complete GitHub logs. */
+/** Extract one stable terminal cache observation per job and key from complete GitHub logs. */
 pub fn parse_cache_observations(logs: dict, run_id: int, job_names: list<string>) -> list {
   let observations = {}
   for job in job_names {
