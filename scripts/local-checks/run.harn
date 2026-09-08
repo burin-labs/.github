@@ -2,6 +2,38 @@ import { Check, CheckReport, CheckResult, Plan } from "./model.harn"
 
 pub type RunOptions = {root: string, platform: string, build_wrapper: list<string>, group: string?}
 
+fn runtime_environment(env: HarnessEnv) -> dict<string, string> {
+  let result: dict<string, string> = {}
+  for name in [
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "NO_COLOR",
+  ] {
+    const value = env.get(name)
+    if value != nil {
+      result = result + {[name]: value ?? ""}
+    }
+  }
+  return result
+}
+
 fn pending(check: Check, options: RunOptions) -> string? {
   const supported = check.disposition.platforms
   if supported != nil && !supported.contains(options.platform) {
@@ -106,7 +138,8 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
               program: argv[0],
               args: argv[1:len(argv)],
               cwd: path_join(options.root, check.directory),
-              env: check.environment
+              env: runtime_environment(harness.env)
+                + check.environment
                 + {GIT_CONFIG_GLOBAL: global_config, GIT_CONFIG_NOSYSTEM: "1", CI: "true"},
               timeout_ms: check.timeout_ms,
             },

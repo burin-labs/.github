@@ -19,6 +19,12 @@ unmeasured, setup, and remote-only steps. `ok` stays false when the workflow
 census is incomplete or when no check ran, so an empty read cannot certify the
 repository.
 
+Each command inherits only the host's runtime essentials, including `PATH`,
+home, temporary-directory, operating-system, and locale variables. Workflow
+and policy environment values override that base. Other ambient variables are
+not forwarded, so a credential reaches a check only when its contract declares
+it.
+
 Consumer packages can expose the same CLI without copying its boundary:
 
 ```harn

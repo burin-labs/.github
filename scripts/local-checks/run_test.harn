@@ -62,6 +62,35 @@ pipeline test_default_bash_matches_githubs_unset_variable_behavior(harness: Harn
   assert(result.ok)
 }
 
+pipeline test_runner_preserves_runtime_path_and_home(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("runtime-env-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Runtime environment
+        run: printf '%s\n%s\n' "$PATH" "$HOME" > runtime-env.txt
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(
+    harness.fs.read_text(path_join(root, "runtime-env.txt")),
+    to_string(harness.env.get("PATH") ?? "") + "\n"
+      + to_string(harness.env.get("HOME") ?? "")
+      + "\n",
+  )
+  assert(result.ok)
+}
+
 pipeline test_unavailable_platform_is_named_and_pending(harness: Harness) {
   const root = harness.fs.mkdtemp_in_workspace("platform-control-")
   const plan = plan_checks(
