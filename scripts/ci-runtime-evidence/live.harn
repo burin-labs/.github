@@ -74,15 +74,27 @@ fn request_options(token: string, max_response_bytes: int) -> dict {
 }
 
 fn gh_json(net: HarnessNet, token: string, endpoint: string) -> unknown {
-  const response = net.get(API_ROOT + endpoint, request_options(token, MAX_JSON_RESPONSE_BYTES))
-  if !response.ok {
-    throw "GitHub API request failed with HTTP " + to_string(response.status)
+  let last_error = "no response"
+  for attempt in [1, 2, 3] {
+    const outcome = try {
+      net.get(API_ROOT + endpoint, request_options(token, MAX_JSON_RESPONSE_BYTES))
+    }
+    if !is_ok(outcome) {
+      last_error = to_string(unwrap_err(outcome))
+      continue
+    }
+    const response = unwrap(outcome)
+    if !response.ok {
+      last_error = "HTTP " + to_string(response.status)
+      continue
+    }
+    try {
+      return json_parse(response.body)
+    } catch (error) {
+      last_error = "invalid JSON: " + to_string(error)
+    }
   }
-  try {
-    return json_parse(response.body)
-  } catch (error) {
-    throw "GitHub API returned invalid JSON: " + to_string(error)
-  }
+  throw "GitHub API request " + endpoint + " failed after 3 attempts: " + last_error
 }
 
 fn archive_job_name(job: string) -> string {
@@ -159,15 +171,21 @@ fn run_logs(
     command_run(tools, ["rm", "-f", "--", archive_path])
     command_run(tools, ["rmdir", "--", directory])
   }
-  const download = net.download(
-    API_ROOT + "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/attempts/"
-      + to_string(attempt)
-      + "/logs",
-    archive_path,
-    request_options(token, MAX_LOG_ARCHIVE_BYTES),
-  )
+  const endpoint = "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/attempts/"
+    + to_string(attempt)
+    + "/logs"
+  const download_outcome = try {
+    net.download(API_ROOT + endpoint, archive_path, request_options(token, MAX_LOG_ARCHIVE_BYTES))
+  }
+  if !is_ok(download_outcome) {
+    throw "run " + to_string(run_id) + " attempt " + to_string(attempt)
+      + " log download failed: "
+      + to_string(unwrap_err(download_outcome))
+  }
+  const download = unwrap(download_outcome)
   if !download.ok || download.bytes_written <= 0 {
-    throw "run " + to_string(run_id) + " log download failed with HTTP "
+    throw "run " + to_string(run_id) + " attempt " + to_string(attempt)
+      + " log download failed with HTTP "
       + to_string(download.status)
   }
   return logs_from_archive(tools, archive_path, run_id, job_names)
