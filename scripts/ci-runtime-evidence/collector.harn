@@ -343,7 +343,8 @@ pub fn parse_cache_observations(logs: dict, run_id: int, job_names: list<string>
       const identity = job + "\\u0000" + found.key
       const existing = observations[identity]
       if existing != nil && existing.outcome != found.outcome {
-        throw "cache " + found.key + " in " + job + " reported both hit and miss"
+        throw "run " + to_string(run_id) + " cache " + found.key + " in " + job
+          + " reported both hit and miss"
       }
       observations = observations
         + {
