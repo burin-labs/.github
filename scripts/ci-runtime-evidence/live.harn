@@ -15,8 +15,9 @@ fn run(
   tools: HarnessTools,
   argv: list<string>,
   capture: dict = {max_inline_bytes: 10000000},
+  env: dict<string, string> = {},
 ) -> dict {
-  const result = command_run(tools, argv, {capture: capture, timeout_ms: 120000})
+  const result = command_run(tools, {argv: argv, env: env}, {capture: capture, timeout_ms: 120000})
   if !result.success {
     throw "command failed: " + diagnostic(tools, result)
   }
@@ -51,11 +52,12 @@ fn complete_stdout(tools: HarnessTools, result: dict) -> string {
   }
 }
 
-fn gh_json(tools: HarnessTools, endpoint: string) -> unknown {
+fn gh_json(tools: HarnessTools, token: string, endpoint: string) -> unknown {
   const result = run(
     tools,
     ["gh", "api", "-H", "X-GitHub-Api-Version: " + API_VERSION, endpoint],
     {transport: "file", max_inline_bytes: 1},
+    {GH_TOKEN: token},
   )
   try {
     return json_parse(complete_stdout(tools, result))
@@ -122,7 +124,13 @@ pub fn logs_from_archive(
   return logs
 }
 
-fn run_logs(tools: HarnessTools, repository: string, run_id: int, job_names: list<string>) -> dict {
+fn run_logs(
+  tools: HarnessTools,
+  token: string,
+  repository: string,
+  run_id: int,
+  job_names: list<string>,
+) -> dict {
   const archive = run(
     tools,
     [
@@ -133,6 +141,7 @@ fn run_logs(tools: HarnessTools, repository: string, run_id: int, job_names: lis
       "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/logs",
     ],
     {transport: "file", max_inline_bytes: 1},
+    {GH_TOKEN: token},
   )
   const archive_path = archive?.stdout_path
   if type_of(archive_path) != "string" || archive_path == "" {
@@ -141,11 +150,16 @@ fn run_logs(tools: HarnessTools, repository: string, run_id: int, job_names: lis
   return logs_from_archive(tools, archive_path, run_id, job_names)
 }
 
-/** Build the production GitHub evidence adapter from the caller's command tools. */
-pub fn live_source(tools: HarnessTools) -> EvidenceSource {
+/** Build the production GitHub evidence adapter from command tools and an Actions token. */
+pub fn live_source(tools: HarnessTools, token: string) -> EvidenceSource {
   return {
-    json: fn(endpoint) { return gh_json(tools, endpoint) },
-    logs:
-      fn(repository, run_id, job_names) { return run_logs(tools, repository, run_id, job_names) },
+    json: fn(endpoint) { return gh_json(tools, token, endpoint) },
+    logs: fn(repository, run_id, job_names) { return run_logs(
+      tools,
+      token,
+      repository,
+      run_id,
+      job_names,
+    ) },
   }
 }
