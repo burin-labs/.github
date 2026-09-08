@@ -27,6 +27,7 @@ jobs:
         run: |
           harn package check .
           harn test scripts/local-checks
+          harn test scripts/ci-runtime-evidence
           bash .github/actions/local-workflow-checks/run_test.sh
 
   package-smoke:
@@ -114,7 +115,6 @@ jobs:
           ruby .github/actions/local-workflow-checks/run_contract_test.rb
           ruby .github/actions/require-successful-needs/require-successful-needs_test.rb
           ruby .github/actions/check-dependabot-config/check_dependabot_config_test.rb
-          ruby .github/actions/ci-runtime-evidence/collect_test.rb
           ruby .github/actions/ci-latency-policy/ci_latency_baseline_test.rb
           ruby .github/actions/ci-latency-policy/check_ci_latency_policy_test.rb
           ruby .github/actions/check-commit-signatures/check_commit_signatures_test.rb
@@ -146,6 +146,7 @@ jobs:
           bash -n .github/actions/harn-package/run-contract.sh
           bash -n .github/actions/local-workflow-checks/run.sh
           bash -n .github/actions/local-workflow-checks/run_test.sh
+          bash -n .github/actions/ci-runtime-evidence/run.sh
           bash -n .github/actions/pr-title-check/check.sh
           bash -n .github/actions/exact-tree-ci-proof/gate.sh
           bash -n .github/actions/exact-tree-ci-proof/workflow-proof.sh

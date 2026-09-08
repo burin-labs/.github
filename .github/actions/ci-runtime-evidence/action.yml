@@ -2,6 +2,14 @@ name: Collect CI runtime evidence
 description: Collect complete job timing, runner, and cache evidence from GitHub Actions history.
 
 inputs:
+  harn-version:
+    description: Exact Harn release with or without a leading v. Defaults to harn-version-file.
+    required: false
+    default: ""
+  harn-version-file:
+    description: Repository-relative file containing the exact Harn version.
+    required: false
+    default: .harn-version
   github-token:
     description: Token with Actions read access to the measured repository.
     required: true
@@ -30,6 +38,12 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Set up exact Harn release
+      uses: burin-labs/harn/.github/actions/setup-harn@bd78be56d71af872affe677d482408565b87b391 # v0.10.133
+      with:
+        version: ${{ inputs.harn-version }}
+        version-file: ${{ inputs.harn-version-file }}
+
     - name: Collect complete runtime evidence
       id: collect
       shell: bash
@@ -40,9 +54,4 @@ runs:
         CI_RUNTIME_QUERIES_JSON: ${{ inputs.queries-json }}
         CI_RUNTIME_OUTPUT: ${{ inputs.output }}
       run: |
-        set -euo pipefail
-        mkdir -p "$(dirname "${CI_RUNTIME_OUTPUT}")"
-        ruby "${GITHUB_ACTION_PATH}/collect.rb"
-        measured="$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("measuredRuns")' "${CI_RUNTIME_OUTPUT}")"
-        printf 'report=%s\n' "${CI_RUNTIME_OUTPUT}" >> "${GITHUB_OUTPUT}"
-        printf 'measured-runs=%s\n' "${measured}" >> "${GITHUB_OUTPUT}"
+        bash "$GITHUB_ACTION_PATH/run.sh"

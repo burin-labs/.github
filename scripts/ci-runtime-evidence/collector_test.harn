@@ -1,0 +1,278 @@
+import { read_yaml } from "std/fs"
+import { assert_error_contains } from "std/testing"
+import { collect, parse_cache_observations, parse_queries } from "./collector.harn"
+import { logs_from_archive } from "./live.harn"
+
+fn query(event: string, count: int, branch: string? = nil) -> dict {
+  return {event: event, count: count, branch: branch}
+}
+
+fn workflow_run(id: int, branch: string) -> dict {
+  return {
+    id: id,
+    head_branch: branch,
+    conclusion: "success",
+    created_at: "2026-09-08T10:00:00Z",
+    updated_at: "2026-09-08T10:02:00Z",
+    html_url: "https://example.test/runs/" + to_string(id),
+  }
+}
+
+fn job(id: int, name: string, labels: list<string>, runner_name: string) -> dict {
+  return {
+    id: id,
+    name: name,
+    conclusion: "success",
+    created_at: "2026-09-08T10:00:05Z",
+    started_at: "2026-09-08T10:00:08Z",
+    completed_at: "2026-09-08T10:01:08Z",
+    runner_name: runner_name,
+    labels: labels,
+    steps: [
+      {
+        name: "Restore cache",
+        conclusion: "success",
+        started_at: "2026-09-08T10:00:10Z",
+        completed_at: "2026-09-08T10:00:14Z",
+      },
+    ],
+  }
+}
+
+fn fixture_source(overrides: dict = {}) {
+  const pull_runs =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100"
+  const push_runs =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=push&status=completed&per_page=100&branch=main"
+  const pull_jobs = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const push_jobs = "/repos/acme/widgets/actions/runs/20/jobs?per_page=100&page=1"
+  const responses = {
+    [pull_runs]: {workflow_runs: [workflow_run(10, "feature")]},
+    [push_runs]: {workflow_runs: [workflow_run(20, "main")]},
+    [pull_jobs]: {total_count: 1, jobs: [job(101, "test", ["ubuntu-latest"], "GitHub Actions 1")]},
+    [push_jobs]: {total_count: 1, jobs: [job(201, "build", ["self-hosted"], "worker-1")]},
+  }
+    + (overrides?.responses ?? {})
+  const logs = {
+    "10": {
+      test: "Cache hit for: node-cache-Linux-key\nCache restored from key: node-cache-Linux-key\n",
+    },
+    "20": {build: "Cache not found for input keys: rust-target-key\n"},
+  }
+    + (overrides?.logs ?? {})
+  return {
+    json: fn(endpoint) {
+      const response = responses?.[endpoint]
+      if response == nil {
+        throw "unexpected fixture endpoint " + endpoint
+      }
+      return response
+    },
+    logs: fn(_repository, run_id, _job_names) { return logs[to_string(run_id)] ?? {} },
+  }
+}
+
+pipeline test_collects_queue_runner_step_and_cache_evidence() {
+  const report = collect(
+    fixture_source(),
+    "acme/widgets",
+    "ci.yml",
+    [query("pull_request", 1), query("push", 1, "main")],
+    "2026-09-08T11:00:00Z",
+  )
+  assert_eq(report.requestedRuns, 2)
+  assert_eq(report.measuredRuns, 2)
+  const by_id = {
+    "10": report.runs.filter(fn(run) { run.id == 10 })[0],
+    "20": report.runs.filter(fn(run) { run.id == 20 })[0],
+  }
+  assert_eq(by_id["10"].jobs[0].queueMs, 3000)
+  assert_eq(by_id["10"].jobs[0].wallMs, 60000)
+  assert_eq(by_id["10"].jobs[0].steps[0].wallMs, 4000)
+  assert_eq(by_id["10"].jobs[0].runnerClass, "github-hosted")
+  assert_eq(by_id["20"].jobs[0].runnerClass, "self-hosted")
+  assert_eq(by_id["10"].cache[0].outcome, "hit")
+  assert_eq(by_id["20"].cache[0].outcome, "miss")
+}
+
+pipeline test_query_contract_rejects_empty_invalid_and_oversized_input() {
+  assert_error_contains(fn() { parse_queries("[]") }, "non-empty JSON list")
+  assert_error_contains(fn() { parse_queries("not json") }, "invalid JSON")
+  assert_error_contains(fn() { parse_queries("[{\"event\":\"push\",\"count\":101}]") }, "1 to 100")
+}
+
+pipeline test_short_and_overlapping_censuses_fail_closed() {
+  assert_error_contains(
+    fn() { collect(fixture_source(), "acme/widgets", "ci.yml", [query("pull_request", 2)], "now") },
+    "measured 1 of 2",
+  )
+  assert_error_contains(
+    fn() { collect(
+      fixture_source(),
+      "acme/widgets",
+      "ci.yml",
+      [query("pull_request", 1), query("pull_request", 1)],
+      "now",
+    ) },
+    "only 1 unique ids",
+  )
+}
+
+pipeline test_job_pagination_must_reach_exact_reported_total() {
+  const first = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const second = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=2"
+  const source = fixture_source(
+    {
+      responses: {
+        [first]: {total_count: 2, jobs: [job(101, "test", ["ubuntu-latest"], "GitHub Actions 1")]},
+        [second]: {
+          total_count: 2,
+          jobs: [job(102, "package", ["ubuntu-latest"], "GitHub Actions 2")],
+        },
+      },
+    },
+  )
+  const report = collect(source, "acme/widgets", "ci.yml", [query("pull_request", 1)], "now")
+  assert_eq(report.runs[0].jobs.map(fn(row) { row.name }), ["test", "package"])
+  const partial = fixture_source(
+    {
+      responses: {
+        [first]: {total_count: 2, jobs: [job(101, "test", ["ubuntu-latest"], "GitHub Actions 1")]},
+        [second]: {total_count: 2, jobs: []},
+      },
+    },
+  )
+  assert_error_contains(
+    fn() { collect(partial, "acme/widgets", "ci.yml", [query("pull_request", 1)], "now") },
+    "empty before 2 rows",
+  )
+}
+
+pipeline test_zero_jobs_is_a_measured_empty_result() {
+  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const report = collect(
+    fixture_source({responses: {[endpoint]: {total_count: 0, jobs: []}}}),
+    "acme/widgets",
+    "ci.yml",
+    [query("pull_request", 1)],
+    "now",
+  )
+  assert_eq(report.runs[0].jobs, [])
+  assert_eq(report.runs[0].cache, [])
+}
+
+pipeline test_duplicate_job_ids_and_malformed_timestamps_fail() {
+  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const duplicate = fixture_source(
+    {
+      responses: {
+        [endpoint]: {
+          total_count: 2,
+          jobs: [
+            job(101, "test", ["ubuntu-latest"], "GitHub Actions 1"),
+            job(101, "package", ["ubuntu-latest"], "GitHub Actions 2"),
+          ],
+        },
+      },
+    },
+  )
+  assert_error_contains(
+    fn() { collect(duplicate, "acme/widgets", "ci.yml", [query("pull_request", 1)], "now") },
+    "jobs require unique ids",
+  )
+  const runs =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100"
+  const invalid = workflow_run(10, "feature") + {created_at: "yesterday"}
+  assert_error_contains(
+    fn() { collect(
+      fixture_source({responses: {[runs]: {workflow_runs: [invalid]}}}),
+      "acme/widgets",
+      "ci.yml",
+      [query("pull_request", 1)],
+      "now",
+    ) },
+    "ISO-8601 timestamp",
+  )
+}
+
+pipeline test_skipped_jobs_ignore_github_inverted_execution_timestamps() {
+  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const skipped = job(101, "conditional", ["ubuntu-latest"], "")
+    + {
+      conclusion: "skipped",
+      started_at: "2026-09-08T10:00:08Z",
+      completed_at: "2026-09-08T10:00:07Z",
+    }
+  const report = collect(
+    fixture_source({responses: {[endpoint]: {total_count: 1, jobs: [skipped]}}}),
+    "acme/widgets",
+    "ci.yml",
+    [query("pull_request", 1)],
+    "now",
+  )
+  assert_eq(report.runs[0].jobs[0].wallMs, nil)
+  assert_eq(report.runs[0].jobs[0].queueMs, nil)
+}
+
+pipeline test_executed_job_inverted_timestamps_fail() {
+  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const inverted = job(101, "test", ["ubuntu-latest"], "GitHub Actions 1")
+    + {completed_at: "2026-09-08T10:00:07Z"}
+  assert_error_contains(
+    fn() { collect(
+      fixture_source({responses: {[endpoint]: {total_count: 1, jobs: [inverted]}}}),
+      "acme/widgets",
+      "ci.yml",
+      [query("pull_request", 1)],
+      "now",
+    ) },
+    "completed_at precedes started_at",
+  )
+}
+
+pipeline test_conflicting_cache_outcomes_fail() {
+  assert_error_contains(
+    fn() { parse_cache_observations(
+      {test: "Cache hit for: shared-key\nCache not found for input keys: shared-key\n"},
+      10,
+      ["test"],
+    ) },
+    "reported both hit and miss",
+  )
+}
+
+pipeline test_reads_complete_job_logs_from_github_archive_names(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("ci-runtime-evidence-")
+  const archive = directory + "/logs.zip"
+  const marker = "Cache hit for: build-Linux-key\n"
+  harness.fs.write_bytes(
+    archive,
+    zip_create(
+      [
+        {path: "7_build _ linux.txt", content: "x".repeat(10000050) + "\n" + marker},
+        {path: "build _ linux/1_step.txt", content: "step details must not replace the summary"},
+      ],
+    ),
+  )
+  const logs = logs_from_archive(harness.tools, archive, 10, ["build / linux", "not executed"])
+  assert_eq(len(logs["build / linux"]), 10000051 + len(marker))
+  assert(logs["build / linux"].ends_with(marker))
+  assert_eq(logs["not executed"], "")
+}
+
+pipeline test_action_passes_token_only_through_environment(harness: Harness) {
+  const action = read_yaml(harness.fs, "../../.github/actions/ci-runtime-evidence/action.yml", nil)
+  const setup = action.runs.steps[0]
+  const collect_step = action.runs.steps[1]
+  assert_eq(
+    setup.uses,
+    "burin-labs/harn/.github/actions/setup-harn@bd78be56d71af872affe677d482408565b87b391",
+  )
+  assert_eq(collect_step.env.GH_TOKEN, "$" + "{{ inputs.github-token }}")
+  assert(!collect_step.run.contains("github-token"))
+  assert(collect_step.run.contains("run.sh"))
+  assert(!collect_step.run.contains("ruby"))
+  const bootstrap = harness.fs.read_text("../../.github/actions/ci-runtime-evidence/run.sh")
+  assert(!bootstrap.contains("github-token"))
+  assert(bootstrap.contains("harn run"))
+}

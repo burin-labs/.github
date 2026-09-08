@@ -1,0 +1,374 @@
+const SCHEMA_VERSION = 1
+
+const MAX_QUERY_COUNT = 100
+
+const MAX_CONCURRENCY = 8
+
+/** External evidence reads required by the deterministic collector. */
+pub type EvidenceSource = {json: fn(string) -> unknown, logs: fn(string, int, list<string>) -> dict}
+
+fn mapping(raw: unknown, message: string) -> dict {
+  return match type_of(raw) {
+    "dict" -> { raw }
+    _ -> {
+      throw message
+    }
+  }
+}
+
+fn list_value(raw: unknown, message: string) -> list {
+  return match type_of(raw) {
+    "list" -> { raw }
+    _ -> {
+      throw message
+    }
+  }
+}
+
+fn required_text(value: unknown, field: string) -> string {
+  if type_of(value) != "string" || trim(value) == "" {
+    throw field + " must be a non-empty string"
+  }
+  return value
+}
+
+fn positive_integer(value: unknown, field: string) -> int {
+  if type_of(value) != "int" || value <= 0 {
+    throw field + " must be a positive integer"
+  }
+  return value
+}
+
+fn timestamp(value: unknown, field: string) {
+  const text = required_text(value, field)
+  try {
+    return date_parse(text)
+  } catch (_error) {
+    throw field + " must be an ISO-8601 timestamp"
+  }
+}
+
+fn optional_timestamp(value: unknown, field: string) {
+  return value == nil ? nil : timestamp(value, field)
+}
+
+fn milliseconds(started: any, completed: any) -> int {
+  return to_int(round((completed - started) * 1000))
+}
+
+/** Decode and validate the bounded workflow-run queries accepted by the action. */
+pub fn parse_queries(raw: string) -> list<dict> {
+  let decoded = nil
+  try {
+    decoded = json_parse(raw)
+  } catch (error) {
+    throw "queries-json is invalid JSON: " + to_string(error)
+  }
+  if type_of(decoded) != "list" || len(decoded) == 0 {
+    throw "queries-json must be a non-empty JSON list"
+  }
+  let queries: list<dict> = []
+  let index = 0
+  for raw_query in decoded {
+    index = index + 1
+    const row = mapping(raw_query, "query " + to_string(index) + " must be an object")
+    const event = required_text(row?.event, "query " + to_string(index) + " event")
+    const count = row?.count
+    if type_of(count) != "int" || count < 1 || count > MAX_QUERY_COUNT {
+      throw "query " + to_string(index) + " count must be an integer from 1 to 100"
+    }
+    const branch = row?.branch
+    if branch != nil && (type_of(branch) != "string" || trim(branch) == "") {
+      throw "query " + to_string(index) + " branch must be a non-empty string"
+    }
+    queries = queries + [{event: event, count: count, branch: branch}]
+  }
+  return queries
+}
+
+fn query_label(query: dict) -> string {
+  const branch = query?.branch == nil ? "" : " branch=" + query.branch
+  return "event=" + query.event + branch
+}
+
+fn runs_for_query(
+  source: EvidenceSource,
+  repository: string,
+  workflow: string,
+  query: dict,
+) -> list {
+  let endpoint = "/repos/" + repository + "/actions/workflows/" + url_encode(workflow)
+    + "/runs?event="
+    + url_encode(query.event)
+    + "&status=completed&per_page=100"
+  if query?.branch != nil {
+    endpoint = endpoint + "&branch=" + url_encode(query.branch)
+  }
+  const response = source.json(endpoint)
+  const runs = response?.workflow_runs
+  if type_of(runs) != "list" {
+    throw query_label(query) + " response omitted workflow_runs"
+  }
+  if len(runs) < query.count {
+    throw query_label(query) + " measured " + to_string(len(runs)) + " of "
+      + to_string(query.count)
+      + " requested runs"
+  }
+  let selected = []
+  for run in runs[0:query.count] {
+    if type_of(run) != "dict" {
+      throw query_label(query) + " contains a non-object run"
+    }
+    selected = selected + [{query: query, run: run}]
+  }
+  return selected
+}
+
+fn all_jobs(source: EvidenceSource, repository: string, run_id: int) -> list {
+  let jobs = []
+  let page = 1
+  let total = nil
+  while true {
+    const endpoint = "/repos/" + repository + "/actions/runs/" + to_string(run_id)
+      + "/jobs?per_page=100&page="
+      + to_string(page)
+    const response = source.json(endpoint)
+    const rows = response?.jobs
+    const count = response?.total_count
+    if type_of(rows) != "list" {
+      throw "run " + to_string(run_id) + " jobs page " + to_string(page) + " omitted jobs"
+    }
+    if type_of(count) != "int" || count < 0 {
+      throw "run " + to_string(run_id) + " jobs page " + to_string(page)
+        + " omitted total_count"
+    }
+    if total == nil {
+      total = count
+    } else if count != total {
+      throw "run " + to_string(run_id) + " job total changed from " + to_string(total)
+        + " to "
+        + to_string(count)
+        + " during pagination"
+    }
+    jobs = jobs + rows
+    if len(jobs) >= to_int(total) {
+      break
+    }
+    if len(rows) == 0 {
+      throw "run " + to_string(run_id) + " jobs page " + to_string(page)
+        + " was empty before "
+        + to_string(total)
+        + " rows"
+    }
+    page = page + 1
+  }
+  if len(jobs) != total {
+    throw "run " + to_string(run_id) + " measured " + to_string(len(jobs)) + " of "
+      + to_string(total)
+      + " reported jobs"
+  }
+  let ids = []
+  for job in jobs {
+    if type_of(job) != "dict" || job?.id == nil {
+      throw "run " + to_string(run_id) + " jobs require unique ids"
+    }
+    ids = ids + [job.id]
+  }
+  if len(ids.unique()) != len(ids) {
+    throw "run " + to_string(run_id) + " jobs require unique ids"
+  }
+  return jobs
+}
+
+fn runner_class(raw: dict) -> string {
+  const labels = type_of(raw?.labels) == "list" ? raw.labels.map(
+    fn(label) { to_string(label) },
+  ) : []
+  const runner_name = to_string(raw?.runner_name ?? "")
+  if starts_with(runner_name, "blacksmith-")
+    || labels.any(fn(label) { starts_with(label, "blacksmith-") }) {
+    return "blacksmith"
+  }
+  if labels.includes("self-hosted") {
+    return "self-hosted"
+  }
+  if starts_with(runner_name, "GitHub Actions ")
+    || labels.any(fn(label) { ends_with(label, "-latest") }) {
+    return "github-hosted"
+  }
+  if runner_name == "" && len(labels) == 0 {
+    return "unassigned"
+  }
+  return "other"
+}
+
+fn normalize_steps(job_id: int, raw_steps: unknown) -> list {
+  const rows = list_value(raw_steps, "job " + to_string(job_id) + " omitted steps")
+  let steps = []
+  for raw in rows {
+    const row = mapping(raw, "job " + to_string(job_id) + " contains a non-object step")
+    let started = optional_timestamp(
+      row?.started_at,
+      "job " + to_string(job_id) + " step started_at",
+    )
+    let completed = optional_timestamp(
+      row?.completed_at,
+      "job " + to_string(job_id) + " step completed_at",
+    )
+    if row?.conclusion == "skipped" {
+      started = nil
+      completed = nil
+    }
+    if started != nil && completed != nil && completed < started {
+      throw "job " + to_string(job_id) + " step completed_at precedes started_at"
+    }
+    steps = steps
+      + [
+        {
+          name: required_text(row?.name, "job " + to_string(job_id) + " step name"),
+          conclusion: row?.conclusion,
+          wallMs: started != nil && completed != nil ? milliseconds(started, completed) : nil,
+        },
+      ]
+  }
+  return steps
+}
+
+fn normalize_job(run_id: int, raw: unknown) -> dict {
+  const row = mapping(raw, "run " + to_string(run_id) + " contains a non-object job")
+  const id = positive_integer(row?.id, "run " + to_string(run_id) + " job id")
+  const created = optional_timestamp(row?.created_at, "job " + to_string(id) + " created_at")
+  let started = optional_timestamp(row?.started_at, "job " + to_string(id) + " started_at")
+  let completed = optional_timestamp(row?.completed_at, "job " + to_string(id) + " completed_at")
+  if row?.conclusion == "skipped" {
+    started = nil
+    completed = nil
+  }
+  if started != nil && completed != nil && completed < started {
+    throw "job " + to_string(id) + " completed_at precedes started_at"
+  }
+  if created != nil && started != nil && started < created {
+    throw "job " + to_string(id) + " started_at precedes created_at"
+  }
+  return {
+    id: id,
+    name: required_text(row?.name, "job " + to_string(id) + " name"),
+    conclusion: row?.conclusion,
+    wallMs: started != nil && completed != nil ? milliseconds(started, completed) : nil,
+    queueMs: created != nil && started != nil ? milliseconds(created, started) : nil,
+    runnerClass: runner_class(row),
+    steps: normalize_steps(id, row?.steps),
+  }
+}
+
+fn cache_match(message: string) -> dict? {
+  for candidate in [
+    {pattern: "(?i)Cache restored from key:\\s*(\\S+)", outcome: "hit"},
+    {pattern: "(?i)Cache hit for:\\s*(\\S+)", outcome: "hit"},
+    {pattern: "(?i)Cache not found for input keys:\\s*([^ ,]+)", outcome: "miss"},
+  ] {
+    const matches = regex_captures(candidate.pattern, message) ?? []
+    if len(matches) > 0 && len(matches[0]?.groups ?? []) > 0 {
+      return {key: regex_replace("[,:]$", "", matches[0].groups[0]), outcome: candidate.outcome}
+    }
+  }
+  return nil
+}
+
+/** Extract one stable cache observation per job and key from complete GitHub logs. */
+pub fn parse_cache_observations(logs: dict, run_id: int, job_names: list<string>) -> list {
+  let observations = {}
+  for job in job_names {
+    for message in to_string(logs[job] ?? "").split("\n") {
+      const found = cache_match(trim(message))
+      if found == nil {
+        continue
+      }
+      const identity = job + "\\u0000" + found.key
+      const existing = observations[identity]
+      if existing != nil && existing.outcome != found.outcome {
+        throw "cache " + found.key + " in " + job + " reported both hit and miss"
+      }
+      observations = observations
+        + {
+          [identity]: {
+            job: job,
+            key: found.key,
+            outcome: found.outcome,
+            source: "github-actions-log",
+          },
+        }
+    }
+  }
+  return keys(observations).map(fn(key) { observations[key] }).sorted_by(
+    fn(row) { [row.job, row.key, row.outcome] },
+  )
+}
+
+fn normalize_run(source: EvidenceSource, repository: string, entry: dict) -> dict {
+  const raw = entry.run
+  const run_id = positive_integer(raw?.id, "run id")
+  const created = timestamp(raw?.created_at, "run " + to_string(run_id) + " created_at")
+  const updated = timestamp(raw?.updated_at, "run " + to_string(run_id) + " updated_at")
+  if updated < created {
+    throw "run " + to_string(run_id) + " updated_at precedes created_at"
+  }
+  const jobs = all_jobs(source, repository, run_id).map(fn(job) { normalize_job(run_id, job) })
+  let cache = []
+  if len(jobs) > 0 {
+    const names = jobs.map(fn(job) { job.name })
+    cache = parse_cache_observations(source.logs(repository, run_id, names), run_id, names)
+  }
+  return {
+    id: run_id,
+    event: entry.query.event,
+    branch: raw?.head_branch,
+    conclusion: required_text(raw?.conclusion, "run " + to_string(run_id) + " conclusion"),
+    createdAt: raw.created_at,
+    wallMs: milliseconds(created, updated),
+    url: required_text(raw?.html_url, "run " + to_string(run_id) + " html_url"),
+    jobs: jobs,
+    cache: cache,
+  }
+}
+
+/** Collect an exact, versioned runtime census or fail when any requested evidence is incomplete. */
+pub fn collect(
+  source: EvidenceSource,
+  repository_value: unknown,
+  workflow_value: unknown,
+  queries: list<dict>,
+  generated_at: string,
+) -> dict {
+  const repository = required_text(repository_value, "repository")
+  const workflow = required_text(workflow_value, "workflow")
+  let selected = []
+  for query in queries {
+    selected = selected + runs_for_query(source, repository, workflow, query)
+  }
+  const ids = selected.map(fn(entry) { entry.run.id })
+  if len(ids.unique()) != len(ids) {
+    throw "run queries overlap: measured " + to_string(len(ids)) + " rows but only "
+      + to_string(len(ids.unique()))
+      + " unique ids"
+  }
+  const details = parallel each selected with { max_concurrent: MAX_CONCURRENCY } { entry ->
+    normalize_run(source, repository, entry)
+  }
+  const ordered = details.sorted_by(fn(run) { [run.createdAt, run.id] }).reversed()
+  const expected = queries.map(fn(query) { query.count }).sum()
+  if len(ordered) != expected {
+    throw "runtime census measured " + to_string(len(ordered)) + " of " + to_string(expected)
+      + " requested runs"
+  }
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    generatedAt: generated_at,
+    repository: repository,
+    workflow: workflow,
+    requestedRuns: expected,
+    measuredRuns: len(ordered),
+    queries: queries,
+    runs: ordered,
+  }
+}

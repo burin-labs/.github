@@ -382,6 +382,7 @@ Run it from a scheduled workflow and pin the action to an exact commit:
 - id: runtime-evidence
   uses: burin-labs/.github/.github/actions/ci-runtime-evidence@<full-commit-sha>
   with:
+    harn-version: 0.10.133
     github-token: ${{ secrets.ACTIONS_READ_TOKEN }}
     repository: owner/repository
     workflow: ci.yml
@@ -392,10 +393,11 @@ Run it from a scheduled workflow and pin the action to an exact commit:
 ```
 
 The token needs Actions read access to the measured repository. The action
-requires Ruby and `unzip`, downloads each run's GitHub-generated log archive
+requires Harn and `unzip`, downloads each run's GitHub-generated log archive
 once, and fails when run or job evidence is short, partial, duplicated, or
 internally inconsistent. A skipped job remains a measured job with null
-execution timing.
+execution timing. Omit `harn-version` when the calling repository keeps its
+exact release in `.harn-version`.
 
 Package repositories should keep the exact release in `.harn-version`.
 Their complete CI adapter delegates package verification and rolls every
