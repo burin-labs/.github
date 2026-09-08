@@ -12,6 +12,7 @@ fn workflow_run(id: int, branch: string) -> dict {
     id: id,
     head_branch: branch,
     conclusion: "success",
+    run_attempt: 1,
     created_at: "2026-09-08T10:00:00Z",
     updated_at: "2026-09-08T10:02:00Z",
     html_url: "https://example.test/runs/" + to_string(id),
@@ -44,8 +45,8 @@ fn fixture_source(overrides: dict = {}) {
     "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100"
   const push_runs =
     "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=push&status=completed&per_page=100&branch=main"
-  const pull_jobs = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
-  const push_jobs = "/repos/acme/widgets/actions/runs/20/jobs?per_page=100&page=1"
+  const pull_jobs = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
+  const push_jobs = "/repos/acme/widgets/actions/runs/20/attempts/1/jobs?per_page=100&page=1"
   const responses = {
     [pull_runs]: {workflow_runs: [workflow_run(10, "feature")]},
     [push_runs]: {workflow_runs: [workflow_run(20, "main")]},
@@ -68,7 +69,7 @@ fn fixture_source(overrides: dict = {}) {
       }
       return response
     },
-    logs: fn(_repository, run_id, _job_names) { return logs[to_string(run_id)] ?? {} },
+    logs: fn(_repository, run_id, _attempt, _job_names) { return logs[to_string(run_id)] ?? {} },
   }
 }
 
@@ -119,8 +120,8 @@ pipeline test_short_and_overlapping_censuses_fail_closed() {
 }
 
 pipeline test_job_pagination_must_reach_exact_reported_total() {
-  const first = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
-  const second = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=2"
+  const first = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
+  const second = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=2"
   const source = fixture_source(
     {
       responses: {
@@ -149,7 +150,7 @@ pipeline test_job_pagination_must_reach_exact_reported_total() {
 }
 
 pipeline test_zero_jobs_fails_closed() {
-  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const endpoint = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
   assert_error_contains(
     fn() { collect(
       fixture_source({responses: {[endpoint]: {total_count: 0, jobs: []}}}),
@@ -163,7 +164,7 @@ pipeline test_zero_jobs_fails_closed() {
 }
 
 pipeline test_duplicate_job_ids_and_malformed_timestamps_fail() {
-  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const endpoint = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
   const duplicate = fixture_source(
     {
       responses: {
@@ -197,7 +198,7 @@ pipeline test_duplicate_job_ids_and_malformed_timestamps_fail() {
 }
 
 pipeline test_skipped_jobs_ignore_github_inverted_execution_timestamps() {
-  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const endpoint = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
   const skipped = job(101, "conditional", ["ubuntu-latest"], "")
     + {
       conclusion: "skipped",
@@ -216,7 +217,7 @@ pipeline test_skipped_jobs_ignore_github_inverted_execution_timestamps() {
 }
 
 pipeline test_rerun_reused_jobs_do_not_report_copied_timing() {
-  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const endpoint = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
   const reused = job(101, "already green", ["ubuntu-latest"], "GitHub Actions 1")
     + {
       created_at: "2026-09-08T11:00:00Z",
@@ -237,7 +238,7 @@ pipeline test_rerun_reused_jobs_do_not_report_copied_timing() {
 }
 
 pipeline test_cancelled_unassigned_jobs_do_not_report_clock_skew_as_execution() {
-  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const endpoint = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
   const cancelled = job(101, "never assigned", ["ubuntu-latest"], "")
     + {
       conclusion: "cancelled",
@@ -260,7 +261,7 @@ pipeline test_cancelled_unassigned_jobs_do_not_report_clock_skew_as_execution() 
 }
 
 pipeline test_executed_job_inverted_timestamps_fail() {
-  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const endpoint = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
   const inverted = job(101, "test", ["ubuntu-latest"], "GitHub Actions 1")
     + {completed_at: "2026-09-08T10:00:07Z"}
   assert_error_contains(

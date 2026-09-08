@@ -150,6 +150,7 @@ fn run_logs(
   token: string,
   repository: string,
   run_id: int,
+  attempt: int,
   job_names: list<string>,
 ) -> dict {
   const directory = fs.mkdtemp_in_workspace("ci-runtime-evidence-")
@@ -159,7 +160,9 @@ fn run_logs(
     command_run(tools, ["rmdir", "--", directory])
   }
   const download = net.download(
-    API_ROOT + "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/logs",
+    API_ROOT + "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/attempts/"
+      + to_string(attempt)
+      + "/logs",
     archive_path,
     request_options(token, MAX_LOG_ARCHIVE_BYTES),
   )
@@ -179,13 +182,14 @@ pub fn live_source(
 ) -> EvidenceSource {
   return {
     json: fn(endpoint) { return gh_json(net, token, endpoint) },
-    logs: fn(repository, run_id, job_names) { return run_logs(
+    logs: fn(repository, run_id, attempt, job_names) { return run_logs(
       net,
       tools,
       fs,
       token,
       repository,
       run_id,
+      attempt,
       job_names,
     ) },
   }

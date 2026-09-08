@@ -5,7 +5,10 @@ const MAX_QUERY_COUNT = 100
 const MAX_CONCURRENCY = 8
 
 /** External evidence reads required by the deterministic collector. */
-pub type EvidenceSource = {json: fn(string) -> unknown, logs: fn(string, int, list<string>) -> dict}
+pub type EvidenceSource = {
+  json: fn(string) -> unknown,
+  logs: fn(string, int, int, list<string>) -> dict,
+}
 
 fn mapping(raw: unknown, message: string) -> dict {
   return match type_of(raw) {
@@ -124,12 +127,14 @@ fn runs_for_query(
   return selected
 }
 
-fn all_jobs(source: EvidenceSource, repository: string, run_id: int) -> list {
+fn all_jobs(source: EvidenceSource, repository: string, run_id: int, attempt: int) -> list {
   let jobs = []
   let page = 1
   let total = nil
   while true {
     const endpoint = "/repos/" + repository + "/actions/runs/" + to_string(run_id)
+      + "/attempts/"
+      + to_string(attempt)
       + "/jobs?per_page=100&page="
       + to_string(page)
     const response = source.json(endpoint)
@@ -327,20 +332,24 @@ fn normalize_run(source: EvidenceSource, repository: string, entry: dict) -> dic
   const run_id = positive_integer(raw?.id, "run id")
   const created = timestamp(raw?.created_at, "run " + to_string(run_id) + " created_at")
   const updated = timestamp(raw?.updated_at, "run " + to_string(run_id) + " updated_at")
+  const attempt = positive_integer(raw?.run_attempt, "run " + to_string(run_id) + " attempt")
   if updated < created {
     throw "run " + to_string(run_id) + " updated_at precedes created_at"
   }
-  const jobs = all_jobs(source, repository, run_id).map(fn(job) { normalize_job(run_id, job) })
+  const jobs = all_jobs(source, repository, run_id, attempt).map(
+    fn(job) { normalize_job(run_id, job) },
+  )
   let cache = []
   if len(jobs) > 0 {
     const names = jobs.map(fn(job) { job.name })
-    cache = parse_cache_observations(source.logs(repository, run_id, names), run_id, names)
+    cache = parse_cache_observations(source.logs(repository, run_id, attempt, names), run_id, names)
   }
   return {
     id: run_id,
     event: entry.query.event,
     branch: raw?.head_branch,
     conclusion: required_text(raw?.conclusion, "run " + to_string(run_id) + " conclusion"),
+    attempt: attempt,
     createdAt: raw.created_at,
     wallMs: milliseconds(created, updated),
     url: required_text(raw?.html_url, "run " + to_string(run_id) + " html_url"),
