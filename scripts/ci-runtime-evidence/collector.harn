@@ -99,6 +99,7 @@ fn runs_for_query(
   repository: string,
   workflow: string,
   query: dict,
+  page: int,
 ) -> list {
   let endpoint = "/repos/" + repository + "/actions/workflows/" + url_encode(workflow)
     + "/runs?event="
@@ -107,18 +108,19 @@ fn runs_for_query(
   if query?.branch != nil {
     endpoint = endpoint + "&branch=" + url_encode(query.branch)
   }
+  endpoint = endpoint + "&page=" + to_string(page)
   const response = source.json(endpoint)
   const runs = response?.workflow_runs
   if type_of(runs) != "list" {
     throw query_label(query) + " response omitted workflow_runs"
   }
-  if len(runs) < query.count {
+  if page == 1 && len(runs) < query.count {
     throw query_label(query) + " measured " + to_string(len(runs)) + " of "
       + to_string(query.count)
       + " requested runs"
   }
   let selected = []
-  for run in runs[0:query.count] {
+  for run in runs {
     if type_of(run) != "dict" {
       throw query_label(query) + " contains a non-object run"
     }
@@ -149,9 +151,6 @@ fn all_jobs(source: EvidenceSource, repository: string, run_id: int, attempt: in
     }
     if total == nil {
       total = count
-      if total == 0 {
-        throw "run " + to_string(run_id) + " job census measured zero reported jobs"
-      }
     } else if count != total {
       throw "run " + to_string(run_id) + " job total changed from " + to_string(total)
         + " to "
@@ -186,6 +185,41 @@ fn all_jobs(source: EvidenceSource, repository: string, run_id: int, attempt: in
     throw "run " + to_string(run_id) + " jobs require unique ids"
   }
   return jobs
+}
+
+fn measured_runs_for_query(
+  source: EvidenceSource,
+  repository: string,
+  workflow: string,
+  query: dict,
+) -> list {
+  const first_page = runs_for_query(source, repository, workflow, query, 1)
+  const initial = first_page[0:query.count]
+  let measured = parallel each initial with { max_concurrent: MAX_CONCURRENCY } { entry ->
+    normalize_run(source, repository, entry)
+  }
+    .filter(fn(run) { len(run.jobs) > 0 })
+    .to_list()
+  let page = 2
+  while len(measured) < query.count {
+    const candidates = runs_for_query(source, repository, workflow, query, page)
+    if len(candidates) == 0 {
+      throw query_label(query) + " measured " + to_string(len(measured)) + " of "
+        + to_string(query.count)
+        + " requested runs with reported jobs"
+    }
+    for entry in candidates {
+      const run = normalize_run(source, repository, entry)
+      if len(run.jobs) > 0 {
+        measured = measured + [run]
+      }
+      if len(measured) == query.count {
+        break
+      }
+    }
+    page = page + 1
+  }
+  return measured
 }
 
 fn runner_class(raw: dict) -> string {
@@ -368,18 +402,15 @@ pub fn collect(
 ) -> dict {
   const repository = required_text(repository_value, "repository")
   const workflow = required_text(workflow_value, "workflow")
-  let selected = []
+  let details = []
   for query in queries {
-    selected = selected + runs_for_query(source, repository, workflow, query)
+    details = details + measured_runs_for_query(source, repository, workflow, query)
   }
-  const ids = selected.map(fn(entry) { entry.run.id })
+  const ids = details.map(fn(run) { run.id })
   if len(ids.unique()) != len(ids) {
     throw "run queries overlap: measured " + to_string(len(ids)) + " rows but only "
       + to_string(len(ids.unique()))
       + " unique ids"
-  }
-  const details = parallel each selected with { max_concurrent: MAX_CONCURRENCY } { entry ->
-    normalize_run(source, repository, entry)
   }
   const ordered = details.sorted_by(fn(run) { [run.createdAt, run.id] }).reversed()
   const expected = queries.map(fn(query) { query.count }).sum()

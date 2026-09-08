@@ -42,9 +42,9 @@ fn job(id: int, name: string, labels: list<string>, runner_name: string) -> dict
 
 fn fixture_source(overrides: dict = {}) {
   const pull_runs =
-    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100"
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=1"
   const push_runs =
-    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=push&status=completed&per_page=100&branch=main"
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=push&status=completed&per_page=100&branch=main&page=1"
   const pull_jobs = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
   const push_jobs = "/repos/acme/widgets/actions/runs/20/attempts/1/jobs?per_page=100&page=1"
   const responses = {
@@ -151,16 +151,51 @@ pipeline test_job_pagination_must_reach_exact_reported_total() {
 
 pipeline test_zero_jobs_fails_closed() {
   const endpoint = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
+  const second_page =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=2"
   assert_error_contains(
     fn() { collect(
-      fixture_source({responses: {[endpoint]: {total_count: 0, jobs: []}}}),
+      fixture_source(
+        {responses: {[endpoint]: {total_count: 0, jobs: []}, [second_page]: {workflow_runs: []}}},
+      ),
       "acme/widgets",
       "ci.yml",
       [query("pull_request", 1)],
       "now",
     ) },
-    "job census measured zero reported jobs",
+    "measured 0 of 1 requested runs with reported jobs",
   )
+}
+
+pipeline test_jobless_cancelled_run_is_replaced_by_the_next_completed_run() {
+  const first_page =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=1"
+  const second_page =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=2"
+  const jobless = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
+  const first_jobs = "/repos/acme/widgets/actions/runs/11/attempts/1/jobs?per_page=100&page=1"
+  const backfill_jobs = "/repos/acme/widgets/actions/runs/12/attempts/1/jobs?per_page=100&page=1"
+  const source = fixture_source(
+    {
+      responses: {
+        [first_page]: {workflow_runs: [workflow_run(10, "cancelled"), workflow_run(11, "feature")]},
+        [second_page]: {workflow_runs: [workflow_run(12, "older-feature")]},
+        [jobless]: {total_count: 0, jobs: []},
+        [first_jobs]: {
+          total_count: 1,
+          jobs: [job(111, "test", ["ubuntu-latest"], "GitHub Actions 1")],
+        },
+        [backfill_jobs]: {
+          total_count: 1,
+          jobs: [job(121, "test", ["ubuntu-latest"], "GitHub Actions 2")],
+        },
+      },
+      logs: {"11": {test: ""}, "12": {test: ""}},
+    },
+  )
+  const report = collect(source, "acme/widgets", "ci.yml", [query("pull_request", 2)], "now")
+  assert_eq(report.runs.map(fn(run) { run.id }).sorted(), [11, 12])
+  assert_eq(report.measuredRuns, 2)
 }
 
 pipeline test_duplicate_job_ids_and_malformed_timestamps_fail() {
@@ -183,7 +218,7 @@ pipeline test_duplicate_job_ids_and_malformed_timestamps_fail() {
     "jobs require unique ids",
   )
   const runs =
-    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100"
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=1"
   const invalid = workflow_run(10, "feature") + {created_at: "yesterday"}
   assert_error_contains(
     fn() { collect(
