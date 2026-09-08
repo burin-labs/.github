@@ -69,7 +69,10 @@ fn request_options(token: string) -> dict {
 }
 
 fn gh_json(net: HarnessNet, token: string, endpoint: string) -> unknown {
-  const response = net.get(API_ROOT + endpoint, request_options(token))
+  const response = net.get(
+    API_ROOT + endpoint,
+    request_options(token) + {max_response_bytes: 33554432},
+  )
   if !response.ok {
     throw "GitHub API request failed with HTTP " + to_string(response.status)
   }
