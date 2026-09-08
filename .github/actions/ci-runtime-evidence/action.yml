@@ -1,0 +1,57 @@
+name: Collect CI runtime evidence
+description: Collect complete job timing, runner, and cache evidence from GitHub Actions history.
+
+inputs:
+  harn-version:
+    description: Exact Harn release with or without a leading v. Defaults to harn-version-file.
+    required: false
+    default: ""
+  harn-version-file:
+    description: Repository-relative file containing the exact Harn version.
+    required: false
+    default: .harn-version
+  github-token:
+    description: Token with Actions read access to the measured repository.
+    required: true
+  repository:
+    description: Repository in owner/name form.
+    required: true
+  workflow:
+    description: Workflow file name or numeric workflow id.
+    required: true
+  queries-json:
+    description: Event quotas as JSON, with optional branch per query and at most 100 runs each.
+    required: true
+  output:
+    description: Path for the versioned JSON evidence record.
+    required: false
+    default: .harn/ci-runtime-evidence.json
+
+outputs:
+  report:
+    description: Path to the JSON evidence record.
+    value: ${{ steps.collect.outputs.report }}
+  measured-runs:
+    description: Number of complete workflow runs in the evidence record.
+    value: ${{ steps.collect.outputs.measured-runs }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up exact Harn release
+      uses: burin-labs/harn/.github/actions/setup-harn@bd78be56d71af872affe677d482408565b87b391 # v0.10.133
+      with:
+        version: ${{ inputs.harn-version }}
+        version-file: ${{ inputs.harn-version-file }}
+
+    - name: Collect complete runtime evidence
+      id: collect
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        CI_RUNTIME_REPOSITORY: ${{ inputs.repository }}
+        CI_RUNTIME_WORKFLOW: ${{ inputs.workflow }}
+        CI_RUNTIME_QUERIES_JSON: ${{ inputs.queries-json }}
+        CI_RUNTIME_OUTPUT: ${{ inputs.output }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/run.sh"

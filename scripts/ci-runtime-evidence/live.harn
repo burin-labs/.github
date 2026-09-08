@@ -1,0 +1,214 @@
+import { command_output_range, command_output_tail, command_run } from "std/command"
+import { EvidenceSource } from "./collector.harn"
+
+const API_VERSION = "2026-03-10"
+
+const API_ROOT = "https://api.github.com"
+
+const MAX_JSON_RESPONSE_BYTES = 33554432
+
+const MAX_LOG_ARCHIVE_BYTES = 1073741824
+
+fn diagnostic(tools: HarnessTools, result: dict) -> string {
+  const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
+  const lines = trim(stderr).split("\n")
+  const tail = lines[max(0, len(lines) - 3):len(lines)]
+  const text = trim(join(tail, " "))
+  return text == "" ? "no diagnostic" : text
+}
+
+fn run(
+  tools: HarnessTools,
+  argv: list<string>,
+  capture: dict = {max_inline_bytes: 10000000},
+) -> dict {
+  const result = command_run(tools, argv, {capture: capture, timeout_ms: 120000})
+  if !result.success {
+    throw "command failed: " + diagnostic(tools, result)
+  }
+  return result
+}
+
+fn complete_stdout(tools: HarnessTools, result: dict) -> string {
+  let offset = 0
+  let output = ""
+  while true {
+    const page = command_output_range(
+      tools,
+      result,
+      {source: "stdout", offset: offset, length: 1048576},
+    )
+    if page.offset != offset {
+      throw "command output reader returned an unexpected offset"
+    }
+    if page.bytes_read == 0 && !page.eof {
+      throw "command output reader made no progress before EOF"
+    }
+    output = output + page.content
+    offset = offset + page.bytes_read
+    if page.eof {
+      if offset != page.total_bytes {
+        throw "command output reader reached EOF after " + to_string(offset) + " of "
+          + to_string(page.total_bytes)
+          + " bytes"
+      }
+      return output
+    }
+  }
+}
+
+fn request_options(token: string, max_response_bytes: int) -> dict {
+  return {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: "Bearer " + token,
+      "X-GitHub-Api-Version": API_VERSION,
+      "User-Agent": "burin-labs-ci-runtime-evidence",
+    },
+    timeout_ms: 120000,
+    retry: {max: 3, backoff_ms: 1000},
+    follow_redirects: true,
+    max_redirects: 5,
+    max_response_bytes: max_response_bytes,
+  }
+}
+
+fn gh_json(net: HarnessNet, token: string, endpoint: string) -> unknown {
+  let last_error = "no response"
+  for attempt in [1, 2, 3] {
+    const outcome = try {
+      net.get(API_ROOT + endpoint, request_options(token, MAX_JSON_RESPONSE_BYTES))
+    }
+    if !is_ok(outcome) {
+      last_error = to_string(unwrap_err(outcome))
+      continue
+    }
+    const response = unwrap(outcome)
+    if !response.ok {
+      last_error = "HTTP " + to_string(response.status)
+      continue
+    }
+    try {
+      return json_parse(response.body)
+    } catch (error) {
+      last_error = "invalid JSON: " + to_string(error)
+    }
+  }
+  throw "GitHub API request " + endpoint + " failed after 3 attempts: " + last_error
+}
+
+fn archive_job_name(job: string) -> string {
+  return job.replace(" / ", " _ ")
+}
+
+/** Read each requested job's complete top-level summary from a GitHub log archive. */
+pub fn logs_from_archive(
+  tools: HarnessTools,
+  archive_path: string,
+  run_id: int,
+  job_names: list<string>,
+) -> dict {
+  let archive_names = {}
+  for job in job_names {
+    const name = archive_job_name(job)
+    if archive_names[name] != nil {
+      throw "run " + to_string(run_id) + " job names collapse to the same log archive name"
+    }
+    archive_names = archive_names + {[name]: job}
+  }
+  const listing = run(
+    tools,
+    ["unzip", "-Z1", archive_path],
+    {transport: "file", max_inline_bytes: 1},
+  )
+  const entries = complete_stdout(tools, listing).split("\n").filter(fn(entry) { entry != "" })
+  const unsafe = entries.filter(
+    fn(entry) { return starts_with(entry, "/") || entry.split("/").includes("..") },
+  )
+  if len(unsafe) > 0 {
+    throw "run " + to_string(run_id) + " log archive contains an unsafe path"
+  }
+  const top_level = entries.filter(fn(entry) { !contains(entry, "/") })
+  if len(top_level) == 0 {
+    throw "run " + to_string(run_id) + " log archive contains no job summaries"
+  }
+  let logs = {}
+  for job in job_names {
+    logs = logs + {[job]: ""}
+  }
+  for entry in top_level {
+    const captures = regex_captures("^[0-9]+_(.*)\\.txt$", entry) ?? []
+    if len(captures) == 0 || len(captures[0]?.groups ?? []) == 0 {
+      continue
+    }
+    const job = archive_names[captures[0].groups[0]]
+    if job == nil {
+      continue
+    }
+    const extracted = run(
+      tools,
+      ["unzip", "-p", archive_path, entry],
+      {transport: "file", max_inline_bytes: 1},
+    )
+    logs = logs + {[job]: complete_stdout(tools, extracted)}
+  }
+  return logs
+}
+
+fn run_logs(
+  net: HarnessNet,
+  tools: HarnessTools,
+  fs: HarnessFs,
+  token: string,
+  repository: string,
+  run_id: int,
+  attempt: int,
+  job_names: list<string>,
+) -> dict {
+  const directory = fs.mkdtemp_in_workspace("ci-runtime-evidence-")
+  const archive_path = directory + "/logs.zip"
+  defer {
+    command_run(tools, ["rm", "-f", "--", archive_path])
+    command_run(tools, ["rmdir", "--", directory])
+  }
+  const endpoint = "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/attempts/"
+    + to_string(attempt)
+    + "/logs"
+  const download_outcome = try {
+    net.download(API_ROOT + endpoint, archive_path, request_options(token, MAX_LOG_ARCHIVE_BYTES))
+  }
+  if !is_ok(download_outcome) {
+    throw "run " + to_string(run_id) + " attempt " + to_string(attempt)
+      + " log download failed: "
+      + to_string(unwrap_err(download_outcome))
+  }
+  const download = unwrap(download_outcome)
+  if !download.ok || download.bytes_written <= 0 {
+    throw "run " + to_string(run_id) + " attempt " + to_string(attempt)
+      + " log download failed with HTTP "
+      + to_string(download.status)
+  }
+  return logs_from_archive(tools, archive_path, run_id, job_names)
+}
+
+/** Build the production GitHub evidence adapter from network, file, and command capabilities. */
+pub fn live_source(
+  net: HarnessNet,
+  tools: HarnessTools,
+  fs: HarnessFs,
+  token: string,
+) -> EvidenceSource {
+  return {
+    json: fn(endpoint) { return gh_json(net, token, endpoint) },
+    logs: fn(repository, run_id, attempt, job_names) { return run_logs(
+      net,
+      tools,
+      fs,
+      token,
+      repository,
+      run_id,
+      attempt,
+      job_names,
+    ) },
+  }
+}

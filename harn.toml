@@ -10,5 +10,6 @@ docs_url = "docs/local-workflow-checks.md"
 [exports]
 local_checks = "scripts/local-checks/lib.harn"
 local_checks_cli = "scripts/local-checks/cli.harn"
+ci_runtime_evidence = "scripts/ci-runtime-evidence/collector.harn"
 
 [dependencies]

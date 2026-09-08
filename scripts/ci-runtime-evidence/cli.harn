@@ -1,0 +1,30 @@
+import { write_json } from "std/fs"
+import { gha_write_output } from "std/gha"
+import { collect, parse_queries } from "./collector.harn"
+import { live_source } from "./live.harn"
+
+fn required_env(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name)
+  if value == nil || trim(value) == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn main(harness: Harness) {
+  harness.net.egress_policy({default: "allow", block_private: "private"})
+  const output = required_env(harness.env, "CI_RUNTIME_OUTPUT")
+  const report = collect(
+    live_source(harness.net, harness.tools, harness.fs, required_env(harness.env, "GH_TOKEN")),
+    required_env(harness.env, "CI_RUNTIME_REPOSITORY"),
+    required_env(harness.env, "CI_RUNTIME_WORKFLOW"),
+    parse_queries(required_env(harness.env, "CI_RUNTIME_QUERIES_JSON")),
+    harness.clock.date_iso(),
+  )
+  write_json(harness.fs, output, report, {pretty: true, trailing_newline: true})
+  gha_write_output(harness, "report", output)
+  gha_write_output(harness, "measured-runs", report.measuredRuns)
+  harness.stdio.println(
+    "Measured " + to_string(report.measuredRuns) + " workflow runs into " + output,
+  )
+}

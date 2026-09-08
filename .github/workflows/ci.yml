@@ -27,6 +27,7 @@ jobs:
         run: |
           harn package check .
           harn test scripts/local-checks
+          harn test scripts/ci-runtime-evidence
           bash .github/actions/local-workflow-checks/run_test.sh
 
   package-smoke:
@@ -145,6 +146,7 @@ jobs:
           bash -n .github/actions/harn-package/run-contract.sh
           bash -n .github/actions/local-workflow-checks/run.sh
           bash -n .github/actions/local-workflow-checks/run_test.sh
+          bash -n .github/actions/ci-runtime-evidence/run.sh
           bash -n .github/actions/pr-title-check/check.sh
           bash -n .github/actions/exact-tree-ci-proof/gate.sh
           bash -n .github/actions/exact-tree-ci-proof/workflow-proof.sh
