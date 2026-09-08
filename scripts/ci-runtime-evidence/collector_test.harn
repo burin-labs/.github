@@ -278,5 +278,14 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   assert(bootstrap.contains("GITHUB_WORKSPACE"))
   assert(bootstrap.contains("gh_token=env:GH_TOKEN,expose=GH_TOKEN,for=gh"))
   assert(bootstrap.contains("gh_config=env:GH_CONFIG_DIR,expose=GH_CONFIG_DIR,for=gh"))
+  for variable in [
+    "CI_RUNTIME_REPOSITORY",
+    "CI_RUNTIME_WORKFLOW",
+    "CI_RUNTIME_QUERIES_JSON",
+    "CI_RUNTIME_OUTPUT",
+    "GITHUB_OUTPUT",
+  ] {
+    assert(bootstrap.contains("env:" + variable + ",expose=" + variable))
+  }
   assert(bootstrap.contains("harn run"))
 }
