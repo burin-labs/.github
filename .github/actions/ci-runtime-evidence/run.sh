@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly package_root="$(cd "${GITHUB_ACTION_PATH:?GITHUB_ACTION_PATH is required}/../../.." && pwd)"
 readonly workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+export GH_CONFIG_DIR="${GH_CONFIG_DIR:-${workspace}/.harn/gh-config}"
 
 harn run \
   --standalone \

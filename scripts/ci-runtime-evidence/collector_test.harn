@@ -274,5 +274,7 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   assert(!collect_step.run.contains("ruby"))
   const bootstrap = harness.fs.read_text("../../.github/actions/ci-runtime-evidence/run.sh")
   assert(!bootstrap.contains("github-token"))
+  assert(bootstrap.contains("GH_CONFIG_DIR"))
+  assert(bootstrap.contains("GITHUB_WORKSPACE"))
   assert(bootstrap.contains("harn run"))
 }
