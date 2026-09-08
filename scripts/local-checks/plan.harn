@@ -1,0 +1,214 @@
+import { Check, Disposition, LocalPolicy, Plan } from "./model.harn"
+
+/** Parse and validate repository local-check policy at its owning boundary. */
+pub fn parse_policy(text: string) -> LocalPolicy {
+  const policy: LocalPolicy = schema_expect(json_parse(text), schema_of(LocalPolicy))
+  if len(policy.jobs) == 0 {
+    throw "local check policy declares no jobs"
+  }
+  for job in keys(policy.jobs) {
+    const row = policy.jobs[job]
+    if row.disposition != nil {
+      validate_disposition(job, row.disposition)
+    }
+    for name in keys(row.steps ?? {}) {
+      const disposition = row.steps?.[name]
+      if disposition == nil {
+        throw job + " / " + name + ": disposition was not readable"
+      }
+      validate_disposition(job + " / " + name, disposition)
+    }
+  }
+  for name in keys(policy.actions) {
+    const disposition = policy.actions[name]
+    if disposition == nil {
+      throw name + ": action disposition was not readable"
+    }
+    validate_disposition(name, disposition)
+  }
+  return policy
+}
+
+fn validate_disposition(name: string, disposition: Disposition) {
+  if disposition.kind != "check" && trim(disposition.reason ?? "") == "" {
+    throw name + ": an unexecuted step requires a reason"
+  }
+  for group in disposition.groups ?? [] {
+    if trim(group) == "" {
+      throw name + ": local check group names cannot be empty"
+    }
+  }
+}
+
+fn mapping(raw: unknown, name: string) -> dict {
+  return match type_of(raw) {
+    "dict" -> { raw }
+    _ -> {
+      throw name + " must be a mapping"
+    }
+  }
+}
+
+fn environment(raw: unknown, name: string) -> dict<string, string> {
+  if raw == nil {
+    return {}
+  }
+  let result: dict<string, string> = {}
+  const values = mapping(raw, name)
+  for key in keys(values) {
+    const value = values[key]
+    if type_of(value) != "string" && type_of(value) != "int" && type_of(value) != "bool" {
+      throw name + "." + key + " must be scalar"
+    }
+    result[key] = to_string(value)
+  }
+  return result
+}
+
+fn step_name(step: dict, position: int) -> string {
+  const declared = to_string(step.id ?? step.name ?? "").trim()
+  return declared == "" ? "step " + to_string(position) : declared
+}
+
+fn action_name(reference: string) -> string {
+  return reference.split("@")[0]
+}
+
+fn job_steps(job: dict, name: string) -> list {
+  const steps = job.steps ?? []
+  if type_of(steps) != "list" {
+    throw name + ": steps must be a list"
+  }
+  return steps
+}
+
+fn workflow_timeout(raw: unknown) -> {milliseconds: int?, expression: string} {
+  if raw == nil {
+    return {milliseconds: nil, expression: ""}
+  }
+  const minutes = to_int(raw)
+  if minutes == nil {
+    const expression = to_string(raw)
+    if expression.contains("$" + "{{") {
+      return {milliseconds: nil, expression: expression}
+    }
+    throw "workflow timeout must be positive minutes"
+  }
+  if minutes <= 0 {
+    throw "workflow timeout must be positive minutes"
+  }
+  return {milliseconds: minutes * 60000, expression: ""}
+}
+
+/** Workflow commands remain authoritative; policy supplies local execution facts. */
+pub fn plan_checks(source: string, policy: LocalPolicy) -> Plan {
+  const workflow = mapping(yaml_parse(source), "workflow")
+  const jobs = mapping(workflow.jobs, "workflow.jobs")
+  if len(jobs) == 0 {
+    throw "CI census found no jobs"
+  }
+  const workflow_env = environment(workflow.env, "workflow.env")
+  let checks: list<Check> = []
+  let missing: list<string> = []
+  for job_name in keys(jobs).sorted() {
+    const job = mapping(jobs[job_name], job_name)
+    const row = policy.jobs[job_name]
+    if row == nil {
+      missing = missing + [job_name + ": missing job"]
+      continue
+    }
+    const job_disposition = row.disposition ?? {kind: "check"}
+    if job.uses != nil {
+      const reference = to_string(job.uses)
+      checks = checks
+        + [
+          {
+            job: job_name,
+            name: reference,
+            command: "",
+            directory: ".",
+            shell: "bash",
+            environment: {},
+            timeout_ms: nil,
+            timeout_expression: "",
+            condition: "",
+            disposition: job_disposition.kind == "check" ? {
+              kind: "remote",
+              reason: "reusable workflow requires GitHub Actions",
+            } : job_disposition,
+          },
+        ]
+    }
+    let seen: list<string> = []
+    let seen_ids: list<string> = []
+    let position = 0
+    for raw_step in job_steps(job, job_name) {
+      position = position + 1
+      const step = mapping(raw_step, job_name + " step")
+      const id = to_string(step.id ?? "").trim()
+      if id != "" && seen_ids.contains(id) {
+        throw job_name + ": duplicate step id " + id
+      }
+      seen_ids = id == "" ? seen_ids : seen_ids + [id]
+      const name = step_name(step, position)
+      seen = seen + [name]
+      const action = to_string(step.uses ?? "")
+      const disposition = row.steps?.[name]
+        ?? (job_disposition.kind != "check" ? job_disposition : action == "" ? job_disposition : policy
+          .actions[action_name(action)])
+      if disposition == nil {
+        missing = missing + [job_name + " / " + name + ": missing command"]
+        continue
+      }
+      const command = to_string(step.run ?? "")
+      if action != "" && disposition.kind == "check" {
+        missing = missing
+          + [
+            job_name + " / " + name + ": action check needs a local command adapter for "
+              + action,
+          ]
+        continue
+      }
+      if action == "" && command.trim() == "" {
+        missing = missing + [job_name + " / " + name + ": empty command"]
+        continue
+      }
+      const timeout = workflow_timeout(step["timeout-minutes"] ?? job["timeout-minutes"])
+      checks = checks
+        + [
+          {
+            job: job_name,
+            name: name,
+            command: command,
+            directory: to_string(
+              step["working-directory"] ?? job.defaults?.run?.["working-directory"]
+                ?? workflow.defaults?.run?.["working-directory"]
+                ?? ".",
+            ),
+            shell: to_string(
+              step.shell ?? job.defaults?.run?.shell ?? workflow.defaults?.run?.shell ?? "bash",
+            ),
+            environment: workflow_env + environment(job.env, job_name + ".env")
+              + environment(step.env, job_name + " / " + name + ".env")
+              + policy.environment
+              + (disposition.env ?? {}),
+            timeout_ms: timeout.milliseconds,
+            timeout_expression: timeout.expression,
+            condition: to_string(step["if"] ?? ""),
+            disposition: disposition,
+          },
+        ]
+    }
+    for name in keys(row.steps ?? {}) {
+      if !seen.contains(name) {
+        missing = missing + [job_name + " / " + name + ": stale command disposition"]
+      }
+    }
+  }
+  for name in keys(policy.jobs) {
+    if jobs[name] == nil {
+      missing = missing + [name + ": stale job disposition"]
+    }
+  }
+  return {jobs: len(jobs), checks: checks, missing: missing}
+}

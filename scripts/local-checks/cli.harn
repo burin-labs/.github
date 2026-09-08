@@ -1,0 +1,77 @@
+import { help_requested, parse, parser, render_help } from "std/cli/argparse"
+import { parse_policy, plan_checks } from "./plan.harn"
+import { run_checks } from "./run.harn"
+
+fn specification() {
+  return parser(
+    {
+      name: "local-workflow-checks",
+      about: "Run workflow-authored checks through repository-owned local policy.",
+      args: [
+        {name: "workflow", kind: "flag", long: "--workflow", required: true},
+        {name: "policy", kind: "flag", long: "--policy", required: true},
+        {name: "root", kind: "flag", long: "--root", default: "."},
+        {name: "platform", kind: "flag", long: "--platform", required: false},
+        {
+          name: "group",
+          kind: "flag",
+          long: "--group",
+          required: false,
+          help: "Run the named strict subset while retaining the complete workflow census.",
+        },
+        {
+          name: "build_wrapper",
+          kind: "flag",
+          long: "--build-wrapper",
+          parse: "list",
+          default: [],
+          help: "Comma-separated argv prepended to checks marked heavy.",
+        },
+      ],
+      examples: [
+        "harn run cli.harn -- --workflow .github/workflows/ci.yml --policy .github/local-checks.json",
+      ],
+    },
+  )
+}
+
+fn platform_name(system: HarnessSystem) -> string {
+  const os = system.platform().os
+  return os == "darwin" ? "macos" : os
+}
+
+/** Run the shared command-line boundary with caller-supplied arguments. */
+pub fn run_cli(harness: Harness, arguments: list<string>) -> int {
+  const spec = specification()
+  if help_requested(arguments) {
+    harness.stdio.println(render_help(spec))
+    return 0
+  }
+  const parsed = parse(spec, arguments)
+  if is_err(parsed) {
+    harness.stdio.eprintln(render_help(spec))
+    harness.stdio.eprintln("error: " + unwrap_err(parsed).message)
+    return 2
+  }
+  const options = unwrap(parsed).options
+  const root = path_normalize(path_join(harness.fs.cwd(), to_string(options.root)))
+  const plan = plan_checks(
+    harness.fs.read_text(path_join(root, to_string(options.workflow))),
+    parse_policy(harness.fs.read_text(path_join(root, to_string(options.policy)))),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {
+      root: root,
+      platform: to_string(options.platform ?? platform_name(harness.system)),
+      build_wrapper: options.build_wrapper ?? [],
+      group: options.group == nil ? nil : to_string(options.group),
+    },
+  )
+  return result.ok ? 0 : 1
+}
+
+fn main(harness: Harness) -> int {
+  return run_cli(harness, argv)
+}

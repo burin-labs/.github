@@ -1,0 +1,14 @@
+[package]
+name = "burin-ci-checks"
+version = "0.1.0"
+description = "Workflow-derived local check planning for Burin Labs repositories."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/burin-labs/.github"
+harn = ">=0.10.132,<0.11"
+docs_url = "docs/local-workflow-checks.md"
+
+[exports]
+local_checks = "scripts/local-checks/lib.harn"
+local_checks_cli = "scripts/local-checks/cli.harn"
+
+[dependencies]

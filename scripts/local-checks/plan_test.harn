@@ -1,0 +1,167 @@
+import { LocalPolicy } from "./model.harn"
+import { parse_policy, plan_checks } from "./plan.harn"
+
+fn policy() -> LocalPolicy {
+  return parse_policy(
+    """{
+    "version": 1,
+    "jobs": {"contracts": {}},
+    "actions": {},
+    "environment": {}
+  }""",
+  )
+}
+
+fn workflow() -> string {
+  return """jobs:
+  contracts:
+    env:
+      FIXTURE_MODE: isolated
+    defaults:
+      run:
+        working-directory: fixture
+    steps:
+      - name: First check
+        run: exit 17
+      - name: Second check
+        env:
+          FIXTURE_MODE: overridden
+        run: exit 0
+"""
+}
+
+pipeline test_commands_and_effective_environment_come_from_workflow() {
+  const result = plan_checks(workflow(), policy())
+  assert_eq(result.missing, [])
+  assert_eq(len(result.checks), 2)
+  assert_eq(result.checks[0]?.command, "exit 17")
+  assert_eq(result.checks[0]?.directory, "fixture")
+  assert_eq(result.checks[0]?.environment?.FIXTURE_MODE, "isolated")
+  assert_eq(result.checks[1]?.environment?.FIXTURE_MODE, "overridden")
+}
+
+pipeline test_new_commands_are_included_and_new_jobs_are_named() {
+  const source = workflow()
+    + "\n      - name: Unwired check\n        run: exit 1"
+    + "\n  unwired:\n    steps:\n      - run: exit 1\n"
+  const result = plan_checks(source, policy())
+  assert_eq(result.missing, ["unwired: missing job"])
+  assert_eq(result.checks[2]?.name, "Unwired check")
+}
+
+pipeline test_deleted_command_cannot_leave_a_stale_disposition() {
+  const source = """jobs:
+  contracts:
+    steps:
+      - name: First check
+        run: exit 17
+"""
+  const with_override = parse_policy(
+    """{
+    "version": 1, "jobs": {"contracts": {"steps": {
+      "Second check": {"kind": "remote", "reason": "fixture"}
+    }}}, "actions": {}, "environment": {}
+  }""",
+  )
+  assert_eq(
+    plan_checks(source, with_override).missing,
+    ["contracts / Second check: stale command disposition"],
+  )
+}
+
+pipeline test_empty_and_duplicate_workflows_are_refused() {
+  const empty = try {
+    plan_checks("jobs: {}", policy())
+  }
+  assert(is_err(empty))
+  const duplicate = try {
+    plan_checks(workflow() + "\njobs: {}\n", policy())
+  }
+  assert(is_err(duplicate))
+}
+
+pipeline test_actions_are_inventoried_even_without_run_commands() {
+  const source = workflow() + "\n      - uses: example/unknown@0123456789\n"
+  assert_eq(plan_checks(source, policy()).missing, ["contracts / step 3: missing command"])
+}
+
+pipeline test_unnamed_and_duplicate_named_steps_have_valid_identities() {
+  const source = """jobs:
+  contracts:
+    steps:
+      - run: exit 0
+      - run: exit 0
+      - name: Same display name
+        run: exit 0
+      - name: Same display name
+        run: exit 0
+"""
+  const result = plan_checks(source, policy())
+  assert_eq(result.missing, [])
+  assert_eq(
+    result.checks.map(fn(check) { check.name }),
+    ["step 1", "step 2", "Same display name", "Same display name"],
+  )
+}
+
+pipeline test_duplicate_explicit_step_ids_are_refused() {
+  const source = """jobs:
+  contracts:
+    steps:
+      - id: same
+        run: exit 0
+      - id: same
+        run: exit 0
+"""
+  const result = try {
+    plan_checks(source, policy())
+  }
+  assert(is_err(result))
+}
+
+pipeline test_remote_job_disposition_covers_action_steps() {
+  const source = """jobs:
+  publish:
+    steps:
+      - uses: example/publish@0123456789
+"""
+  const configured = parse_policy(
+    """{
+    "version": 1,
+    "jobs": {"publish": {"disposition": {
+      "kind": "remote", "reason": "requires GitHub release authority"
+    }}},
+    "actions": {},
+    "environment": {}
+  }""",
+  )
+  const result = plan_checks(source, configured)
+  assert_eq(result.missing, [])
+  assert_eq(result.checks[0]?.disposition.kind, "remote")
+}
+
+pipeline test_local_policy_replaces_job_selection_but_preserves_step_conditions() {
+  const source = """jobs:
+  contracts:
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Local check
+        run: exit 0
+      - name: Outcome report
+        if: always()
+        run: exit 0
+"""
+  const result = plan_checks(source, policy())
+  assert_eq(result.checks[0]?.condition, "")
+  assert_eq(result.checks[1]?.condition, "always()")
+}
+
+pipeline test_github_timeout_expression_is_preserved_for_the_runner() {
+  const expression = "$" + "{{ vars.USE_FAST && 10 || 20 }}"
+  const source = "jobs:\n  contracts:\n    timeout-minutes: \"" + expression
+    + "\"\n    steps:\n      - name: Local check\n        run: exit 0\n"
+  const result = plan_checks(source, policy())
+  assert_eq(result.missing, [])
+  assert_eq(result.checks[0]?.timeout_ms, nil)
+  assert_eq(result.checks[0]?.timeout_expression, expression)
+}

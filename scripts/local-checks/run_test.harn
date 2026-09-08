@@ -1,0 +1,248 @@
+import { parse_policy, plan_checks } from "./plan.harn"
+import { report, run_checks } from "./run.harn"
+
+pipeline test_a_failed_process_is_named_and_the_next_check_fires(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("check-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Seeded failure
+        run: exit 17
+      - name: Reached after failure
+        run: printf reached > reached.txt
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(result.failed, 1)
+  assert_eq(result.passed, 1)
+  assert_eq(result.results[0]?.name, "probe / Seeded failure")
+  assert_eq(result.results[0]?.exit_code, 17)
+  assert_eq(harness.fs.read_text(path_join(root, "reached.txt")), "reached")
+  assert(!result.ok)
+}
+
+pipeline test_no_measurements_cannot_be_a_clean_report() {
+  assert(!report([], []).ok)
+  const pending = report([], ["unwired: missing job"])
+  assert_eq(pending.pending, 1)
+  assert(!pending.ok)
+}
+
+pipeline test_default_bash_matches_githubs_unset_variable_behavior(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("bash-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Optional environment
+        run: test -z "$WORKFLOW_OPTIONAL"
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(result.passed, 1)
+  assert(result.ok)
+}
+
+pipeline test_runner_preserves_runtime_path_and_home(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("runtime-env-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Runtime environment
+        run: printf '%s\n%s\n' "$PATH" "$HOME" > runtime-env.txt
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(
+    harness.fs.read_text(path_join(root, "runtime-env.txt")),
+    to_string(harness.env.get("PATH") ?? "") + "\n"
+      + to_string(harness.env.get("HOME") ?? "")
+      + "\n",
+  )
+  assert(result.ok)
+}
+
+pipeline test_runner_supplies_absolute_workspace_and_temporary_roots(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("runner-root-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Runner roots
+        run: printf '%s\n%s\n' "$GITHUB_WORKSPACE" "$RUNNER_TEMP" > runner-roots.txt
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  const roots = harness.fs.read_text(path_join(root, "runner-roots.txt")).trim().split("\n")
+  assert_eq(roots[0], root)
+  assert(path_is_absolute(roots[0] ?? ""))
+  assert(path_is_absolute(roots[1] ?? ""))
+  assert(harness.fs.exists(roots[1] ?? ""))
+  assert(result.ok)
+}
+
+pipeline test_unavailable_platform_is_named_and_pending(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("platform-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Linux check
+        run: exit 0
+""",
+    parse_policy(
+      """{
+    "version": 1,
+    "jobs": {"probe": {"disposition": {
+      "kind": "check", "platforms": ["linux"]
+    }}},
+    "actions": {},
+    "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(result.pending, 1)
+  assert_eq(result.results[0]?.state, "unmeasured")
+  assert_eq(result.results[0]?.reason, "requires linux; current platform is macos")
+  assert(!result.ok)
+}
+
+pipeline test_heavy_check_without_a_build_wrapper_is_unmeasured(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("heavy-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Heavy check
+        run: exit 0
+""",
+    parse_policy(
+      """{
+    "version": 1,
+    "jobs": {"probe": {"disposition": {"kind": "check", "heavy": true}}},
+    "actions": {},
+    "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(result.pending, 1)
+  assert_eq(result.results[0]?.reason, "heavy check requires a build wrapper")
+  assert(!result.ok)
+}
+
+pipeline test_unresolved_workflow_timeout_is_named_and_unmeasured(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("timeout-control-")
+  const expression = "$" + "{{ vars.USE_FAST && 10 || 20 }}"
+  const plan = plan_checks(
+    "jobs:\n  probe:\n    timeout-minutes: \"" + expression
+      + "\"\n    steps:\n      - name: Timed check\n        run: exit 0\n",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(result.pending, 1)
+  assert_eq(result.results[0]?.reason, "unresolved workflow timeout: " + expression)
+  assert(!result.ok)
+}
+
+pipeline test_group_runs_a_strict_subset_without_skipping_the_census(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("group-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Fast check
+        run: exit 0
+      - name: Full check
+        run: exit 19
+""",
+    parse_policy(
+      """{
+    "version": 1,
+    "jobs": {"probe": {"steps": {
+      "Fast check": {"kind": "check", "groups": ["precommit"]}
+    }}},
+    "actions": {},
+    "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: "precommit"},
+  )
+  assert_eq(result.passed, 1)
+  assert_eq(result.failed, 0)
+  assert_eq(result.results.map(fn(row) { row.name }), ["probe / Fast check"])
+  assert(result.ok)
+  const empty = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: "unknown"},
+  )
+  assert_eq(empty.results, [])
+  assert(!empty.ok)
+  const missing = run_checks(
+    harness,
+    {jobs: plan.jobs, checks: plan.checks, missing: ["new-job: missing job"]},
+    {root: root, platform: "macos", build_wrapper: [], group: "precommit"},
+  )
+  assert_eq(missing.pending, 1)
+  assert(!missing.ok)
+}

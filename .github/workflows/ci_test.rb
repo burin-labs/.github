@@ -28,7 +28,8 @@ abort "smoke inputs drifted" unless smoke.fetch("with") == expected_inputs
 
 status = jobs.fetch("ci-status")
 abort "CI status must always report smoke failures" unless status.fetch("if") == "${{ always() }}"
-abort "CI status must own the smoke result" unless status.fetch("needs") == ["package-smoke"]
+expected_needs = ["local-check-contract", "package-smoke"]
+abort "CI status must own every reusable contract result" unless status.fetch("needs") == expected_needs
 steps = status.fetch("steps")
 checkout = steps.find { |step| step["uses"]&.start_with?("actions/checkout@") }
 expected_checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -49,6 +50,7 @@ expected_policy_sources = [
   ".github/actions/exact-tree-ci-proof/action.yml",
   ".github/actions/harn-package/action.yml",
   ".github/actions/harn-repo-policy/action.yml",
+  ".github/actions/local-workflow-checks/action.yml",
   ".github/actions/pr-title-check/action.yml",
   ".github/actions/require-successful-needs/action.yml",
   ".github/actions/rust-test-impact/action.yml",
@@ -167,7 +169,8 @@ expected_shell_tests = Dir.glob(
 ).map { |test| test.delete_prefix("#{repository_root}/") }.sort
 abort "shell test census must not be vacuous" if expected_shell_tests.empty?
 
-shell_steps = steps.select do |step|
+workflow_steps = jobs.values.flat_map { |job| job.fetch("steps", []) }
+shell_steps = workflow_steps.select do |step|
   step["run"].is_a?(String) && step["run"].lines.any? { |line| line.strip.start_with?("bash .github/", "bash scripts/") }
 end
 abort "CI must run shell tests" if shell_steps.empty?
@@ -225,7 +228,15 @@ end
 require_smoke = status.fetch("steps").find { |step| step["name"] == "Require reusable package smoke" }
 abort "CI status does not require the smoke result" unless require_smoke
 expected_result = "${{ needs.package-smoke.result }}"
-abort "CI status reads the wrong result" unless require_smoke.fetch("env") == {"PACKAGE_SMOKE_RESULT" => expected_result}
+expected_contract_result = "${{ needs.local-check-contract.result }}"
+expected_result_env = {
+  "LOCAL_CHECK_CONTRACT_RESULT" => expected_contract_result,
+  "PACKAGE_SMOKE_RESULT" => expected_result,
+}
+abort "CI status reads the wrong results" unless require_smoke.fetch("env") == expected_result_env
+unless require_smoke.fetch("run").include?('test "$LOCAL_CHECK_CONTRACT_RESULT" = success')
+  abort "CI status does not require the local check contract"
+end
 
 dependabot_check = steps.find { |step| step["name"] == "Check Dependabot config" }
 abort "CI must dogfood the Dependabot delivery-policy action" unless dependabot_check

@@ -1,0 +1,58 @@
+name: Run local workflow checks
+description: Run workflow-authored commands through repository-owned local policy.
+
+inputs:
+  harn-version:
+    description: Exact Harn release with or without a leading v. Defaults to harn-version-file.
+    required: false
+    default: ""
+  harn-version-file:
+    description: Repository-relative file containing the exact Harn version.
+    required: false
+    default: .harn-version
+  workflow:
+    description: Repository-relative workflow to inventory and run.
+    required: false
+    default: .github/workflows/ci.yml
+  policy:
+    description: Repository-relative local execution policy.
+    required: false
+    default: .github/local-checks.json
+  platform:
+    description: Optional platform override. By default Harn detects the current platform.
+    required: false
+    default: ""
+  build-wrapper:
+    description: Optional comma-separated argv prepended to checks marked heavy.
+    required: false
+    default: ""
+  group:
+    description: Optional named strict subset from the repository policy.
+    required: false
+    default: ""
+
+outputs:
+  harn-version:
+    description: Resolved Harn release without a leading v.
+    value: ${{ steps.setup.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up exact Harn release
+      id: setup
+      uses: burin-labs/harn/.github/actions/setup-harn@cf52e20564cb722f2f060bc222fa79d996cd3c30 # v0.10.52
+      with:
+        version: ${{ inputs.harn-version }}
+        version-file: ${{ inputs.harn-version-file }}
+
+    - name: Run workflow-derived checks
+      shell: bash
+      env:
+        LOCAL_CHECK_WORKFLOW: ${{ inputs.workflow }}
+        LOCAL_CHECK_POLICY: ${{ inputs.policy }}
+        LOCAL_CHECK_PLATFORM: ${{ inputs.platform }}
+        LOCAL_CHECK_BUILD_WRAPPER: ${{ inputs.build-wrapper }}
+        LOCAL_CHECK_GROUP: ${{ inputs.group }}
+        LOCAL_CHECK_ROOT: ${{ github.workspace }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

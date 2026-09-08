@@ -1,0 +1,6 @@
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read the checked-out package
+        run: test -f harn.toml
