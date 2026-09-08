@@ -205,7 +205,7 @@ fn runner_class(raw: dict) -> string {
   return "other"
 }
 
-fn normalize_steps(job_id: int, raw_steps: unknown) -> list {
+fn normalize_steps(job_id: int, raw_steps: unknown, execution_measured: bool = true) -> list {
   const rows = list_value(raw_steps, "job " + to_string(job_id) + " omitted steps")
   let steps = []
   for raw in rows {
@@ -218,7 +218,7 @@ fn normalize_steps(job_id: int, raw_steps: unknown) -> list {
       row?.completed_at,
       "job " + to_string(job_id) + " step completed_at",
     )
-    if row?.conclusion == "skipped" {
+    if row?.conclusion == "skipped" || !execution_measured {
       started = nil
       completed = nil
     }
@@ -250,8 +250,19 @@ fn normalize_job(run_id: int, raw: unknown) -> dict {
   if started != nil && completed != nil && completed < started {
     throw "job " + to_string(id) + " completed_at precedes started_at"
   }
+  // GitHub creates new job ids for a rerun while copying successful jobs from
+  // the earlier attempt. Those records carry the rerun's created_at with the
+  // earlier attempt's start, completion, runner, and steps. They did not run
+  // in the measured attempt, so retain the named job but do not turn copied
+  // timestamps into negative queue time or duplicate execution samples.
+  const reused = created != nil && started != nil && completed != nil && started < created
+    && completed < created
   if created != nil && started != nil && started < created {
-    throw "job " + to_string(id) + " started_at precedes created_at"
+    if !reused {
+      throw "job " + to_string(id) + " started_at precedes created_at"
+    }
+    started = nil
+    completed = nil
   }
   return {
     id: id,
@@ -260,7 +271,7 @@ fn normalize_job(run_id: int, raw: unknown) -> dict {
     wallMs: started != nil && completed != nil ? milliseconds(started, completed) : nil,
     queueMs: created != nil && started != nil ? milliseconds(created, started) : nil,
     runnerClass: runner_class(row),
-    steps: normalize_steps(id, row?.steps),
+    steps: normalize_steps(id, row?.steps, !reused),
   }
 }
 
