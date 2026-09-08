@@ -3,6 +3,8 @@ import { EvidenceSource } from "./collector.harn"
 
 const API_VERSION = "2026-03-10"
 
+const API_ROOT = "https://api.github.com"
+
 fn diagnostic(tools: HarnessTools, result: dict) -> string {
   const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
   const lines = trim(stderr).split("\n")
@@ -15,9 +17,8 @@ fn run(
   tools: HarnessTools,
   argv: list<string>,
   capture: dict = {max_inline_bytes: 10000000},
-  env: dict<string, string> = {},
 ) -> dict {
-  const result = command_run(tools, {argv: argv, env: env}, {capture: capture, timeout_ms: 120000})
+  const result = command_run(tools, argv, {capture: capture, timeout_ms: 120000})
   if !result.success {
     throw "command failed: " + diagnostic(tools, result)
   }
@@ -52,15 +53,28 @@ fn complete_stdout(tools: HarnessTools, result: dict) -> string {
   }
 }
 
-fn gh_json(tools: HarnessTools, token: string, endpoint: string) -> unknown {
-  const result = run(
-    tools,
-    ["gh", "api", "-H", "X-GitHub-Api-Version: " + API_VERSION, endpoint],
-    {transport: "file", max_inline_bytes: 1},
-    {GH_TOKEN: token},
-  )
+fn request_options(token: string) -> dict {
+  return {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: "Bearer " + token,
+      "X-GitHub-Api-Version": API_VERSION,
+      "User-Agent": "burin-labs-ci-runtime-evidence",
+    },
+    timeout_ms: 120000,
+    retry: {max: 3, backoff_ms: 1000},
+    follow_redirects: true,
+    max_redirects: 5,
+  }
+}
+
+fn gh_json(net: HarnessNet, token: string, endpoint: string) -> unknown {
+  const response = net.get(API_ROOT + endpoint, request_options(token))
+  if !response.ok {
+    throw "GitHub API request failed with HTTP " + to_string(response.status)
+  }
   try {
-    return json_parse(complete_stdout(tools, result))
+    return json_parse(response.body)
   } catch (error) {
     throw "GitHub API returned invalid JSON: " + to_string(error)
   }
@@ -125,6 +139,7 @@ pub fn logs_from_archive(
 }
 
 fn run_logs(
+  net: HarnessNet,
   tools: HarnessTools,
   fs: HarnessFs,
   token: string,
@@ -138,28 +153,29 @@ fn run_logs(
     command_run(tools, ["rm", "-f", "--", archive_path])
     command_run(tools, ["rmdir", "--", directory])
   }
-  run(
-    tools,
-    [
-      "bash",
-      "-c",
-      "exec gh api -H \"$1\" \"$2\" > \"$3\"",
-      "ci-runtime-evidence",
-      "X-GitHub-Api-Version: " + API_VERSION,
-      "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/logs",
-      archive_path,
-    ],
-    {max_inline_bytes: 1000},
-    {GH_TOKEN: token},
+  const download = net.download(
+    API_ROOT + "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/logs",
+    archive_path,
+    request_options(token),
   )
+  if !download.ok || download.bytes_written <= 0 {
+    throw "run " + to_string(run_id) + " log download failed with HTTP "
+      + to_string(download.status)
+  }
   return logs_from_archive(tools, archive_path, run_id, job_names)
 }
 
-/** Build the production GitHub evidence adapter from command tools and an Actions token. */
-pub fn live_source(tools: HarnessTools, fs: HarnessFs, token: string) -> EvidenceSource {
+/** Build the production GitHub evidence adapter from network, file, and command capabilities. */
+pub fn live_source(
+  net: HarnessNet,
+  tools: HarnessTools,
+  fs: HarnessFs,
+  token: string,
+) -> EvidenceSource {
   return {
-    json: fn(endpoint) { return gh_json(tools, token, endpoint) },
+    json: fn(endpoint) { return gh_json(net, token, endpoint) },
     logs: fn(repository, run_id, job_names) { return run_logs(
+      net,
       tools,
       fs,
       token,
