@@ -118,7 +118,7 @@ pub fn plan_checks(source: string, policy: LocalPolicy) -> Plan {
             shell: "bash",
             environment: {},
             timeout_ms: nil,
-            condition: to_string(job["if"] ?? ""),
+            condition: "",
             disposition: job_disposition.kind == "check" ? {
               kind: "remote",
               reason: "reusable workflow requires GitHub Actions",
@@ -179,7 +179,7 @@ pub fn plan_checks(source: string, policy: LocalPolicy) -> Plan {
               + policy.environment
               + (disposition.env ?? {}),
             timeout_ms: timeout_milliseconds(step["timeout-minutes"] ?? job["timeout-minutes"]),
-            condition: to_string(step["if"] ?? job["if"] ?? ""),
+            condition: to_string(step["if"] ?? ""),
             disposition: disposition,
           },
         ]

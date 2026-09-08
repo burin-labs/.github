@@ -33,13 +33,14 @@ fn platform_name(system: HarnessSystem) -> string {
   return os == "darwin" ? "macos" : os
 }
 
-fn main(harness: Harness) -> int {
+/** Run the shared command-line boundary with caller-supplied arguments. */
+pub fn run_cli(harness: Harness, arguments: list<string>) -> int {
   const spec = specification()
-  if help_requested(argv) {
+  if help_requested(arguments) {
     harness.stdio.println(render_help(spec))
     return 0
   }
-  const parsed = parse(spec, argv)
+  const parsed = parse(spec, arguments)
   if is_err(parsed) {
     harness.stdio.eprintln(render_help(spec))
     harness.stdio.eprintln("error: " + unwrap_err(parsed).message)
@@ -61,4 +62,8 @@ fn main(harness: Harness) -> int {
     },
   )
   return result.ok ? 0 : 1
+}
+
+fn main(harness: Harness) -> int {
+  return run_cli(harness, argv)
 }

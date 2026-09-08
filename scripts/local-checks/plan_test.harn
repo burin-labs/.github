@@ -139,3 +139,19 @@ pipeline test_remote_job_disposition_covers_action_steps() {
   assert_eq(result.missing, [])
   assert_eq(result.checks[0]?.disposition.kind, "remote")
 }
+
+pipeline test_local_policy_replaces_job_selection_but_preserves_step_conditions() {
+  const source = """jobs:
+  contracts:
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Local check
+        run: exit 0
+      - name: Outcome report
+        if: always()
+        run: exit 0
+"""
+  const result = plan_checks(source, policy())
+  assert_eq(result.checks[0]?.condition, "")
+  assert_eq(result.checks[1]?.condition, "always()")
+}

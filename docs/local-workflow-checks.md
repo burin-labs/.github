@@ -6,12 +6,28 @@ shells, timeouts, and environment values. A repository-owned JSON policy adds
 only facts the workflow cannot supply, such as platform support, heavyweight
 build wrapping, and checks that require GitHub-hosted state.
 
+Job-level workflow conditions select CI lanes from event and changed-path
+state. Declaring that job as a local check replaces that selection decision;
+otherwise nearly every CI command would be unavailable outside GitHub. Explicit
+step conditions remain authoritative and are reported as unavailable when the
+local runner cannot evaluate them.
+
 Call `parse_policy` once at the input boundary, pass its result with the
 workflow text to `plan_checks`, then call `run_checks`. The runner continues
 after independent failures and returns a `CheckReport` that names failed,
 unmeasured, setup, and remote-only steps. `ok` stays false when the workflow
 census is incomplete or when no check ran, so an empty read cannot certify the
 repository.
+
+Consumer packages can expose the same CLI without copying its boundary:
+
+```harn
+import { run_cli } from "burin-ci-checks/local_checks_cli"
+
+fn main(harness: Harness) -> int {
+  return run_cli(harness, argv)
+}
+```
 
 Use the package command for a local run:
 
