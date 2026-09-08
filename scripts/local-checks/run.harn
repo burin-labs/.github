@@ -1,0 +1,145 @@
+import { Check, CheckReport, CheckResult, Plan } from "./model.harn"
+
+pub type RunOptions = {root: string, platform: string, build_wrapper: list<string>}
+
+fn pending(check: Check, platform: string) -> string? {
+  const supported = check.disposition.platforms
+  if supported != nil && !supported.contains(platform) {
+    return "requires " + supported.join(", ") + "; current platform is " + platform
+  }
+  if check.shell != "bash" && check.shell != "bash --noprofile --norc -e -o pipefail {0}" {
+    return "unsupported shell " + check.shell
+  }
+  if check.condition.trim() != "" && check.condition.trim() != "true" {
+    return "workflow condition requires GitHub Actions: " + check.condition
+  }
+  const expression = "$" + "{{"
+  if check.command.contains(expression) || check.directory.contains(expression) {
+    return "unresolved workflow context in command or directory"
+  }
+  for name in keys(check.environment).sorted() {
+    if (check.environment[name] ?? "").contains(expression) {
+      return "unresolved workflow environment " + name
+    }
+  }
+  return nil
+}
+
+/** Aggregate results without allowing an empty measurement to read as success. */
+pub fn report(results: list<CheckResult>, missing: list<string>) -> CheckReport {
+  const passed = len(results.filter(fn(row) { row.state == "passed" }))
+  const failed = len(results.filter(fn(row) { row.state == "failed" }))
+  const pending_count = len(results.filter(fn(row) { row.state == "unmeasured" })) + len(missing)
+  const setup = len(results.filter(fn(row) { row.state == "setup" }))
+  const remote = len(results.filter(fn(row) { row.state == "remote" }))
+  return {
+    results: results,
+    missing: missing,
+    passed: passed,
+    failed: failed,
+    pending: pending_count,
+    setup: setup,
+    remote: remote,
+    ok: passed > 0 && failed == 0 && pending_count == 0,
+  }
+}
+
+/** Continue independent checks after failure and preserve every terminal verdict. */
+pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckReport {
+  const temporary = harness.fs.mkdtemp_in_workspace("local-checks-")
+  const global_config = path_join(temporary, "gitconfig")
+  harness.fs.write_text(global_config, "")
+  let results: list<CheckResult> = []
+  for missing in plan.missing {
+    harness.stdio.println("MISSING " + missing)
+  }
+  for check in plan.checks {
+    const name = check.job + " / " + check.name
+    let result: CheckResult = {name: name, state: "unmeasured", exit_code: nil, reason: ""}
+    if check.disposition.kind == "remote" {
+      result.state = "remote"
+      result.reason = check.disposition.reason ?? ""
+    } else if check.disposition.kind == "setup" && check.command == "" {
+      result.state = "setup"
+      result.reason = check.disposition.reason ?? ""
+    } else {
+      const reason = pending(check, options.platform)
+      if reason != nil {
+        result.reason = reason
+      } else {
+        harness.stdio.println("RUN " + name)
+        const attempted = try {
+          const command = [
+            "env",
+            "-u",
+            "GIT_DIR",
+            "-u",
+            "GIT_WORK_TREE",
+            "-u",
+            "GIT_INDEX_FILE",
+            "-u",
+            "GIT_COMMON_DIR",
+            "-u",
+            "GIT_CONFIG_PARAMETERS",
+            "-u",
+            "GIT_CONFIG_COUNT",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-eo",
+            "pipefail",
+            "-c",
+            check.command,
+          ]
+          const argv = check.disposition.heavy ?? false ? options.build_wrapper + command : command
+          const child = harness.process.run(
+            {
+              program: argv[0],
+              args: argv[1:len(argv)],
+              cwd: path_join(options.root, check.directory),
+              env: check.environment
+                + {GIT_CONFIG_GLOBAL: global_config, GIT_CONFIG_NOSYSTEM: "1", CI: "true"},
+              timeout_ms: check.timeout_ms,
+            },
+          )
+          harness.fs.write_text(
+            path_join(temporary, to_string(len(results)) + ".log"),
+            child.stdout + child.stderr,
+          )
+          if !child.success {
+            harness.stdio.eprintln(child.stdout + child.stderr)
+          }
+          result.state = if !child.success || child.exit_code != 0 {
+            "failed"
+          } else if check.disposition.kind == "setup" {
+            "setup"
+          } else {
+            "passed"
+          }
+          result.exit_code = child.exit_code
+          result.reason = child.timed_out ? "workflow-derived timeout elapsed" : ""
+        }
+        if is_err(attempted) {
+          result.state = "failed"
+          result.reason = to_string(attempted)
+        }
+      }
+    }
+    results = results + [result]
+    harness.stdio.println(
+      result.state.to_upper() + " " + name + (result.reason == "" ? "" : ": " + result.reason),
+    )
+  }
+  const summary = report(results, plan.missing)
+  harness.fs.write_text(path_join(temporary, "report.json"), json_stringify_pretty(summary) + "\n")
+  harness.stdio.println(
+    "Checks: " + to_string(summary.passed) + " passed, " + to_string(summary.failed)
+      + " failed, "
+      + to_string(summary.pending)
+      + " pending, "
+      + to_string(summary.remote)
+      + " remote; report: "
+      + path_join(temporary, "report.json"),
+  )
+  return summary
+}

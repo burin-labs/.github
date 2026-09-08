@@ -1,0 +1,55 @@
+/** Declares whether a workflow step runs locally and any local-only constraints. */
+pub type Disposition = {
+  kind: "check" | "setup" | "remote",
+  reason?: string,
+  platforms?: list<string>,
+  heavy?: bool,
+  env?: dict<string, string>,
+}
+
+/** Applies a default disposition to one job with optional named step overrides. */
+pub type JobPolicy = {disposition?: Disposition, steps?: dict<string, Disposition>}
+
+/** Repository-owned facts that cannot be derived from workflow YAML. */
+pub type LocalPolicy = {
+  version: 1,
+  jobs: dict<string, JobPolicy>,
+  actions: dict<string, Disposition>,
+  environment: dict<string, string>,
+}
+
+/** One normalized workflow step ready for a local execution decision. */
+pub type Check = {
+  job: string,
+  name: string,
+  command: string,
+  directory: string,
+  shell: string,
+  environment: dict<string, string>,
+  timeout_ms: int?,
+  condition: string,
+  disposition: Disposition,
+}
+
+/** Complete workflow census with every runnable or explicitly excluded step. */
+pub type Plan = {jobs: int, checks: list<Check>, missing: list<string>}
+
+/** Terminal local disposition or execution result for one workflow step. */
+pub type CheckResult = {
+  name: string,
+  state: "passed" | "failed" | "unmeasured" | "setup" | "remote",
+  exit_code: int?,
+  reason: string,
+}
+
+/** Non-vacuous aggregate report that retains failures and unavailable checks. */
+pub type CheckReport = {
+  results: list<CheckResult>,
+  missing: list<string>,
+  passed: int,
+  failed: int,
+  pending: int,
+  setup: int,
+  remote: int,
+  ok: bool,
+}

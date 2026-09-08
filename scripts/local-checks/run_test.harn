@@ -1,0 +1,82 @@
+import { parse_policy, plan_checks } from "./plan.harn"
+import { report, run_checks } from "./run.harn"
+
+pipeline test_a_failed_process_is_named_and_the_next_check_fires(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("check-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Seeded failure
+        run: exit 17
+      - name: Reached after failure
+        run: printf reached > reached.txt
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(harness, plan, {root: root, platform: "macos", build_wrapper: []})
+  assert_eq(result.failed, 1)
+  assert_eq(result.passed, 1)
+  assert_eq(result.results[0]?.name, "probe / Seeded failure")
+  assert_eq(result.results[0]?.exit_code, 17)
+  assert_eq(harness.fs.read_text(path_join(root, "reached.txt")), "reached")
+  assert(!result.ok)
+}
+
+pipeline test_no_measurements_cannot_be_a_clean_report() {
+  assert(!report([], []).ok)
+  const pending = report([], ["unwired: missing job"])
+  assert_eq(pending.pending, 1)
+  assert(!pending.ok)
+}
+
+pipeline test_default_bash_matches_githubs_unset_variable_behavior(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("bash-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Optional environment
+        run: test -z "$WORKFLOW_OPTIONAL"
+""",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(harness, plan, {root: root, platform: "macos", build_wrapper: []})
+  assert_eq(result.passed, 1)
+  assert(result.ok)
+}
+
+pipeline test_unavailable_platform_is_named_and_pending(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("platform-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Linux check
+        run: exit 0
+""",
+    parse_policy(
+      """{
+    "version": 1,
+    "jobs": {"probe": {"disposition": {
+      "kind": "check", "platforms": ["linux"]
+    }}},
+    "actions": {},
+    "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(harness, plan, {root: root, platform: "macos", build_wrapper: []})
+  assert_eq(result.pending, 1)
+  assert_eq(result.results[0]?.state, "unmeasured")
+  assert_eq(result.results[0]?.reason, "requires linux; current platform is macos")
+  assert(!result.ok)
+}

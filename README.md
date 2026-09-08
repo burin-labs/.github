@@ -2,6 +2,19 @@
 
 Burin Labs organization defaults and reusable GitHub Actions workflows.
 
+## Local workflow checks
+
+`burin-labs/.github/.github/actions/local-workflow-checks` runs the commands
+already declared in a repository's GitHub Actions workflow. The repository's
+versioned `.github/local-checks.json` adds local-only facts such as platform
+support, setup steps, remote-only steps, and shared build locking; it does not
+copy commands out of the workflow.
+
+The runner reports every passed, failed, unavailable, setup, and remote step.
+An incomplete workflow census and a run with zero measured checks both fail.
+See [Local workflow checks](docs/local-workflow-checks.md) for the policy
+contract, local command, and pinned action syntax.
+
 ## Selective Rust tests
 
 `burin-labs/.github/.github/actions/rust-test-impact` is the organization-owned
