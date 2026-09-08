@@ -6,6 +6,7 @@ readonly workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 
 harn run \
   --standalone \
+  --allow-process-network \
   --grant gh_token=env:GH_TOKEN,expose=GH_TOKEN \
   --grant repository=env:CI_RUNTIME_REPOSITORY,expose=CI_RUNTIME_REPOSITORY \
   --grant workflow=env:CI_RUNTIME_WORKFLOW,expose=CI_RUNTIME_WORKFLOW \

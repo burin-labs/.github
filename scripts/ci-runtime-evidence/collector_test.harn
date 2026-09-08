@@ -275,6 +275,7 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   const bootstrap = harness.fs.read_text("../../.github/actions/ci-runtime-evidence/run.sh")
   assert(!bootstrap.contains("github-token"))
   assert(bootstrap.contains("GITHUB_WORKSPACE"))
+  assert(bootstrap.contains("--allow-process-network"))
   assert(bootstrap.contains("gh_token=env:GH_TOKEN,expose=GH_TOKEN"))
   assert(!bootstrap.contains("expose=GH_TOKEN,for="))
   for variable in [
@@ -291,4 +292,7 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   assert(live.contains("Authorization: \"Bearer \" + token"))
   assert(live.contains("net.download"))
   assert(!live.contains("exec gh"))
+  const cli = harness.fs.read_text("./cli.harn")
+  assert(cli.contains("egress_policy"))
+  assert(cli.contains("block_private: \"private\""))
 }

@@ -12,6 +12,7 @@ fn required_env(env: HarnessEnv, name: string) -> string {
 }
 
 fn main(harness: Harness) {
+  harness.net.egress_policy({default: "allow", block_private: "private"})
   const output = required_env(harness.env, "CI_RUNTIME_OUTPUT")
   const report = collect(
     live_source(harness.net, harness.tools, harness.fs, required_env(harness.env, "GH_TOKEN")),
