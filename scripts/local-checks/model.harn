@@ -28,6 +28,7 @@ pub type Check = {
   shell: string,
   environment: dict<string, string>,
   timeout_ms: int?,
+  timeout_expression: string,
   condition: string,
   disposition: Disposition,
 }

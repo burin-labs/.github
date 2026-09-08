@@ -121,6 +121,28 @@ pipeline test_heavy_check_without_a_build_wrapper_is_unmeasured(harness: Harness
   assert(!result.ok)
 }
 
+pipeline test_unresolved_workflow_timeout_is_named_and_unmeasured(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("timeout-control-")
+  const expression = "$" + "{{ vars.USE_FAST && 10 || 20 }}"
+  const plan = plan_checks(
+    "jobs:\n  probe:\n    timeout-minutes: \"" + expression
+      + "\"\n    steps:\n      - name: Timed check\n        run: exit 0\n",
+    parse_policy(
+      """{
+    "version": 1, "jobs": {"probe": {}}, "actions": {}, "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(result.pending, 1)
+  assert_eq(result.results[0]?.reason, "unresolved workflow timeout: " + expression)
+  assert(!result.ok)
+}
+
 pipeline test_group_runs_a_strict_subset_without_skipping_the_census(harness: Harness) {
   const root = harness.fs.mkdtemp_in_workspace("group-control-")
   const plan = plan_checks(

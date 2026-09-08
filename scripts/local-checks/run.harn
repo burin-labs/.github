@@ -10,6 +10,9 @@ fn pending(check: Check, options: RunOptions) -> string? {
   if (check.disposition.heavy ?? false) && len(options.build_wrapper) == 0 {
     return "heavy check requires a build wrapper"
   }
+  if check.timeout_expression != "" {
+    return "unresolved workflow timeout: " + check.timeout_expression
+  }
   if check.shell != "bash" && check.shell != "bash --noprofile --norc -e -o pipefail {0}" {
     return "unsupported shell " + check.shell
   }

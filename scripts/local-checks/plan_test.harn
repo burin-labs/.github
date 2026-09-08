@@ -155,3 +155,13 @@ pipeline test_local_policy_replaces_job_selection_but_preserves_step_conditions(
   assert_eq(result.checks[0]?.condition, "")
   assert_eq(result.checks[1]?.condition, "always()")
 }
+
+pipeline test_github_timeout_expression_is_preserved_for_the_runner() {
+  const expression = "$" + "{{ vars.USE_FAST && 10 || 20 }}"
+  const source = "jobs:\n  contracts:\n    timeout-minutes: \"" + expression
+    + "\"\n    steps:\n      - name: Local check\n        run: exit 0\n"
+  const result = plan_checks(source, policy())
+  assert_eq(result.missing, [])
+  assert_eq(result.checks[0]?.timeout_ms, nil)
+  assert_eq(result.checks[0]?.timeout_expression, expression)
+}

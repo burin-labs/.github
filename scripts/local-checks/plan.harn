@@ -82,15 +82,22 @@ fn job_steps(job: dict, name: string) -> list {
   return steps
 }
 
-fn timeout_milliseconds(raw: unknown) -> int? {
+fn workflow_timeout(raw: unknown) -> {milliseconds: int?, expression: string} {
   if raw == nil {
-    return nil
+    return {milliseconds: nil, expression: ""}
   }
   const minutes = to_int(raw)
-  if minutes == nil || minutes <= 0 {
+  if minutes == nil {
+    const expression = to_string(raw)
+    if expression.contains("$" + "{{") {
+      return {milliseconds: nil, expression: expression}
+    }
     throw "workflow timeout must be positive minutes"
   }
-  return minutes * 60000
+  if minutes <= 0 {
+    throw "workflow timeout must be positive minutes"
+  }
+  return {milliseconds: minutes * 60000, expression: ""}
 }
 
 /** Workflow commands remain authoritative; policy supplies local execution facts. */
@@ -123,6 +130,7 @@ pub fn plan_checks(source: string, policy: LocalPolicy) -> Plan {
             shell: "bash",
             environment: {},
             timeout_ms: nil,
+            timeout_expression: "",
             condition: "",
             disposition: job_disposition.kind == "check" ? {
               kind: "remote",
@@ -165,6 +173,7 @@ pub fn plan_checks(source: string, policy: LocalPolicy) -> Plan {
         missing = missing + [job_name + " / " + name + ": empty command"]
         continue
       }
+      const timeout = workflow_timeout(step["timeout-minutes"] ?? job["timeout-minutes"])
       checks = checks
         + [
           {
@@ -183,7 +192,8 @@ pub fn plan_checks(source: string, policy: LocalPolicy) -> Plan {
               + environment(step.env, job_name + " / " + name + ".env")
               + policy.environment
               + (disposition.env ?? {}),
-            timeout_ms: timeout_milliseconds(step["timeout-minutes"] ?? job["timeout-minutes"]),
+            timeout_ms: timeout.milliseconds,
+            timeout_expression: timeout.expression,
             condition: to_string(step["if"] ?? ""),
             disposition: disposition,
           },

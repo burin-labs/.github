@@ -54,6 +54,10 @@ marked `heavy` share a repository build lock by passing its comma-separated
 argument vector as `build-wrapper`. A heavy check without that wrapper is
 reported as unmeasured and does not start.
 
+GitHub expressions in step conditions, commands, environment values, working
+directories, and timeouts stay visible in the plan. The runner reports the
+affected check as unmeasured instead of guessing the expression's value.
+
 A disposition can add `"groups": ["precommit"]`. Passing `--group precommit`
 or the action's `group` input runs only those checks, while the planner still
 censuses the complete workflow and policy. A group with no measured check and
