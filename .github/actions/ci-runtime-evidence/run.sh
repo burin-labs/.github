@@ -7,6 +7,7 @@ export GH_CONFIG_DIR="${GH_CONFIG_DIR:-${workspace}/.harn/gh-config}"
 
 harn run \
   --standalone \
+  --allow-process-network \
   --grant gh_token=env:GH_TOKEN,expose=GH_TOKEN \
   --grant gh_config=env:GH_CONFIG_DIR,expose=GH_CONFIG_DIR,for=gh \
   --grant repository=env:CI_RUNTIME_REPOSITORY,expose=CI_RUNTIME_REPOSITORY \
