@@ -93,6 +93,34 @@ pipeline test_unavailable_platform_is_named_and_pending(harness: Harness) {
   assert(!result.ok)
 }
 
+pipeline test_heavy_check_without_a_build_wrapper_is_unmeasured(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("heavy-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Heavy check
+        run: exit 0
+""",
+    parse_policy(
+      """{
+    "version": 1,
+    "jobs": {"probe": {"disposition": {"kind": "check", "heavy": true}}},
+    "actions": {},
+    "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
+  assert_eq(result.pending, 1)
+  assert_eq(result.results[0]?.reason, "heavy check requires a build wrapper")
+  assert(!result.ok)
+}
+
 pipeline test_group_runs_a_strict_subset_without_skipping_the_census(harness: Harness) {
   const root = harness.fs.mkdtemp_in_workspace("group-control-")
   const plan = plan_checks(

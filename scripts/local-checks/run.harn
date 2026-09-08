@@ -2,10 +2,13 @@ import { Check, CheckReport, CheckResult, Plan } from "./model.harn"
 
 pub type RunOptions = {root: string, platform: string, build_wrapper: list<string>, group: string?}
 
-fn pending(check: Check, platform: string) -> string? {
+fn pending(check: Check, options: RunOptions) -> string? {
   const supported = check.disposition.platforms
-  if supported != nil && !supported.contains(platform) {
-    return "requires " + supported.join(", ") + "; current platform is " + platform
+  if supported != nil && !supported.contains(options.platform) {
+    return "requires " + supported.join(", ") + "; current platform is " + options.platform
+  }
+  if (check.disposition.heavy ?? false) && len(options.build_wrapper) == 0 {
+    return "heavy check requires a build wrapper"
   }
   if check.shell != "bash" && check.shell != "bash --noprofile --norc -e -o pipefail {0}" {
     return "unsupported shell " + check.shell
@@ -66,7 +69,7 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
       result.state = "setup"
       result.reason = check.disposition.reason ?? ""
     } else {
-      const reason = pending(check, options.platform)
+      const reason = pending(check, options)
       if reason != nil {
         result.reason = reason
       } else {

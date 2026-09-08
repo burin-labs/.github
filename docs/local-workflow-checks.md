@@ -50,8 +50,9 @@ Repositories use the composite action from an immutable commit:
 
 The action installs the exact Harn release named by `harn-version-file`. Pass
 `harn-version` only in repositories that do not own a version file. Checks
-marked `heavy` can share a repository build lock by passing its comma-separated
-argument vector as `build-wrapper`.
+marked `heavy` share a repository build lock by passing its comma-separated
+argument vector as `build-wrapper`. A heavy check without that wrapper is
+reported as unmeasured and does not start.
 
 A disposition can add `"groups": ["precommit"]`. Passing `--group precommit`
 or the action's `group` input runs only those checks, while the planner still
