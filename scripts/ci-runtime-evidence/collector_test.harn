@@ -148,17 +148,18 @@ pipeline test_job_pagination_must_reach_exact_reported_total() {
   )
 }
 
-pipeline test_zero_jobs_is_a_measured_empty_result() {
+pipeline test_zero_jobs_fails_closed() {
   const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
-  const report = collect(
-    fixture_source({responses: {[endpoint]: {total_count: 0, jobs: []}}}),
-    "acme/widgets",
-    "ci.yml",
-    [query("pull_request", 1)],
-    "now",
+  assert_error_contains(
+    fn() { collect(
+      fixture_source({responses: {[endpoint]: {total_count: 0, jobs: []}}}),
+      "acme/widgets",
+      "ci.yml",
+      [query("pull_request", 1)],
+      "now",
+    ) },
+    "job census measured zero reported jobs",
   )
-  assert_eq(report.runs[0].jobs, [])
-  assert_eq(report.runs[0].cache, [])
 }
 
 pipeline test_duplicate_job_ids_and_malformed_timestamps_fail() {

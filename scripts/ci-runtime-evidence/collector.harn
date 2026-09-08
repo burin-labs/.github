@@ -144,6 +144,9 @@ fn all_jobs(source: EvidenceSource, repository: string, run_id: int) -> list {
     }
     if total == nil {
       total = count
+      if total == 0 {
+        throw "run " + to_string(run_id) + " job census measured zero reported jobs"
+      }
     } else if count != total {
       throw "run " + to_string(run_id) + " job total changed from " + to_string(total)
         + " to "
