@@ -33,7 +33,10 @@ def invoke_runner(overrides = {})
     }.merge(overrides)
     _stdout, stderr, status = Open3.capture3(env, RUNNER)
     argv = File.exist?(argv_receipt) ? File.binread(argv_receipt).split("\0") : []
-    {argv: argv, status: status, stderr: stderr}
+    toolchain_roots = env.fetch("PATH").split(File::PATH_SEPARATOR).select do |path|
+      !path.empty? && Dir.exist?(path)
+    end
+    {argv: argv, status: status, stderr: stderr, toolchain_roots: toolchain_roots}
   end
 end
 
@@ -55,6 +58,7 @@ abort "default runner failed: #{default}" unless default.fetch(:status).success?
 package_root = File.expand_path("../../..", ACTION_DIR)
 expected = [
   "run", "--standalone", "--read-only-root", package_root, "--write-root", "/workspace",
+] + default.fetch(:toolchain_roots).flat_map { |path| ["--sandbox-read-root", path] } + [
   File.join(package_root, "scripts/local-checks/cli.harn"), "--",
   "--workflow", ".github/workflows/ci.yml",
   "--policy", ".github/local-checks.json",
@@ -68,7 +72,13 @@ overridden = invoke_runner(
   "LOCAL_CHECK_GROUP" => "precommit",
 )
 abort "overridden runner failed: #{overridden}" unless overridden.fetch(:status).success?
-expected_overridden = expected + [
+expected_overridden = [
+  "run", "--standalone", "--read-only-root", package_root, "--write-root", "/workspace",
+] + overridden.fetch(:toolchain_roots).flat_map { |path| ["--sandbox-read-root", path] } + [
+  File.join(package_root, "scripts/local-checks/cli.harn"), "--",
+  "--workflow", ".github/workflows/ci.yml",
+  "--policy", ".github/local-checks.json",
+  "--root", "/workspace",
   "--platform", "linux",
   "--build-wrapper", "build-lock.sh,env,CARGO_BUILD_JOBS=4",
   "--group", "precommit",

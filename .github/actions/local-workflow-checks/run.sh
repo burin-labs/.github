@@ -11,6 +11,21 @@ args=(
   --standalone
   --read-only-root "$package_root"
   --write-root "$root"
+)
+
+# A workflow command can only execute tools advertised on PATH if the process
+# sandbox can read those tool directories. This remains subprocess-only: Harn
+# filesystem builtins retain the package + repository boundary above, and the
+# toolchain roots are never writable. In particular, pnpm keeps its selected
+# release below PNPM_HOME, which is normally itself a PATH entry.
+IFS=: read -r -a path_roots <<< "${PATH:-}"
+for path_root in "${path_roots[@]}"; do
+  if [[ -n "$path_root" && -d "$path_root" ]]; then
+    args+=(--sandbox-read-root "$path_root")
+  fi
+done
+
+args+=(
   "${package_root}/scripts/local-checks/cli.harn" --
   --workflow "$workflow"
   --policy "$policy"

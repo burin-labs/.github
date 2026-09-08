@@ -137,7 +137,7 @@ pipeline test_remote_job_disposition_covers_action_steps() {
   )
   const result = plan_checks(source, configured)
   assert_eq(result.missing, [])
-  assert_eq(result.checks[0]?.disposition.kind, "remote")
+  assert_eq(result.checks[0]?.disposition?.kind, "remote")
 }
 
 pipeline test_local_policy_replaces_job_selection_but_preserves_step_conditions() {
