@@ -33,6 +33,11 @@ fn validate_disposition(name: string, disposition: Disposition) {
   if disposition.kind != "check" && trim(disposition.reason ?? "") == "" {
     throw name + ": an unexecuted step requires a reason"
   }
+  for group in disposition.groups ?? [] {
+    if trim(group) == "" {
+      throw name + ": local check group names cannot be empty"
+    }
+  }
 }
 
 fn mapping(raw: unknown, name: string) -> dict {

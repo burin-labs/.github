@@ -28,6 +28,7 @@ def invoke_runner(overrides = {})
       "LOCAL_CHECK_ROOT" => "/workspace",
       "LOCAL_CHECK_PLATFORM" => "",
       "LOCAL_CHECK_BUILD_WRAPPER" => "",
+      "LOCAL_CHECK_GROUP" => "",
       "PATH" => "#{directory}:#{ENV.fetch("PATH")}",
     }.merge(overrides)
     _stdout, stderr, status = Open3.capture3(env, RUNNER)
@@ -64,11 +65,13 @@ abort "default runner argv drifted: #{default.fetch(:argv).inspect}" unless defa
 overridden = invoke_runner(
   "LOCAL_CHECK_PLATFORM" => "linux",
   "LOCAL_CHECK_BUILD_WRAPPER" => "build-lock.sh,env,CARGO_BUILD_JOBS=4",
+  "LOCAL_CHECK_GROUP" => "precommit",
 )
 abort "overridden runner failed: #{overridden}" unless overridden.fetch(:status).success?
 expected_overridden = expected + [
   "--platform", "linux",
   "--build-wrapper", "build-lock.sh,env,CARGO_BUILD_JOBS=4",
+  "--group", "precommit",
 ]
 unless overridden.fetch(:argv) == expected_overridden
   abort "override runner argv drifted: #{overridden.fetch(:argv).inspect}"

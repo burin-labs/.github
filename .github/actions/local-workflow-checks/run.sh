@@ -22,5 +22,8 @@ fi
 if [[ -n "${LOCAL_CHECK_BUILD_WRAPPER:-}" ]]; then
   args+=(--build-wrapper "$LOCAL_CHECK_BUILD_WRAPPER")
 fi
+if [[ -n "${LOCAL_CHECK_GROUP:-}" ]]; then
+  args+=(--group "$LOCAL_CHECK_GROUP")
+fi
 
 harn "${args[@]}"

@@ -53,6 +53,12 @@ The action installs the exact Harn release named by `harn-version-file`. Pass
 marked `heavy` can share a repository build lock by passing its comma-separated
 argument vector as `build-wrapper`.
 
+A disposition can add `"groups": ["precommit"]`. Passing `--group precommit`
+or the action's `group` input runs only those checks, while the planner still
+censuses the complete workflow and policy. A group with no measured check and
+any missing workflow coverage both fail, so a fast hook remains a strict subset
+of the same contract instead of becoming a second command list.
+
 The policy schema is versioned. Each workflow job needs one `jobs` entry.
 Named step overrides must still exist in the workflow, and a deleted job or
 override fails the census as stale configuration.

@@ -26,6 +26,10 @@ inputs:
     description: Optional comma-separated argv prepended to checks marked heavy.
     required: false
     default: ""
+  group:
+    description: Optional named strict subset from the repository policy.
+    required: false
+    default: ""
 
 outputs:
   harn-version:
@@ -49,5 +53,6 @@ runs:
         LOCAL_CHECK_POLICY: ${{ inputs.policy }}
         LOCAL_CHECK_PLATFORM: ${{ inputs.platform }}
         LOCAL_CHECK_BUILD_WRAPPER: ${{ inputs.build-wrapper }}
+        LOCAL_CHECK_GROUP: ${{ inputs.group }}
         LOCAL_CHECK_ROOT: ${{ github.workspace }}
       run: bash "$GITHUB_ACTION_PATH/run.sh"

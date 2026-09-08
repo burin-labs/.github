@@ -1,6 +1,6 @@
 import { Check, CheckReport, CheckResult, Plan } from "./model.harn"
 
-pub type RunOptions = {root: string, platform: string, build_wrapper: list<string>}
+pub type RunOptions = {root: string, platform: string, build_wrapper: list<string>, group: string?}
 
 fn pending(check: Check, platform: string) -> string? {
   const supported = check.disposition.platforms
@@ -54,6 +54,9 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
     harness.stdio.println("MISSING " + missing)
   }
   for check in plan.checks {
+    if options.group != nil && !(check.disposition.groups ?? []).contains(options.group ?? "") {
+      continue
+    }
     const name = check.job + " / " + check.name
     let result: CheckResult = {name: name, state: "unmeasured", exit_code: nil, reason: ""}
     if check.disposition.kind == "remote" {

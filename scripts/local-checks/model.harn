@@ -5,6 +5,7 @@ pub type Disposition = {
   platforms?: list<string>,
   heavy?: bool,
   env?: dict<string, string>,
+  groups?: list<string>,
 }
 
 /** Applies a default disposition to one job with optional named step overrides. */

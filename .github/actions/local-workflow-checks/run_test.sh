@@ -32,6 +32,7 @@ output="$({
     LOCAL_CHECK_ROOT="$fixture_root" \
     LOCAL_CHECK_PLATFORM=linux \
     LOCAL_CHECK_BUILD_WRAPPER= \
+    LOCAL_CHECK_GROUP= \
     bash "$(dirname "$0")/run.sh"
 } 2>&1)"
 status=$?

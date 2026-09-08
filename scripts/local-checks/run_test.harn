@@ -18,7 +18,11 @@ pipeline test_a_failed_process_is_named_and_the_next_check_fires(harness: Harnes
   }""",
     ),
   )
-  const result = run_checks(harness, plan, {root: root, platform: "macos", build_wrapper: []})
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
   assert_eq(result.failed, 1)
   assert_eq(result.passed, 1)
   assert_eq(result.results[0]?.name, "probe / Seeded failure")
@@ -49,7 +53,11 @@ pipeline test_default_bash_matches_githubs_unset_variable_behavior(harness: Harn
   }""",
     ),
   )
-  const result = run_checks(harness, plan, {root: root, platform: "macos", build_wrapper: []})
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
   assert_eq(result.passed, 1)
   assert(result.ok)
 }
@@ -74,9 +82,60 @@ pipeline test_unavailable_platform_is_named_and_pending(harness: Harness) {
   }""",
     ),
   )
-  const result = run_checks(harness, plan, {root: root, platform: "macos", build_wrapper: []})
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: nil},
+  )
   assert_eq(result.pending, 1)
   assert_eq(result.results[0]?.state, "unmeasured")
   assert_eq(result.results[0]?.reason, "requires linux; current platform is macos")
   assert(!result.ok)
+}
+
+pipeline test_group_runs_a_strict_subset_without_skipping_the_census(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("group-control-")
+  const plan = plan_checks(
+    """jobs:
+  probe:
+    steps:
+      - name: Fast check
+        run: exit 0
+      - name: Full check
+        run: exit 19
+""",
+    parse_policy(
+      """{
+    "version": 1,
+    "jobs": {"probe": {"steps": {
+      "Fast check": {"kind": "check", "groups": ["precommit"]}
+    }}},
+    "actions": {},
+    "environment": {}
+  }""",
+    ),
+  )
+  const result = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: "precommit"},
+  )
+  assert_eq(result.passed, 1)
+  assert_eq(result.failed, 0)
+  assert_eq(result.results.map(fn(row) { row.name }), ["probe / Fast check"])
+  assert(result.ok)
+  const empty = run_checks(
+    harness,
+    plan,
+    {root: root, platform: "macos", build_wrapper: [], group: "unknown"},
+  )
+  assert_eq(empty.results, [])
+  assert(!empty.ok)
+  const missing = run_checks(
+    harness,
+    {jobs: plan.jobs, checks: plan.checks, missing: ["new-job: missing job"]},
+    {root: root, platform: "macos", build_wrapper: [], group: "precommit"},
+  )
+  assert_eq(missing.pending, 1)
+  assert(!missing.ok)
 }
