@@ -356,7 +356,7 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   const collect_step = action.runs.steps[1]
   assert_eq(
     setup.uses,
-    "burin-labs/harn/.github/actions/setup-harn@bd78be56d71af872affe677d482408565b87b391",
+    "burin-labs/harn/.github/actions/setup-harn@450ec9e6fdf5e9879b23e6489742687918e1df55",
   )
   assert_eq(collect_step.env.GH_TOKEN, "$" + "{{ inputs.github-token }}")
   assert(!collect_step.run.contains("github-token"))

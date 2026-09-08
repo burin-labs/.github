@@ -1,0 +1,28 @@
+const RETRY_SETUP =
+  "burin-labs/harn/.github/actions/setup-harn@450ec9e6fdf5e9879b23e6489742687918e1df55"
+
+pipeline test_every_shared_setup_uses_the_bounded_installer(harness: Harness) {
+  for path in [
+    "../../.github/actions/harn-package/action.yml",
+    "../../.github/actions/local-workflow-checks/action.yml",
+    "../../.github/actions/ci-runtime-evidence/action.yml",
+    "../../.github/workflows/ci-latency-observer.yml",
+  ] {
+    const source = harness.fs.read_text(path)
+    assert(contains(source, RETRY_SETUP), "unbounded setup-harn pin: ${path}")
+  }
+}
+
+pipeline test_bootstrap_download_retries_transient_failures(harness: Harness) {
+  const source = harness.fs.read_text("../../.github/workflows/ci.yml")
+  assert(contains(source, "--retry 5"))
+  assert(contains(source, "--retry-all-errors"))
+  assert(contains(source, "--retry-delay 2"))
+  // Negative control: a one-shot curl must not satisfy this contract merely
+  // because the workflow still verifies the downloaded archive's checksum.
+  const one_shot = source.replace("--retry 5", "").replace("--retry-all-errors", "").replace(
+    "--retry-delay 2",
+    "",
+  )
+  assert_eq(contains(one_shot, "--retry"), false)
+}
