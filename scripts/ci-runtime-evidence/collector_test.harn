@@ -279,7 +279,7 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   assert(bootstrap.contains("--allow-process-network"))
   assert(bootstrap.contains("gh_token=env:GH_TOKEN,expose=GH_TOKEN"))
   assert(!bootstrap.contains("expose=GH_TOKEN,for="))
-  assert(bootstrap.contains("gh_config=env:GH_CONFIG_DIR,expose=GH_CONFIG_DIR,for=gh"))
+  assert(bootstrap.contains("gh_config=env:GH_CONFIG_DIR,expose=GH_CONFIG_DIR"))
   for variable in [
     "CI_RUNTIME_REPOSITORY",
     "CI_RUNTIME_WORKFLOW",

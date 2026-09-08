@@ -9,7 +9,7 @@ harn run \
   --standalone \
   --allow-process-network \
   --grant gh_token=env:GH_TOKEN,expose=GH_TOKEN \
-  --grant gh_config=env:GH_CONFIG_DIR,expose=GH_CONFIG_DIR,for=gh \
+  --grant gh_config=env:GH_CONFIG_DIR,expose=GH_CONFIG_DIR \
   --grant repository=env:CI_RUNTIME_REPOSITORY,expose=CI_RUNTIME_REPOSITORY \
   --grant workflow=env:CI_RUNTIME_WORKFLOW,expose=CI_RUNTIME_WORKFLOW \
   --grant queries=env:CI_RUNTIME_QUERIES_JSON,expose=CI_RUNTIME_QUERIES_JSON \
