@@ -14,7 +14,7 @@ fn required_env(env: HarnessEnv, name: string) -> string {
 fn main(harness: Harness) {
   const output = required_env(harness.env, "CI_RUNTIME_OUTPUT")
   const report = collect(
-    live_source(harness.tools, required_env(harness.env, "GH_TOKEN")),
+    live_source(harness.tools, harness.fs, required_env(harness.env, "GH_TOKEN")),
     required_env(harness.env, "CI_RUNTIME_REPOSITORY"),
     required_env(harness.env, "CI_RUNTIME_WORKFLOW"),
     parse_queries(required_env(harness.env, "CI_RUNTIME_QUERIES_JSON")),

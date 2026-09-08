@@ -126,36 +126,42 @@ pub fn logs_from_archive(
 
 fn run_logs(
   tools: HarnessTools,
+  fs: HarnessFs,
   token: string,
   repository: string,
   run_id: int,
   job_names: list<string>,
 ) -> dict {
-  const archive = run(
+  const directory = fs.mkdtemp_in_workspace("ci-runtime-evidence-")
+  const archive_path = directory + "/logs.zip"
+  defer {
+    command_run(tools, ["rm", "-f", "--", archive_path])
+    command_run(tools, ["rmdir", "--", directory])
+  }
+  run(
     tools,
     [
-      "gh",
-      "api",
-      "-H",
+      "bash",
+      "-c",
+      "exec gh api -H \"$1\" \"$2\" > \"$3\"",
+      "ci-runtime-evidence",
       "X-GitHub-Api-Version: " + API_VERSION,
       "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/logs",
+      archive_path,
     ],
-    {transport: "file", max_inline_bytes: 1},
+    {max_inline_bytes: 1000},
     {GH_TOKEN: token},
   )
-  const archive_path = archive?.stdout_path
-  if type_of(archive_path) != "string" || archive_path == "" {
-    throw "run " + to_string(run_id) + " log read produced no binary artifact"
-  }
   return logs_from_archive(tools, archive_path, run_id, job_names)
 }
 
 /** Build the production GitHub evidence adapter from command tools and an Actions token. */
-pub fn live_source(tools: HarnessTools, token: string) -> EvidenceSource {
+pub fn live_source(tools: HarnessTools, fs: HarnessFs, token: string) -> EvidenceSource {
   return {
     json: fn(endpoint) { return gh_json(tools, token, endpoint) },
     logs: fn(repository, run_id, job_names) { return run_logs(
       tools,
+      fs,
       token,
       repository,
       run_id,
