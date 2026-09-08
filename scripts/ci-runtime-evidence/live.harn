@@ -5,6 +5,10 @@ const API_VERSION = "2026-03-10"
 
 const API_ROOT = "https://api.github.com"
 
+const MAX_JSON_RESPONSE_BYTES = 33554432
+
+const MAX_LOG_ARCHIVE_BYTES = 1073741824
+
 fn diagnostic(tools: HarnessTools, result: dict) -> string {
   const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
   const lines = trim(stderr).split("\n")
@@ -53,7 +57,7 @@ fn complete_stdout(tools: HarnessTools, result: dict) -> string {
   }
 }
 
-fn request_options(token: string) -> dict {
+fn request_options(token: string, max_response_bytes: int) -> dict {
   return {
     headers: {
       Accept: "application/vnd.github+json",
@@ -65,14 +69,12 @@ fn request_options(token: string) -> dict {
     retry: {max: 3, backoff_ms: 1000},
     follow_redirects: true,
     max_redirects: 5,
+    max_response_bytes: max_response_bytes,
   }
 }
 
 fn gh_json(net: HarnessNet, token: string, endpoint: string) -> unknown {
-  const response = net.get(
-    API_ROOT + endpoint,
-    request_options(token) + {max_response_bytes: 33554432},
-  )
+  const response = net.get(API_ROOT + endpoint, request_options(token, MAX_JSON_RESPONSE_BYTES))
   if !response.ok {
     throw "GitHub API request failed with HTTP " + to_string(response.status)
   }
@@ -159,7 +161,7 @@ fn run_logs(
   const download = net.download(
     API_ROOT + "/repos/" + repository + "/actions/runs/" + to_string(run_id) + "/logs",
     archive_path,
-    request_options(token),
+    request_options(token, MAX_LOG_ARCHIVE_BYTES),
   )
   if !download.ok || download.bytes_written <= 0 {
     throw "run " + to_string(run_id) + " log download failed with HTTP "

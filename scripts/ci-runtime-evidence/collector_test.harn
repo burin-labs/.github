@@ -313,6 +313,7 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   const live = harness.fs.read_text("./live.harn")
   assert(live.contains("Authorization: \"Bearer \" + token"))
   assert(live.contains("net.download"))
+  assert(live.contains("request_options(token, MAX_LOG_ARCHIVE_BYTES)"))
   assert(!live.contains("exec gh"))
   const cli = harness.fs.read_text("./cli.harn")
   assert(cli.contains("egress_policy"))
