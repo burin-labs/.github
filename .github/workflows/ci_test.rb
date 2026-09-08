@@ -47,6 +47,7 @@ expected_policy_sources = [
   ".github/actions/check-commit-signatures/action.yml",
   ".github/actions/check-dependabot-config/action.yml",
   ".github/actions/ci-latency-policy/action.yml",
+  ".github/actions/ci-runtime-evidence/action.yml",
   ".github/actions/exact-tree-ci-proof/action.yml",
   ".github/actions/harn-package/action.yml",
   ".github/actions/harn-repo-policy/action.yml",

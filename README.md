@@ -369,6 +369,34 @@ fails on a sustained p90 regression past the reproducible observed baseline or
 one run past its max-latency regression fuse. Missing, stale, invalid, or empty
 evidence also fails closed. A same-topology baseline may only tighten.
 
+## CI runtime evidence
+
+`.github/actions/ci-runtime-evidence` collects a versioned JSON census of
+completed workflow runs. Each run includes every reported job, wall and queue
+time, runner class, step timing, and standard `actions/cache` hit or miss
+messages. Event and branch quotas stay with the calling repository.
+
+Run it from a scheduled workflow and pin the action to an exact commit:
+
+```yaml
+- id: runtime-evidence
+  uses: burin-labs/.github/.github/actions/ci-runtime-evidence@<full-commit-sha>
+  with:
+    github-token: ${{ secrets.ACTIONS_READ_TOKEN }}
+    repository: owner/repository
+    workflow: ci.yml
+    queries-json: >-
+      [{"event":"pull_request","count":100},
+       {"event":"push","branch":"main","count":100}]
+    output: .harn/ci-runtime-evidence.json
+```
+
+The token needs Actions read access to the measured repository. The action
+requires Ruby and `unzip`, downloads each run's GitHub-generated log archive
+once, and fails when run or job evidence is short, partial, duplicated, or
+internally inconsistent. A skipped job remains a measured job with null
+execution timing.
+
 Package repositories should keep the exact release in `.harn-version`.
 Their complete CI adapter delegates package verification and rolls every
 required job into one stable status check:
