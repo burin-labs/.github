@@ -240,10 +240,13 @@ fn normalize_steps(job_id: int, raw_steps: unknown, execution_measured: bool = t
 fn normalize_job(run_id: int, raw: unknown) -> dict {
   const row = mapping(raw, "run " + to_string(run_id) + " contains a non-object job")
   const id = positive_integer(row?.id, "run " + to_string(run_id) + " job id")
+  const raw_steps = list_value(row?.steps, "job " + to_string(id) + " omitted steps")
   const created = optional_timestamp(row?.created_at, "job " + to_string(id) + " created_at")
   let started = optional_timestamp(row?.started_at, "job " + to_string(id) + " started_at")
   let completed = optional_timestamp(row?.completed_at, "job " + to_string(id) + " completed_at")
-  if row?.conclusion == "skipped" {
+  const never_executed = row?.conclusion == "skipped"
+    || (row?.conclusion == "cancelled" && len(raw_steps) == 0)
+  if never_executed {
     started = nil
     completed = nil
   }
@@ -271,7 +274,7 @@ fn normalize_job(run_id: int, raw: unknown) -> dict {
     wallMs: started != nil && completed != nil ? milliseconds(started, completed) : nil,
     queueMs: created != nil && started != nil ? milliseconds(created, started) : nil,
     runnerClass: runner_class(row),
-    steps: normalize_steps(id, row?.steps, !reused),
+    steps: normalize_steps(id, raw_steps, !never_executed && !reused),
   }
 }
 

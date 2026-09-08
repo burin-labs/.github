@@ -236,6 +236,29 @@ pipeline test_rerun_reused_jobs_do_not_report_copied_timing() {
   assert(measured.steps.every(fn(step) { step.wallMs == nil }))
 }
 
+pipeline test_cancelled_unassigned_jobs_do_not_report_clock_skew_as_execution() {
+  const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
+  const cancelled = job(101, "never assigned", ["ubuntu-latest"], "")
+    + {
+      conclusion: "cancelled",
+      created_at: "2026-09-08T10:00:09Z",
+      started_at: "2026-09-08T10:00:09Z",
+      completed_at: "2026-09-08T10:00:08Z",
+      steps: [],
+    }
+  const report = collect(
+    fixture_source({responses: {[endpoint]: {total_count: 1, jobs: [cancelled]}}}),
+    "acme/widgets",
+    "ci.yml",
+    [query("pull_request", 1)],
+    "now",
+  )
+  const measured = report.runs[0].jobs[0]
+  assert_eq(measured.wallMs, nil)
+  assert_eq(measured.queueMs, nil)
+  assert_eq(measured.runnerClass, "github-hosted")
+}
+
 pipeline test_executed_job_inverted_timestamps_fail() {
   const endpoint = "/repos/acme/widgets/actions/runs/10/jobs?per_page=100&page=1"
   const inverted = job(101, "test", ["ubuntu-latest"], "GitHub Actions 1")
