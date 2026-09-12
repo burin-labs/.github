@@ -2,6 +2,12 @@
 
 Burin Labs organization defaults and reusable GitHub Actions workflows.
 
+## Check Harn examples
+
+The [documentation checker action](docs/check-harn-docs.md) validates Harn examples
+using repository path rules and the checker maintained by Harn. It checks syntax,
+types, formatting, and lint rules, and refuses a scan with no checked examples.
+
 ## Local workflow checks
 
 `burin-labs/.github/.github/actions/local-workflow-checks` runs the commands

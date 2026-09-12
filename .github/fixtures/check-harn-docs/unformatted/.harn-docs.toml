@@ -1,0 +1,8 @@
+version = 1
+include = ["README.md"]
+
+[defaults]
+validation = "check"
+format = true
+lint = "strict"
+line_width = 74

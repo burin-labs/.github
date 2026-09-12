@@ -1,0 +1,251 @@
+import { regex_all_first_captures } from "std/text"
+
+fn root(fs: HarnessFs) -> string {
+  return path_normalize(path_join(fs.cwd(), "../.."))
+}
+
+fn read(harness: HarnessFs, path: string) -> string {
+  return harness.read_text(path_join(root(harness), path))
+}
+
+fn workflow(harness: Harness, name: string) -> any {
+  return yaml_parse(read(harness.fs, ".github/workflows/" + name + ".yml"))
+}
+
+fn step(steps: list, name: string) -> any {
+  return steps.find({ item -> item?.name == name })
+}
+
+fn expression(body: string) -> string {
+  return "$" + "{{ " + body + " }}"
+}
+
+fn sort(items: list) -> list {
+  return items.sorted()
+}
+
+fn census(harness: HarnessFs, patterns: list) -> list {
+  let paths = []
+  for pattern in patterns {
+    for path in harness.glob(pattern, {base: root(harness)}) {
+      paths = paths + [path_normalize(path).substring(len(root(harness)) + 1)]
+    }
+  }
+  return sort(unique(paths))
+}
+
+pipeline test_ci_joins_contracts_and_uses_exact_package_fixture(harness: Harness) {
+  const jobs = workflow(harness, "ci").jobs
+  assert(
+    read(harness.fs, ".github/dependabot.yml").starts_with(
+      read(harness.fs, "templates/dependabot.yml"),
+    ),
+  )
+  assert_eq(jobs["package-smoke"].uses, "./.github/workflows/harn-package.yml")
+  assert_eq(jobs["package-smoke"].strategy, {"fail-fast": false, matrix: {strict: [false, true]}})
+  assert_eq(
+    jobs["package-smoke"]["with"],
+    {
+      "harn-version": "0.10.52",
+      "package-path": ".github/fixtures/harn-package",
+      strict: expression("matrix.strict"),
+      "validate-command":
+        "test \"$(harn --version)\" = \"harn 0.10.52\" && test -s .harn/receipts/package-verify.json",
+      "artifact-name": "harn-package-smoke-" + expression("matrix.strict && 'strict' || 'default'")
+        + "-receipts",
+    },
+  )
+  const status = jobs["ci-status"]
+  assert_eq(status["if"], expression("always()"))
+  assert_eq(status.needs, ["local-check-contract", "package-smoke"])
+  const smoke = step(status.steps, "Require reusable package smoke")
+  assert_eq(
+    smoke.env,
+    {
+      LOCAL_CHECK_CONTRACT_RESULT: expression("needs.local-check-contract.result"),
+      PACKAGE_SMOKE_RESULT: expression("needs.package-smoke.result"),
+    },
+  )
+  assert(smoke.run.contains("test \"$LOCAL_CHECK_CONTRACT_RESULT\" = success"))
+  assert(smoke.run.contains("test \"$PACKAGE_SMOKE_RESULT\" = success"))
+}
+
+pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
+  const sources = census(
+    harness.fs,
+    [
+      ".github/workflows/*.yml",
+      ".github/workflows/*.yaml",
+      ".github/actions/**/action.yml",
+      ".github/actions/**/action.yaml",
+    ],
+  )
+  const actions = [
+    "check-commit-signatures",
+    "check-dependabot-config",
+    "check-harn-docs",
+    "ci-latency-policy",
+    "ci-runtime-evidence",
+    "exact-tree-ci-proof",
+    "harn-package",
+    "harn-repo-policy",
+    "local-workflow-checks",
+    "pr-title-check",
+    "require-successful-needs",
+    "rust-test-impact",
+  ]
+  const workflows = [
+    "ci-latency-observer",
+    "ci",
+    "dependabot-waiver-audit",
+    "docs-checker-smoke",
+    "harn-package",
+    "merge-override-dispatch",
+    "merge-override",
+    "register-package-release",
+    "reusable-pin-drift",
+    "runner-availability",
+    "runner-fleet-health",
+  ]
+  assert_eq(
+    sources,
+    sort(
+      actions.map({ name -> ".github/actions/" + name + "/action.yml" })
+        + workflows.map({ name -> ".github/workflows/" + name + ".yml" }),
+    ),
+  )
+  let checkout_count = 0
+  for source in sources {
+    const policy = yaml_parse(read(harness.fs, source))
+    const groups = if policy.has("jobs") {
+      values(policy.jobs).map({ job -> job?.steps ?? [] })
+    } else {
+      [policy?.runs?.steps ?? []]
+    }
+    for steps in groups {
+      for item in steps {
+        if to_string(item?.uses ?? "").starts_with("actions/checkout@") {
+          checkout_count = checkout_count + 1
+          assert_eq(item.uses, "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+          assert_eq(item?.["with"]?.["persist-credentials"], false)
+        }
+      }
+    }
+  }
+  assert(checkout_count > 0, "checkout policy scan must not be vacuous")
+  const checkout = workflow(harness, "ci").jobs["ci-status"].steps.find(
+    { item -> to_string(item?.uses ?? "").starts_with("actions/checkout@") },
+  )
+  assert_eq(checkout["with"], {"persist-credentials": false})
+}
+
+pipeline test_observer_retains_coverage_and_read_only_permissions(harness: Harness) {
+  const observer = workflow(harness, "ci-latency-observer")
+  assert_eq(observer.on.schedule[0].cron, "17 */6 * * *")
+  assert(observer.on.has("workflow_dispatch"))
+  assert_eq(observer.permissions, {contents: "read"})
+  const job = observer.jobs.observe
+  assert_eq(job["runs-on"], "ubuntu-latest")
+  const app = step(job.steps, "Mint read-only release-app token")["with"]
+  assert_eq(app["permission-actions"], "read")
+  assert_eq(app["permission-contents"], "read")
+  const run = step(job.steps, "Observe full CI runs").run
+  assert(run.contains("ruby scripts/ci_latency_observer.rb"))
+  assert(run.contains("exit \"$observer_status\""))
+  const runner = read(harness.fs, "scripts/ci_latency_observer.rb")
+  for required in [
+    "REPOSITORIES = [\".github\", \"harn\", \"burin-code\", \"harn-cloud\"].freeze",
+    "\"--json\", \"--check\"",
+    "status=completed&per_page=#{FULL_RUN_CANDIDATE_LIMIT}",
+    "FULL_RUN_CANDIDATE_LIMIT = 100",
+    "\"breaching_repositories\"",
+    "\"pending_repositories\"",
+    "File.join(@reports, \"org-summary.json\")",
+  ] {
+    assert(runner.contains(required), required)
+  }
+}
+
+pipeline test_ci_preserves_lint_title_and_owner_tests(harness: Harness) {
+  const steps = workflow(harness, "ci").jobs["ci-status"].steps
+  const markdown = step(steps, "Markdown lint")
+  assert_eq(
+    markdown.uses,
+    "DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff",
+  )
+  assert_eq(markdown["with"], {globs: "**/*.md"})
+  const install = step(steps, "Install actionlint").env
+  assert_eq(install.ACTIONLINT_VERSION, "1.7.12")
+  assert_eq(
+    install.ACTIONLINT_SHA256,
+    "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+  )
+  assert_eq(step(steps, "GitHub Actions lint").run, "actionlint")
+  assert_eq(
+    step(steps, "Test graph-derived Rust impact planning").run,
+    "node --test .github/actions/rust-test-impact/plan.test.mjs",
+  )
+  assert_eq(
+    step(steps, "Test exact-tree CI proof reuse").run,
+    "bash .github/actions/exact-tree-ci-proof/run-tests.sh",
+  )
+  const title = step(steps, "Check PR title and description")
+  assert_eq(title.uses, "./.github/actions/pr-title-check")
+  assert(title["if"].contains("github.event_name == 'pull_request'"))
+  assert_eq(
+    step(steps, "Check Dependabot config").uses,
+    "./.github/actions/check-dependabot-config",
+  )
+}
+
+pipeline test_override_waits_for_competing_runs_before_publishing(harness: Harness) {
+  const steps = workflow(harness, "merge-override").jobs.apply.steps
+  const names = steps.map({ item -> item?.name ?? "" })
+  const cancel = "Cancel competing workflow runs"
+  const publish = "Publish successful CI status check"
+  assert(names.contains(cancel) && names.contains(publish))
+  assert(names.index_of(cancel) < names.index_of(publish))
+  const command = step(steps, cancel).run
+  for required in ["gh run watch \"$run_id\"", "timeout 120", "run_status=\"$(gh api"] {
+    assert(command.contains(required), required)
+  }
+}
+
+pipeline test_ci_reaches_every_shell_and_remaining_ruby_test(harness: Harness) {
+  const jobs = workflow(harness, "ci").jobs
+  const expected_shell = census(harness.fs, [".github/**/*_test.sh", "scripts/**/*_test.sh"])
+  assert(len(expected_shell) > 0)
+  let reachable = []
+  for job in values(jobs) {
+    for item in job?.steps ?? [] {
+      for line in split(to_string(item?.run ?? ""), "\n") {
+        const command = trim(line)
+        if command.starts_with("bash .github/") || command.starts_with("bash scripts/") {
+          const path = split(command, " ")[1]
+          if path.ends_with("_test.sh") {
+            reachable = reachable + [path]
+          } else if harness.fs.exists(path_join(root(harness.fs), path)) {
+            for name in regex_all_first_captures(
+              "([A-Za-z0-9_.-]+_test\\.sh)",
+              read(harness.fs, path),
+            ) {
+              reachable = reachable + [path_join(dirname(path), name)]
+            }
+          }
+        }
+      }
+    }
+  }
+  assert_eq(sort(unique(reachable)), expected_shell)
+  const ruby_run = step(jobs["ci-status"].steps, "Test package workflow policy").run
+  const declared = split(ruby_run, "\n").map({ line -> trim(line) }).filter(
+    { line -> line.starts_with("ruby ") },
+  )
+    .map({ line -> line[5:len(line)] })
+  assert_eq(sort(declared), census(harness.fs, [".github/**/*_test.rb", "scripts/**/*_test.rb"]))
+  const local = step(jobs["local-check-contract"].steps, "Check the Harn package and controls").run
+  assert(
+    local.contains("harn test scripts/workflow-policy"),
+    "the replacement Harn policy test must execute in CI",
+  )
+}

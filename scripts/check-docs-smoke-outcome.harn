@@ -1,0 +1,29 @@
+fn main(harness: Harness) {
+  const expected = harness.env.get("CHECKER_EXPECTED")
+  const actual = harness.env.get("CHECKER_ACTUAL")
+  if !(expected == "success" || expected == "failure") {
+    throw "fixture must name its expected outcome"
+  }
+  if !(actual == expected) {
+    throw "documentation action did not report the expected outcome"
+  }
+  const log_path = harness.env.get("CHECKER_LOG")
+  if !(log_path != nil && log_path != "") {
+    throw "setup failure is not checker evidence"
+  }
+  const log = harness.fs.read_text(log_path)
+  const diagnostics = {
+    valid: "1 checked, 0 skipped (,ignore), 0 failed",
+    "invalid-config": "Additional properties are not allowed ('unknown_option' was unexpected)",
+    unformatted: "HARN-FMT-002: would be reformatted",
+    "empty-scan": "check-docs-snippets inspected 0 validated snippet(s)",
+  }
+  const fixture = harness.env.get("CHECKER_FIXTURE")
+  if !(fixture != nil && diagnostics.has(fixture)) {
+    throw "fixture must name its validation diagnostic"
+  }
+  if !log.contains(diagnostics[fixture]) {
+    throw "failure must come from the selected validation rule"
+  }
+  harness.stdio.println("documentation action outcome verified")
+}

@@ -1,0 +1,60 @@
+name: Check Harn documentation
+description: Check Harn examples with the Harn-owned documentation checker and repository policy.
+inputs:
+  config:
+    description: Documentation policy file, relative to the working directory.
+    required: false
+    default: .harn-docs.toml
+  working-directory:
+    description: Repository directory containing the documentation to check.
+    required: false
+    default: .
+outputs:
+  log:
+    description: Checker output, retained even when validation fails.
+    value: ${{ runner.temp }}/harn-docs-check.log
+runs:
+  using: composite
+  steps:
+    - name: Set up the checker runtime
+      id: runtime
+      uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
+      with:
+        version: 0.10.135
+    - name: Fetch the Harn-owned checker
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: burin-labs/harn
+        ref: 5b3276976f59a9b8275e4e86841afff0017f4c03
+        path: .harn-tools/check-docs
+        persist-credentials: false
+        sparse-checkout-cone-mode: false
+        # Non-cone patterns include only executable sources. In particular,
+        # fetched Markdown must never enter a consumer's broad documentation scan.
+        sparse-checkout: |
+          /scripts/check_docs_snippets.harn
+          /scripts/docs_snippet_policy.harn
+          /scripts/path_visibility.harn
+    - name: Check repository examples
+      id: check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        HARN_BIN: ${{ steps.runtime.outputs.path }}
+        DOCS_POLICY: ${{ inputs.config }}
+        HARN_STATE_DIR: ${{ runner.temp }}/harn-docs-state
+        HARN_RUN_DIR: ${{ runner.temp }}/harn-docs-runs
+        HARN_SESSION_STORE_ROOT: ${{ runner.temp }}/harn-docs-sessions
+      run: |
+        exec "$HARN_BIN" run --standalone --read-only-root "$GITHUB_WORKSPACE" \
+          "$GITHUB_WORKSPACE/.harn-tools/check-docs/scripts/check_docs_snippets.harn" \
+          -- --config "$DOCS_POLICY" > "$RUNNER_TEMP/harn-docs-check.log" 2>&1
+    - name: Show checker output
+      if: ${{ always() && steps.check.outcome != 'skipped' }}
+      shell: bash
+      env:
+        HARN_BIN: ${{ steps.runtime.outputs.path }}
+        DOCS_CHECK_LOG: ${{ runner.temp }}/harn-docs-check.log
+      run: |
+        exec "$HARN_BIN" run --standalone --read-only-root "$RUNNER_TEMP" \
+          "$GITHUB_ACTION_PATH/show-log.harn"
