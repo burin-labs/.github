@@ -1,0 +1,7 @@
+fn main(harness: Harness) {
+  const log = harness.env.get("DOCS_CHECK_LOG")
+  if log == nil || log == "" {
+    throw "DOCS_CHECK_LOG is required"
+  }
+  harness.stdio.print(harness.fs.read_text(log))
+}

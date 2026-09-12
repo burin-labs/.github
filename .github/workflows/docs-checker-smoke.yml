@@ -1,0 +1,45 @@
+name: Documentation checker smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checker:
+    name: Documentation checker (${{ matrix.fixture }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fixture: valid
+            expected: success
+          - fixture: invalid-config
+            expected: failure
+          - fixture: unformatted
+            expected: failure
+          - fixture: empty-scan
+            expected: failure
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the published action path
+        id: checker
+        continue-on-error: true
+        uses: ./.github/actions/check-harn-docs
+        with:
+          working-directory: .github/fixtures/check-harn-docs/${{ matrix.fixture }}
+      - name: Assert the measured outcome
+        if: ${{ always() }}
+        env:
+          CHECKER_EXPECTED: ${{ matrix.expected }}
+          CHECKER_LOG: ${{ steps.checker.outputs.log }}
+          CHECKER_FIXTURE: ${{ matrix.fixture }}
+          CHECKER_ACTUAL: ${{ steps.checker.outcome }}
+        run: harn run --standalone --read-only-root "$RUNNER_TEMP" scripts/check-docs-smoke-outcome.harn

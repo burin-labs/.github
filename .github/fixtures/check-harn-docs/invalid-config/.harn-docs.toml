@@ -1,0 +1,9 @@
+version = 1
+unknown_option = true
+include = ["README.md"]
+
+[defaults]
+validation = "check"
+format = true
+lint = "strict"
+line_width = 74
