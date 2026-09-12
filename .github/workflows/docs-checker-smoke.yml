@@ -11,19 +11,31 @@ permissions:
 
 jobs:
   checker:
-    name: Documentation checker (${{ matrix.fixture }})
+    name: Documentation checker (${{ matrix.fixture }}, ${{ matrix.runtime }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - fixture: valid
+            runtime: explicit-version
+            version: 0.10.135
+            expected: success
+          - fixture: valid
+            runtime: version-file
+            version: ""
             expected: success
           - fixture: invalid-config
+            runtime: explicit-version
+            version: 0.10.135
             expected: failure
           - fixture: unformatted
+            runtime: explicit-version
+            version: 0.10.135
             expected: failure
           - fixture: empty-scan
+            runtime: explicit-version
+            version: 0.10.135
             expected: failure
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,6 +46,8 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/check-harn-docs
         with:
+          version: ${{ matrix.version }}
+          version-file: .github/fixtures/check-harn-docs/valid/runtime-version.txt
           working-directory: .github/fixtures/check-harn-docs/${{ matrix.fixture }}
       - name: Assert the measured outcome
         if: ${{ always() }}
