@@ -1,6 +1,14 @@
 name: Check Harn documentation
 description: Check Harn examples with the Harn-owned documentation checker and repository policy.
 inputs:
+  version:
+    description: Harn version with or without a leading v. Overrides version-file when set.
+    required: false
+    default: ""
+  version-file:
+    description: Version file relative to the repository root, independent of working-directory.
+    required: false
+    default: .harn-version
   config:
     description: Documentation policy file, relative to the working directory.
     required: false
@@ -20,12 +28,13 @@ runs:
       id: runtime
       uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
       with:
-        version: 0.10.135
+        version: ${{ inputs.version }}
+        version-file: ${{ inputs.version-file }}
     - name: Fetch the Harn-owned checker
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: burin-labs/harn
-        ref: 5b3276976f59a9b8275e4e86841afff0017f4c03
+        ref: ab198286b32d1a7de92174454b8d33e2eddcc7fe
         path: .harn-tools/check-docs
         persist-credentials: false
         sparse-checkout-cone-mode: false
