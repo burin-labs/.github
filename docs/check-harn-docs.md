@@ -1,9 +1,9 @@
 # Check Harn examples
 
 Use `burin-labs/.github/.github/actions/check-harn-docs` to check Harn examples
-with the same checker used by Harn itself. The action uses your runtime pin and an immutable checker
-source. Your repository owns which documents to scan and how strictly to check
-its examples.
+with the same checker used by Harn itself. The action uses your runtime pin and
+an immutable checker source. Your repository owns which documents to scan and
+how strictly to check its examples.
 
 Check out your repository, then call this action at an exact commit. Its `config`
 input defaults to `.harn-docs.toml`; `working-directory` defaults to the repository
@@ -11,8 +11,9 @@ root. Set `version` to an exact Harn release, or let `version-file` read your
 repository's runtime pin (default `.harn-version`). An explicit `version` takes
 precedence. The version file is relative to the repository root, while the
 configuration file is relative to `working-directory`. The checker requires
-Harn 0.10.135 or later. The checker fails on invalid policy, malformed examples, and a scan with no
-checked examples. The action does not rewrite documents or diagnostic snapshots.
+Harn 0.10.135 or later. The checker fails on invalid policy, malformed examples,
+and a scan with no checked examples. The action does not rewrite documents or
+diagnostic snapshots.
 Its `log` output names the retained checker log, which is also printed after
 validation so a failed check keeps its explanation.
 
