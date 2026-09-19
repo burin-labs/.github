@@ -62,10 +62,78 @@ lines.each_with_index do |line, index|
   next unless line.strip == "exit 0"
 
   preceding = lines[0...index].reject { |candidate| candidate.strip.empty? }.last(2)
-  next if preceding.any? { |candidate| candidate.strip == "report_unmeasured" }
+  next if preceding.any? { |candidate| candidate.strip.start_with?("report_unmeasured") }
 
   abort "#{path}: `exit 0` on line #{index + 1} of the detect script must be preceded by report_unmeasured"
 end
+
+# The structural checks above prove the reporter writes every key. They cannot
+# prove which reason a given credentials state produces, and that is the whole
+# point of the Dependabot carve-out: the same "no token" condition must route a
+# private repository onto the fleet and a public one onto hosted runners. So
+# run the real script text under each state and read the outputs it emits.
+require "open3"
+require "tmpdir"
+
+def rehearse(script, env)
+  Dir.mktmpdir do |dir|
+    script_path = File.join(dir, "detect.sh")
+    output_path = File.join(dir, "github_output")
+    File.write(script_path, script)
+    File.write(output_path, "")
+    base = {
+      "GITHUB_OUTPUT" => output_path, "GH_TOKEN" => "", "OWNER" => "burin-labs",
+      "DEFAULT_TAG" => "harn-ci", "LINUX_TAG" => "harn-ci", "LINUX_BIG_TAG" => "harn-ci-big",
+      "LINUX_FETCH_TAG" => "harn-fetch-ok", "LINUX_PROBE_TAG" => "", "MACOS_TAG" => "harn-ci",
+      "WINDOWS_TAG" => "harn-ci", "RUNNER_GROUPS" => "Default", "SELFHOSTED_DISABLED" => "",
+      "MINIMUM_ONLINE" => "1", "MINIMUM_ONLINE_BY_POOL" => "{}"
+    }
+    _, stderr, status = Open3.capture3(base.merge(env), "bash", script_path)
+    abort "rehearsal exited #{status.exitstatus}: #{stderr}" unless status.success?
+    File.read(output_path).lines.map(&:strip).reject(&:empty?).to_h { |l| l.split("=", 2) }
+  end
+end
+
+def expect(outputs, key, value, message)
+  return if outputs[key] == value
+
+  abort "#{message}: expected #{key}=#{value}, got #{key}=#{outputs[key].inspect}"
+end
+
+DEPENDABOT = "dependabot[bot]"
+
+private_bump = rehearse(script, "IS_DEPENDABOT_ACTOR" => "true", "REPOSITORY_PRIVATE" => "true")
+expect(private_bump, "probe_state", "probe_unavailable:dependabot_secret_store",
+       "a private Dependabot bump must name the credentials state, not claim the fleet is unmeasured")
+expect(private_bump, "selfhosted_permitted", "true",
+       "a private Dependabot bump must be allowed onto the fleet")
+expect(private_bump, "linux", "true",
+       "a private Dependabot bump must offer the Linux lane")
+
+public_bump = rehearse(script, "IS_DEPENDABOT_ACTOR" => "true", "REPOSITORY_PRIVATE" => "false")
+expect(public_bump, "probe_state", "probe_unavailable:dependabot_secret_store",
+       "a public Dependabot bump must still name the credentials state")
+expect(public_bump, "selfhosted_permitted", "false",
+       "a public repository must keep falling through to hosted runners")
+expect(public_bump, "linux", "false",
+       "a public Dependabot bump must not be offered the fleet")
+
+# A fork pull request is not Dependabot and must be untouched by the carve-out.
+fork_pr = rehearse(script, "IS_DEPENDABOT_ACTOR" => "false", "REPOSITORY_PRIVATE" => "false")
+expect(fork_pr, "probe_state", "unmeasured",
+       "a tokenless non-Dependabot run must stay plain unmeasured")
+expect(fork_pr, "selfhosted_permitted", "false", "a fork must never reach the fleet")
+
+# A private repo alone must not open the fleet; the carve-out is Dependabot-only.
+private_human = rehearse(script, "IS_DEPENDABOT_ACTOR" => "false", "REPOSITORY_PRIVATE" => "true")
+expect(private_human, "probe_state", "unmeasured",
+       "a tokenless human run on a private repo is still an unmeasured probe")
+expect(private_human, "selfhosted_permitted", "false",
+       "repository visibility alone must not permit the fleet")
+
+# The three states must stay distinguishable; collapsing any two is the defect.
+states = [private_bump, public_bump, fork_pr].map { |o| [o["probe_state"], o["selfhosted_permitted"]] }
+abort "probe_state and selfhosted_permitted must distinguish all three cases" unless states.uniq.length == 3
 
 puts "runner-availability policy: ok"
 

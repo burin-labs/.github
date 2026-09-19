@@ -188,6 +188,24 @@ on:
           caller that treats 0 as "busy" would repeat the conflation this
           detector exists to prevent. Gate on `measured` before reading counts.
         value: ${{ jobs.detect.outputs.capacity }}
+      probe_state:
+        description: >-
+          Why the capacity numbers read the way they do, as one typed token.
+          `measured` means the fleet was counted. `unmeasured` means the probe
+          could not run and the caller should treat self-hosted as unavailable.
+          `probe_unavailable:dependabot_secret_store` means the probe was denied
+          its credentials because GitHub served the Dependabot secret store, not
+          because the fleet is down; on a private repository the lane booleans
+          are true anyway, because a Dependabot lockfile bump on a repo only
+          members can open pull requests against is not fork-shaped code.
+          Read this, never a count of 0, when deciding why a lane was refused.
+        value: ${{ jobs.detect.outputs.probe_state }}
+      selfhosted_permitted:
+        description: >-
+          true when the caller may use self-hosted runners even though capacity
+          was not measured. Only the private-repository Dependabot case sets
+          this; every other unmeasured outcome leaves it false.
+        value: ${{ jobs.detect.outputs.selfhosted_permitted }}
 
 permissions:
   contents: read
@@ -201,6 +219,12 @@ jobs:
       # Promote to job env so step-level `if:` can gate on secret presence; the
       # `secrets` context is unavailable directly in step `if:` expressions.
       HAS_RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+      # Dependabot pull requests are served the Dependabot secret store, so the
+      # app credentials above are absent by design and the probe cannot run.
+      # That is a credentials state, not a statement about the fleet, and the
+      # script has to be able to tell the two apart.
+      IS_DEPENDABOT_ACTOR: ${{ github.actor == 'dependabot[bot]' || github.triggering_actor == 'dependabot[bot]' }}
+      REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
     outputs:
       linux: ${{ steps.detect.outputs.linux }}
       linux_big: ${{ steps.detect.outputs.linux_big }}
@@ -210,6 +234,8 @@ jobs:
       macos: ${{ steps.detect.outputs.macos }}
       selfhosted_disabled: ${{ steps.detect.outputs.selfhosted_disabled }}
       capacity: ${{ steps.detect.outputs.capacity }}
+      probe_state: ${{ steps.detect.outputs.probe_state }}
+      selfhosted_permitted: ${{ steps.detect.outputs.selfhosted_permitted }}
     steps:
       - name: Mint GitHub App token
         id: app-token
@@ -293,16 +319,26 @@ jobs:
           # key silently arrives at the caller as the empty string, and
           # `fromJSON('')` then fails inside the caller's `runs-on`, where the
           # error is far from its cause.
+          # $1 is the typed probe state and $2 is whether the caller may still
+          # use self-hosted runners. Both are required: a caller that reads a
+          # count of 0 cannot tell a retired lane from a fleet outage from a
+          # probe that was denied its credentials, and those three want
+          # different behaviour. The lane booleans follow $2, never the counts,
+          # because nothing was counted on any path through here.
           report_unmeasured() {
+            probe_state="$1"
+            permitted="$2"
             {
-              echo "linux=false"
-              echo "linux_big=false"
-              echo "linux_fetch=false"
-              echo "linux_probe=false"
-              echo "windows=false"
-              echo "macos=false"
-              echo "capacity=$(jq -c -n '["linux", "linux_big", "linux_fetch", "linux_probe", "macos", "windows"]
-                | map({key: ., value: {online: 0, idle: 0, measured: false, eligible: false}})
+              echo "linux=${permitted}"
+              echo "linux_big=${permitted}"
+              echo "linux_fetch=${permitted}"
+              echo "linux_probe=${permitted}"
+              echo "windows=${permitted}"
+              echo "macos=${permitted}"
+              echo "probe_state=${probe_state}"
+              echo "selfhosted_permitted=${permitted}"
+              echo "capacity=$(jq -c -n --argjson permitted "$permitted" '["linux", "linux_big", "linux_fetch", "linux_probe", "macos", "windows"]
+                | map({key: ., value: {online: 0, idle: 0, measured: false, eligible: $permitted}})
                 | from_entries')"
             } >> "$GITHUB_OUTPUT"
           }
@@ -329,13 +365,32 @@ jobs:
           # answer cannot change the outcome.
           if is_disabled linux && is_disabled linux_big && is_disabled linux_fetch \
             && is_disabled macos && is_disabled windows; then
-            report_unmeasured
+            report_unmeasured disabled false
             exit 0
           fi
 
           if [ -z "${GH_TOKEN:-}" ]; then
+            # A Dependabot pull request is served the Dependabot secret store,
+            # so the app credentials are absent by design and no probe is
+            # possible. On a PRIVATE repository that is not a reason to refuse
+            # the fleet. Only organization members can open pull requests
+            # there, the diff is a lockfile bump authored by a GitHub-operated
+            # bot, and the workflow is the one already on the base branch. The
+            # fork case is the one this guard exists for, and it is untouched:
+            # a public repository still falls through to hosted runners.
+            if [ "${IS_DEPENDABOT_ACTOR:-false}" = "true" ] \
+              && [ "${REPOSITORY_PRIVATE:-false}" = "true" ]; then
+              echo "::notice::runner-availability: Dependabot secret store withheld the probe credentials on a private repository; permitting self-hosted without a measurement"
+              report_unmeasured probe_unavailable:dependabot_secret_store true
+              exit 0
+            fi
+            if [ "${IS_DEPENDABOT_ACTOR:-false}" = "true" ]; then
+              echo "::notice::runner-availability: Dependabot secret store withheld the probe credentials on a public repository; using GitHub-hosted runners"
+              report_unmeasured probe_unavailable:dependabot_secret_store false
+              exit 0
+            fi
             echo "::notice::runner-availability: no GH_TOKEN; using GitHub-hosted runners"
-            report_unmeasured
+            report_unmeasured unmeasured false
             exit 0
           fi
 
@@ -348,7 +403,7 @@ jobs:
           # of this detector conflated the two for six days.
           fall_through() {
             echo "::warning::runner-availability: $1; falling back to GitHub-hosted runners"
-            report_unmeasured
+            report_unmeasured unmeasured false
             exit 0
           }
 
@@ -581,5 +636,12 @@ jobs:
             echo "::notice::runner-availability linux_probe=$([ "$probe_count" -gt 0 ] && echo true || echo false) (${probe_count} idle of ${probe_online} online Linux ${LINUX_PROBE_TAG} runner(s))"
           fi
 
-          echo "capacity=${capacity}" >> "$GITHUB_OUTPUT"
+          # The measured path is the only one that reaches here, so it is the
+          # only one that may claim `measured`. Written beside `capacity` so a
+          # future lane added above cannot return without a probe state.
+          {
+            echo "probe_state=measured"
+            echo "selfhosted_permitted=true"
+            echo "capacity=${capacity}"
+          } >> "$GITHUB_OUTPUT"
           echo "::notice::runner-availability capacity=${capacity}"
