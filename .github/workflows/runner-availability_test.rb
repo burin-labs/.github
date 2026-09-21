@@ -131,6 +131,58 @@ expect(private_human, "probe_state", "unmeasured",
 expect(private_human, "selfhosted_permitted", "false",
        "repository visibility alone must not permit the fleet")
 
+# THE case this file gained for #112. The kill switch and the probe credentials
+# are independent, and only the measured path used to ask about the switch. A
+# run with no credentials and one operating system retired published that
+# operating system as available, and a caller keying `runs-on` on the boolean
+# routed onto the retired pool. The whole-fleet shortcut hid it: that fires only
+# when EVERY operating system is disabled, so a partial switch fell through.
+#
+# Asserted on both the boolean and the capacity entry, because a consumer that
+# reads the typed state first and one that still reads the boolean must both
+# stay on hosted capacity.
+disabled_bump = rehearse(
+  script,
+  "IS_DEPENDABOT_ACTOR" => "true", "REPOSITORY_PRIVATE" => "true",
+  "SELFHOSTED_DISABLED" => "linux"
+)
+expect(disabled_bump, "linux", "false",
+       "an unmeasured run must not offer a lane the kill switch retired")
+expect(disabled_bump, "linux_big", "false", "linux implies its big subset")
+expect(disabled_bump, "linux_fetch", "false", "linux implies its fetch subset")
+expect(disabled_bump, "linux_probe", "false", "linux implies its probe subset")
+expect(disabled_bump, "macos", "true",
+       "the switch is per operating system; an untouched lane must stay offered")
+expect(disabled_bump, "selfhosted_disabled", "linux,linux_big,linux_fetch",
+       "the retired set must still be published for the caller to read")
+# The probe genuinely was unavailable, so the typed state must keep saying so.
+# Renaming it here would break every consumer that refuses a state it does not
+# know, which is the correct behaviour for those consumers.
+expect(disabled_bump, "probe_state", "probe_unavailable:dependabot_secret_store",
+       "the switch does not change why the probe could not run")
+capacity = JSON.parse(disabled_bump.fetch("capacity"))
+abort "a retired lane must be ineligible in capacity too" if capacity.fetch("linux").fetch("eligible")
+abort "an untouched lane must stay eligible in capacity" unless capacity.fetch("macos").fetch("eligible")
+abort "nothing was counted, so no lane may claim a measurement" if capacity.values.any? { |lane| lane.fetch("measured") }
+
+# A switch naming a lane nobody asked about must not disturb the others, and a
+# caller that is not permitted at all stays false whatever the switch says.
+macos_only = rehearse(
+  script,
+  "IS_DEPENDABOT_ACTOR" => "true", "REPOSITORY_PRIVATE" => "true",
+  "SELFHOSTED_DISABLED" => "macos"
+)
+expect(macos_only, "macos", "false", "the named lane must be retired")
+expect(macos_only, "linux", "true", "an unnamed lane must be untouched")
+
+forbidden = rehearse(
+  script,
+  "IS_DEPENDABOT_ACTOR" => "true", "REPOSITORY_PRIVATE" => "false",
+  "SELFHOSTED_DISABLED" => "macos"
+)
+expect(forbidden, "linux", "false",
+       "a caller that may not use the fleet stays off it whatever the switch names")
+
 # The three states must stay distinguishable; collapsing any two is the defect.
 states = [private_bump, public_bump, fork_pr].map { |o| [o["probe_state"], o["selfhosted_permitted"]] }
 abort "probe_state and selfhosted_permitted must distinguish all three cases" unless states.uniq.length == 3
