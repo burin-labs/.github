@@ -93,6 +93,7 @@ pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
     "pr-title-check",
     "require-successful-needs",
     "rust-test-impact",
+    "validate-candidate-manifest",
   ]
   const workflows = [
     "ci-latency-observer",

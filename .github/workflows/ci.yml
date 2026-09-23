@@ -162,3 +162,4 @@ jobs:
           bash -n scripts/runner-fleet-health.sh
           bash -n scripts/reusable-pin-drift.sh
           bash -n scripts/release-promotion/run.sh
+          bash -n .github/actions/validate-candidate-manifest/run.sh

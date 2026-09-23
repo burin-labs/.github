@@ -2,6 +2,7 @@ import {
   CANDIDATE_MANIFEST_FILE,
   CandidateManifest,
   candidate_manifest_artifact,
+  expect_manifest_identity,
   validate_candidate_manifest,
 } from "./manifest.harn"
 
@@ -14,11 +15,20 @@ pub type GitHub = {
   download: fn(int, string, string) -> nil,
   attest: fn(string, dict) -> string?,
   create_draft: fn(dict) -> nil,
-  publish_draft: fn(int) -> unknown,
+  publish_draft: fn(int, bool) -> unknown,
 }
 
-/** What the caller asked to promote. */
-pub type PromotionRequest = {repository: string, sha: string, run_id: int, tag: string}
+/**
+ * What the caller asked to promote. A tag with a pre-release suffix, such as
+ * v1.2.3-rc.1, is a prerelease and never becomes the latest release.
+ */
+pub type PromotionRequest = {
+  repository: string,
+  sha: string,
+  run_id: int,
+  tag: string,
+  prerelease: bool,
+}
 
 /** The run facts promotion relies on after it has checked them. */
 pub type VerifiedRun = {url: string, attempt: int}
@@ -27,7 +37,7 @@ pub type VerifiedRun = {url: string, attempt: int}
 pub type Candidate = {
   manifest: CandidateManifest,
   manifest_path: string,
-  files: list<{name: string, path: string, sha256: string}>,
+  files: list<{kind: string, name: string, path: string, sha256: string}>,
 }
 
 fn expect_format(value: string, pattern: string, message: string) -> string {
@@ -45,8 +55,18 @@ pub fn parse_request(
   expect_format(repository, "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "repository must be owner/name")
   expect_format(sha, "^[0-9a-f]{40}$", "sha must be a full 40-character lowercase commit SHA")
   expect_format(run_id, "^[1-9][0-9]*$", "run-id must be a workflow run id")
-  expect_format(tag, "^v[0-9]+\\.[0-9]+\\.[0-9]+$", "tag must look like vX.Y.Z, got " + tag)
-  return {repository: repository, sha: sha, run_id: to_int(run_id), tag: tag}
+  expect_format(
+    tag,
+    "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$",
+    "tag must look like vX.Y.Z or vX.Y.Z-suffix, got " + tag,
+  )
+  return {
+    repository: repository,
+    sha: sha,
+    run_id: to_int(run_id),
+    tag: tag,
+    prerelease: tag.contains("-"),
+  }
 }
 
 fn run_label(request: PromotionRequest) -> string {
@@ -134,18 +154,10 @@ fn load_manifest(
   } catch (error) {
     throw CANDIDATE_MANIFEST_FILE + " is not JSON: " + to_string(error)
   }
-  const manifest = validate_candidate_manifest(raw)
-  if manifest.repository != request.repository {
-    throw "manifest repository is " + manifest.repository + ", not " + request.repository
-  }
-  if manifest.sourceCommit != request.sha {
-    throw "manifest sourceCommit is " + manifest.sourceCommit + ", not the requested "
-      + request.sha
-  }
-  if manifest.runId != to_string(request.run_id) {
-    throw "manifest runId is " + manifest.runId + ", not the requested "
-      + to_string(request.run_id)
-  }
+  const manifest = expect_manifest_identity(
+    validate_candidate_manifest(raw),
+    {repository: request.repository, source_commit: request.sha, run_id: to_string(request.run_id)},
+  )
   if to_int(manifest.runAttempt) > run.attempt {
     throw "manifest runAttempt " + manifest.runAttempt + " is later than the run's attempt "
       + to_string(run.attempt)
@@ -179,7 +191,7 @@ pub fn check_candidate(
         + [item.file + " has sha256 " + actual + " but the manifest records " + item.sha256]
       continue
     }
-    files = files + [{name: item.file, path: candidate, sha256: actual}]
+    files = files + [{kind: item.kind, name: item.file, path: candidate, sha256: actual}]
   }
   if len(mismatches) > 0 {
     throw "candidate files do not match the manifest: " + join(mismatches, "; ")
@@ -283,10 +295,17 @@ pub fn publish_candidate(
   if stale != nil {
     throw "a draft release for " + request.tag + " already exists: " + to_string(stale?.html_url)
   }
+  // The notes file is the release body, byte for byte as the run built it;
+  // every other candidate file, and the manifest, is an asset.
+  const notes = candidate.files.find({ file -> file.kind == "notes" })
+  if notes == nil {
+    throw "the candidate has no notes file for the release body"
+  }
+  const assets = candidate.files.filter({ file -> file.kind != "notes" }).to_list()
   let expected: dict<string, string> = {
     [CANDIDATE_MANIFEST_FILE]: sha256(fs.read_bytes(candidate.manifest_path)),
   }
-  for file in candidate.files {
+  for file in assets {
     expected = expected + {[file.name]: file.sha256}
   }
   github.create_draft(
@@ -294,10 +313,9 @@ pub fn publish_candidate(
       tag: request.tag,
       sha: request.sha,
       title: request.tag,
-      notes: "Promoted from " + run.url + " at " + request.sha + ". "
-        + CANDIDATE_MANIFEST_FILE
-        + " records the sha256 of every file.",
-      files: candidate.files.map({ file -> file.path }) + [candidate.manifest_path],
+      notes_file: notes.path,
+      prerelease: request.prerelease,
+      files: assets.map({ file -> file.path }) + [candidate.manifest_path],
     },
   )
   const draft = draft_for(github, request)
@@ -321,12 +339,20 @@ pub fn publish_candidate(
       differences = differences + [name + " is not a candidate file"]
     }
   }
+  // GitHub does not report a digest for the body, so compare the text. Only
+  // surrounding whitespace is allowed to differ.
+  if trim(to_string(draft?.body ?? "")) != trim(fs.read_text(notes.path)) {
+    differences = differences + ["the release body is not " + notes.name]
+  }
+  if draft?.prerelease != request.prerelease {
+    differences = differences + ["prerelease is " + to_string(draft?.prerelease)]
+  }
   if len(differences) > 0 {
     throw "draft release " + to_string(draft?.html_url) + " does not hold the candidate: "
       + join(differences, "; ")
       + ". It was left unpublished."
   }
-  const published = github.publish_draft(draft.id)
+  const published = github.publish_draft(draft.id, !request.prerelease)
   const landed = tag_commit(github, request)
   if landed != request.sha {
     throw "published " + request.tag + " but the tag points at " + to_string(landed) + ", not "

@@ -12,7 +12,8 @@ pub const CANDIDATE_MANIFEST_FILE = "candidate-manifest.json"
 
 /** A promoted file, as the run that built it recorded it. */
 pub type CandidateArtifact = {
-  target: string,
+  kind: string,
+  target?: string,
   artifact: string,
   file: string,
   sha256: string,
@@ -68,7 +69,7 @@ pub const CANDIDATE_MANIFEST_SCHEMA = {
         type: "object",
         additionalProperties: false,
         required: [
-          "target",
+          "kind",
           "artifact",
           "file",
           "sha256",
@@ -77,7 +78,16 @@ pub const CANDIDATE_MANIFEST_SCHEMA = {
           "notarizationStatus",
         ],
         properties: {
-          target: {description: "Platform the file is for.", type: "string", pattern: NAME},
+          kind: {
+            description:
+              "archive: a platform build, and the only kind with a target. checksums, asset-index: release files built beside the archives. notes: the release body, exactly one per manifest, never uploaded as an asset.",
+            enum: ["archive", "checksums", "asset-index", "notes"],
+          },
+          target: {
+            description: "Platform an archive is for. Required on archives, absent otherwise.",
+            type: "string",
+            pattern: NAME,
+          },
           artifact: {
             description: "Run artifact that contains the file.",
             type: "string",
@@ -135,13 +145,35 @@ pub fn validate_candidate_manifest(raw: unknown) -> CandidateManifest {
   }
   const manifest: CandidateManifest = unwrap(checked)
   let problems = []
-  for target in duplicates(manifest.artifacts.map({ item -> item.target })) {
+  const archives = manifest.artifacts.filter({ item -> item.kind == "archive" }).to_list()
+  if len(archives) == 0 {
+    problems = problems + ["it lists no archive"]
+  }
+  const notes = manifest.artifacts.filter({ item -> item.kind == "notes" }).to_list()
+  if len(notes) != 1 {
+    problems = problems
+      + ["it lists " + to_string(len(notes)) + " notes files; a release has exactly one body"]
+  }
+  for target in duplicates(archives.map({ item -> item.target ?? "" })) {
     problems = problems + ["target " + target + " appears more than once"]
   }
   for file in duplicates(manifest.artifacts.map({ item -> item.file })) {
     problems = problems + ["file " + file + " appears more than once"]
   }
   for item in manifest.artifacts {
+    if item.kind == "archive" && item.target == nil {
+      problems = problems + ["archive " + item.file + " has no target"]
+    }
+    if item.kind != "archive" && item.target != nil {
+      problems = problems + [item.kind + " file " + item.file + " names a target"]
+    }
+    if item.kind != "archive"
+      && (item.signingStatus != "not_applicable" || item.notarizationStatus != "not_applicable") {
+      problems = problems
+        + [
+          item.kind + " file " + item.file + " must be not_applicable for signing and notarization",
+        ]
+    }
     if item.file == CANDIDATE_MANIFEST_FILE {
       problems = problems + ["file " + item.file + " collides with the manifest itself"]
     }
@@ -151,6 +183,30 @@ pub fn validate_candidate_manifest(raw: unknown) -> CandidateManifest {
   }
   if len(problems) > 0 {
     throw "candidate manifest is inconsistent: " + join(problems, "; ")
+  }
+  return manifest
+}
+
+/** The identity a caller expects a manifest to carry; nil fields are not checked. */
+pub type ManifestIdentity = {repository: string?, source_commit: string?, run_id: string?}
+
+/**
+ * Refuse a valid manifest that names a different repository, commit, or run
+ * than the caller expects. Returns the manifest unchanged otherwise.
+ */
+pub fn expect_manifest_identity(
+  manifest: CandidateManifest,
+  expected: ManifestIdentity,
+) -> CandidateManifest {
+  if expected.repository != nil && manifest.repository != expected.repository {
+    throw "manifest repository is " + manifest.repository + ", not " + expected.repository
+  }
+  if expected.source_commit != nil && manifest.sourceCommit != expected.source_commit {
+    throw "manifest sourceCommit is " + manifest.sourceCommit + ", not the requested "
+      + expected.source_commit
+  }
+  if expected.run_id != nil && manifest.runId != expected.run_id {
+    throw "manifest runId is " + manifest.runId + ", not the requested " + expected.run_id
   }
   return manifest
 }

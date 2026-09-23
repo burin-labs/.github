@@ -6,6 +6,7 @@
   "runAttempt": "1",
   "artifacts": [
     {
+      "kind": "archive",
       "target": "aarch64-apple-darwin",
       "artifact": "harn-aarch64-apple-darwin",
       "file": "harn-aarch64-apple-darwin.tar.gz",
@@ -15,6 +16,7 @@
       "notarizationStatus": "notarized"
     },
     {
+      "kind": "archive",
       "target": "aarch64-unknown-linux-gnu",
       "artifact": "harn-aarch64-unknown-linux-gnu",
       "file": "harn-aarch64-unknown-linux-gnu.tar.gz",
@@ -24,6 +26,7 @@
       "notarizationStatus": "not_applicable"
     },
     {
+      "kind": "archive",
       "target": "x86_64-apple-darwin",
       "artifact": "harn-x86_64-apple-darwin",
       "file": "harn-x86_64-apple-darwin.tar.gz",
@@ -33,6 +36,7 @@
       "notarizationStatus": "notarized"
     },
     {
+      "kind": "archive",
       "target": "x86_64-pc-windows-msvc",
       "artifact": "harn-x86_64-pc-windows-msvc",
       "file": "harn-x86_64-pc-windows-msvc.zip",
@@ -42,10 +46,38 @@
       "notarizationStatus": "not_applicable"
     },
     {
+      "kind": "archive",
       "target": "x86_64-unknown-linux-gnu",
       "artifact": "harn-x86_64-unknown-linux-gnu",
       "file": "harn-x86_64-unknown-linux-gnu.tar.gz",
       "sha256": "8c6f35a689c372c26995ca87b5792ae0c59562333508355535f0d46ddc834dc0",
+      "attestationPredicateType": "https://harnlang.com/attestations/release-archive/v1",
+      "signingStatus": "not_applicable",
+      "notarizationStatus": "not_applicable"
+    },
+    {
+      "kind": "checksums",
+      "artifact": "harn-release-files",
+      "file": "SHA256SUMS",
+      "sha256": "5e1aaf9ce0a1f047a0cceb4e850969e937e449c89fc1ba057ab8917aeb61aac4",
+      "attestationPredicateType": "https://harnlang.com/attestations/release-archive/v1",
+      "signingStatus": "not_applicable",
+      "notarizationStatus": "not_applicable"
+    },
+    {
+      "kind": "asset-index",
+      "artifact": "harn-release-files",
+      "file": "release-assets.json",
+      "sha256": "b50b1ade774f6223d46888b86f5e47ed18a68a22fb50601fa075653e6881cf98",
+      "attestationPredicateType": "https://harnlang.com/attestations/release-archive/v1",
+      "signingStatus": "not_applicable",
+      "notarizationStatus": "not_applicable"
+    },
+    {
+      "kind": "notes",
+      "artifact": "harn-release-files",
+      "file": "release-notes.md",
+      "sha256": "1bc5b39d23bb6515252b05f1d9fe3ff6038977293b11206c3f1a4b4ed1c8752a",
       "attestationPredicateType": "https://harnlang.com/attestations/release-archive/v1",
       "signingStatus": "not_applicable",
       "notarizationStatus": "not_applicable"

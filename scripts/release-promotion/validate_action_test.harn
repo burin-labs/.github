@@ -1,0 +1,73 @@
+import { command_run } from "std/command"
+
+const ACTION = "../../.github/actions/validate-candidate-manifest"
+
+fn root(fs: HarnessFs) -> string {
+  return path_normalize(path_join(fs.cwd(), "../.."))
+}
+
+/** Run the action's own bootstrap, as a composite step would, on one manifest. */
+fn validate(
+  host: {fs: HarnessFs, tools: HarnessTools},
+  manifest: string,
+  expected: dict = {},
+) -> dict {
+  const action = path_normalize(path_join(host.fs.cwd(), ACTION))
+  return command_run(
+    host.tools,
+    ["bash", path_join(action, "run.sh")],
+    {
+      capture: {max_inline_bytes: 100000},
+      timeout_ms: 60000,
+      env: {
+        GITHUB_ACTION_PATH: action,
+        CANDIDATE_MANIFEST: path_join(root(host.fs), manifest),
+        CANDIDATE_REPOSITORY: expected?.repository ?? "",
+        CANDIDATE_SOURCE_COMMIT: expected?.source_commit ?? "",
+        CANDIDATE_RUN_ID: expected?.run_id ?? "",
+      },
+    },
+  )
+}
+
+pipeline test_the_action_accepts_a_valid_manifest(harness: Harness) {
+  const result = validate(
+    {fs: harness.fs, tools: harness.tools},
+    "scripts/release-promotion/fixtures/harn-candidate-manifest.json",
+    {
+      repository: "burin-labs/harn",
+      source_commit: "0e926289a777480b70c5fe9b29c6b67585559030",
+      run_id: "35858262708",
+    },
+  )
+  assert(result.success, to_string(result.stderr))
+  assert(result.stdout.contains("is a valid burin-labs.candidate_manifest.v1 manifest"))
+}
+
+pipeline test_the_action_refuses_the_old_harn_manifest(harness: Harness) {
+  const result = validate(
+    {fs: harness.fs, tools: harness.tools},
+    "scripts/release-promotion/fixtures/harn-archive-manifest-legacy.json",
+  )
+  assert(!result.success, "the old harn-shaped manifest must be refused")
+  assert(
+    result.stderr.contains("candidate manifest does not match burin-labs.candidate_manifest.v1"),
+    to_string(result.stderr),
+  )
+  assert(result.stderr.contains("'archives'"), to_string(result.stderr))
+}
+
+pipeline test_the_action_refuses_a_manifest_for_another_commit(harness: Harness) {
+  const result = validate(
+    {fs: harness.fs, tools: harness.tools},
+    "scripts/release-promotion/fixtures/harn-candidate-manifest.json",
+    {source_commit: "69d95851b5bbf43a076cb557716f3308c980ba6c"},
+  )
+  assert(!result.success, "a manifest for another commit must be refused")
+  assert(
+    result.stderr.contains(
+      "manifest sourceCommit is 0e926289a777480b70c5fe9b29c6b67585559030, not the requested 69d95851b5bbf43a076cb557716f3308c980ba6c",
+    ),
+    to_string(result.stderr),
+  )
+}

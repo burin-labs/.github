@@ -23,6 +23,15 @@
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+-]*$",
             "type": "string"
           },
+          "kind": {
+            "description": "archive: a platform build, and the only kind with a target. checksums, asset-index: release files built beside the archives. notes: the release body, exactly one per manifest, never uploaded as an asset.",
+            "enum": [
+              "archive",
+              "checksums",
+              "asset-index",
+              "notes"
+            ]
+          },
           "notarizationStatus": {
             "enum": [
               "notarized",
@@ -41,13 +50,13 @@
             ]
           },
           "target": {
-            "description": "Platform the file is for.",
+            "description": "Platform an archive is for. Required on archives, absent otherwise.",
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+-]*$",
             "type": "string"
           }
         },
         "required": [
-          "target",
+          "kind",
           "artifact",
           "file",
           "sha256",

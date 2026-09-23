@@ -26,8 +26,8 @@ fn real_manifest(fs: HarnessFs) -> dict {
   return json_parse(fs.read_text("fixtures/harn-candidate-manifest.json"))
 }
 
-fn request() -> PromotionRequest {
-  return parse_request({repository: REPO, sha: SHA, run_id: RUN_ID, tag: TAG})
+fn request(tag: string = TAG) -> PromotionRequest {
+  return parse_request({repository: REPO, sha: SHA, run_id: RUN_ID, tag: tag})
 }
 
 fn run_record(overrides: dict = {}) -> dict {
@@ -53,7 +53,8 @@ fn candidate(fs: HarnessFs) -> dict {
   let files = {}
   let artifacts = []
   for item in manifest.artifacts {
-    const content = "archive for " + item.target + "\n"
+    const content = item.kind == "archive" ? "archive for " + (item.target ?? "")
+      + "\n" : "release file " + item.file + "\n"
     files = files + {[item.file]: content}
     artifacts = artifacts + [item + {sha256: sha256(content)}]
   }
@@ -72,7 +73,7 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
     ["/repos/" + REPO + "/releases?per_page=100"]: [],
   }
     + (options?.responses ?? {})
-  let state = {drafts: [], published: false, uploaded: []}
+  let state = {drafts: [], published: false, uploaded: [], latest: nil}
   const forged = options?.forged ?? []
   const stored_override = options?.stored ?? {}
   const github = {
@@ -80,7 +81,7 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
       if endpoint == "/repos/" + REPO + "/releases?per_page=100" {
         return state.drafts
       }
-      if endpoint == "/repos/" + REPO + "/git/ref/tags/" + TAG && state.published {
+      if endpoint.starts_with("/repos/" + REPO + "/git/ref/tags/") && state.published {
         return {object: {type: "commit", sha: SHA}}
       }
       return responses[endpoint]
@@ -124,15 +125,18 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
           id: 7,
           tag_name: release.tag,
           draft: true,
+          prerelease: release.prerelease,
+          body: options?.body ?? fs.read_text(release.notes_file),
           html_url: "https://github.com/" + REPO + "/releases/tag/untagged-7",
           assets: assets,
         },
       ]
       return nil
     },
-    publish_draft: fn(id) {
+    publish_draft: fn(id, latest) {
       assert_eq(id, 7)
       state.published = true
+      state.latest = latest
       return {html_url: "https://github.com/" + REPO + "/releases/tag/" + TAG}
     },
   }
@@ -151,7 +155,12 @@ pipeline test_real_harn_manifest_validates(harness: Harness) {
   const manifest = validate_candidate_manifest(real_manifest(harness.fs))
   assert_eq(manifest.sourceCommit, SHA)
   assert_eq(
-    manifest.artifacts.map({ item -> item.target }),
+    manifest.artifacts.map({ item -> item.kind }),
+    ["archive", "archive", "archive", "archive", "archive", "checksums", "asset-index", "notes"],
+  )
+  assert_eq(
+    manifest.artifacts.filter({ item -> item.kind == "archive" }).map({ item -> item.target })
+      .to_list(),
     [
       "aarch64-apple-darwin",
       "aarch64-unknown-linux-gnu",
@@ -173,7 +182,7 @@ pipeline test_promotes_exactly_the_files_the_run_tested(harness: Harness) {
   const directory = harness.fs.mkdtemp_in_workspace("promotion-")
   const world = fixture(harness.fs)
   const verified = verify_candidate(world.github, harness.fs, request(), directory)
-  assert_eq(len(verified.files), 5)
+  assert_eq(len(verified.files), 8)
   const release = publish_candidate(
     world.github,
     harness.fs,
@@ -183,10 +192,97 @@ pipeline test_promotes_exactly_the_files_the_run_tested(harness: Harness) {
   )
   assert_eq(release, {tag: TAG, url: "https://github.com/" + REPO + "/releases/tag/" + TAG})
   assert(world.state().published)
+  assert_eq(world.state().latest, true)
+  assert_eq(world.state().drafts[0].prerelease, false)
+  // The notes file is the body and is not uploaded; everything else is.
+  assert_eq(world.state().drafts[0].body, "release file release-notes.md\n")
   assert_eq(
     world.state().uploaded.sorted(),
-    (verified.files.map({ file -> file.name }) + [CANDIDATE_MANIFEST_FILE]).sorted(),
+    (verified.files.filter({ file -> file.kind != "notes" }).map({ file -> file.name }).to_list()
+      + [CANDIDATE_MANIFEST_FILE])
+      .sorted(),
   )
+  assert(world.state().uploaded.contains("SHA256SUMS"))
+  assert(world.state().uploaded.contains("release-assets.json"))
+  assert(!world.state().uploaded.contains("release-notes.md"))
+}
+
+pipeline test_a_prerelease_tag_is_never_the_latest_release(harness: Harness) {
+  const tag = "v0.10.142-rc.1"
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-")
+  const world = fixture(harness.fs)
+  verify_candidate(world.github, harness.fs, request(tag), directory)
+  publish_candidate(
+    world.github,
+    harness.fs,
+    request(tag),
+    verify_run(world.github, request(tag)),
+    directory,
+  )
+  assert_eq(world.state().drafts[0].prerelease, true)
+  assert_eq(world.state().latest, false)
+  assert(!request().prerelease)
+}
+
+pipeline test_refuses_two_release_bodies(harness: Harness) {
+  const manifest = real_manifest(harness.fs)
+  const notes = manifest.artifacts.find({ item -> item.kind == "notes" })
+  assert_error_contains(
+    fn() { validate_candidate_manifest(
+      manifest + {artifacts: manifest.artifacts + [notes + {file: "more-notes.md"}]},
+    ) },
+    "it lists 2 notes files; a release has exactly one body",
+  )
+  assert_error_contains(
+    fn() { validate_candidate_manifest(
+      manifest + {artifacts: manifest.artifacts.filter({ item -> item.kind != "notes" }).to_list()},
+    ) },
+    "it lists 0 notes files",
+  )
+  assert_error_contains(
+    fn() { validate_candidate_manifest(
+      manifest + {artifacts: manifest.artifacts + [notes + {file: "x.md", kind: "archive"}]},
+    ) },
+    "archive x.md has no target",
+  )
+  assert_error_contains(
+    fn() { validate_candidate_manifest(
+      manifest
+        + {
+          artifacts: manifest.artifacts.map(
+            { item -> item.kind == "checksums" ? item + {signingStatus: "signed"} : item },
+          ),
+        },
+    ) },
+    "checksums file SHA256SUMS must be not_applicable",
+  )
+}
+
+pipeline test_refuses_a_notes_file_whose_digest_differs(harness: Harness) {
+  const recorded = sha256("release file release-notes.md\n")
+  assert_error_contains(
+    fn() { verify(harness.fs, {files: {"release-notes.md": "edited after testing\n"}}) },
+    "release-notes.md has sha256 " + sha256("edited after testing\n")
+      + " but the manifest records "
+      + recorded,
+  )
+}
+
+pipeline test_leaves_a_draft_unpublished_when_its_body_is_not_the_notes(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-")
+  const world = fixture(harness.fs, {body: "generated notes"})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  assert_error_contains(
+    fn() { publish_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      verify_run(world.github, request()),
+      directory,
+    ) },
+    "the release body is not release-notes.md",
+  )
+  assert(!world.state().published)
 }
 
 pipeline test_refuses_a_run_that_tested_another_commit(harness: Harness) {
@@ -363,6 +459,6 @@ pipeline test_rejects_malformed_inputs() {
   )
   assert_error_contains(
     fn() { parse_request({repository: REPO, sha: SHA, run_id: RUN_ID, tag: "0.10.142"}) },
-    "tag must look like vX.Y.Z",
+    "tag must look like vX.Y.Z or vX.Y.Z-suffix",
   )
 }
