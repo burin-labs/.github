@@ -10,6 +10,12 @@ fn required_env(env: HarnessEnv, name: string) -> string {
   return value
 }
 
+fn write_output(harness: Harness, name: string, value: string) {
+  if !gha_write_output(harness, name, value) {
+    throw "GITHUB_OUTPUT is not set, so " + name + " cannot reach the caller"
+  }
+}
+
 fn main(harness: Harness) {
   harness.net.egress_policy({default: "allow", block_private: "private"})
   const request = parse_request(
@@ -49,8 +55,8 @@ fn main(harness: Harness) {
       verify_run(github, request),
       directory,
     )
-    gha_write_output(harness, "tag", release.tag)
-    gha_write_output(harness, "release-url", release.url)
+    write_output(harness, "tag", release.tag)
+    write_output(harness, "release-url", release.url)
     harness.stdio.println("Published " + release.tag + ": " + release.url)
     return
   }
