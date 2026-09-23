@@ -129,9 +129,12 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          # Creating the release and its tag is the whole authority this step
-          # needs. A release made with the app token, unlike one made with the
-          # workflow token, starts the workflows that listen for it.
+          # Publishing re-reads the run immediately before it creates the
+          # release (actions read), then creates the release and its tag
+          # (contents write). A release made with the app token, unlike one
+          # made with the workflow token, starts the workflows that listen
+          # for it.
+          permission-actions: read
           permission-contents: write
 
       - name: Publish the verified files

@@ -76,7 +76,9 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   }
   assert_eq(verify.env.PROMOTE_REPOSITORY, expression("github.repository"))
   const grants = keys(token["with"]).filter({ key -> key.starts_with("permission-") })
-  assert_eq(grants, ["permission-contents"])
+  // Publish mode re-verifies the run with this token before it publishes.
+  assert_eq(grants.sort(), ["permission-actions", "permission-contents"])
+  assert_eq(token["with"]["permission-actions"], "read")
   assert_eq(token["with"]["permission-contents"], "write")
   assert_eq(token["with"].repositories, expression("github.event.repository.name"))
   assert_eq(job.outputs.tag, expression("steps.publish.outputs.tag"))
