@@ -5,7 +5,9 @@
 # a run artifact, attests it, and records its SHA-256 in a candidate manifest
 # (schemas/candidate-manifest.v1.json). This workflow proves that the run passed
 # at the requested commit and that the files are the ones the manifest names,
-# then tags that commit and publishes those same files. It never builds.
+# then tags that commit and publishes those same files. It never builds and
+# never writes release content: the release body is the manifest's notes file,
+# and checksums or asset indexes are files the run built like any other.
 #
 # Call it from a workflow that starts after the release commit's CI run has
 # finished, since the run must have concluded before it can be promoted:
@@ -48,7 +50,7 @@ on:
         required: true
         type: string
       tag:
-        description: Release tag to create at sha, as vX.Y.Z.
+        description: Release tag to create at sha, as vX.Y.Z. A vX.Y.Z-suffix tag publishes a prerelease that never becomes latest.
         required: true
         type: string
     secrets:

@@ -103,3 +103,30 @@ pipeline test_promotion_bootstrap_only_dispatches_harn(harness: Harness) {
     assert(!bootstrap.contains(forbidden), forbidden)
   }
 }
+
+pipeline test_manifest_action_runs_the_one_validator_without_a_token(harness: Harness) {
+  const action = yaml_parse(
+    read(harness.fs, ".github/actions/validate-candidate-manifest/action.yml"),
+  )
+  assert_eq(action.runs.using, "composite")
+  assert_eq(
+    keys(action.inputs).sorted(),
+    ["harn-version", "harn-version-file", "manifest", "repository", "run-id", "source-commit"],
+  )
+  assert_eq(action.inputs.manifest.required, true)
+  const steps = action.runs.steps
+  assert_eq(
+    steps.map({ step -> step.name }),
+    ["Set up exact Harn release", "Validate the manifest"],
+  )
+  assert(to_string(steps[0].uses).starts_with("burin-labs/harn/.github/actions/setup-harn@"))
+  assert_eq(steps[1].run, "bash \"$GITHUB_ACTION_PATH/run.sh\"")
+  assert(!keys(steps[1].env).any({ name -> name.contains("TOKEN") }))
+  const bootstrap = read(harness.fs, ".github/actions/validate-candidate-manifest/run.sh")
+  assert(bootstrap.contains("scripts/release-promotion/validate.harn"))
+  assert(!bootstrap.contains("--allow-process-network"))
+  // The validator is imported, never restated: the entrypoint holds no schema.
+  const entry = read(harness.fs, "scripts/release-promotion/validate.harn")
+  assert(entry.contains("validate_candidate_manifest"))
+  assert(!entry.contains("schema_check"))
+}

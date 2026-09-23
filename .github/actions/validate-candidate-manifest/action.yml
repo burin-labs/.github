@@ -1,0 +1,50 @@
+name: Validate candidate manifest
+description: Refuse a candidate manifest that promote-release.yml would refuse, at the moment the build assembles it.
+
+# The schema and its validator have one owner,
+# scripts/release-promotion/manifest.harn. This action runs that validator, so
+# a producer learns about a bad manifest in the run that wrote it rather than
+# at promotion. It needs no token.
+
+inputs:
+  manifest:
+    description: Path to the candidate manifest JSON file.
+    required: true
+  repository:
+    description: Expected repository, as owner/name. Checked when given.
+    required: false
+    default: ""
+  source-commit:
+    description: Expected sourceCommit. Checked when given.
+    required: false
+    default: ""
+  run-id:
+    description: Expected runId. Checked when given.
+    required: false
+    default: ""
+  harn-version:
+    description: Exact Harn release with or without a leading v. Defaults to harn-version-file.
+    required: false
+    default: ""
+  harn-version-file:
+    description: Repository-relative file containing the exact Harn version.
+    required: false
+    default: .harn-version
+
+runs:
+  using: composite
+  steps:
+    - name: Set up exact Harn release
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f # bounded release-asset retries
+      with:
+        version: ${{ inputs.harn-version }}
+        version-file: ${{ inputs.harn-version-file }}
+
+    - name: Validate the manifest
+      shell: bash
+      env:
+        CANDIDATE_MANIFEST: ${{ inputs.manifest }}
+        CANDIDATE_REPOSITORY: ${{ inputs.repository }}
+        CANDIDATE_SOURCE_COMMIT: ${{ inputs.source-commit }}
+        CANDIDATE_RUN_ID: ${{ inputs.run-id }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

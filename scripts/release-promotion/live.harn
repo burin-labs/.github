@@ -164,15 +164,16 @@ pub fn live_github(
           "--draft",
           "--title",
           release.title,
-          "--notes",
-          release.notes,
+          "--notes-file",
+          release.notes_file,
         ]
+          + (release.prerelease ? ["--prerelease"] : [])
           + release.files,
         "creating the draft release",
       )
       return nil
     },
-    publish_draft: fn(id) {
+    publish_draft: fn(id, latest) {
       const result = gh_ok(
         tools,
         env,
@@ -183,6 +184,8 @@ pub fn live_github(
           "repos/" + repository + "/releases/" + to_string(id),
           "-F",
           "draft=false",
+          "-f",
+          "make_latest=" + (latest ? "true" : "false"),
         ],
         "publishing the draft release",
       )

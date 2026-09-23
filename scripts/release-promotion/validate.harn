@@ -1,0 +1,36 @@
+import { expect_manifest_identity, validate_candidate_manifest } from "./manifest.harn"
+
+fn optional_env(env: HarnessEnv, name: string) -> string? {
+  const value = trim(env.get(name) ?? "")
+  return value == "" ? nil : value
+}
+
+/** Validate a candidate manifest a build just assembled, before it is uploaded. */
+fn main(harness: Harness) {
+  const path = trim(harness.env.get("CANDIDATE_MANIFEST") ?? "")
+  if path == "" {
+    throw "CANDIDATE_MANIFEST is required"
+  }
+  let raw = nil
+  try {
+    raw = json_parse(harness.fs.read_text(path))
+  } catch (error) {
+    throw path + " is not a readable JSON document: " + to_string(error)
+  }
+  const manifest = expect_manifest_identity(
+    validate_candidate_manifest(raw),
+    {
+      repository: optional_env(harness.env, "CANDIDATE_REPOSITORY"),
+      source_commit: optional_env(harness.env, "CANDIDATE_SOURCE_COMMIT"),
+      run_id: optional_env(harness.env, "CANDIDATE_RUN_ID"),
+    },
+  )
+  harness.stdio.println(
+    path + " is a valid " + manifest.schemaVersion + " manifest for " + manifest.repository
+      + " at "
+      + manifest.sourceCommit
+      + " with "
+      + to_string(len(manifest.artifacts))
+      + " files",
+  )
+}
