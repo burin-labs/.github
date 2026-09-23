@@ -1,0 +1,97 @@
+{
+  "$id": "https://github.com/burin-labs/.github/blob/main/schemas/candidate-manifest.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Files one CI run built and tested at one commit. The run uploads this document as candidate-manifest.json inside the run artifact named candidate-manifest-<sourceCommit>, and each file inside the run artifact its entry names.",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact": {
+            "description": "Run artifact that contains the file.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+-]*$",
+            "type": "string"
+          },
+          "attestationPredicateType": {
+            "description": "Predicate type of the build attestation the run made for the file.",
+            "pattern": "^https://[^\\s]+$",
+            "type": "string"
+          },
+          "file": {
+            "description": "File name inside the run artifact, and the release asset name.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+-]*$",
+            "type": "string"
+          },
+          "notarizationStatus": {
+            "enum": [
+              "notarized",
+              "not_applicable"
+            ]
+          },
+          "sha256": {
+            "description": "Lowercase hex SHA-256 of the file.",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "signingStatus": {
+            "enum": [
+              "signed",
+              "not_applicable"
+            ]
+          },
+          "target": {
+            "description": "Platform the file is for.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+-]*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "artifact",
+          "file",
+          "sha256",
+          "attestationPredicateType",
+          "signingStatus",
+          "notarizationStatus"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "repository": {
+      "description": "Repository that ran the build, as owner/name.",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+      "type": "string"
+    },
+    "runAttempt": {
+      "description": "Run attempt that wrote this manifest.",
+      "pattern": "^[1-9][0-9]*$",
+      "type": "string"
+    },
+    "runId": {
+      "description": "Workflow run id.",
+      "pattern": "^[1-9][0-9]*$",
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": "burin-labs.candidate_manifest.v1"
+    },
+    "sourceCommit": {
+      "description": "Full commit SHA the run built and tested.",
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "repository",
+    "sourceCommit",
+    "runId",
+    "runAttempt",
+    "artifacts"
+  ],
+  "title": "Candidate manifest",
+  "type": "object"
+}

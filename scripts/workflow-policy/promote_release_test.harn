@@ -1,0 +1,105 @@
+fn read(fs: HarnessFs, path: string) -> string {
+  return fs.read_text(path_join(path_normalize(path_join(fs.cwd(), "../..")), path))
+}
+
+fn expression(body: string) -> string {
+  return "$" + "{{ " + body + " }}"
+}
+
+fn promote(fs: HarnessFs) -> dict {
+  return yaml_parse(read(fs, ".github/workflows/promote-release.yml"))
+}
+
+pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harness) {
+  const workflow = promote(harness.fs)
+  assert_eq(keys(workflow.on), ["workflow_call"])
+  const call = workflow.on.workflow_call
+  assert_eq(keys(call.inputs).sorted(), ["run-id", "sha", "tag"])
+  for name in keys(call.inputs) {
+    assert_eq(call.inputs[name].required, true)
+    assert_eq(call.inputs[name].type, "string")
+  }
+  for name in keys(call.secrets) {
+    assert_eq(call.secrets[name].required, true)
+  }
+  assert_eq(call.outputs.tag.value, expression("jobs.promote.outputs.tag"))
+  assert_eq(call.outputs["release-url"].value, expression("jobs.promote.outputs.release-url"))
+  assert_eq(workflow.permissions, {contents: "read"})
+}
+
+pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: Harness) {
+  const job = promote(harness.fs).jobs.promote
+  assert_eq(job["runs-on"], "ubuntu-latest")
+  assert_eq(job.permissions, {contents: "read", actions: "read", attestations: "read"})
+  // The complete step list is the contract: a build step cannot be added
+  // without changing this test, and the write token exists only after the
+  // verification step has passed.
+  assert_eq(
+    job.steps.map({ step -> step.name }),
+    [
+      "Require called-workflow identity",
+      "Check out workflow implementation",
+      "Set up exact Harn release",
+      "Verify the run and its files",
+      "Mint the release token",
+      "Publish the verified files",
+    ],
+  )
+  const implementation = job.steps[1]
+  assert_eq(
+    implementation["with"],
+    {
+      repository: expression("fromJSON(toJSON(job)).workflow_repository"),
+      ref: expression("fromJSON(toJSON(job)).workflow_sha"),
+      path: ".harn/promote-release/implementation",
+      "persist-credentials": false,
+    },
+  )
+  const verify = job.steps[3]
+  const token = job.steps[4]
+  const publish = job.steps[5]
+  const entry = "bash .harn/promote-release/implementation/scripts/release-promotion/run.sh"
+  assert_eq(verify.run, entry)
+  assert_eq(publish.run, entry)
+  assert_eq(verify.env.PROMOTE_MODE, "verify")
+  assert_eq(verify.env.GH_TOKEN, expression("github.token"))
+  assert_eq(publish.env.PROMOTE_MODE, "publish")
+  assert_eq(publish.env.GH_TOKEN, expression("steps.token.outputs.token"))
+  for name in [
+    "PROMOTE_REPOSITORY",
+    "PROMOTE_SHA",
+    "PROMOTE_RUN_ID",
+    "PROMOTE_TAG",
+    "PROMOTE_DIRECTORY",
+  ] {
+    assert_eq(verify.env[name], publish.env[name])
+  }
+  assert_eq(verify.env.PROMOTE_REPOSITORY, expression("github.repository"))
+  const grants = keys(token["with"]).filter({ key -> key.starts_with("permission-") })
+  assert_eq(grants, ["permission-contents"])
+  assert_eq(token["with"]["permission-contents"], "write")
+  assert_eq(token["with"].repositories, expression("github.event.repository.name"))
+  assert_eq(job.outputs.tag, expression("steps.publish.outputs.tag"))
+  assert_eq(job.outputs["release-url"], expression("steps.publish.outputs.release-url"))
+}
+
+pipeline test_promotion_bootstrap_only_dispatches_harn(harness: Harness) {
+  const bootstrap = read(harness.fs, "scripts/release-promotion/run.sh")
+  assert(bootstrap.contains("scripts/release-promotion/cli.harn"))
+  assert(bootstrap.contains("--allow-process-network"))
+  for variable in [
+    "GH_TOKEN",
+    "PROMOTE_MODE",
+    "PROMOTE_REPOSITORY",
+    "PROMOTE_SHA",
+    "PROMOTE_RUN_ID",
+    "PROMOTE_TAG",
+    "PROMOTE_DIRECTORY",
+    "GITHUB_OUTPUT",
+  ] {
+    assert(bootstrap.contains("=env:" + variable + ",expose=" + variable), variable)
+  }
+  for forbidden in ["gh ", "curl", "cargo", "make "] {
+    assert(!bootstrap.contains(forbidden), forbidden)
+  }
+}

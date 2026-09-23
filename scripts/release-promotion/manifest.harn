@@ -1,0 +1,156 @@
+/**
+ * The candidate manifest: the record a main CI run publishes beside the files
+ * it built and tested, so that a later promotion can prove it releases exactly
+ * those files. This module is the one owner of that shape.
+ * `schemas/candidate-manifest.v1.json` is a checked projection of
+ * CANDIDATE_MANIFEST_SCHEMA for emitters that are not written in Harn.
+ */
+pub const CANDIDATE_MANIFEST_VERSION = "burin-labs.candidate_manifest.v1"
+
+/** File name of the manifest inside its run artifact. */
+pub const CANDIDATE_MANIFEST_FILE = "candidate-manifest.json"
+
+/** A promoted file, as the run that built it recorded it. */
+pub type CandidateArtifact = {
+  target: string,
+  artifact: string,
+  file: string,
+  sha256: string,
+  attestationPredicateType: string,
+  signingStatus: string,
+  notarizationStatus: string,
+}
+
+/** A validated candidate manifest. */
+pub type CandidateManifest = {
+  schemaVersion: string,
+  repository: string,
+  sourceCommit: string,
+  runId: string,
+  runAttempt: string,
+  artifacts: list<CandidateArtifact>,
+}
+
+const NAME = "^[A-Za-z0-9][A-Za-z0-9_.+-]*$"
+
+/** JSON Schema for one candidate manifest. */
+pub const CANDIDATE_MANIFEST_SCHEMA = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/burin-labs/.github/blob/main/schemas/candidate-manifest.v1.json",
+  title: "Candidate manifest",
+  description:
+    "Files one CI run built and tested at one commit. The run uploads this document as candidate-manifest.json inside the run artifact named candidate-manifest-<sourceCommit>, and each file inside the run artifact its entry names.",
+  type: "object",
+  additionalProperties: false,
+  required: ["schemaVersion", "repository", "sourceCommit", "runId", "runAttempt", "artifacts"],
+  properties: {
+    schemaVersion: {const: CANDIDATE_MANIFEST_VERSION},
+    repository: {
+      description: "Repository that ran the build, as owner/name.",
+      type: "string",
+      pattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+    },
+    sourceCommit: {
+      description: "Full commit SHA the run built and tested.",
+      type: "string",
+      pattern: "^[0-9a-f]{40}$",
+    },
+    runId: {description: "Workflow run id.", type: "string", pattern: "^[1-9][0-9]*$"},
+    runAttempt: {
+      description: "Run attempt that wrote this manifest.",
+      type: "string",
+      pattern: "^[1-9][0-9]*$",
+    },
+    artifacts: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "target",
+          "artifact",
+          "file",
+          "sha256",
+          "attestationPredicateType",
+          "signingStatus",
+          "notarizationStatus",
+        ],
+        properties: {
+          target: {description: "Platform the file is for.", type: "string", pattern: NAME},
+          artifact: {
+            description: "Run artifact that contains the file.",
+            type: "string",
+            pattern: NAME,
+          },
+          file: {
+            description: "File name inside the run artifact, and the release asset name.",
+            type: "string",
+            pattern: NAME,
+          },
+          sha256: {
+            description: "Lowercase hex SHA-256 of the file.",
+            type: "string",
+            pattern: "^[0-9a-f]{64}$",
+          },
+          attestationPredicateType: {
+            description: "Predicate type of the build attestation the run made for the file.",
+            type: "string",
+            pattern: "^https://[^\\s]+$",
+          },
+          signingStatus: {enum: ["signed", "not_applicable"]},
+          notarizationStatus: {enum: ["notarized", "not_applicable"]},
+        },
+      },
+    },
+  },
+}
+
+/** Run artifact that carries the manifest for a source commit. */
+pub fn candidate_manifest_artifact(source_commit: string) -> string {
+  return "candidate-manifest-" + source_commit
+}
+
+fn duplicates(values: list<string>) -> list<string> {
+  let seen = []
+  let repeated = []
+  for value in values {
+    if seen.contains(value) && !repeated.contains(value) {
+      repeated = repeated + [value]
+    }
+    seen = seen + [value]
+  }
+  return repeated
+}
+
+/**
+ * Validate an untrusted manifest document. Throws a message naming every
+ * violation; returns the typed manifest otherwise.
+ */
+pub fn validate_candidate_manifest(raw: unknown) -> CandidateManifest {
+  const checked = schema_check(raw, CANDIDATE_MANIFEST_SCHEMA)
+  if !is_ok(checked) {
+    throw "candidate manifest does not match " + CANDIDATE_MANIFEST_VERSION + ": "
+      + join(unwrap_err(checked).errors.map({ error -> to_string(error) }), "; ")
+  }
+  const manifest: CandidateManifest = unwrap(checked)
+  let problems = []
+  for target in duplicates(manifest.artifacts.map({ item -> item.target })) {
+    problems = problems + ["target " + target + " appears more than once"]
+  }
+  for file in duplicates(manifest.artifacts.map({ item -> item.file })) {
+    problems = problems + ["file " + file + " appears more than once"]
+  }
+  for item in manifest.artifacts {
+    if item.file == CANDIDATE_MANIFEST_FILE {
+      problems = problems + ["file " + item.file + " collides with the manifest itself"]
+    }
+    if item.notarizationStatus == "notarized" && item.signingStatus != "signed" {
+      problems = problems + ["file " + item.file + " is notarized but not signed"]
+    }
+  }
+  if len(problems) > 0 {
+    throw "candidate manifest is inconsistent: " + join(problems, "; ")
+  }
+  return manifest
+}

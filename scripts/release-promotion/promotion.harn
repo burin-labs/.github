@@ -1,0 +1,336 @@
+import {
+  CANDIDATE_MANIFEST_FILE,
+  CandidateManifest,
+  candidate_manifest_artifact,
+  validate_candidate_manifest,
+} from "./manifest.harn"
+
+/**
+ * Everything promotion asks of GitHub. The live adapter implements it with
+ * the REST API and the gh CLI; tests implement it with recorded responses.
+ */
+pub type GitHub = {
+  json: fn(string) -> unknown,
+  download: fn(int, string, string) -> nil,
+  attest: fn(string, dict) -> string?,
+  create_draft: fn(dict) -> nil,
+  publish_draft: fn(int) -> unknown,
+}
+
+/** What the caller asked to promote. */
+pub type PromotionRequest = {repository: string, sha: string, run_id: int, tag: string}
+
+/** The run facts promotion relies on after it has checked them. */
+pub type VerifiedRun = {url: string, attempt: int}
+
+/** A candidate whose manifest and file digests have been checked on disk. */
+pub type Candidate = {
+  manifest: CandidateManifest,
+  manifest_path: string,
+  files: list<{name: string, path: string, sha256: string}>,
+}
+
+fn expect_format(value: string, pattern: string, message: string) -> string {
+  if regex_match(pattern, value) == nil {
+    throw message
+  }
+  return value
+}
+
+/** Validate the caller's inputs once, at the boundary. */
+pub fn parse_request(
+  input: {repository: string, sha: string, run_id: string, tag: string},
+) -> PromotionRequest {
+  const {repository, sha, run_id, tag} = input
+  expect_format(repository, "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "repository must be owner/name")
+  expect_format(sha, "^[0-9a-f]{40}$", "sha must be a full 40-character lowercase commit SHA")
+  expect_format(run_id, "^[1-9][0-9]*$", "run-id must be a workflow run id")
+  expect_format(tag, "^v[0-9]+\\.[0-9]+\\.[0-9]+$", "tag must look like vX.Y.Z, got " + tag)
+  return {repository: repository, sha: sha, run_id: to_int(run_id), tag: tag}
+}
+
+fn run_label(request: PromotionRequest) -> string {
+  return "run " + to_string(request.run_id)
+}
+
+/**
+ * Refuse unless the run belongs to the repository, built that repository's
+ * own commit, concluded success, tested exactly the requested commit, and
+ * that commit is on the default branch.
+ */
+pub fn verify_run(github: GitHub, request: PromotionRequest) -> VerifiedRun {
+  const run = github.json(
+    "/repos/" + request.repository + "/actions/runs/" + to_string(request.run_id),
+  )
+  if run == nil {
+    throw run_label(request) + " does not exist in " + request.repository
+  }
+  const owner = run?.repository?.full_name
+  if owner != request.repository {
+    throw run_label(request) + " belongs to " + to_string(owner) + ", not " + request.repository
+  }
+  const head_owner = run?.head_repository?.full_name
+  if head_owner != request.repository {
+    throw run_label(request) + " built a commit from " + to_string(head_owner) + ", not "
+      + request.repository
+  }
+  if run?.status != "completed" || run?.conclusion != "success" {
+    throw run_label(request) + " did not succeed: status " + to_string(run?.status)
+      + ", conclusion "
+      + to_string(run?.conclusion)
+  }
+  if run?.head_sha != request.sha {
+    throw run_label(request) + " tested " + to_string(run?.head_sha) + ", not the requested "
+      + request.sha
+  }
+  const repository = github.json("/repos/" + request.repository)
+  const branch = repository?.default_branch
+  if type_of(branch) != "string" || branch == "" {
+    throw request.repository + " reported no default branch"
+  }
+  const comparison = github.json(
+    "/repos/" + request.repository + "/compare/" + url_encode(branch) + "..." + request.sha,
+  )
+  const relation = comparison?.status
+  if relation != "identical" && relation != "behind" {
+    throw "commit " + request.sha + " is not on " + branch + " (compare status "
+      + to_string(relation)
+      + ")"
+  }
+  const attempt = run?.run_attempt
+  if type_of(attempt) != "int" || attempt < 1 {
+    throw run_label(request) + " reported no run attempt"
+  }
+  return {url: to_string(run?.html_url), attempt: attempt}
+}
+
+/** Where a verification directory keeps each downloaded file. */
+fn manifest_path(directory: string) -> string {
+  return path_join(directory, "manifest", CANDIDATE_MANIFEST_FILE)
+}
+
+fn file_path(directory: string, artifact: string, file: string) -> string {
+  return path_join(directory, "artifacts", artifact, file)
+}
+
+/**
+ * Read and validate the downloaded manifest, and require that it names this
+ * request: the same repository, commit, and run.
+ */
+fn load_manifest(
+  fs: HarnessFs,
+  request: PromotionRequest,
+  run: VerifiedRun,
+  directory: string,
+) -> CandidateManifest {
+  const path = manifest_path(directory)
+  if !fs.exists(path) {
+    throw "run artifact " + candidate_manifest_artifact(request.sha) + " has no "
+      + CANDIDATE_MANIFEST_FILE
+  }
+  let raw = nil
+  try {
+    raw = json_parse(fs.read_text(path))
+  } catch (error) {
+    throw CANDIDATE_MANIFEST_FILE + " is not JSON: " + to_string(error)
+  }
+  const manifest = validate_candidate_manifest(raw)
+  if manifest.repository != request.repository {
+    throw "manifest repository is " + manifest.repository + ", not " + request.repository
+  }
+  if manifest.sourceCommit != request.sha {
+    throw "manifest sourceCommit is " + manifest.sourceCommit + ", not the requested "
+      + request.sha
+  }
+  if manifest.runId != to_string(request.run_id) {
+    throw "manifest runId is " + manifest.runId + ", not the requested "
+      + to_string(request.run_id)
+  }
+  if to_int(manifest.runAttempt) > run.attempt {
+    throw "manifest runAttempt " + manifest.runAttempt + " is later than the run's attempt "
+      + to_string(run.attempt)
+  }
+  return manifest
+}
+
+/**
+ * Check a downloaded candidate on disk: the manifest validates, names this
+ * request, and every file's SHA-256 equals the manifest. Touches no network,
+ * so publishing repeats it against the exact bytes it uploads.
+ */
+pub fn check_candidate(
+  fs: HarnessFs,
+  request: PromotionRequest,
+  run: VerifiedRun,
+  directory: string,
+) -> Candidate {
+  const manifest = load_manifest(fs, request, run, directory)
+  let files = []
+  let mismatches = []
+  for item in manifest.artifacts {
+    const candidate = file_path(directory, item.artifact, item.file)
+    if !fs.exists(candidate) {
+      mismatches = mismatches + [item.file + " is missing from run artifact " + item.artifact]
+      continue
+    }
+    const actual = sha256(fs.read_bytes(candidate))
+    if actual != item.sha256 {
+      mismatches = mismatches
+        + [item.file + " has sha256 " + actual + " but the manifest records " + item.sha256]
+      continue
+    }
+    files = files + [{name: item.file, path: candidate, sha256: actual}]
+  }
+  if len(mismatches) > 0 {
+    throw "candidate files do not match the manifest: " + join(mismatches, "; ")
+  }
+  return {manifest: manifest, manifest_path: manifest_path(directory), files: files}
+}
+
+/**
+ * Download the run's manifest and files into directory, check them, and verify
+ * each file's build attestation. Returns the verified candidate.
+ */
+pub fn verify_candidate(
+  github: GitHub,
+  fs: HarnessFs,
+  request: PromotionRequest,
+  directory: string,
+) -> Candidate {
+  const run = verify_run(github, request)
+  github.download(
+    request.run_id,
+    candidate_manifest_artifact(request.sha),
+    path_join(directory, "manifest"),
+  )
+  const manifest = load_manifest(fs, request, run, directory)
+  let artifacts = []
+  for item in manifest.artifacts {
+    if !artifacts.contains(item.artifact) {
+      artifacts = artifacts + [item.artifact]
+    }
+  }
+  for name in artifacts {
+    github.download(request.run_id, name, path_join(directory, "artifacts", name))
+  }
+  const candidate = check_candidate(fs, request, run, directory)
+  let refused = []
+  for item in candidate.manifest.artifacts {
+    const diagnostic = github.attest(
+      file_path(directory, item.artifact, item.file),
+      {
+        repository: request.repository,
+        predicate_type: item.attestationPredicateType,
+        source_digest: request.sha,
+      },
+    )
+    if diagnostic != nil {
+      refused = refused + [item.file + ": " + diagnostic]
+    }
+  }
+  if len(refused) > 0 {
+    throw "build attestation did not verify for " + join(refused, "; ")
+  }
+  return candidate
+}
+
+fn tag_commit(github: GitHub, request: PromotionRequest) -> string? {
+  const ref = github.json("/repos/" + request.repository + "/git/ref/tags/" + request.tag)
+  if ref == nil {
+    return nil
+  }
+  if ref?.object?.type == "commit" {
+    return to_string(ref.object.sha)
+  }
+  const annotated = github.json(
+    "/repos/" + request.repository + "/git/tags/" + to_string(ref?.object?.sha),
+  )
+  return to_string(annotated?.object?.sha)
+}
+
+fn draft_for(github: GitHub, request: PromotionRequest) -> dict? {
+  const releases = github.json("/repos/" + request.repository + "/releases?per_page=100")
+  for release in to_list(releases ?? []) {
+    if release?.tag_name == request.tag && release?.draft == true {
+      return release
+    }
+  }
+  return nil
+}
+
+/**
+ * Publish a checked candidate: create a draft release at the commit holding
+ * exactly the candidate files and the manifest, confirm GitHub stored those
+ * exact digests, then publish it, which creates the tag. Returns the release.
+ */
+pub fn publish_candidate(
+  github: GitHub,
+  fs: HarnessFs,
+  request: PromotionRequest,
+  run: VerifiedRun,
+  directory: string,
+) -> {tag: string, url: string} {
+  const candidate = check_candidate(fs, request, run, directory)
+  const existing = github.json("/repos/" + request.repository + "/releases/tags/" + request.tag)
+  if existing != nil {
+    throw "release " + request.tag + " already exists: " + to_string(existing?.html_url)
+  }
+  const tagged = tag_commit(github, request)
+  if tagged != nil && tagged != request.sha {
+    throw "tag " + request.tag + " already points at " + tagged + ", not " + request.sha
+  }
+  const stale = draft_for(github, request)
+  if stale != nil {
+    throw "a draft release for " + request.tag + " already exists: " + to_string(stale?.html_url)
+  }
+  let expected: dict<string, string> = {
+    [CANDIDATE_MANIFEST_FILE]: sha256(fs.read_bytes(candidate.manifest_path)),
+  }
+  for file in candidate.files {
+    expected = expected + {[file.name]: file.sha256}
+  }
+  github.create_draft(
+    {
+      tag: request.tag,
+      sha: request.sha,
+      title: request.tag,
+      notes: "Promoted from " + run.url + " at " + request.sha + ". "
+        + CANDIDATE_MANIFEST_FILE
+        + " records the sha256 of every file.",
+      files: candidate.files.map({ file -> file.path }) + [candidate.manifest_path],
+    },
+  )
+  const draft = draft_for(github, request)
+  if draft == nil {
+    throw "the draft release for " + request.tag + " did not appear"
+  }
+  let stored = {}
+  for asset in to_list(draft?.assets ?? []) {
+    stored = stored + {[to_string(asset?.name)]: to_string(asset?.digest)}
+  }
+  let differences = []
+  for name in keys(expected).sorted() {
+    const digest = "sha256:" + (expected[name] ?? "")
+    if stored[name] != digest {
+      differences = differences
+        + [name + " stored as " + to_string(stored[name]) + ", expected " + digest]
+    }
+  }
+  for name in keys(stored).sorted() {
+    if expected[name] == nil {
+      differences = differences + [name + " is not a candidate file"]
+    }
+  }
+  if len(differences) > 0 {
+    throw "draft release " + to_string(draft?.html_url) + " does not hold the candidate: "
+      + join(differences, "; ")
+      + ". It was left unpublished."
+  }
+  const published = github.publish_draft(draft.id)
+  const landed = tag_commit(github, request)
+  if landed != request.sha {
+    throw "published " + request.tag + " but the tag points at " + to_string(landed) + ", not "
+      + request.sha
+  }
+  return {tag: request.tag, url: to_string(published?.html_url)}
+}
