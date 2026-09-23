@@ -1,0 +1,368 @@
+import { assert_error_contains } from "std/testing"
+import {
+  CANDIDATE_MANIFEST_FILE,
+  CANDIDATE_MANIFEST_SCHEMA,
+  validate_candidate_manifest,
+} from "./manifest.harn"
+import {
+  PromotionRequest,
+  parse_request,
+  publish_candidate,
+  verify_candidate,
+  verify_run,
+} from "./promotion.harn"
+
+const REPO = "burin-labs/harn"
+
+const SHA = "0e926289a777480b70c5fe9b29c6b67585559030"
+
+const OTHER_SHA = "69d95851b5bbf43a076cb557716f3308c980ba6c"
+
+const RUN_ID = "35858262708"
+
+const TAG = "v0.10.142"
+
+fn real_manifest(fs: HarnessFs) -> dict {
+  return json_parse(fs.read_text("fixtures/harn-candidate-manifest.json"))
+}
+
+fn request() -> PromotionRequest {
+  return parse_request({repository: REPO, sha: SHA, run_id: RUN_ID, tag: TAG})
+}
+
+fn run_record(overrides: dict = {}) -> dict {
+  return {
+    id: to_int(RUN_ID),
+    status: "completed",
+    conclusion: "success",
+    head_sha: SHA,
+    run_attempt: 1,
+    html_url: "https://github.com/" + REPO + "/actions/runs/" + RUN_ID,
+    repository: {full_name: REPO},
+    head_repository: {full_name: REPO},
+  }
+    + overrides
+}
+
+/**
+ * The real harn manifest with each file replaced by a small stand-in whose
+ * digest it records, so the whole flow runs offline on real shapes.
+ */
+fn candidate(fs: HarnessFs) -> dict {
+  const manifest = real_manifest(fs)
+  let files = {}
+  let artifacts = []
+  for item in manifest.artifacts {
+    const content = "archive for " + item.target + "\n"
+    files = files + {[item.file]: content}
+    artifacts = artifacts + [item + {sha256: sha256(content)}]
+  }
+  return {manifest: manifest + {artifacts: artifacts}, files: files}
+}
+
+/** A recorded GitHub: REST responses by endpoint, run artifacts by name, and release state. */
+fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
+  const built = candidate(fs)
+  const manifest = options?.manifest ?? built.manifest
+  const files = built.files + (options?.files ?? {})
+  const responses = {
+    ["/repos/" + REPO + "/actions/runs/" + RUN_ID]: run_record(options?.run ?? {}),
+    ["/repos/" + REPO]: {default_branch: "main"},
+    ["/repos/" + REPO + "/compare/main..." + SHA]: {status: options?.relation ?? "behind"},
+    ["/repos/" + REPO + "/releases?per_page=100"]: [],
+  }
+    + (options?.responses ?? {})
+  let state = {drafts: [], published: false, uploaded: []}
+  const forged = options?.forged ?? []
+  const stored_override = options?.stored ?? {}
+  const github = {
+    json: fn(endpoint) {
+      if endpoint == "/repos/" + REPO + "/releases?per_page=100" {
+        return state.drafts
+      }
+      if endpoint == "/repos/" + REPO + "/git/ref/tags/" + TAG && state.published {
+        return {object: {type: "commit", sha: SHA}}
+      }
+      return responses[endpoint]
+    },
+    download: fn(run_id, name, directory) {
+      assert_eq(to_string(run_id), RUN_ID)
+      if name == "candidate-manifest-" + SHA {
+        fs.write_text(
+          path_join(directory, CANDIDATE_MANIFEST_FILE),
+          options?.manifest_text ?? json_stringify(manifest),
+        )
+        return nil
+      }
+      for item in manifest.artifacts {
+        if item.artifact == name {
+          fs.write_text(path_join(directory, item.file), files[item.file])
+        }
+      }
+      return nil
+    },
+    attest: fn(path, expect) {
+      assert_eq(expect.repository, REPO)
+      assert_eq(expect.source_digest, SHA)
+      for name in forged {
+        if path.ends_with("/" + name) {
+          return "no attestation for " + name + " was signed by " + REPO
+        }
+      }
+      return nil
+    },
+    create_draft: fn(release) {
+      let assets = []
+      for path in release.files {
+        const name = basename(path)
+        const digest = (stored_override[name] ?? "sha256:") + sha256(fs.read_bytes(path))
+        assets = assets + [{name: name, digest: digest}]
+      }
+      state.uploaded = release.files.map({ path -> basename(path) })
+      state.drafts = [
+        {
+          id: 7,
+          tag_name: release.tag,
+          draft: true,
+          html_url: "https://github.com/" + REPO + "/releases/tag/untagged-7",
+          assets: assets,
+        },
+      ]
+      return nil
+    },
+    publish_draft: fn(id) {
+      assert_eq(id, 7)
+      state.published = true
+      return {html_url: "https://github.com/" + REPO + "/releases/tag/" + TAG}
+    },
+  }
+  // Closures share the captured state; the fixture record holds a copy, so
+  // tests read release state through this getter.
+  return {github: github, state: fn() { return state }}
+}
+
+fn verify(fs: HarnessFs, options: dict = {}) {
+  const directory = fs.mkdtemp_in_workspace("promotion-")
+  const world = fixture(fs, options)
+  return verify_candidate(world.github, fs, request(), directory)
+}
+
+pipeline test_real_harn_manifest_validates(harness: Harness) {
+  const manifest = validate_candidate_manifest(real_manifest(harness.fs))
+  assert_eq(manifest.sourceCommit, SHA)
+  assert_eq(
+    manifest.artifacts.map({ item -> item.target }),
+    [
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+    ],
+  )
+}
+
+pipeline test_published_schema_is_the_validators_schema(harness: Harness) {
+  assert_eq(
+    json_parse(harness.fs.read_text("../../schemas/candidate-manifest.v1.json")),
+    CANDIDATE_MANIFEST_SCHEMA,
+  )
+}
+
+pipeline test_promotes_exactly_the_files_the_run_tested(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-")
+  const world = fixture(harness.fs)
+  const verified = verify_candidate(world.github, harness.fs, request(), directory)
+  assert_eq(len(verified.files), 5)
+  const release = publish_candidate(
+    world.github,
+    harness.fs,
+    request(),
+    verify_run(world.github, request()),
+    directory,
+  )
+  assert_eq(release, {tag: TAG, url: "https://github.com/" + REPO + "/releases/tag/" + TAG})
+  assert(world.state().published)
+  assert_eq(
+    world.state().uploaded.sorted(),
+    (verified.files.map({ file -> file.name }) + [CANDIDATE_MANIFEST_FILE]).sorted(),
+  )
+}
+
+pipeline test_refuses_a_run_that_tested_another_commit(harness: Harness) {
+  assert_error_contains(
+    fn() { verify(harness.fs, {run: {head_sha: OTHER_SHA}}) },
+    "run " + RUN_ID + " tested " + OTHER_SHA + ", not the requested " + SHA,
+  )
+}
+
+pipeline test_refuses_a_run_that_did_not_succeed(harness: Harness) {
+  assert_error_contains(
+    fn() { verify(harness.fs, {run: {conclusion: "failure"}}) },
+    "run " + RUN_ID + " did not succeed: status completed, conclusion failure",
+  )
+  assert_error_contains(
+    fn() { verify(harness.fs, {run: {status: "in_progress", conclusion: nil}}) },
+    "did not succeed: status in_progress",
+  )
+}
+
+pipeline test_refuses_a_file_whose_digest_differs(harness: Harness) {
+  const tampered = "archive for x86_64-unknown-linux-gnu, rebuilt\n"
+  const built = candidate(harness.fs)
+  const recorded = built.manifest.artifacts.find(
+    { item -> item.target == "x86_64-unknown-linux-gnu" },
+  ).sha256
+  assert_error_contains(
+    fn() { verify(harness.fs, {files: {"harn-x86_64-unknown-linux-gnu.tar.gz": tampered}}) },
+    "harn-x86_64-unknown-linux-gnu.tar.gz has sha256 " + sha256(tampered)
+      + " but the manifest records "
+      + recorded,
+  )
+}
+
+pipeline test_refuses_a_manifest_that_fails_the_schema(harness: Harness) {
+  const built = candidate(harness.fs)
+  const unsigned = built.manifest
+    + {artifacts: built.manifest.artifacts.map({ item -> item + {signingStatus: "unsigned"} })}
+  assert_error_contains(
+    fn() { verify(harness.fs, {manifest: unsigned}) },
+    "candidate manifest does not match burin-labs.candidate_manifest.v1",
+  )
+  const old_shape = real_manifest(harness.fs)
+    + {schemaVersion: "harn.candidate_archive_manifest.v1"}
+  assert_error_contains(
+    fn() { validate_candidate_manifest(old_shape) },
+    "does not match burin-labs.candidate_manifest.v1",
+  )
+  assert_error_contains(
+    fn() { validate_candidate_manifest(real_manifest(harness.fs) + {artifacts: []}) },
+    "does not match",
+  )
+  assert_error_contains(
+    fn() { verify(harness.fs, {manifest_text: "{not json"}) },
+    CANDIDATE_MANIFEST_FILE + " is not JSON",
+  )
+}
+
+pipeline test_refuses_an_inconsistent_manifest(harness: Harness) {
+  const manifest = real_manifest(harness.fs)
+  const first = manifest.artifacts[0]
+  assert_error_contains(
+    fn() { validate_candidate_manifest(manifest + {artifacts: manifest.artifacts + [first]}) },
+    "target aarch64-apple-darwin appears more than once",
+  )
+  assert_error_contains(
+    fn() { validate_candidate_manifest(
+      manifest + {artifacts: [first + {signingStatus: "not_applicable"}]},
+    ) },
+    "harn-aarch64-apple-darwin.tar.gz is notarized but not signed",
+  )
+}
+
+pipeline test_refuses_a_run_outside_the_calling_repository(harness: Harness) {
+  assert_error_contains(
+    fn() { verify(harness.fs, {run: {repository: {full_name: "someone/harn"}}}) },
+    "run " + RUN_ID + " belongs to someone/harn, not " + REPO,
+  )
+  assert_error_contains(
+    fn() { verify(harness.fs, {run: {head_repository: {full_name: "fork/harn"}}}) },
+    "built a commit from fork/harn",
+  )
+  assert_error_contains(
+    fn() { verify(harness.fs, {responses: {["/repos/" + REPO + "/actions/runs/" + RUN_ID]: nil}}) },
+    "run " + RUN_ID + " does not exist in " + REPO,
+  )
+}
+
+pipeline test_refuses_a_commit_that_is_not_on_the_default_branch(harness: Harness) {
+  assert_error_contains(
+    fn() { verify(harness.fs, {relation: "ahead"}) },
+    "commit " + SHA + " is not on main (compare status ahead)",
+  )
+}
+
+pipeline test_refuses_a_manifest_for_another_commit_or_run(harness: Harness) {
+  const built = candidate(harness.fs)
+  assert_error_contains(
+    fn() { verify(harness.fs, {manifest: built.manifest + {sourceCommit: OTHER_SHA}}) },
+    "manifest sourceCommit is " + OTHER_SHA + ", not the requested " + SHA,
+  )
+  assert_error_contains(
+    fn() { verify(harness.fs, {manifest: built.manifest + {runId: "1"}}) },
+    "manifest runId is 1, not the requested " + RUN_ID,
+  )
+  assert_error_contains(
+    fn() { verify(harness.fs, {manifest: built.manifest + {runAttempt: "2"}}) },
+    "manifest runAttempt 2 is later than the run's attempt 1",
+  )
+}
+
+pipeline test_refuses_a_file_without_a_build_attestation(harness: Harness) {
+  assert_error_contains(
+    fn() { verify(harness.fs, {forged: ["harn-x86_64-pc-windows-msvc.zip"]}) },
+    "build attestation did not verify for harn-x86_64-pc-windows-msvc.zip",
+  )
+}
+
+pipeline test_refuses_to_overwrite_a_release_or_move_a_tag(harness: Harness) {
+  const releases = "/repos/" + REPO + "/releases/tags/" + TAG
+  const ref = "/repos/" + REPO + "/git/ref/tags/" + TAG
+  for case in [
+    {
+      responses: {[releases]: {html_url: "https://example.test/release"}},
+      message: "release " + TAG + " already exists",
+    },
+    {
+      responses: {[ref]: {object: {type: "commit", sha: OTHER_SHA}}},
+      message: "tag " + TAG + " already points at " + OTHER_SHA,
+    },
+  ] {
+    const directory = harness.fs.mkdtemp_in_workspace("promotion-")
+    const world = fixture(harness.fs, {responses: case.responses})
+    verify_candidate(world.github, harness.fs, request(), directory)
+    assert_error_contains(
+      fn() { publish_candidate(
+        world.github,
+        harness.fs,
+        request(),
+        verify_run(world.github, request()),
+        directory,
+      ) },
+      case.message,
+    )
+    assert(!world.state().published)
+  }
+}
+
+pipeline test_leaves_a_draft_unpublished_when_github_stored_other_bytes(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-")
+  const world = fixture(harness.fs, {stored: {"harn-aarch64-apple-darwin.tar.gz": "sha256:00"}})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  assert_error_contains(
+    fn() { publish_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      verify_run(world.github, request()),
+      directory,
+    ) },
+    "harn-aarch64-apple-darwin.tar.gz stored as sha256:00",
+  )
+  assert(!world.state().published)
+}
+
+pipeline test_rejects_malformed_inputs() {
+  assert_error_contains(
+    fn() { parse_request({repository: REPO, sha: "abc", run_id: RUN_ID, tag: TAG}) },
+    "sha must be a full 40-character",
+  )
+  assert_error_contains(
+    fn() { parse_request({repository: REPO, sha: SHA, run_id: "12x", tag: TAG}) },
+    "run-id must be a workflow run id",
+  )
+  assert_error_contains(
+    fn() { parse_request({repository: REPO, sha: SHA, run_id: RUN_ID, tag: "0.10.142"}) },
+    "tag must look like vX.Y.Z",
+  )
+}

@@ -1,0 +1,146 @@
+# Promote the files one CI run built and tested into a GitHub release.
+#
+# A release publishes exactly the files that main CI built and tested at one
+# commit; nothing is rebuilt after testing. The build run uploads each file as
+# a run artifact, attests it, and records its SHA-256 in a candidate manifest
+# (schemas/candidate-manifest.v1.json). This workflow proves that the run passed
+# at the requested commit and that the files are the ones the manifest names,
+# then tags that commit and publishes those same files. It never builds.
+#
+# Call it from a workflow that starts after the release commit's CI run has
+# finished, since the run must have concluded before it can be promoted:
+#
+#   on:
+#     workflow_run:
+#       workflows: [CI]
+#       types: [completed]
+#       branches: [main]
+#   jobs:
+#     promote:
+#       if: github.event.workflow_run.conclusion == 'success'
+#       uses: burin-labs/.github/.github/workflows/promote-release.yml@<sha>
+#       permissions:
+#         contents: read
+#         actions: read
+#         attestations: read
+#       with:
+#         sha: ${{ github.event.workflow_run.head_sha }}
+#         run-id: ${{ github.event.workflow_run.id }}
+#         tag: v1.2.3
+#       secrets:
+#         RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+#         RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+#
+# Publishing to package registries is the caller's next job, gated on this
+# one. It reads the files from the release this workflow outputs.
+
+name: Promote release
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: Full commit SHA the run built and tested.
+        required: true
+        type: string
+      run-id:
+        description: Id of the calling repository's workflow run that built and tested the files.
+        required: true
+        type: string
+      tag:
+        description: Release tag to create at sha, as vX.Y.Z.
+        required: true
+        type: string
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        description: GitHub App client id with contents write on the calling repository.
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        description: GitHub App private key.
+        required: true
+    outputs:
+      tag:
+        description: The tag the release was published under.
+        value: ${{ jobs.promote.outputs.tag }}
+      release-url:
+        description: URL of the published release.
+        value: ${{ jobs.promote.outputs.release-url }}
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Promote tested files
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Reading the run, its artifacts, and its attestations uses the caller's
+    # own token. Only publishing uses the app token, and only after every
+    # check has passed.
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
+      release-url: ${{ steps.publish.outputs.release-url }}
+    steps:
+      - name: Require called-workflow identity
+        if: ${{ fromJSON(toJSON(job)).workflow_repository == '' || fromJSON(toJSON(job)).workflow_sha == '' }}
+        shell: bash
+        run: |
+          echo "::error::promote-release.yml requires GitHub.com job.workflow_repository and job.workflow_sha; GitHub Enterprise Server is not supported"
+          exit 2
+
+      - name: Check out workflow implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # actionlint v1.7.12 predates these GitHub.com fields; the JSON
+          # round-trip keeps this workflow lintable without changing runtime.
+          repository: ${{ fromJSON(toJSON(job)).workflow_repository }}
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          path: .harn/promote-release/implementation
+          persist-credentials: false
+
+      - name: Set up exact Harn release
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f # bounded release-asset retries
+        with:
+          version: 0.10.133
+
+      - name: Verify the run and its files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTE_MODE: verify
+          PROMOTE_REPOSITORY: ${{ github.repository }}
+          PROMOTE_SHA: ${{ inputs.sha }}
+          PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_TAG: ${{ inputs.tag }}
+          PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
+        run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh
+
+      - name: Mint the release token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          # Creating the release and its tag is the whole authority this step
+          # needs. A release made with the app token, unlike one made with the
+          # workflow token, starts the workflows that listen for it.
+          permission-contents: write
+
+      - name: Publish the verified files
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PROMOTE_MODE: publish
+          PROMOTE_REPOSITORY: ${{ github.repository }}
+          PROMOTE_SHA: ${{ inputs.sha }}
+          PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_TAG: ${{ inputs.tag }}
+          PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
+        run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh

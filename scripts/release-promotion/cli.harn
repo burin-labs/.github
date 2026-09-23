@@ -1,0 +1,64 @@
+import { gha_write_output } from "std/gha"
+import { live_github } from "./live.harn"
+import { parse_request, publish_candidate, verify_candidate, verify_run } from "./promotion.harn"
+
+fn required_env(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name)
+  if value == nil || trim(value) == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn write_output(harness: Harness, name: string, value: string) {
+  if !gha_write_output(harness, name, value) {
+    throw "GITHUB_OUTPUT is not set, so " + name + " cannot reach the caller"
+  }
+}
+
+fn main(harness: Harness) {
+  harness.net.egress_policy({default: "allow", block_private: "private"})
+  const request = parse_request(
+    {
+      repository: required_env(harness.env, "PROMOTE_REPOSITORY"),
+      sha: required_env(harness.env, "PROMOTE_SHA"),
+      run_id: required_env(harness.env, "PROMOTE_RUN_ID"),
+      tag: required_env(harness.env, "PROMOTE_TAG"),
+    },
+  )
+  const directory = required_env(harness.env, "PROMOTE_DIRECTORY")
+  const github = live_github(
+    harness.net,
+    harness.tools,
+    required_env(harness.env, "GH_TOKEN"),
+    request.repository,
+    harness.fs.mkdtemp_in_workspace("promote-release-gh-"),
+  )
+  const mode = required_env(harness.env, "PROMOTE_MODE")
+  if mode == "verify" {
+    const candidate = verify_candidate(github, harness.fs, request, directory)
+    for file in candidate.files {
+      harness.stdio.println("verified " + file.name + " sha256 " + file.sha256)
+    }
+    harness.stdio.println(
+      "Run " + to_string(request.run_id) + " passed at " + request.sha + " and its "
+        + to_string(len(candidate.files))
+        + " files match their manifest digests and attestations.",
+    )
+    return
+  }
+  if mode == "publish" {
+    const release = publish_candidate(
+      github,
+      harness.fs,
+      request,
+      verify_run(github, request),
+      directory,
+    )
+    write_output(harness, "tag", release.tag)
+    write_output(harness, "release-url", release.url)
+    harness.stdio.println("Published " + release.tag + ": " + release.url)
+    return
+  }
+  throw "PROMOTE_MODE must be verify or publish, got " + mode
+}
