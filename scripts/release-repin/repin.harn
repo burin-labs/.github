@@ -1,0 +1,170 @@
+/**
+ * Repin every registered consumer of a released repository. The registry at
+ * .github/release-consumers.json is the one list of who pins what; this module
+ * is the one owner of its shape. Each consumer owns its repin: this module
+ * only starts the workflow the registry names, with the released tag as its
+ * `version` input, and the consumer's own CI gates the result.
+ */
+pub const REGISTRY_PATH = ".github/release-consumers.json"
+
+/** A consumer and the workflow in it that repins onto a new release. */
+pub type Consumer = {repository: string, workflow: string}
+
+/** Everything repinning asks of GitHub. */
+pub type Dispatcher = {
+  release: fn(string, string) -> unknown,
+  dispatch: fn(Consumer, string) -> string?,
+}
+
+const SLUG = "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+
+const REGISTRY_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["schema_version", "released"],
+  properties: {
+    schema_version: {const: 1},
+    released: {
+      type: "object",
+      additionalProperties: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["repository", "workflow"],
+          properties: {
+            repository: {type: "string", pattern: SLUG},
+            workflow: {type: "string", pattern: "^[A-Za-z0-9_.-]+\\.ya?ml$"},
+          },
+        },
+      },
+    },
+  },
+}
+
+fn owner(slug: string) -> string {
+  return slug.split("/")[0]
+}
+
+fn name(slug: string) -> string {
+  return slug.split("/")[1]
+}
+
+/**
+ * Validate the registry document. Throws naming every problem; returns the
+ * consumers for each released repository otherwise.
+ */
+pub fn validate_registry(raw: unknown) -> dict<string, list<Consumer>> {
+  const checked = schema_check(raw, REGISTRY_SCHEMA)
+  if !is_ok(checked) {
+    throw REGISTRY_PATH + " is malformed: "
+      + join(unwrap_err(checked).errors.map({ error -> to_string(error) }), "; ")
+  }
+  const released: dict<string, list<Consumer>> = unwrap(checked).released
+  let problems = []
+  for repository in keys(released).sorted() {
+    if regex_match(SLUG, repository) == nil {
+      problems = problems + ["released repository " + repository + " is not owner/name"]
+      continue
+    }
+    let seen = []
+    for consumer in released[repository] ?? [] {
+      if seen.contains(consumer.repository) {
+        problems = problems + [consumer.repository + " is listed twice under " + repository]
+      }
+      seen = seen + [consumer.repository]
+      if consumer.repository == repository {
+        problems = problems + [repository + " lists itself as a consumer"]
+      }
+      // The dispatch token is minted for the released repository's owner.
+      if owner(consumer.repository) != owner(repository) {
+        problems = problems
+          + [
+            consumer.repository + " is outside " + owner(repository) + ", so " + repository
+              + " cannot dispatch it",
+          ]
+      }
+    }
+  }
+  if len(problems) > 0 {
+    throw REGISTRY_PATH + " is malformed: " + join(problems, "; ")
+  }
+  return released
+}
+
+/**
+ * Choose the consumers to repin. An empty request means every registered
+ * consumer; a named consumer that is not registered is refused, never skipped.
+ */
+pub fn plan(
+  raw_registry: unknown,
+  released: string,
+  tag: string,
+  requested: list<string>,
+) -> list<Consumer> {
+  if regex_match("^v[0-9]+\\.[0-9]+\\.[0-9]+$", tag) == nil {
+    throw "tag must look like vX.Y.Z, got " + tag
+  }
+  const registry = validate_registry(raw_registry)
+  const consumers = registry[released]
+  if consumers == nil {
+    throw released + " has no consumers in " + REGISTRY_PATH
+  }
+  if len(requested) == 0 {
+    return consumers
+  }
+  const registered = consumers.map({ consumer -> consumer.repository })
+  const unknown = requested.filter({ repository -> !registered.contains(repository) })
+  if len(unknown) > 0 {
+    throw join(unknown, ", ") + (len(unknown) == 1 ? " is not a" : " are not")
+      + " registered consumer"
+      + (len(unknown) == 1 ? "" : "s")
+      + " of "
+      + released
+      + " in "
+      + REGISTRY_PATH
+  }
+  return consumers.filter({ consumer -> requested.contains(consumer.repository) }).to_list()
+}
+
+/** Repository names, without the owner, for scoping the dispatch token. */
+pub fn token_repositories(consumers: list<Consumer>) -> string {
+  return join(consumers.map({ consumer -> name(consumer.repository) }), "\n")
+}
+
+/**
+ * Start each consumer's repin workflow once the release is published. Tries
+ * every consumer, then fails naming each dispatch that GitHub refused.
+ */
+pub fn dispatch_all(
+  dispatcher: Dispatcher,
+  released: string,
+  tag: string,
+  consumers: list<Consumer>,
+) -> list<Consumer> {
+  const release = dispatcher.release(released, tag)
+  if release == nil {
+    throw released + " has no release " + tag
+  }
+  if release?.draft == true {
+    throw released + " release " + tag + " is still a draft"
+  }
+  let refused = []
+  let started = []
+  for consumer in consumers {
+    const diagnostic = dispatcher.dispatch(consumer, tag)
+    if diagnostic == nil {
+      started = started + [consumer]
+    } else {
+      refused = refused + [consumer.repository + " " + consumer.workflow + ": " + diagnostic]
+    }
+  }
+  if len(refused) > 0 {
+    throw "could not start the repin in " + to_string(len(refused)) + " of "
+      + to_string(len(consumers))
+      + " consumers: "
+      + join(refused, "; ")
+  }
+  return started
+}

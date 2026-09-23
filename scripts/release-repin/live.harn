@@ -1,0 +1,62 @@
+import { command_output_tail, command_run } from "std/command"
+import { Dispatcher } from "./repin.harn"
+
+fn diagnostic(tools: HarnessTools, result: dict) -> string {
+  const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
+  const lines = trim(stderr).split("\n")
+  const tail = lines[max(0, len(lines) - 3):len(lines)]
+  const text = trim(join(tail, " "))
+  return text == "" ? "exit " + to_string(result?.exit_code) : text
+}
+
+/**
+ * Build the production dispatcher. gh keeps its config and caches under
+ * scratch, inside the sandbox's write roots.
+ */
+pub fn live_dispatcher(tools: HarnessTools, token: string, scratch: string) -> Dispatcher {
+  const env = {
+    GH_TOKEN: token,
+    GH_CONFIG_DIR: path_join(scratch, "config"),
+    XDG_CACHE_HOME: path_join(scratch, "cache"),
+    XDG_STATE_HOME: path_join(scratch, "state"),
+    XDG_DATA_HOME: path_join(scratch, "data"),
+    GH_PROMPT_DISABLED: "1",
+    GH_NO_UPDATE_NOTIFIER: "1",
+    NO_COLOR: "1",
+  }
+  const options = {capture: {max_inline_bytes: 1000000}, env: env, timeout_ms: 120000}
+  return {
+    release: fn(repository, tag) {
+      const result = command_run(
+        tools,
+        ["gh", "api", "repos/" + repository + "/releases/tags/" + tag],
+        options,
+      )
+      if result.success {
+        return json_parse(result.stdout)
+      }
+      const reason = diagnostic(tools, result)
+      if reason.contains("HTTP 404") {
+        return nil
+      }
+      throw "reading " + repository + " release " + tag + " failed: " + reason
+    },
+    dispatch: fn(consumer, tag) {
+      const result = command_run(
+        tools,
+        [
+          "gh",
+          "workflow",
+          "run",
+          consumer.workflow,
+          "--repo",
+          consumer.repository,
+          "-f",
+          "version=" + tag,
+        ],
+        options,
+      )
+      return result.success ? nil : diagnostic(tools, result)
+    },
+  }
+}

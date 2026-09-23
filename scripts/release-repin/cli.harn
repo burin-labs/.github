@@ -1,0 +1,60 @@
+import { gha_write_output } from "std/gha"
+import { live_dispatcher } from "./live.harn"
+import { REGISTRY_PATH, dispatch_all, plan, token_repositories } from "./repin.harn"
+
+fn required_env(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name)
+  if value == nil || trim(value) == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn write_output(harness: Harness, name: string, value: string) {
+  if !gha_write_output(harness, name, value) {
+    throw "GITHUB_OUTPUT is not set, so " + name + " cannot reach the next step"
+  }
+}
+
+fn main(harness: Harness) {
+  const released = required_env(harness.env, "REPIN_RELEASED_REPOSITORY")
+  const caller = required_env(harness.env, "REPIN_CALLER")
+  if released != caller {
+    throw "released-repository is " + released + ", but " + caller
+      + " called repin; a repository can only repin its own consumers"
+  }
+  const tag = required_env(harness.env, "REPIN_TAG")
+  const requested = regex_split(trim(harness.env.get("REPIN_CONSUMERS") ?? ""), "[\\s,]+").filter(
+    { item -> item != "" },
+  )
+  const registry_path = path_join(required_env(harness.env, "REPIN_ROOT"), REGISTRY_PATH)
+  let raw = nil
+  try {
+    raw = json_parse(harness.fs.read_text(registry_path))
+  } catch (error) {
+    throw REGISTRY_PATH + " is malformed: " + to_string(error)
+  }
+  const consumers = plan(raw, released, tag, requested)
+  const mode = required_env(harness.env, "REPIN_MODE")
+  if mode == "plan" {
+    write_output(harness, "repositories", token_repositories(consumers))
+    for consumer in consumers {
+      harness.stdio.println("will repin " + consumer.repository + " via " + consumer.workflow)
+    }
+    return
+  }
+  if mode == "dispatch" {
+    const dispatcher = live_dispatcher(
+      harness.tools,
+      required_env(harness.env, "GH_TOKEN"),
+      harness.fs.mkdtemp_in_workspace("repin-gh-"),
+    )
+    for consumer in dispatch_all(dispatcher, released, tag, consumers) {
+      harness.stdio.println(
+        "started " + consumer.workflow + " in " + consumer.repository + " for " + tag,
+      )
+    }
+    return
+  }
+  throw "REPIN_MODE must be plan or dispatch, got " + mode
+}

@@ -1,0 +1,123 @@
+# Ask every consumer of a released repository to repin onto the new release.
+#
+# .github/release-consumers.json is the one list of which repositories pin
+# which released repository, and the workflow in each that repins it. This
+# workflow starts that workflow in every registered consumer with the released
+# tag as its `version` input. The consumer owns the repin: its workflow opens
+# the pull request, and its normal CI and review rules decide whether it
+# merges. There is no separate rehearsal.
+#
+# Call it from the released repository once its release is published:
+#
+#   jobs:
+#     repin:
+#       needs: promote
+#       uses: burin-labs/.github/.github/workflows/repin.yml@<sha>
+#       with:
+#         released-repository: ${{ github.repository }}
+#         tag: ${{ needs.promote.outputs.tag }}
+#       secrets:
+#         RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+#         RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+#
+# The registry is read at the SHA this workflow is pinned to, like the rest of
+# its implementation, so a consumer added to the registry takes effect once
+# the released repository's pin includes it.
+
+name: Repin consumers
+
+on:
+  workflow_call:
+    inputs:
+      released-repository:
+        description: Repository that published the release, as owner/name. Must be the calling repository.
+        required: true
+        type: string
+      tag:
+        description: Published release tag, as vX.Y.Z.
+        required: true
+        type: string
+      consumers:
+        description: Registered consumers to repin, separated by spaces or commas. Empty repins every registered consumer.
+        required: false
+        default: ""
+        type: string
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        description: GitHub App client id with actions write on the consumer repositories.
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        description: GitHub App private key.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  repin:
+    name: Start consumer repins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require called-workflow identity
+        if: ${{ fromJSON(toJSON(job)).workflow_repository == '' || fromJSON(toJSON(job)).workflow_sha == '' }}
+        shell: bash
+        run: |
+          echo "::error::repin.yml requires GitHub.com job.workflow_repository and job.workflow_sha; GitHub Enterprise Server is not supported"
+          exit 2
+
+      - name: Check out workflow implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # actionlint v1.7.12 predates these GitHub.com fields; the JSON
+          # round-trip keeps this workflow lintable without changing runtime.
+          repository: ${{ fromJSON(toJSON(job)).workflow_repository }}
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          path: .harn/repin/implementation
+          persist-credentials: false
+
+      - name: Set up exact Harn release
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f # bounded release-asset retries
+        with:
+          version: 0.10.133
+
+      - name: Plan the repins from the registry
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPIN_MODE: plan
+          REPIN_CALLER: ${{ github.repository }}
+          REPIN_RELEASED_REPOSITORY: ${{ inputs.released-repository }}
+          REPIN_TAG: ${{ inputs.tag }}
+          REPIN_CONSUMERS: ${{ inputs.consumers }}
+        run: bash .harn/repin/implementation/scripts/release-repin/run.sh
+
+      - name: Mint the consumer dispatch token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Exactly the planned consumers, plus the released repository so the
+          # dispatch step can confirm its release is published.
+          repositories: |-
+            ${{ github.event.repository.name }}
+            ${{ steps.plan.outputs.repositories }}
+          # Starting each consumer's own repin workflow is the whole authority
+          # this workflow needs. The consumer's workflow opens its pull request
+          # with its own token.
+          permission-actions: write
+          permission-contents: read
+
+      - name: Start each consumer's repin
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          REPIN_MODE: dispatch
+          REPIN_CALLER: ${{ github.repository }}
+          REPIN_RELEASED_REPOSITORY: ${{ inputs.released-repository }}
+          REPIN_TAG: ${{ inputs.tag }}
+          REPIN_CONSUMERS: ${{ inputs.consumers }}
+        run: bash .harn/repin/implementation/scripts/release-repin/run.sh

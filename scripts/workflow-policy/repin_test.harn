@@ -1,0 +1,86 @@
+fn read(fs: HarnessFs, path: string) -> string {
+  return fs.read_text(path_join(path_normalize(path_join(fs.cwd(), "../..")), path))
+}
+
+fn expression(body: string) -> string {
+  return "$" + "{{ " + body + " }}"
+}
+
+pipeline test_repin_is_callable_only_and_dispatches_only_what_it_planned(harness: Harness) {
+  const workflow = yaml_parse(read(harness.fs, ".github/workflows/repin.yml"))
+  assert_eq(keys(workflow.on), ["workflow_call"])
+  const call = workflow.on.workflow_call
+  assert_eq(keys(call.inputs).sorted(), ["consumers", "released-repository", "tag"])
+  assert_eq(call.inputs["released-repository"].required, true)
+  assert_eq(call.inputs.tag.required, true)
+  assert_eq(call.inputs.consumers.default, "")
+  for name in keys(call.secrets) {
+    assert_eq(call.secrets[name].required, true)
+  }
+  assert_eq(workflow.permissions, {contents: "read"})
+  const job = workflow.jobs.repin
+  assert_eq(job["runs-on"], "ubuntu-latest")
+  assert_eq(
+    job.steps.map({ step -> step.name }),
+    [
+      "Require called-workflow identity",
+      "Check out workflow implementation",
+      "Set up exact Harn release",
+      "Plan the repins from the registry",
+      "Mint the consumer dispatch token",
+      "Start each consumer's repin",
+    ],
+  )
+  assert_eq(
+    job.steps[1]["with"],
+    {
+      repository: expression("fromJSON(toJSON(job)).workflow_repository"),
+      ref: expression("fromJSON(toJSON(job)).workflow_sha"),
+      path: ".harn/repin/implementation",
+      "persist-credentials": false,
+    },
+  )
+  const planned = job.steps[3]
+  const token = job.steps[4]
+  const dispatch = job.steps[5]
+  const entry = "bash .harn/repin/implementation/scripts/release-repin/run.sh"
+  assert_eq(planned.run, entry)
+  assert_eq(dispatch.run, entry)
+  assert_eq(planned.env.REPIN_MODE, "plan")
+  assert_eq(planned.env.GH_TOKEN, expression("github.token"))
+  assert_eq(dispatch.env.REPIN_MODE, "dispatch")
+  assert_eq(dispatch.env.GH_TOKEN, expression("steps.token.outputs.token"))
+  for name in ["REPIN_CALLER", "REPIN_RELEASED_REPOSITORY", "REPIN_TAG", "REPIN_CONSUMERS"] {
+    assert_eq(planned.env[name], dispatch.env[name])
+  }
+  // The caller identity comes from GitHub, not from an input the caller sets.
+  assert_eq(planned.env.REPIN_CALLER, expression("github.repository"))
+  // The dispatch token reaches only the planned consumers and the release.
+  assert(token["with"].repositories.contains(expression("steps.plan.outputs.repositories")))
+  assert_eq(
+    keys(token["with"]).filter({ key -> key.starts_with("permission-") }).sorted(),
+    ["permission-actions", "permission-contents"],
+  )
+  assert_eq(token["with"]["permission-actions"], "write")
+  assert_eq(token["with"]["permission-contents"], "read")
+}
+
+pipeline test_repin_bootstrap_only_dispatches_harn(harness: Harness) {
+  const bootstrap = read(harness.fs, "scripts/release-repin/run.sh")
+  assert(bootstrap.contains("scripts/release-repin/cli.harn"))
+  for variable in [
+    "GH_TOKEN",
+    "REPIN_MODE",
+    "REPIN_ROOT",
+    "REPIN_CALLER",
+    "REPIN_RELEASED_REPOSITORY",
+    "REPIN_TAG",
+    "REPIN_CONSUMERS",
+    "GITHUB_OUTPUT",
+  ] {
+    assert(bootstrap.contains("=env:" + variable + ",expose=" + variable), variable)
+  }
+  for forbidden in ["gh ", "curl", "cargo", "make "] {
+    assert(!bootstrap.contains(forbidden), forbidden)
+  }
+}

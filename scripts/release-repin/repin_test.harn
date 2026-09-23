@@ -1,0 +1,140 @@
+import { assert_error_contains } from "std/testing"
+import { dispatch_all, plan, token_repositories, validate_registry } from "./repin.harn"
+
+const HARN = "burin-labs/harn"
+
+fn registry(fs: HarnessFs) -> dict {
+  return json_parse(fs.read_text("../../.github/release-consumers.json"))
+}
+
+fn small_registry() -> dict {
+  return {
+    schema_version: 1,
+    released: {
+      [HARN]: [
+        {repository: "burin-labs/burin-code", workflow: "bump-harn.yml"},
+        {repository: "burin-labs/homebrew-burin", workflow: "bump-harn-formula.yml"},
+      ],
+    },
+  }
+}
+
+fn recorder(release: unknown, refuse: list<string> = []) -> dict {
+  let calls = []
+  const dispatcher = {
+    release: fn(_repository, _tag) { return release },
+    dispatch: fn(consumer, tag) {
+      calls = calls + [consumer.repository + " " + consumer.workflow + " version=" + tag]
+      return refuse.contains(consumer.repository) ? "HTTP 403: Resource not accessible" : nil
+    },
+  }
+  // Closures share the captured list; read it through this getter.
+  return {dispatcher: dispatcher, calls: fn() { return calls }}
+}
+
+pipeline test_the_registry_validates_and_lists_harns_consumers(harness: Harness) {
+  const released = validate_registry(registry(harness.fs))
+  const consumers = released[HARN] ?? []
+  assert(len(consumers) > 1, "harn must have registered consumers")
+  assert(
+    consumers.any({ consumer -> consumer.repository == "burin-labs/burin-code" }),
+    "burin-code pins harn",
+  )
+}
+
+pipeline test_repins_every_registered_consumer_with_the_tag() {
+  const consumers = plan(small_registry(), HARN, "v0.10.142", [])
+  assert_eq(token_repositories(consumers), "burin-code\nhomebrew-burin")
+  const world = recorder({draft: false})
+  dispatch_all(world.dispatcher, HARN, "v0.10.142", consumers)
+  assert_eq(
+    world.calls(),
+    [
+      "burin-labs/burin-code bump-harn.yml version=v0.10.142",
+      "burin-labs/homebrew-burin bump-harn-formula.yml version=v0.10.142",
+    ],
+  )
+}
+
+pipeline test_repins_only_the_named_registered_consumers() {
+  const consumers = plan(small_registry(), HARN, "v0.10.142", ["burin-labs/homebrew-burin"])
+  assert_eq(
+    consumers,
+    [{repository: "burin-labs/homebrew-burin", workflow: "bump-harn-formula.yml"}],
+  )
+}
+
+pipeline test_refuses_a_consumer_missing_from_the_registry() {
+  assert_error_contains(
+    fn() { plan(small_registry(), HARN, "v0.10.142", ["burin-labs/burin-code", "burin-labs/unlisted"]) },
+    "burin-labs/unlisted is not a registered consumer of burin-labs/harn in .github/release-consumers.json",
+  )
+}
+
+pipeline test_refuses_a_released_repository_with_no_consumers() {
+  assert_error_contains(
+    fn() { plan(small_registry(), "burin-labs/unreleased", "v1.0.0", []) },
+    "burin-labs/unreleased has no consumers in .github/release-consumers.json",
+  )
+}
+
+pipeline test_refuses_a_malformed_registry() {
+  const base = small_registry()
+  const entries = base.released[HARN]
+  for case in [
+    {registry: base + {schema_version: 2}, message: "is malformed"},
+    {registry: {released: base.released}, message: "\"schema_version\" is a required property"},
+    {
+      registry: base
+        + {released: {[HARN]: [{repository: "burin-code", workflow: "bump-harn.yml"}]}},
+      message: "does not match",
+    },
+    {
+      registry: base + {released: {[HARN]: [entries[0] + {workflow: "bump harn"}]}},
+      message: "does not match",
+    },
+    {
+      registry: base + {released: {[HARN]: [entries[0] + {ref: "main"}]}},
+      message: "'ref' was unexpected",
+    },
+    {registry: base + {released: {[HARN]: []}}, message: "is malformed"},
+    {
+      registry: base + {released: {[HARN]: [entries[0], entries[0]]}},
+      message: "burin-labs/burin-code is listed twice under burin-labs/harn",
+    },
+    {
+      registry: base + {released: {[HARN]: [{repository: HARN, workflow: "bump-harn.yml"}]}},
+      message: "burin-labs/harn lists itself as a consumer",
+    },
+    {
+      registry: base + {released: {[HARN]: [{repository: "elsewhere/app", workflow: "bump.yml"}]}},
+      message: "elsewhere/app is outside burin-labs",
+    },
+    {registry: [], message: "is malformed"},
+  ] {
+    assert_error_contains(fn() { plan(case.registry, HARN, "v0.10.142", []) }, case.message)
+  }
+}
+
+pipeline test_refuses_an_unpublished_release_and_names_every_refused_dispatch() {
+  const consumers = plan(small_registry(), HARN, "v0.10.142", [])
+  assert_error_contains(
+    fn() { dispatch_all(recorder(nil).dispatcher, HARN, "v0.10.142", consumers) },
+    "burin-labs/harn has no release v0.10.142",
+  )
+  assert_error_contains(
+    fn() { dispatch_all(recorder({draft: true}).dispatcher, HARN, "v0.10.142", consumers) },
+    "release v0.10.142 is still a draft",
+  )
+  const world = recorder({draft: false}, ["burin-labs/burin-code"])
+  assert_error_contains(
+    fn() { dispatch_all(world.dispatcher, HARN, "v0.10.142", consumers) },
+    "could not start the repin in 1 of 2 consumers: burin-labs/burin-code bump-harn.yml: HTTP 403",
+  )
+  // A refused consumer does not stop the others from being started.
+  assert_eq(len(world.calls()), 2)
+  assert_error_contains(
+    fn() { plan(small_registry(), HARN, "0.10.142", []) },
+    "tag must look like vX.Y.Z",
+  )
+}
