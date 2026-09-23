@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "released": {
+    "burin-labs/harn": [
+      {
+        "repository": "burin-labs/20eq",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/burin-code",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/burin-commerce",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-bitbucket-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-box-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-buildkite-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-bump-fleet",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-business-receipts",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-canon",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-circleci-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-cloud",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-confluence-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-documents",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-dropbox-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-duffel-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-forgejo-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-gitea-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-github-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-gitlab-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-google-workspace-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-latex",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-linear-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-microsoft-365-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-notion-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-openapi",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-packages",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-slack-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-sourcehut-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-stripe-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/harn-svn-connector",
+        "workflow": "bump-harn.yml"
+      },
+      {
+        "repository": "burin-labs/homebrew-burin",
+        "workflow": "bump-harn-formula.yml"
+      },
+      {
+        "repository": "burin-labs/notion-sdk-harn",
+        "workflow": "bump-harn.yml"
+      }
+    ]
+  }
+}

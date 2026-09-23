@@ -105,6 +105,7 @@ pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
     "merge-override",
     "promote-release",
     "register-package-release",
+    "repin",
     "reusable-pin-drift",
     "runner-availability",
     "runner-fleet-health",
