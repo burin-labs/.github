@@ -22,6 +22,8 @@ const RUN_ID = "35858262708"
 
 const TAG = "v0.10.142"
 
+const TAG_OBJECT = "5b1d0c3e9f2a4b6c8d7e0f1a2b3c4d5e6f708192"
+
 fn real_manifest(fs: HarnessFs) -> dict {
   return json_parse(fs.read_text("fixtures/harn-candidate-manifest.json"))
 }
@@ -73,7 +75,7 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
     ["/repos/" + REPO + "/releases?per_page=100"]: [],
   }
     + (options?.responses ?? {})
-  let state = {drafts: [], published: false, uploaded: [], latest: nil}
+  let state = {drafts: [], published: false, uploaded: [], latest: nil, tag: nil, tagged_first: nil}
   const forged = options?.forged ?? []
   const stored_override = options?.stored ?? {}
   const github = {
@@ -81,8 +83,14 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
       if endpoint == "/repos/" + REPO + "/releases?per_page=100" {
         return state.drafts
       }
+      if endpoint.starts_with("/repos/" + REPO + "/git/ref/tags/") && state.tag != nil {
+        return {object: {type: "tag", sha: TAG_OBJECT}}
+      }
       if endpoint.starts_with("/repos/" + REPO + "/git/ref/tags/") && state.published {
         return {object: {type: "commit", sha: SHA}}
+      }
+      if endpoint == "/repos/" + REPO + "/git/tags/" + TAG_OBJECT && state.tag != nil {
+        return {object: {type: "commit", sha: state.tag.sha}}
       }
       return responses[endpoint]
     },
@@ -131,6 +139,11 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
           assets: assets,
         },
       ]
+      return nil
+    },
+    create_tag: fn(tag, sha, message) {
+      state.tag = {name: tag, sha: sha, message: message}
+      state.tagged_first = !state.published
       return nil
     },
     publish_draft: fn(id, latest) {
@@ -193,6 +206,9 @@ pipeline test_promotes_exactly_the_files_the_run_tested(harness: Harness) {
   assert_eq(release, {tag: TAG, url: "https://github.com/" + REPO + "/releases/tag/" + TAG})
   assert(world.state().published)
   assert_eq(world.state().latest, true)
+  // The release adopts an annotated tag made before it was published.
+  assert_eq(world.state().tag, {name: TAG, sha: SHA, message: "Release " + TAG})
+  assert_eq(world.state().tagged_first, true)
   assert_eq(world.state().drafts[0].prerelease, false)
   // The notes file is the body and is not uploaded; everything else is.
   assert_eq(world.state().drafts[0].body, "release file release-notes.md\n")
@@ -399,6 +415,29 @@ pipeline test_refuses_a_file_without_a_build_attestation(harness: Harness) {
     fn() { verify(harness.fs, {forged: ["harn-x86_64-pc-windows-msvc.zip"]}) },
     "build attestation did not verify for harn-x86_64-pc-windows-msvc.zip",
   )
+}
+
+pipeline test_a_rerun_adopts_its_own_annotated_tag(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-")
+  const world = fixture(
+    harness.fs,
+    {
+      responses: {
+        ["/repos/" + REPO + "/git/ref/tags/" + TAG]: {object: {type: "tag", sha: TAG_OBJECT}},
+        ["/repos/" + REPO + "/git/tags/" + TAG_OBJECT]: {object: {type: "commit", sha: SHA}},
+      },
+    },
+  )
+  verify_candidate(world.github, harness.fs, request(), directory)
+  publish_candidate(
+    world.github,
+    harness.fs,
+    request(),
+    verify_run(world.github, request()),
+    directory,
+  )
+  assert(world.state().published)
+  assert_eq(world.state().tag, nil)
 }
 
 pipeline test_refuses_to_overwrite_a_release_or_move_a_tag(harness: Harness) {
