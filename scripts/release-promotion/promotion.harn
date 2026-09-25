@@ -15,6 +15,7 @@ pub type GitHub = {
   download: fn(int, string, string) -> nil,
   attest: fn(string, dict) -> string?,
   create_draft: fn(dict) -> nil,
+  create_tag: fn(string, string, string) -> nil,
   publish_draft: fn(int, bool) -> unknown,
 }
 
@@ -351,6 +352,13 @@ pub fn publish_candidate(
     throw "draft release " + to_string(draft?.html_url) + " does not hold the candidate: "
       + join(differences, "; ")
       + ". It was left unpublished."
+  }
+  // Tag the commit with an annotated tag before publishing, so the release
+  // adopts it. Publishing alone would create a lightweight tag, which carries
+  // no tagger or message and which tag verifiers written for every earlier
+  // release refuse. A rerun after a partial publish finds the tag in place.
+  if tagged == nil {
+    github.create_tag(request.tag, request.sha, "Release " + request.tag)
   }
   const published = github.publish_draft(draft.id, !request.prerelease)
   const landed = tag_commit(github, request)

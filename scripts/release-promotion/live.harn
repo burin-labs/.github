@@ -173,6 +173,47 @@ pub fn live_github(
       )
       return nil
     },
+    create_tag: fn(tag, sha, message) {
+      const created = gh_ok(
+        tools,
+        env,
+        [
+          "api",
+          "--method",
+          "POST",
+          "repos/" + repository + "/git/tags",
+          "-f",
+          "tag=" + tag,
+          "-f",
+          "message=" + message,
+          "-f",
+          "object=" + sha,
+          "-f",
+          "type=commit",
+        ],
+        "creating the annotated tag",
+      )
+      const object = json_parse(created.stdout)
+      if object?.object?.sha != sha || type_of(object?.sha) != "string" {
+        throw "creating the annotated tag returned " + created.stdout + ", not a tag of " + sha
+      }
+      gh_ok(
+        tools,
+        env,
+        [
+          "api",
+          "--method",
+          "POST",
+          "repos/" + repository + "/git/refs",
+          "-f",
+          "ref=refs/tags/" + tag,
+          "-f",
+          "sha=" + object.sha,
+        ],
+        "creating the tag ref",
+      )
+      return nil
+    },
     publish_draft: fn(id, latest) {
       const result = gh_ok(
         tools,
