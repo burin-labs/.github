@@ -213,7 +213,11 @@ permissions:
 jobs:
   detect:
     name: Detect self-hosted runner availability
-    runs-on: ubuntu-latest
+    # The probe is a few API reads that finish in seconds, so the per-job
+    # minimum bill is nearly all of its cost. The 1 vCPU runner bills a third
+    # of ubuntu-latest, and its 15-minute job cap is far above this job's own
+    # 5-minute limit. The minutes bill to the calling repository.
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     env:
       # Promote to job env so step-level `if:` can gate on secret presence; the
