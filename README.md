@@ -555,6 +555,13 @@ Organization admins can also use GitHub’s “Bypass rules and merge” UI: the
 org-wide `main protection` ruleset grants `OrganizationAdmin` bypass in
 `pull_request` mode.
 
+People and agents use these labels, not `gh pr merge --admin`. An admin merge
+skips the merge queue without an audit comment, and the queue is the only check
+that runs on the combined tree. GitHub ignores `-merge` in `.gitattributes`, so
+two pull requests that each regenerate one file can merge into a stale file
+(burin-labs/harn#8817). `burin-labs/harn`'s `merge queue` ruleset has no admin
+bypass, so there the labels are the only way past the queue.
+
 ### Wire a repository
 
 Copy `templates/merge-override-dispatch.yml` to
