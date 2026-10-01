@@ -1,5 +1,21 @@
 import { regex_all_first_captures } from "std/text"
 
+pipeline test_override_dispatcher_can_supply_every_required_permission(harness: Harness) {
+  const caller = workflow(harness, "merge-override-dispatch").permissions
+  const callee = workflow(harness, "merge-override").permissions
+  const levels = {none: 0, read: 1, write: 2}
+  // A measured non-null requirement prevents simultaneous omission passing.
+  assert_eq(callee.issues, "write")
+  for scope in keys(callee) {
+    assert(caller.has(scope), "override dispatcher omitted required permission: " + scope)
+    assert(levels.has(callee[scope]) && levels.has(caller[scope]))
+    assert(
+      levels[caller[scope]] >= levels[callee[scope]],
+      "override dispatcher cannot supply required permission: " + scope,
+    )
+  }
+}
+
 fn root(fs: HarnessFs) -> string {
   return path_normalize(path_join(fs.cwd(), "../.."))
 }
