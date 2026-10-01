@@ -230,6 +230,48 @@ pipeline test_override_waits_for_competing_runs_before_publishing(harness: Harne
   }
 }
 
+fn assert_override_token_scope(inputs: dict) {
+  const granted = inputs.keys().filter({ key -> key.starts_with("permission-") }).sorted()
+  assert_eq(
+    granted,
+    [
+      "permission-actions",
+      "permission-contents",
+      "permission-pull-requests",
+      "permission-workflows",
+    ],
+  )
+  for permission in granted {
+    assert_eq(inputs[permission], "write")
+  }
+  assert_eq(inputs.owner, expression("inputs.organization"))
+  assert_eq(inputs.repositories, expression("github.event.repository.name"))
+}
+
+pipeline test_override_merge_uses_repository_scoped_workflow_authority(harness: Harness) {
+  const steps = workflow(harness, "merge-override").jobs.apply.steps
+  const token = step(steps, "Mint release-app token for privileged merge")
+  assert_eq(token.id, "app-token")
+  assert_override_token_scope(token["with"])
+  const merge = step(steps, "Squash-merge pull request")
+  assert_eq(merge.env.GH_TOKEN, expression("steps.app-token.outputs.token"))
+  assert(merge.run.contains("gh api -X PUT"))
+  for damaged in [
+    token["with"].removing("permission-workflows"),
+    token["with"] + {"permission-workflows": "read"},
+    token["with"] + {"permission-administration": "write"},
+    token["with"] + {repositories: ""},
+  ] {
+    const refused = try {
+      assert_override_token_scope(damaged)
+      false
+    } catch (_error) {
+      true
+    }
+    assert(refused, "missing workflow authority or unrelated expansion fails the same contract")
+  }
+}
+
 pipeline test_ci_reaches_every_shell_and_remaining_ruby_test(harness: Harness) {
   const jobs = workflow(harness, "ci").jobs
   const expected_shell = census(harness.fs, [".github/**/*_test.sh", "scripts/**/*_test.sh"])
