@@ -4,9 +4,11 @@ fn source(fs: HarnessFs, path: string) -> string {
 
 pipeline test_fleet_owned_bump_reference_keeps_its_paired_input(harness: Harness) {
   const template = source(harness.fs, "templates/dependabot.yml")
-  const actions = yaml_parse(template).updates.find(
-    { update -> update["package-ecosystem"] == "github-actions" },
+  const parsed: DependabotTemplate = schema_expect(
+    yaml_parse(template),
+    schema_of(DependabotTemplate),
   )
+  const actions = parsed.updates.find({ update -> update["package-ecosystem"] == "github-actions" })
   // This exact dependency has a second, coordinated orchestration input.
   // Ordinary Actions remain in the catch-all group and have no ignore.
   assert_eq(
@@ -19,3 +21,5 @@ pipeline test_fleet_owned_bump_reference_keeps_its_paired_input(harness: Harness
     "organization config must project the canonical template prefix",
   )
 }
+
+type DependabotTemplate = {version: int, updates: list<dict>}
