@@ -1,0 +1,21 @@
+fn source(fs: HarnessFs, path: string) -> string {
+  return fs.read_text(path_join(path_normalize(path_join(fs.cwd(), "../..")), path))
+}
+
+pipeline test_fleet_owned_bump_reference_keeps_its_paired_input(harness: Harness) {
+  const template = source(harness.fs, "templates/dependabot.yml")
+  const actions = yaml_parse(template).updates.find(
+    { update -> update["package-ecosystem"] == "github-actions" },
+  )
+  // This exact dependency has a second, coordinated orchestration input.
+  // Ordinary Actions remain in the catch-all group and have no ignore.
+  assert_eq(
+    actions.ignore,
+    [{"dependency-name": "burin-labs/harn/.github/workflows/bump-harn.yml"}],
+  )
+  assert_eq(actions.groups.actions.patterns, ["*"])
+  assert(
+    source(harness.fs, ".github/dependabot.yml").starts_with(template),
+    "organization config must project the canonical template prefix",
+  )
+}
