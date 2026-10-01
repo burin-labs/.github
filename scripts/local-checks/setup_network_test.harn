@@ -1,16 +1,41 @@
-const RETRY_SETUP =
-  "burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f"
+import { regex_all_first_captures } from "std/text"
 
-pipeline test_every_shared_setup_uses_the_bounded_installer(harness: Harness) {
-  for path in [
-    "../../.github/actions/harn-package/action.yml",
-    "../../.github/actions/local-workflow-checks/action.yml",
-    "../../.github/actions/ci-runtime-evidence/action.yml",
-    "../../.github/workflows/ci-latency-observer.yml",
-  ] {
-    const source = harness.fs.read_text(path)
-    assert(contains(source, RETRY_SETUP), "unbounded setup-harn pin: ${path}")
+fn immutable_setup_reference(reference: string) -> bool {
+  return len(
+    regex_all_first_captures(
+      "^(burin-labs/harn/\\.github/actions/setup-harn@[0-9a-f]{40})$",
+      reference,
+    ),
+  )
+    == 1
+}
+
+pipeline test_every_shared_setup_uses_an_immutable_installer_reference(harness: Harness) {
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  let references = []
+  for pattern in [".github/workflows/*.yml", ".github/actions/**/action.yml"] {
+    for path in harness.fs.glob(pattern, {base: root}) {
+      const document = yaml_parse(harness.fs.read_text(path))
+      const groups = if document.has("jobs") {
+        values(document.jobs).map({ job -> job?.steps ?? [] })
+      } else {
+        [document?.runs?.steps ?? []]
+      }
+      for steps in groups {
+        for step in steps {
+          const reference = to_string(step?.uses ?? "")
+          if reference.starts_with("burin-labs/harn/.github/actions/setup-harn@") {
+            assert(immutable_setup_reference(reference), "mutable setup-harn reference: ${path}")
+            references = references + [reference]
+          }
+        }
+      }
+    }
   }
+  assert(len(references) > 0, "the installer-reference census must measure actual steps")
+  const mutable = references[0].substring(0, len(references[0]) - 40) + "main"
+  assert(!immutable_setup_reference(mutable), "a branch must not satisfy the immutable contract")
+  assert(!immutable_setup_reference(references[0] + "x"), "a malformed digest must be refused")
 }
 
 pipeline test_bootstrap_download_retries_transient_failures(harness: Harness) {
