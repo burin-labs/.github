@@ -23,3 +23,33 @@ pipeline test_fleet_owned_bump_reference_keeps_its_paired_input(harness: Harness
 }
 
 type DependabotTemplate = {version: int, updates: list<dict>}
+
+pipeline test_consumer_ignore_entries_extend_one_canonical_list(harness: Harness) {
+  const template = source(harness.fs, "templates/dependabot.yml")
+  assert(
+    trim(template).ends_with(
+      "- dependency-name: \"burin-labs/harn/.github/workflows/bump-harn.yml\"",
+    ),
+    "the canonical prefix ends at its owned ignore entry",
+  )
+  const suffix = "      - dependency-name: \"useblacksmith/stickydisk\"\n"
+  const extended: DependabotTemplate = schema_expect(
+    yaml_parse(template + suffix),
+    schema_of(DependabotTemplate),
+  )
+  assert_eq(
+    extended.updates[0]?.ignore,
+    [
+      {"dependency-name": "burin-labs/harn/.github/workflows/bump-harn.yml"},
+      {"dependency-name": "useblacksmith/stickydisk"},
+    ],
+  )
+  assert_eq(extended.updates[0]?.groups?.actions?.patterns, ["*"])
+  const duplicate = try {
+    yaml_parse(template + "    ignore:\n" + suffix)
+    false
+  } catch (_error) {
+    true
+  }
+  assert(duplicate, "the canonical YAML parser refuses the old duplicate-ignore composition")
+}
