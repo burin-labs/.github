@@ -10,7 +10,8 @@
     "hetzner-1-w2",
     "hetzner-1-w3",
     "hetzner-1-w4",
-    "hetzner-1-w5"
+    "hetzner-1-w5",
+    "hetzner-1-w6"
   ],
   "deliberately_offline": {
     "burin-mbp-01": "Primary development Mac. The org variable CI_SELFHOSTED_DISABLED=macos retires the macOS self-hosted lane, so these are not expected online.",
