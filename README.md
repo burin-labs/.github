@@ -578,16 +578,16 @@ dispatcher, so concurrent label events cannot cancel one another.
 
 ### When to use an override
 
-- The merge queue is backed up enough that speculative CI would burn material
-  Actions spend, and one PR must land before the rest.
+- The default branch is red and this pull request fixes it forward.
+- This pull request unblocks a release; add `release-blocker` first.
 - Required CI is broken in a way you can fix forward on `main` within the same
   working session.
-- You need to serialize a single founder land ahead of a long queue (release
-  unblock, production incident, or similar).
 
 ### When not to use an override
 
 - Ordinary feature work, dependency bumps, or “CI is slow today.”
+- A merge-queue backlog or Actions spend alone; the guard refuses it.
+- A head the merge queue already rejected; fix it and push a new head.
 - Changes you cannot fix forward if they break `main`.
 - Pull requests from forks (the workflow refuses them).
 
