@@ -1,0 +1,72 @@
+import {
+  PINNED_LABEL,
+  RETIRED_LABEL,
+  document_findings,
+  finding_message,
+  scan_repository,
+} from "./policy.harn"
+
+fn repository_root(fs: HarnessFs) -> string {
+  return path_normalize(path_join(fs.cwd(), "../.."))
+}
+
+fn expression(body: string) -> string {
+  return "$" + "{{ " + body + " }}"
+}
+
+pipeline test_every_place_a_workflow_can_name_the_label_is_found(harness: Harness) {
+  const document = yaml_parse(
+    "# ubuntu-latest in a comment is prose, not a runner choice\n"
+      + "on:\n"
+      + "  workflow_call:\n"
+      + "    inputs:\n"
+      + "      runs-on: {type: string, default: ubuntu-latest}\n"
+      + "jobs:\n"
+      + "  literal:\n"
+      + "    runs-on: ubuntu-latest\n"
+      + "  matrix:\n"
+      + "    strategy: {matrix: {os: [macos-15, ubuntu-latest]}}\n"
+      + "    runs-on: "
+      + expression("matrix.os")
+      + "\n"
+      + "  routed:\n"
+      + "    runs-on: \""
+      + expression("vars.SELF_HOSTED == 'true' && 'self-hosted' || 'ubuntu-latest'")
+      + "\"\n"
+      + "  pinned:\n"
+      + "    runs-on: ubuntu-24.04\n"
+      + "  slim:\n"
+      + "    runs-on: ubuntu-slim\n",
+  )
+  assert_eq(
+    document_findings("ci.yml", document).map({ finding -> finding.location }),
+    [
+      "jobs.literal.runs-on",
+      "jobs.matrix.strategy.matrix.os[1]",
+      "jobs.routed.runs-on",
+      "on.workflow_call.inputs.runs-on.default",
+    ],
+  )
+}
+
+pipeline test_the_message_names_the_pin(harness: Harness) {
+  const message = finding_message(
+    {path: "ci.yml", location: "jobs.build.runs-on", value: RETIRED_LABEL},
+  )
+  assert(message.starts_with("jobs.build.runs-on selects `ubuntu-latest`"))
+  assert(message.contains("Pin `" + PINNED_LABEL + "`"))
+}
+
+pipeline test_this_repository_selects_no_floating_label(harness: Harness) {
+  const scan = scan_repository(harness.fs, repository_root(harness.fs))
+  // A scan that read nothing would also report no findings.
+  assert(
+    scan.files.contains(".github/workflows/ci.yml"),
+    "the scan must read this repository's workflows",
+  )
+  assert(
+    scan.files.contains(".github/actions/hosted-runner-labels/action.yml"),
+    "the scan must read composite actions",
+  )
+  assert_eq(scan.findings, [])
+}

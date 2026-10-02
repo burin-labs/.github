@@ -1,0 +1,32 @@
+name: Check hosted runner labels
+description: >-
+  Reject workflows and composite actions that select GitHub's floating latest Ubuntu label, which
+  GitHub moves to a new image without a commit in the calling repository.
+
+inputs:
+  harn-version:
+    description: Exact Harn release with or without a leading v. Defaults to harn-version-file.
+    required: false
+    default: ""
+  harn-version-file:
+    description: Repository-relative file containing the exact Harn version.
+    required: false
+    default: .harn-version
+  skip-harn-setup:
+    description: Use the `harn` already on PATH instead of installing a release.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up exact Harn release
+      if: ${{ inputs.skip-harn-setup != 'true' }}
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f # bounded release-asset retries
+      with:
+        version: ${{ inputs.harn-version }}
+        version-file: ${{ inputs.harn-version-file }}
+
+    - name: Check hosted runner labels
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

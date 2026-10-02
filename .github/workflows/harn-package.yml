@@ -41,7 +41,7 @@ on:
       runs-on:
         description: Runner label for package verification.
         required: false
-        default: ubuntu-latest
+        default: ubuntu-24.04
         type: string
       timeout-minutes:
         description: Maximum verification duration.

@@ -13,7 +13,7 @@ name: runner-availability (reusable)
 #     build:
 #       needs: runner-availability
 #       runs-on: ${{ needs.runner-availability.outputs.linux == 'true'
-#         && fromJSON('["self-hosted", "Linux", "harn-ci-stable"]') || 'ubuntu-latest' }}
+#         && fromJSON('["self-hosted", "Linux", "harn-ci-stable"]') || 'ubuntu-24.04' }}
 #
 # The `.busy | not` filter means a busy/absent self-hosted pool reports that OS
 # as unavailable, so callers route to hosted runners instead of queueing behind
@@ -215,7 +215,7 @@ jobs:
     name: Detect self-hosted runner availability
     # The probe is a few API reads that finish in seconds, so the per-job
     # minimum bill is nearly all of its cost. The 1 vCPU runner bills a third
-    # of ubuntu-latest, and its 15-minute job cap is far above this job's own
+    # of ubuntu-24.04, and its 15-minute job cap is far above this job's own
     # 5-minute limit. The minutes bill to the calling repository.
     runs-on: ubuntu-slim
     timeout-minutes: 5

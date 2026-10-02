@@ -1,0 +1,208 @@
+// Migrated from the Ruby `_test.rb` files that sat beside these workflows.
+fn root(fs: HarnessFs) -> string {
+  return path_normalize(path_join(fs.cwd(), "../.."))
+}
+
+fn workflow(fs: HarnessFs, name: string) -> any {
+  return yaml_parse(fs.read_text(path_join(root(fs), ".github/workflows/" + name + ".yml")))
+}
+
+fn step(steps: list, name: string) -> any {
+  return steps.find({ item -> item?.name == name })
+}
+
+fn assert_contains(text: string, needle: string, message: string) {
+  assert(text.contains(needle), message)
+}
+
+pipeline test_dependabot_waiver_audit_reopens_and_reports(harness: Harness) {
+  const audit_workflow = workflow(harness.fs, "dependabot-waiver-audit")
+  const events = audit_workflow.on
+  assert(events?.schedule?.[0]?.cron != nil, "the waiver audit must run on a schedule")
+  assert(events.has("workflow_dispatch"), "the waiver audit must remain manually runnable")
+  const job = audit_workflow.jobs.audit
+  assert_eq(job["runs-on"], "ubuntu-24.04")
+  assert_eq(job["timeout-minutes"], 10)
+  // The audit is the only thing that reopens a manually dismissed alert, so it
+  // needs write on Dependabot alerts. If this silently degraded to read, every
+  // waiver would look healthy forever and nothing would ever come back.
+  const token = step(job.steps, "Mint release-app token")
+  assert(token != nil, "the waiver audit must mint its token")
+  assert_eq(token["with"]["permission-vulnerability-alerts"], "write")
+  assert_eq(token["with"]["permission-contents"], "read")
+  // Omitting `repositories` is deliberate: the audit has to see every repository
+  // in the org, because a waiver in a repo nobody remembered is exactly the one
+  // that goes unread.
+  assert(
+    !token["with"].has("repositories"),
+    "the waiver audit must not be scoped to one repository",
+  )
+  // The job is deliberately unarmed until the app has the permission above.
+  // Assert the gate exists so nobody arms it by deleting the condition without
+  // noticing what it was protecting.
+  assert_contains(
+    job["if"],
+    "vars.DEPENDABOT_WAIVER_AUDIT",
+    "the waiver audit must stay gated on an explicit opt-in variable",
+  )
+  const run = step(job.steps, "Reconcile waivers against live alerts")?.run ?? ""
+  assert_contains(run, "--apply", "the waiver audit must actually reopen alerts, not just report")
+  // `set -e` would abort on the audit's non-zero exit before the summary is
+  // written, hiding the reason the job failed -- which is the whole report.
+  assert(
+    !run.contains("set -euo pipefail"),
+    "the waiver audit must not abort before writing its summary",
+  )
+  assert_contains(run, "exit \"$result\"", "the waiver audit must propagate the script's exit code")
+}
+
+pipeline test_release_registration_dispatches_with_least_authority(harness: Harness) {
+  const registration = workflow(harness.fs, "register-package-release")
+  assert_eq(
+    keys(registration.on),
+    ["workflow_call"],
+    "release registration must be callable only, so package repositories carry one line",
+  )
+  const call = registration.on.workflow_call
+  assert_eq(call.inputs["index-owner"].default, "burin-labs")
+  assert_eq(call.inputs["index-repository"].default, "harn-packages")
+  assert_eq(call.inputs.wait.default, true, "release registration must default to waiting")
+  for name in keys(call.secrets) {
+    assert_eq(
+      call.secrets[name].required,
+      true,
+      "release registration must require the app credentials it dispatches with",
+    )
+  }
+  const job = registration.jobs.register
+  assert_eq(job["runs-on"], "ubuntu-24.04", "release registration must stay on free hosted compute")
+  const token = step(job.steps, "Mint the reconciler dispatch token")
+  assert(token != nil, "release registration must mint a scoped app token")
+  assert_eq(token["with"]["permission-actions"], "write")
+  // Writing the index belongs to the reconciler, on its own token, in its own
+  // repository. A package repository that could write the index directly would
+  // reintroduce the N-copies-of-the-mechanism problem this workflow removes.
+  assert_eq(
+    keys(token["with"]).filter({ key -> key.starts_with("permission-") }),
+    ["permission-actions"],
+    "release registration must request no authority beyond dispatch",
+  )
+  const dispatch = step(job.steps, "Ask the index to reconcile")
+  const run = dispatch.run
+  assert_contains(run, "-f mode=propose", "release registration must ask for a proposal")
+  // The dispatch API returns nothing identifying, so the run has to be recognized
+  // after the fact. The reason is unique per calling run and the reconciler
+  // carries it in the run name, which is what makes the match exact.
+  assert_contains(
+    to_string(dispatch.env.REASON),
+    "github.run_id",
+    "the dispatch reason must be unique per calling run, or it cannot identify a run",
+  )
+  assert_contains(run, "displayTitle", "release registration must match the run by its name")
+  // `--arg` belongs to jq, not to `gh run list`. Keeping the JSON producer and
+  // matcher as separate commands makes that authority boundary executable rather
+  // than depending on an unsupported gh option that fails every release late.
+  assert_contains(
+    run,
+    "jq -r --arg reason \"$REASON\"",
+    "release registration must pass matcher variables to jq, not gh",
+  )
+  assert(
+    regex_match("gh run list[^|]*--arg", run) == nil,
+    "release registration must not pass jq options to gh run list",
+  )
+  // The fallback exists for an index whose reconciler predates run naming. It is
+  // the old before-and-after diff, which is exact except against a concurrent
+  // caller, and that beats failing a release over an unadvanced pin.
+  assert_contains(
+    run,
+    "before=",
+    "release registration must survive an index that does not name runs",
+  )
+  assert_contains(run, "no new run appeared", "release registration must fail when no run appears")
+  const wait = step(job.steps, "Wait for the index to agree")
+  assert_eq(wait["if"], "inputs.wait", "release registration must be able to gate the release")
+  assert(
+    wait.run.contains("[[ \"$conclusion\" != \"success\" ]]") && wait.run.contains("exit 1"),
+    "an unregistered release must fail the calling run, not pass quietly",
+  )
+}
+
+fn evaluate_fleet(harness: Harness, script: string, dir: string, first: list, second: list) -> any {
+  const first_path = path_join(dir, "first.json")
+  const second_path = path_join(dir, "second.json")
+  harness.fs.write_text(first_path, json_stringify(first))
+  harness.fs.write_text(second_path, json_stringify(second))
+  return harness.process.exec(script, "evaluate", first_path, second_path)
+}
+
+fn fleet_snapshot(expected: list, offline: string?) -> list {
+  return expected.map(
+    { name -> {name: name, status: name == offline ? "offline" : "online", busy: false} },
+  )
+}
+
+pipeline test_runner_fleet_health_recovers_transients_and_names_sustained_outages(
+  harness: Harness,
+) {
+  const observer = workflow(harness.fs, "runner-fleet-health")
+  assert_eq(observer.on.schedule[0].cron, "23 * * * *", "runner observer must run hourly")
+  assert(observer.on.has("workflow_dispatch"), "runner observer must remain manually runnable")
+  const job = observer.jobs.observe
+  assert_eq(job["runs-on"], "ubuntu-24.04", "runner observer must stay on a small bounded job")
+  assert_eq(job["timeout-minutes"], 5, "runner observer must stay on a small bounded job")
+  const token = step(job.steps, "Mint read-only release-app token")
+  assert_eq(token?.["with"]?.["permission-organization-self-hosted-runners"], "read")
+  const run = step(job.steps, "Observe two consecutive fleet snapshots")?.run ?? ""
+  assert_eq(len(run.split("snapshot \"")) - 1, 2, "runner observer must take two snapshots")
+  assert_contains(run, "sleep \"$interval\"", "runner observer must honor the typed probe interval")
+  const policy = json_parse(
+    harness.fs.read_text(path_join(root(harness.fs), ".github/runner-fleet.json")),
+  )
+  const expected = policy.expected_runners
+  assert_eq(policy.schema_version, 1, "runner policy must be versioned")
+  assert_eq(len(expected.unique()), len(expected), "runner policy must not contain duplicate names")
+  // Deliberately NOT a hardcoded count. The previous `== 13` had to be hand-edited
+  // on every fleet change, so when ten of the thirteen hosts went offline for good
+  // the policy stayed as written and the hourly alarm failed 100 runs straight --
+  // an alarm that is always red cannot report a real outage. Assert the shape the
+  // policy has to hold instead of the size it happened to be.
+  const offline = policy?.deliberately_offline ?? {}
+  assert(len(expected) > 0, "runner policy must expect at least one runner")
+  assert_eq(type_of(offline), "dict", "deliberately_offline must map name to reason")
+  for name in keys(offline) {
+    assert(
+      type_of(offline[name]) == "string" && offline[name] != "",
+      "deliberately_offline must map name to reason",
+    )
+    assert(
+      !expected.contains(name),
+      "a runner cannot be both expected online and deliberately offline",
+    )
+  }
+  const script = path_join(root(harness.fs), "scripts/runner-fleet-health.sh")
+  const dir = harness.fs.mkdtemp_in_workspace("runner-fleet-health-")
+  const transient = evaluate_fleet(
+    harness,
+    script,
+    dir,
+    fleet_snapshot(expected, "cattrick-w2"),
+    fleet_snapshot(expected, nil),
+  )
+  assert_eq(transient.exit_code, 0, "a transient one-probe disconnect must recover")
+  assert_eq(json_parse(transient.stdout).ok, true, "a transient one-probe disconnect must recover")
+  const sustained = evaluate_fleet(
+    harness,
+    script,
+    dir,
+    fleet_snapshot(expected, "cattrick-w2"),
+    fleet_snapshot(expected, "cattrick-w2"),
+  )
+  harness.fs.delete(dir)
+  assert(sustained.exit_code != 0, "a sustained offline runner must fail")
+  assert_eq(
+    json_parse(sustained.stdout).unhealthy.map({ entry -> entry.name }),
+    ["cattrick-w2"],
+    "sustained failure must name the runner",
+  )
+}

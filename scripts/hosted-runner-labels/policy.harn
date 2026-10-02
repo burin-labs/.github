@@ -1,0 +1,91 @@
+import { relative_path } from "std/fs"
+
+/**
+ * GitHub moves `ubuntu-latest` to a new image on its own schedule, so a job
+ * that names it changes toolchain without a commit. Hosted Ubuntu jobs pin an
+ * exact image instead, and moving that pin is a deliberate, canaried change
+ * tracked in burin-labs/.github#132.
+ */
+pub const RETIRED_LABEL = "ubuntu-latest"
+
+pub const PINNED_LABEL = "ubuntu-24.04"
+
+pub const TRACKING_ISSUE = "https://github.com/burin-labs/.github/issues/132"
+
+/** Workflows and composite actions are the files that choose a runner. */
+pub const SCANNED_GLOBS = [
+  ".github/workflows/*.yml",
+  ".github/workflows/*.yaml",
+  ".github/actions/*/action.yml",
+  ".github/actions/*/action.yaml",
+]
+
+pub type LabelFinding = {path: string, location: string, value: string}
+
+pub type LabelScan = {files: list<string>, findings: list<LabelFinding>}
+
+fn child_location(location: string, key: string) -> string {
+  if location == "" {
+    return key
+  }
+  return location + "." + key
+}
+
+fn value_findings(path: string, location: string, value: unknown) -> list<LabelFinding> {
+  const kind = type_of(value)
+  if kind == "string" {
+    if value.contains(RETIRED_LABEL) {
+      return [{path: path, location: location, value: value}]
+    }
+    return []
+  }
+  let findings = []
+  if kind == "dict" {
+    for key in keys(value).sorted() {
+      findings = findings
+        + value_findings(path, child_location(location, to_string(key)), value[key])
+    }
+  } else if kind == "list" {
+    let index = 0
+    for item in value {
+      findings = findings + value_findings(path, location + "[" + to_string(index) + "]", item)
+      index = index + 1
+    }
+  }
+  return findings
+}
+
+/**
+ * Every string value in a parsed workflow, so the label is caught in `runs-on`,
+ * matrix values, reusable-workflow inputs, and router expressions alike. YAML
+ * comments are not values, so prose that mentions the label stays legal.
+ */
+pub fn document_findings(path: string, document: unknown) -> list<LabelFinding> {
+  return value_findings(path, "", document)
+}
+
+pub fn scan_repository(fs: HarnessFs, root: string) -> LabelScan {
+  let files = []
+  for pattern in SCANNED_GLOBS {
+    for path in fs.glob(pattern, root) {
+      const relative = relative_path(root, path_join(root, path))
+      if !files.contains(relative) {
+        files = files + [relative]
+      }
+    }
+  }
+  files = files.sorted()
+  let findings = []
+  for path in files {
+    findings = findings + document_findings(path, yaml_parse(fs.read_text(path_join(root, path))))
+  }
+  return {files: files, findings: findings}
+}
+
+pub fn finding_message(finding: LabelFinding) -> string {
+  return finding.location + " selects `" + RETIRED_LABEL
+    + "`, which GitHub moves to a new image without a commit here. Pin `"
+    + PINNED_LABEL
+    + "`; the move to the next image is tracked in "
+    + TRACKING_ISSUE
+}

@@ -71,7 +71,7 @@ permissions:
 jobs:
   register:
     name: Register in the package index
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - name: Mint the reconciler dispatch token

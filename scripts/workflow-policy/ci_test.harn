@@ -105,6 +105,7 @@ pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
     "exact-tree-ci-proof",
     "harn-package",
     "harn-repo-policy",
+    "hosted-runner-labels",
     "local-workflow-checks",
     "pr-title-check",
     "require-successful-needs",
@@ -164,7 +165,7 @@ pipeline test_observer_retains_coverage_and_read_only_permissions(harness: Harne
   assert(observer.on.has("workflow_dispatch"))
   assert_eq(observer.permissions, {contents: "read"})
   const job = observer.jobs.observe
-  assert_eq(job["runs-on"], "ubuntu-latest")
+  assert_eq(job["runs-on"], "ubuntu-24.04")
   const app = step(job.steps, "Mint read-only release-app token")["with"]
   assert_eq(app["permission-actions"], "read")
   assert_eq(app["permission-contents"], "read")

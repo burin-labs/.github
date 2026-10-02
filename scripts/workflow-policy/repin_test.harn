@@ -19,7 +19,7 @@ pipeline test_repin_is_callable_only_and_dispatches_only_what_it_planned(harness
   }
   assert_eq(workflow.permissions, {contents: "read"})
   const job = workflow.jobs.repin
-  assert_eq(job["runs-on"], "ubuntu-latest")
+  assert_eq(job["runs-on"], "ubuntu-24.04")
   assert_eq(
     job.steps.map({ step -> step.name }),
     [

@@ -375,6 +375,33 @@ fails on a sustained p90 regression past the reproducible observed baseline or
 one run past its max-latency regression fuse. Missing, stale, invalid, or empty
 evidence also fails closed. A same-topology baseline may only tighten.
 
+## Hosted runner labels
+
+GitHub moves `ubuntu-latest` to a new image on its own schedule, so a job that
+names it can change toolchain on any run without a commit. Hosted Ubuntu jobs
+pin `ubuntu-24.04` instead. The move to the next image is a deliberate,
+canaried change tracked in
+[#132](https://github.com/burin-labs/.github/issues/132).
+
+`.github/actions/hosted-runner-labels` enforces the pin. It parses every
+`.github/workflows/*.yml` file and every `.github/actions/*/action.yml` file in
+the calling repository and fails on any string value that contains
+`ubuntu-latest`: a `runs-on` key, a matrix value, a reusable-workflow input
+default, or a routing expression. YAML comments are not values, so prose that
+mentions the label stays legal. A scan that finds no files fails, so an empty
+census cannot pass as a clean one.
+
+```yaml
+- uses: burin-labs/.github/.github/actions/hosted-runner-labels@<full-commit-sha>
+  with:
+    # Omit when the repository has a `.harn-version` file.
+    harn-version: 0.10.153
+```
+
+Pass `skip-harn-setup: "true"` when an earlier step already put `harn` on
+`PATH`. The check does not see labels that a script computes at run time;
+each repository's router tests own those.
+
 ## CI runtime evidence
 
 `.github/actions/ci-runtime-evidence` collects a versioned JSON census of
@@ -418,7 +445,7 @@ jobs:
     name: CI status
     if: always()
     needs: [package]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: burin-labs/.github/.github/actions/require-successful-needs@<same-full-commit-sha>
         with:
@@ -756,7 +783,7 @@ consumer inherits a version that has been exercised.
 ```yaml
 jobs:
   pr-shape:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # `gh pr view` reads the pull request through the job's token.
     permissions:
       contents: read
