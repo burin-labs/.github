@@ -187,6 +187,16 @@ on:
           could not see the fleet at all. Counts are 0 in both cases, so a
           caller that treats 0 as "busy" would repeat the conflation this
           detector exists to prevent. Gate on `measured` before reading counts.
+
+          A measured `linux_big` also carries `hosts`, keyed by physical host,
+          each `{online, busy, idle_big}`. Several runners share one machine
+          (`tornadough-w1` through `-w6` are one host), so an idle runner can
+          sit on a saturated host; the per-host counts let a caller see that.
+          The host is the runner name with a trailing `-w<N>` removed, `online`
+          and `busy` count every online Linux runner on that host, and
+          `idle_big` counts its idle runners carrying the big tag. Only hosts
+          with at least one online big-tagged runner appear. `hosts` is absent
+          whenever `measured` is false.
         value: ${{ jobs.detect.outputs.capacity }}
       probe_state:
         description: >-
@@ -626,6 +636,26 @@ jobs:
             echo "linux_big=$big_available" >> "$GITHUB_OUTPUT"
             record_capacity linux_big "$big_online" "$big_count" true
             echo "::notice::runner-availability linux_big=$big_available (${big_count} idle of ${big_online} online Linux ${LINUX_BIG_TAG} runner(s))"
+            # Runner idleness overstates capacity when several runners share a
+            # machine, so publish load per physical host beside the lane counts.
+            # The host is the runner name minus a trailing `-w<N>`; a name
+            # without that suffix is its own host.
+            big_hosts="$(echo "$runner_list" | jq -c --arg tag "$LINUX_BIG_TAG" '
+              [ .runners[]
+                | select(.status == "online")
+                | select(any(.labels[].name; . == "Linux"))
+                | {host: (.name | sub("-w[0-9]+$"; "")), busy: (.busy == true),
+                   big: any(.labels[].name; . == $tag)}
+              ]
+              | group_by(.host)
+              | map(select(any(.[]; .big)))
+              | map({key: .[0].host, value: {
+                  online: length,
+                  busy: (map(select(.busy)) | length),
+                  idle_big: (map(select(.big and (.busy | not))) | length)}})
+              | from_entries')"
+            capacity="$(jq -c --argjson hosts "$big_hosts" '.linux_big.hosts = $hosts' <<< "$capacity")"
+            echo "::notice::runner-availability linux_big hosts=${big_hosts}"
           fi
 
           # Fetch-healthy Linux capacity is also a strict subset: the runner
