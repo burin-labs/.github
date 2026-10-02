@@ -29,7 +29,7 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
 
 pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: Harness) {
   const job = promote(harness.fs).jobs.promote
-  assert_eq(job["runs-on"], "ubuntu-latest")
+  assert_eq(job["runs-on"], "ubuntu-24.04")
   assert_eq(job.permissions, {contents: "read", actions: "read", attestations: "read"})
   // The complete step list is the contract: a build step cannot be added
   // without changing this test, and the write token exists only after the

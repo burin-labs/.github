@@ -1,0 +1,23 @@
+import { gha_error } from "std/gha"
+import { finding_message, scan_repository } from "./policy.harn"
+
+fn main(harness: Harness) {
+  const root = harness.env.get("HOSTED_RUNNER_LABELS_ROOT") ?? harness.fs.cwd()
+  const scan = scan_repository(harness.fs, root)
+  // An empty census would read as a clean repository, so it is a failure.
+  if len(scan.files) == 0 {
+    gha_error(harness.stdio, "no workflow or composite action files found under " + root)
+    harness.runtime.exit(1)
+  }
+  for finding in scan.findings {
+    gha_error(harness.stdio, finding_message(finding), {file: finding.path})
+  }
+  harness.stdio.println(
+    "Scanned " + to_string(len(scan.files)) + " workflow and action files; "
+      + to_string(len(scan.findings))
+      + " select ubuntu-latest",
+  )
+  if len(scan.findings) > 0 {
+    harness.runtime.exit(1)
+  }
+}
