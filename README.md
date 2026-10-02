@@ -633,8 +633,8 @@ done
 gh label create release-blocker --repo burin-labs/<repo> --color D93F0B \
   --description "Unblocks a release; justifies a queue bypass" 2>/dev/null || true
 gh label create founder-override --repo burin-labs/<repo> --color 000000 \
-  --description "Founder only, by hand: skips the queue-bypass guard. Agents never apply this." \
-  2>/dev/null || true
+  --description "Founder only, by hand: skips the queue-bypass guard. \
+Agents never apply this." 2>/dev/null || true
 ```
 
 Public repositories stay in scope: applying a label still requires triage or
