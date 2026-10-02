@@ -1,0 +1,118 @@
+fn read(fs: HarnessFs, path: string) -> string {
+  return fs.read_text(path_join(path_normalize(path_join(fs.cwd(), "../..")), path))
+}
+
+fn expression(body: string) -> string {
+  return "$" + "{{ " + body + " }}"
+}
+
+fn apply_steps(fs: HarnessFs) -> list {
+  const workflow = yaml_parse(read(fs, ".github/workflows/merge-override.yml"))
+  return workflow.jobs.apply.steps
+}
+
+fn step(steps: list, name: string) -> dict {
+  const found = steps.filter({ candidate -> candidate.name == name }).to_list()
+  assert_eq(len(found), 1, "exactly one step named " + name)
+  return found[0]
+}
+
+fn position(steps: list, name: string) -> int {
+  let index = 0
+  for candidate in steps {
+    if candidate.name == name {
+      return index
+    }
+    index = index + 1
+  }
+  throw "no step named " + name
+}
+
+pipeline test_queue_skipping_labels_pass_the_guard_before_any_side_effect(harness: Harness) {
+  const workflow = yaml_parse(read(harness.fs, ".github/workflows/merge-override.yml"))
+  assert_eq(workflow.on.workflow_call.inputs["main-ci-workflow"].default, "ci.yml")
+  const steps = workflow.jobs.apply.steps
+  const guard_step = step(steps, "Guard queue-skipping override")
+  assert_eq(guard_step.run, "bash scripts/merge-override-guard/run.sh")
+  assert_eq(guard_step.env.GUARD_LABEL, expression("steps.request.outputs.label"))
+  assert_eq(guard_step.env.GUARD_HEAD_SHA, expression("inputs.head-sha"))
+  assert_eq(guard_step.env.GUARD_PR, expression("inputs.pr-number"))
+  assert_eq(guard_step.env.GUARD_REPOSITORY, expression("github.repository"))
+  assert_eq(guard_step.env.GUARD_MAIN_CI_WORKFLOW, expression("inputs.main-ci-workflow"))
+  // Only bypass-ci skips the guard.
+  assert(guard_step["if"].contains("steps.request.outputs.label != 'bypass-ci'"), guard_step["if"])
+  assert(
+    position(steps, "Authorize every label actor and same-repo head")
+      < position(steps, "Set up exact Harn release"),
+  )
+  assert(
+    position(steps, "Set up exact Harn release") < position(steps, "Guard queue-skipping override"),
+  )
+  // The guard runs before anything cancels runs, publishes a check, or merges.
+  for side_effect in [
+    "Resolve cancellation policy",
+    "Cancel competing workflow runs",
+    "Publish successful CI status check",
+    "Squash-merge pull request",
+  ] {
+    assert(
+      position(steps, "Guard queue-skipping override") < position(steps, side_effect),
+      side_effect,
+    )
+  }
+}
+
+pipeline test_a_skipped_or_failed_guard_never_reaches_a_side_effect(harness: Harness) {
+  const steps = apply_steps(harness.fs)
+  // Policy is the one gate every later side effect chains from. A guard that
+  // was skipped because an earlier step failed must not read as allowed.
+  const policy = regex_replace("\\s+", " ", step(steps, "Resolve cancellation policy")["if"])
+  assert_eq(
+    trim(policy),
+    "steps.auth.outcome == 'success' && (steps.request.outputs.label == 'bypass-ci' || steps.guard.outcome == 'success')",
+  )
+  assert(step(steps, "Cancel competing workflow runs")["if"].contains("steps.policy.outputs"))
+  assert(
+    step(steps, "Resolve CI status state")["if"].starts_with("steps.policy.outcome == 'success'"),
+  )
+  assert(step(steps, "Plan override actions")["if"].starts_with("steps.ci.outcome == 'success'"))
+  assert(step(steps, "Publish successful CI status check")["if"].starts_with("steps.plan.outputs."))
+  assert(
+    step(steps, "Squash-merge pull request")["if"].starts_with(
+      "steps.plan.outputs.merge == 'true'",
+    ),
+  )
+}
+
+pipeline test_refusals_and_founder_overrides_reach_the_pull_request(harness: Harness) {
+  const steps = apply_steps(harness.fs)
+  const audit = step(steps, "Audit terminal outcome")
+  assert_eq(audit.env.GUARD_VERDICT, expression("steps.guard.outputs.verdict"))
+  assert_eq(audit.env.GUARD_REASON, expression("steps.guard.outputs.reason"))
+  assert_eq(audit.env.FOUNDER_ACTOR, expression("steps.guard.outputs.founder_actor"))
+  assert(audit.run.contains("GUARD_VERDICT\" == \"refused\""))
+  assert(audit.run.contains("FOUNDER OVERRIDE"))
+  const cleanup = step(steps, "Remove consumed override labels")
+  assert_eq(cleanup.env.FOUNDER_OVERRIDE, expression("steps.guard.outputs.founder_override"))
+  assert(cleanup.run.contains("labels/founder-override"))
+  const warn = step(steps, "Warn that bypass-ci is unguarded")
+  assert(warn["if"].contains("steps.request.outputs.label == 'bypass-ci'"))
+  assert(warn.run.contains("GITHUB_STEP_SUMMARY"))
+}
+
+pipeline test_the_guard_bootstrap_only_dispatches_harn(harness: Harness) {
+  const bootstrap = read(harness.fs, "scripts/merge-override-guard/run.sh")
+  assert(bootstrap.contains("scripts/merge-override-guard/cli.harn"))
+  for variable in [
+    "GH_TOKEN",
+    "GUARD_REPOSITORY",
+    "GUARD_PR",
+    "GUARD_HEAD_SHA",
+    "GUARD_LABEL",
+    "GUARD_MAIN_CI_WORKFLOW",
+    "GITHUB_OUTPUT",
+    "GITHUB_STEP_SUMMARY",
+  ] {
+    assert(bootstrap.contains("env:" + variable + ",expose=" + variable), variable)
+  }
+}

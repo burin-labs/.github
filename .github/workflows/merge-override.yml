@@ -3,6 +3,11 @@
 # Labels are the UX. Authority is re-checked from the issue event that attached
 # each consumed label: every actor must be an organization or repository admin,
 # and the pull request head must live in the base repository.
+#
+# force-merge and bypass-merge-queue skip the merge queue, so the queue-bypass
+# guard (scripts/merge-override-guard) also requires a justifying incident (a
+# red default branch or a `release-blocker` label) and refuses a head the queue
+# already rejected. A hand-applied `founder-override` label skips the guard.
 
 name: Merge override
 
@@ -33,6 +38,11 @@ on:
         description: Organization that must list each actor as an admin.
         required: false
         default: burin-labs
+        type: string
+      main-ci-workflow:
+        description: File name of the workflow whose push runs say whether the default branch is red.
+        required: false
+        default: ci.yml
         type: string
     secrets:
       RELEASE_APP_CLIENT_ID:
@@ -151,9 +161,42 @@ jobs:
           echo "reason=" >> "$GITHUB_OUTPUT"
           echo "Authorized label actors: ${actors[*]}"
 
+      - name: Set up exact Harn release
+        id: harn
+        if: steps.auth.outcome == 'success' && steps.request.outputs.label != 'bypass-ci'
+        uses: burin-labs/harn/.github/actions/setup-harn@667a6bb60582e6fcb08abc74621c5fc89fb77703 # bounded release-asset retries
+        with:
+          version: 0.10.133
+
+      - name: Guard queue-skipping override
+        id: guard
+        if: steps.auth.outcome == 'success' && steps.request.outputs.label != 'bypass-ci'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GUARD_REPOSITORY: ${{ github.repository }}
+          GUARD_PR: ${{ inputs.pr-number }}
+          GUARD_HEAD_SHA: ${{ inputs.head-sha }}
+          GUARD_LABEL: ${{ steps.request.outputs.label }}
+          GUARD_MAIN_CI_WORKFLOW: ${{ inputs.main-ci-workflow }}
+        shell: bash
+        run: bash scripts/merge-override-guard/run.sh
+
+      - name: Warn that bypass-ci is unguarded
+        if: steps.auth.outcome == 'success' && steps.request.outputs.label == 'bypass-ci'
+        shell: bash
+        run: |
+          set -euo pipefail
+          message="bypass-ci is not covered by the queue-bypass guard: it publishes a successful CI status without a justifying incident."
+          echo "::warning::${message}"
+          printf '## bypass-ci is unguarded\n\n%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+
+      # Fail closed: a skipped guard (for example because Harn failed to
+      # install) must never read as an allowed one.
       - name: Resolve cancellation policy
         id: policy
-        if: steps.auth.outcome == 'success'
+        if: >-
+          steps.auth.outcome == 'success' &&
+          (steps.request.outputs.label == 'bypass-ci' || steps.guard.outcome == 'success')
         env:
           LABEL: ${{ steps.request.outputs.label }}
         shell: bash
@@ -237,7 +280,7 @@ jobs:
 
       - name: Resolve CI status state
         id: ci
-        if: steps.auth.outcome == 'success' && (steps.sweep.outcome == 'success' || steps.sweep.outcome == 'skipped')
+        if: steps.policy.outcome == 'success' && (steps.sweep.outcome == 'success' || steps.sweep.outcome == 'skipped')
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -343,12 +386,22 @@ jobs:
           ACTIVE: ${{ steps.request.outputs.active }}
           LABELS_JSON: ${{ steps.request.outputs.labels }}
           LABEL_EVENTS_JSON: ${{ steps.request.outputs.label_events }}
+          FOUNDER_OVERRIDE: ${{ steps.guard.outputs.founder_override }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ "$ACTIVE" != "true" ]]; then
             echo 'removed_labels=[]' >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          # founder-override is single-use: once an attempt honors it, a later
+          # bypass label on this pull request must face the guard again.
+          if [[ "$FOUNDER_OVERRIDE" == "true" ]]; then
+            if ! gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/founder-override" >/dev/null 2>&1; then
+              echo "::error::could not remove the consumed founder-override label"
+              exit 1
+            fi
+            echo "Removed consumed label founder-override"
           fi
           labels_file="$(mktemp)"
           event_pages_file="$(mktemp)"
@@ -409,6 +462,13 @@ jobs:
           PENDING_COUNT: ${{ steps.sweep.outputs.pending_count }}
           AUTH_OUTCOME: ${{ steps.auth.outcome }}
           AUTH_REASON: ${{ steps.auth.outputs.reason }}
+          HARN_OUTCOME: ${{ steps.harn.outcome }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          GUARD_VERDICT: ${{ steps.guard.outputs.verdict }}
+          GUARD_REASON: ${{ steps.guard.outputs.reason }}
+          GUARD_RETRY: ${{ steps.guard.outputs.retry }}
+          FOUNDER_OVERRIDE: ${{ steps.guard.outputs.founder_override }}
+          FOUNDER_ACTOR: ${{ steps.guard.outputs.founder_actor }}
           SWEEP_OUTCOME: ${{ steps.sweep.outcome }}
           CI_OUTCOME: ${{ steps.ci.outcome }}
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
@@ -428,11 +488,16 @@ jobs:
             status=refused
             reason="$AUTH_REASON"
             retry_action="An organization or repository admin must re-apply \`$LABEL\`."
+          elif [[ "$GUARD_OUTCOME" == "failure" && "$GUARD_VERDICT" == "refused" ]]; then
+            status=refused
+            reason="$GUARD_REASON"
+            retry_action="${GUARD_RETRY^}"
           elif [[ "$PLAN_OUTCOME" == "failure" ]]; then
             status=refused
             reason="$PLAN_REASON"
             retry_action="Resolve the condition above, then re-apply \`$LABEL\`."
-          elif [[ "$SWEEP_OUTCOME" == "failure" || "$CI_OUTCOME" == "failure" || \
+          elif [[ "$HARN_OUTCOME" == "failure" || "$GUARD_OUTCOME" == "failure" || \
+                  "$SWEEP_OUTCOME" == "failure" || "$CI_OUTCOME" == "failure" || \
                   "$PUBLISH_OUTCOME" == "failure" || "$APP_TOKEN_OUTCOME" == "failure" || \
                   "$MERGE_OUTCOME" == "failure" || "$CLEANUP_OUTCOME" == "failure" ]]; then
             status=errored
@@ -440,6 +505,9 @@ jobs:
             retry_action="After the failing service or step is healthy, re-apply \`$LABEL\`."
           fi
           actions=()
+          if [[ "$FOUNDER_OVERRIDE" == "true" ]]; then
+            actions+=("FOUNDER OVERRIDE: skipped the queue-bypass guard under \`founder-override\` applied by @${FOUNDER_ACTOR}")
+          fi
           if [[ "$CANCEL" == "true" && "$SWEEP_OUTCOME" == "success" ]]; then
             actions+=("cancelled ${PENDING_COUNT:-0} competing workflow run(s)")
           fi

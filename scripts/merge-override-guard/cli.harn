@@ -1,0 +1,86 @@
+import { gha_append_summary, gha_error, gha_warning, gha_write_output } from "std/gha"
+import { decide, measure } from "./guard.harn"
+import { live_reader } from "./live.harn"
+
+fn required_env(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name)
+  if value == nil || trim(value) == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn write_output(harness: Harness, name: string, value: string) {
+  if !gha_write_output(harness, name, value) {
+    throw "GITHUB_OUTPUT is not set, so " + name + " cannot reach the next step"
+  }
+}
+
+fn summarize(harness: Harness, heading: string, lines: list<string>) {
+  const body = "## " + heading + "\n\n" + join(lines.map({ line -> "- " + line }), "\n") + "\n"
+  if !gha_append_summary(harness.env, harness.fs, body) {
+    harness.stdio.println(body)
+  }
+}
+
+fn main(harness: Harness) {
+  const label = required_env(harness.env, "GUARD_LABEL")
+  const request = {
+    repository: required_env(harness.env, "GUARD_REPOSITORY"),
+    pr: to_int(required_env(harness.env, "GUARD_PR")),
+    head_sha: required_env(harness.env, "GUARD_HEAD_SHA"),
+    label: label,
+    main_ci_workflow: required_env(harness.env, "GUARD_MAIN_CI_WORKFLOW"),
+  }
+  let decision = nil
+  try {
+    const reader = live_reader(
+      harness.tools,
+      required_env(harness.env, "GH_TOKEN"),
+      harness.fs.mkdtemp_in_workspace("merge-override-guard-gh-"),
+    )
+    decision = decide(measure(reader, request))
+  } catch (error) {
+    const reason = "the queue-bypass guard could not measure its evidence: " + to_string(error)
+    write_output(harness, "verdict", "errored")
+    write_output(harness, "reason", reason)
+    write_output(harness, "retry", "after GitHub is readable again, re-apply `" + label + "`.")
+    write_output(harness, "founder_override", "false")
+    gha_error(harness.stdio, reason)
+    summarize(harness, "Queue-bypass guard errored", [reason])
+    harness.runtime.exit(1)
+  }
+  write_output(harness, "verdict", decision.verdict)
+  write_output(harness, "reason", decision.reason)
+  write_output(harness, "retry", decision.retry)
+  write_output(harness, "founder_override", decision.founder_override ? "true" : "false")
+  write_output(harness, "founder_actor", decision.founder_actor)
+  if decision.founder_override {
+    gha_warning(harness.stdio, "FOUNDER OVERRIDE: " + decision.reason)
+    summarize(
+      harness,
+      "FOUNDER OVERRIDE: queue-bypass guard skipped",
+      [decision.reason, "the label is consumed by this attempt"],
+    )
+    return
+  }
+  harness.stdio.println(decision.reason)
+  for line in decision.evidence {
+    harness.stdio.println("  " + line)
+  }
+  if decision.verdict == "allowed" {
+    summarize(
+      harness,
+      "Queue-bypass guard allowed `" + label + "`",
+      [decision.reason] + decision.evidence,
+    )
+    return
+  }
+  gha_error(harness.stdio, decision.reason)
+  summarize(
+    harness,
+    "Queue-bypass guard refused `" + label + "`",
+    [decision.reason, "retry: " + decision.retry] + decision.evidence,
+  )
+  harness.runtime.exit(1)
+}

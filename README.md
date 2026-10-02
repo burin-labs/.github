@@ -545,6 +545,31 @@ workflow rejects non-admins and fork pull requests, then acts with the
 - `force-merge`: publish successful `CI status`, then squash-merge immediately.
   Skips CI proof and the merge queue.
 
+### Queue-bypass guard
+
+`force-merge` and `bypass-merge-queue` are refused unless both hold:
+
+1. **An incident justifies skipping the queue.** Either the default branch is
+   red, meaning the newest default-branch commit with a completed push run of
+   the main CI workflow (`ci.yml` unless the caller passes
+   `main-ci-workflow`) concluded `failure` or `timed_out`; or the pull request
+   carries `release-blocker`, which belongs only on a pull request that
+   unblocks a release.
+2. **The queue has not already rejected this head.** No merge-group run for
+   the pull request failed after GitHub first saw its current head. Pushing a
+   new head clears an earlier rejection.
+
+`bypass-merge-queue` also needs every check the base branch's rulesets require
+to be green on the head. A refusal posts the reason and the retry path on the
+pull request. `bypass-ci` is not guarded; each use logs a warning in the run
+summary. The guard lives in `scripts/merge-override-guard/`.
+
+**`founder-override` is the emergency escape.** Only the founder applies it,
+by hand; agents never apply it. Add it before the bypass label: with both
+attached, the guard is skipped, the run summary and audit comment say so, and
+the attempt consumes `founder-override` so the next bypass faces the guard
+again.
+
 Override attempts are serialized per pull request. If several labels are
 attached before an attempt starts, the workflow consumes them together and
 selects the strongest request: `force-merge`, then `bypass-merge-queue`, then
@@ -596,7 +621,7 @@ Copy `templates/merge-override-dispatch.yml` to
 to the full commit SHA of this repository that introduced or last changed
 `merge-override.yml`. Keep its `issues: write` permission: the reusable workflow
 uses the issue event history to re-check who applied every coalesced label and
-removes those labels at terminal completion. Create the three labels once:
+removes those labels at terminal completion. Create the labels once:
 
 ```bash
 for name in bypass-ci bypass-merge-queue force-merge; do
@@ -605,6 +630,11 @@ for name in bypass-ci bypass-merge-queue force-merge; do
     --description "Privileged merge/CI override (org admin only)" \
     2>/dev/null || true
 done
+gh label create release-blocker --repo burin-labs/<repo> --color D93F0B \
+  --description "Unblocks a release; justifies a queue bypass" 2>/dev/null || true
+gh label create founder-override --repo burin-labs/<repo> --color 000000 \
+  --description "Founder only, by hand: skips the queue-bypass guard. Agents never apply this." \
+  2>/dev/null || true
 ```
 
 Public repositories stay in scope: applying a label still requires triage or
