@@ -12,13 +12,33 @@ pub const PINNED_LABEL = "ubuntu-24.04"
 
 pub const TRACKING_ISSUE = "https://github.com/burin-labs/.github/issues/132"
 
-/** Workflows and composite actions are the files that choose a runner. */
+/**
+ * Workflows and composite actions are the files that choose a runner. The
+ * globs reach nested `.github` directories too, because a subtree such as an
+ * SDK can be projected into its own repository and run there.
+ */
 pub const SCANNED_GLOBS = [
-  ".github/workflows/*.yml",
-  ".github/workflows/*.yaml",
-  ".github/actions/*/action.yml",
-  ".github/actions/*/action.yaml",
+  "**/.github/workflows/*.yml",
+  "**/.github/workflows/*.yaml",
+  "**/.github/actions/*/action.yml",
+  "**/.github/actions/*/action.yaml",
 ]
+
+/**
+ * Path segments that hold another repository's files rather than this one's:
+ * Harn package generations and installed npm packages. Their workflows run, if
+ * anywhere, in the repository that owns them.
+ */
+pub const VENDORED_SEGMENTS = [".harn", "node_modules"]
+
+fn is_vendored(relative: string) -> bool {
+  for segment in relative.split("/") {
+    if VENDORED_SEGMENTS.contains(segment) {
+      return true
+    }
+  }
+  return false
+}
 
 pub type LabelFinding = {path: string, location: string, value: string}
 
@@ -69,7 +89,7 @@ pub fn scan_repository(fs: HarnessFs, root: string) -> LabelScan {
   for pattern in SCANNED_GLOBS {
     for path in fs.glob(pattern, root) {
       const relative = relative_path(root, path_join(root, path))
-      if !files.contains(relative) {
+      if !is_vendored(relative) && !files.contains(relative) {
         files = files + [relative]
       }
     }
