@@ -200,6 +200,12 @@ fn measured_runs_for_query(
   }
     .filter(fn(run) { len(run.jobs) > 0 })
     .to_list()
+  // The run list is offset-paginated and newest first. Runs that complete
+  // while the first page is being measured push older rows down, so a later
+  // page can repeat ids this query already considered. Skip those repeats
+  // instead of double-counting them; the count check still demands enough
+  // distinct runs.
+  let seen = initial.map(fn(entry) { entry.run?.id })
   let page = 2
   while len(measured) < query.count {
     const candidates = runs_for_query(source, repository, workflow, query, page)
@@ -209,6 +215,10 @@ fn measured_runs_for_query(
         + " requested runs with reported jobs"
     }
     for entry in candidates {
+      if seen.contains(entry.run?.id) {
+        continue
+      }
+      seen = seen + [entry.run?.id]
       const run = normalize_run(source, repository, entry)
       if len(run.jobs) > 0 {
         measured = measured + [run]
