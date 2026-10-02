@@ -36,9 +36,21 @@ pipeline test_the_registry_validates_and_lists_harns_consumers(harness: Harness)
   const released = validate_registry(registry(harness.fs))
   const consumers = released[HARN] ?? []
   assert(len(consumers) > 1, "harn must have registered consumers")
+  // A bump runs the driver from the orchestration commit harn-bump-fleet pins,
+  // so a release moves that pin first and fleet-owned adapters bump when it
+  // lands. Dispatching a fleet adapter here would race the promotion.
   assert(
-    consumers.any({ consumer -> consumer.repository == "burin-labs/burin-code" }),
-    "burin-code pins harn",
+    consumers.any(
+      { consumer ->
+        consumer.repository == "burin-labs/harn-bump-fleet"
+          && consumer.workflow == "promote-released-orchestration.yml"
+      },
+    ),
+    "a harn release must promote the fleet's bump orchestration",
+  )
+  assert(
+    !consumers.any({ consumer -> consumer.workflow == "bump-harn.yml" }),
+    "fleet-owned bump adapters start from the promoted pin, not from the release",
   )
 }
 
