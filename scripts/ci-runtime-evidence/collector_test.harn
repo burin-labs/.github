@@ -167,6 +167,41 @@ pipeline test_zero_jobs_fails_closed() {
   )
 }
 
+pipeline test_a_run_repeated_by_page_drift_is_counted_once() {
+  // Runs completing while page 1 is measured shift older rows onto page 2,
+  // so page 2 can begin with a run page 1 already held.
+  const first_page =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=1"
+  const second_page =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=2"
+  const jobless = "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1"
+  const first_jobs = "/repos/acme/widgets/actions/runs/11/attempts/1/jobs?per_page=100&page=1"
+  const backfill_jobs = "/repos/acme/widgets/actions/runs/12/attempts/1/jobs?per_page=100&page=1"
+  const source = fixture_source(
+    {
+      responses: {
+        [first_page]: {workflow_runs: [workflow_run(10, "cancelled"), workflow_run(11, "feature")]},
+        [second_page]: {
+          workflow_runs: [workflow_run(11, "feature"), workflow_run(12, "older-feature")],
+        },
+        [jobless]: {total_count: 0, jobs: []},
+        [first_jobs]: {
+          total_count: 1,
+          jobs: [job(111, "test", ["ubuntu-latest"], "GitHub Actions 1")],
+        },
+        [backfill_jobs]: {
+          total_count: 1,
+          jobs: [job(121, "test", ["ubuntu-latest"], "GitHub Actions 2")],
+        },
+      },
+      logs: {"11": {test: ""}, "12": {test: ""}},
+    },
+  )
+  const report = collect(source, "acme/widgets", "ci.yml", [query("pull_request", 2)], "now")
+  assert_eq(report.runs.map(fn(run) { run.id }).sorted(), [11, 12])
+  assert_eq(report.measuredRuns, 2)
+}
+
 pipeline test_jobless_cancelled_run_is_replaced_by_the_next_completed_run() {
   const first_page =
     "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=1"
