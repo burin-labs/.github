@@ -30,6 +30,7 @@ jobs:
           harn test scripts/ci-runtime-evidence
           harn test scripts/release-promotion
           harn test scripts/release-repin
+          harn test scripts/merge-override-guard
           harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels
           bash .github/actions/local-workflow-checks/run_test.sh
@@ -169,3 +170,4 @@ jobs:
           bash -n scripts/release-promotion/run.sh
           bash -n .github/actions/validate-candidate-manifest/run.sh
           bash -n scripts/release-repin/run.sh
+          bash -n scripts/merge-override-guard/run.sh
