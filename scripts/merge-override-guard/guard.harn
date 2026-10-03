@@ -2,8 +2,10 @@
  * Decide whether a queue-skipping override label may act. `force-merge` and
  * `bypass-merge-queue` land a pull request without the merge queue, so each
  * needs a justifying incident and must not land a head the queue already
- * rejected. Every session posts as the same account, so the rule lives here
- * rather than in prose.
+ * rejected. `force-merge` also lands a head whose own checks are red, so it
+ * must not add a red: every check that failed on the head must be red on the
+ * default branch's newest verdict for that same job. Every session posts as
+ * the same account, so the rule lives here rather than in prose.
  *
  * `measure` reads GitHub through a `Reader`; `decide` is pure.
  */
@@ -34,6 +36,8 @@ pub type Request = {
   head_sha: string,
   label: string,
   main_ci_workflow: string,
+  /** Workflow file of the calling override dispatcher, whose own attempts are not CI evidence. */
+  override_workflow: string,
 }
 
 pub type MainState = {red: bool, detail: string}
@@ -41,6 +45,15 @@ pub type MainState = {red: bool, detail: string}
 pub type QueueState = {rejected: bool, run_ids: list<int>, detail: string}
 
 pub type ChecksState = {green: bool, detail: string}
+
+/** One check failing on the head, set against the same job on the default branch. */
+pub type CheckComparison = {check: string, head: string, main: string, inherited: bool}
+
+/**
+ * `force-merge` evidence: every non-passing completed check on the head, and
+ * the checks still running there, which no comparison can judge yet.
+ */
+pub type InheritanceState = {rows: list<CheckComparison>, pending: list<string>}
 
 pub type Evidence = {
   label: string,
@@ -51,6 +64,7 @@ pub type Evidence = {
   main: MainState?,
   queue: QueueState?,
   checks: ChecksState?,
+  inheritance: InheritanceState?,
 }
 
 /** `verdict` is `allowed` or `refused`. */
@@ -61,6 +75,7 @@ pub type Decision = {
   reason: string,
   retry: string,
   evidence: list<string>,
+  comparison: string,
 }
 
 fn short(sha: string) -> string {
@@ -168,19 +183,7 @@ fn main_state(reader: Reader, request: Request, default_branch: string) -> MainS
     if regex_match(SHA, sha ?? "") == nil {
       throw default_branch + " history returned a commit without a SHA"
     }
-    const runs = counted_pages(
-      reader,
-      repo + "/actions/workflows/" + request.main_ci_workflow + "/runs?head_sha=" + sha
-        + "&event=push&branch="
-        + default_branch,
-      "workflow_runs",
-    )
-    // An empty head_sha filter returns every run; never trust a census that
-    // contains another commit.
-    if runs.any({ run -> run?.head_sha != sha }) {
-      throw request.main_ci_workflow + " runs for " + sha + " included another commit"
-    }
-    const run = latest_by(runs.filter({ run -> run.status == "completed" }).to_list(), "created_at")
+    const run = completed_main_run(reader, request, default_branch, sha)
     if run == nil {
       continue
     }
@@ -322,8 +325,186 @@ fn checks_state(reader: Reader, request: Request, base: string) -> ChecksState {
   }
 }
 
+/** Answer a repeated GET from memory, so walks that revisit a page read it once. */
+fn memoized(reader: Reader) -> Reader {
+  let seen = {}
+  return {
+    api: fn(path) {
+      if !contains(keys(seen), path) {
+        seen = seen + {[path]: reader.api(path)}
+      }
+      return seen[path]
+    },
+  }
+}
+
+/** The newest completed push run of the main CI workflow on one default-branch commit. */
+fn completed_main_run(
+  reader: Reader,
+  request: Request,
+  default_branch: string,
+  sha: string,
+) -> dict? {
+  const runs = counted_pages(
+    reader,
+    "repos/" + request.repository + "/actions/workflows/" + request.main_ci_workflow
+      + "/runs?head_sha="
+      + sha
+      + "&event=push&branch="
+      + default_branch,
+    "workflow_runs",
+  )
+  // An empty head_sha filter returns every run; never trust a census that
+  // contains another commit.
+  if runs.any({ run -> run?.head_sha != sha }) {
+    throw request.main_ci_workflow + " runs for " + sha + " included another commit"
+  }
+  return latest_by(runs.filter({ run -> run.status == "completed" }).to_list(), "created_at")
+}
+
+/**
+ * Where did `check` last run to a verdict on the default branch? Walks back
+ * past commits whose run skipped or omitted the job, so a path-filtered push
+ * does not hide the job's current state. Nothing found reads as "never shown
+ * red", not as green.
+ */
+fn main_job_state(reader: Reader, request: Request, default_branch: string, check: string) -> dict {
+  const repo = "repos/" + request.repository
+  const commits = get_list(
+    reader,
+    repo + "/commits?sha=" + default_branch + "&per_page=" + to_string(MAIN_WALK_LIMIT),
+  )
+  for commit in commits {
+    const run = completed_main_run(reader, request, default_branch, commit.sha)
+    if run == nil {
+      continue
+    }
+    const jobs = counted_pages(
+      reader,
+      repo + "/actions/runs/" + to_string(run.id) + "/jobs?filter=latest",
+      "jobs",
+    )
+    const job = latest_by(
+      jobs.filter(
+        { job ->
+          job?.name == check && job?.status == "completed"
+            && job?.conclusion
+              != "skipped"
+        },
+      )
+        .to_list(),
+      "started_at",
+    )
+    if job != nil {
+      return {
+        red: RED.contains(job.conclusion),
+        detail: to_string(job.conclusion) + " in run " + to_string(run.id) + " on "
+          + short(commit.sha),
+      }
+    }
+  }
+  return {
+    red: false,
+    detail: "did not run on the last " + to_string(len(commits)) + " commits of " + default_branch,
+  }
+}
+
+/**
+ * For `force-merge`: compare every check that did not pass on the head with
+ * the same job on the default branch. A check counts as inherited only when
+ * main's newest verdict for that job is itself red. A check from another
+ * workflow or app has no default-branch run to compare, so it never counts.
+ */
+fn inheritance_state(reader: Reader, request: Request, default_branch: string) -> InheritanceState {
+  const repo = "repos/" + request.repository
+  const runs = counted_pages(
+    reader,
+    repo + "/actions/runs?head_sha=" + request.head_sha,
+    "workflow_runs",
+  )
+  if runs.any({ run -> run?.head_sha != request.head_sha }) {
+    throw "workflow runs for " + request.head_sha + " included another commit"
+  }
+  let workflow_by_suite = {}
+  for run in runs {
+    workflow_by_suite = workflow_by_suite + {[to_string(run.check_suite_id)]: run.path ?? ""}
+  }
+  const checks = counted_pages(
+    reader,
+    repo + "/commits/" + request.head_sha + "/check-runs?filter=latest",
+    "check_runs",
+  )
+  const ci_path = ".github/workflows/" + request.main_ci_workflow
+  let names = []
+  for check in checks {
+    if !names.contains(check.name) {
+      names = names + [check.name]
+    }
+  }
+  let rows = []
+  let pending = []
+  for name in names.sorted() {
+    const check = latest_by(checks.filter({ run -> run?.name == name }).to_list(), "started_at")
+    const workflow = workflow_by_suite[to_string(check?.check_suite?.id)] ?? ""
+    if workflow != "" && workflow == request.override_workflow {
+      continue
+    }
+    if check.status != "completed" {
+      pending = pending + [name]
+      continue
+    }
+    if PASSING.contains(check.conclusion) {
+      continue
+    }
+    if workflow != ci_path {
+      rows = rows
+        + [
+          {
+            check: name,
+            head: to_string(check.conclusion),
+            main: "not a " + request.main_ci_workflow + " job ("
+              + (workflow == "" ? "no workflow" : workflow)
+              + "), so main cannot show it red",
+            inherited: false,
+          },
+        ]
+      continue
+    }
+    const main = main_job_state(reader, request, default_branch, name)
+    rows = rows
+      + [{check: name, head: to_string(check.conclusion), main: main.detail, inherited: main.red}]
+  }
+  return {rows: rows, pending: pending}
+}
+
+fn comparison_markdown(head_sha: string, state: InheritanceState) -> string {
+  let lines = [
+    "#### Failing head checks against " + "the default branch (" + short(head_sha) + ")",
+    "",
+  ]
+  if len(state.rows) == 0 {
+    lines = lines + ["No completed check failed on the head."]
+  } else {
+    lines = lines + ["| Check | Head | Default branch | Verdict |", "| --- | --- | --- | --- |"]
+    for row in state.rows {
+      lines = lines
+        + [
+          "| " + row.check + " | " + row.head + " | " + row.main + " | "
+            + (row.inherited ? "inherited red" : "new red")
+            + " |",
+        ]
+    }
+  }
+  if len(state.pending) > 0 {
+    lines = lines
+      + ["", "Still running on the head, not compared: " + join(state.pending, ", ") + "."]
+  }
+  return join(lines, "\n")
+}
+
 /** Measure what the guard needs. Throws when GitHub cannot be read completely. */
-pub fn measure(reader: Reader, request: Request) -> Evidence {
+pub fn measure(source: Reader, request: Request) -> Evidence {
+  const reader = memoized(source)
   if !GUARDED_LABELS.contains(request.label) {
     throw request.label + " is not a queue-skipping label"
   }
@@ -343,6 +524,7 @@ pub fn measure(reader: Reader, request: Request) -> Evidence {
     main: nil,
     queue: nil,
     checks: nil,
+    inheritance: nil,
   }
   if evidence.founder_override {
     // The escape hatch skips every other read: an emergency must not depend
@@ -359,6 +541,11 @@ pub fn measure(reader: Reader, request: Request) -> Evidence {
       main: main_state(reader, request, default_branch),
       queue: queue_state(reader, request, base),
       checks: request.label == "bypass-merge-queue" ? checks_state(reader, request, base) : nil,
+      inheritance: request.label == "force-merge" ? inheritance_state(
+        reader,
+        request,
+        default_branch,
+      ) : nil,
     }
 }
 
@@ -373,6 +560,7 @@ pub fn decide(evidence: Evidence) -> Decision {
         + " skipped the queue-bypass guard",
       retry: "",
       evidence: ["guard skipped by `" + FOUNDER_OVERRIDE + "`"],
+      comparison: "",
     }
   }
   const main = evidence.main
@@ -382,6 +570,9 @@ pub fn decide(evidence: Evidence) -> Decision {
   }
   if evidence.label == "bypass-merge-queue" && evidence.checks == nil {
     throw "evidence is incomplete: bypass-merge-queue needs required-check state"
+  }
+  if evidence.label == "force-merge" && evidence.inheritance == nil {
+    throw "evidence is incomplete: force-merge needs the head-against-main check comparison"
   }
   let lines = [
     "default branch: " + main.detail,
@@ -417,6 +608,35 @@ pub fn decide(evidence: Evidence) -> Decision {
     refusals = refusals + [evidence.checks.detail]
     retries = retries + ["wait for every required check to pass"]
   }
+  let comparison = ""
+  if evidence.inheritance != nil {
+    const inheritance = evidence.inheritance
+    comparison = comparison_markdown(evidence.head_sha, inheritance)
+    const fresh = inheritance.rows.filter({ row -> !row.inherited }).to_list()
+    lines = lines
+      + [
+        "head checks against the default branch: " + to_string(len(inheritance.rows))
+          + " failing, "
+          + to_string(len(fresh))
+          + " not red on the default branch, "
+          + to_string(len(inheritance.pending))
+          + " still running",
+      ]
+    if len(fresh) > 0 {
+      refusals = refusals
+        + [
+          "the head is red where the default branch is not: "
+            + join(
+              fresh.map({ row -> row.check + " (head " + row.head + "; " + row.main + ")" }),
+              "; ",
+            ),
+        ]
+      retries = retries
+        + [
+          "fix those checks on the head, or land through the merge queue; `force-merge` only skips reds the default branch already has",
+        ]
+    }
+  }
   if len(refusals) > 0 {
     return {
       verdict: "refused",
@@ -425,6 +645,7 @@ pub fn decide(evidence: Evidence) -> Decision {
       reason: "`" + evidence.label + "` refused: " + join(refusals, "; ") + ".",
       retry: join(retries, "; ") + ", then re-apply `" + evidence.label + "`.",
       evidence: lines,
+      comparison: comparison,
     }
   }
   const because = main.red ? "the default branch is red (" + main.detail
@@ -436,5 +657,6 @@ pub fn decide(evidence: Evidence) -> Decision {
     reason: "`" + evidence.label + "` allowed: " + because + ".",
     retry: "",
     evidence: lines,
+    comparison: comparison,
   }
 }
