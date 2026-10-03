@@ -83,7 +83,10 @@ fn census(rulesets: unknown) -> list {
 /** Keep the audited protections visible; no protection is inferred from an empty read. */
 pub fn verify_installed(rulesets: unknown, effective_rules: unknown, release_app: unknown) -> dict {
   const measured = census(rulesets)
-  if release_app?.id != RELEASE_APP_ID || release_app?.slug != "harn-release-bot" {
+  if type_of(release_app) != "dict" {
+    throw "release incident App identity is unread"
+  }
+  if release_app.id != RELEASE_APP_ID || release_app.slug != "harn-release-bot" {
     throw "release incident App identity is unproven"
   }
   const matches = measured.filter({ item -> item.name == RULESET_NAME }).to_list()
