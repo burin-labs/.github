@@ -7,7 +7,9 @@ pub fn snapshot(reader: Reader) -> dict {
   let complete = false
   let page = 1
   while page <= 10 {
-    const batch = reader.api(repo + "/rulesets?includes_parents=true&per_page=100&page=" + to_string(page))
+    const batch = reader.api(
+      repo + "/rulesets?includes_parents=true&per_page=100&page=" + to_string(page),
+    )
     if type_of(batch) != "list" {
       throw "ruleset page is unread"
     }
@@ -29,12 +31,16 @@ pub fn snapshot(reader: Reader) -> dict {
     }
     const detail = reader.api(repo + "/rulesets/" + to_string(summary.id))
     if type_of(detail) != "dict" || detail?.id != summary.id || detail?.name != summary?.name
-      || detail?.source != summary?.source || detail?.source_type != summary?.source_type {
+      || detail?.source != summary?.source
+      || detail?.source_type != summary?.source_type {
       throw "ruleset changed or was unread while hydrating the census"
     }
     rulesets = rulesets + [detail]
     ids = ids + [summary.id]
   }
-  return {rulesets: rulesets, effective_rules: reader.api(repo + "/rules/branches/main"),
-    release_app: reader.api("apps/harn-release-bot")}
+  return {
+    rulesets: rulesets,
+    effective_rules: reader.api(repo + "/rules/branches/main"),
+    release_app: reader.api("apps/harn-release-bot"),
+  }
 }
