@@ -109,9 +109,16 @@ jobs:
             ((.workflow_run.head_branch // "") | (capture("^gh-readonly-queue/[^/]+/pr-(?<n>[0-9]+)-").n)?),
             ((.merge_group.head_ref // "") | (capture("/pr-(?<n>[0-9]+)-").n)?)
           ' "$event" | sort -u)"
-          # A sweep, or an event that names no PR, looks at every labeled one.
+          # A sweep, or an event that names no PR, looks at every labeled one,
+          # plus labeled PRs merged in the last two days: release watch follows
+          # a merged change until its deploy is confirmed healthy.
           if [ -z "$numbers" ]; then
-            numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number')"
+            since="$(date -u -d '2 days ago' +%Y-%m-%d)"
+            numbers="$( {
+              gh pr list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number'
+              gh pr list -R "$REPO" --label "$LABEL" --state merged --search "merged:>=$since" \
+                --json number --jq '.[].number'
+            } | sort -u)"
           fi
           echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
           echo "Looking at: ${numbers:-none}"
@@ -130,18 +137,21 @@ jobs:
           set -uo pipefail
           git config --global user.name "harn-release-bot[bot]"
           git config --global user.email "harn-release-bot[bot]@users.noreply.github.com"
+          # The calling repository's checked-in policy, read from its default
+          # branch so a pull request cannot rewrite the rules it is judged by.
           policy="$RUNNER_TEMP/ship.toml"
+          gh api "repos/$REPO/contents/.github/smart-ship.toml" --jq '.content' 2>/dev/null \
+            | base64 -d > "$policy" 2>/dev/null || : > "$policy"
+          extra=()
           if [ "$REPAIR" != "true" ]; then
-            printf '[repair]\nconflict = false\nfailing = false\nreview = false\n' > "$policy"
-          else
-            : > "$policy"
+            extra+=(--no-repair)
           fi
           status=0
           for n in $NUMBERS; do
             echo "::group::$REPO#$n"
             ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
               --pr "$REPO#$n" --state github --ship-label "$LABEL" \
-              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" || status=1
+              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" "${extra[@]}" || status=1
             echo "::endgroup::"
           done
           exit $status
