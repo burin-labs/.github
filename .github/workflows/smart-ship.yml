@@ -1,0 +1,147 @@
+name: Smart Ship
+
+# Reusable: one look at each pull request labeled for shipping, then exit.
+# Callers wire the GitHub events that should wake the shepherd; see
+# burin-labs/burin-code docs/design/smart-ship.md. Memory and history live in a
+# comment on the PR. This lives in the org repo because burin-code is private
+# and a public repository cannot call a private repository's workflows.
+
+on:
+  workflow_call:
+    inputs:
+      burin-ref:
+        description: burin-code ref whose Smart Ship scripts run.
+        type: string
+        default: main
+      ship-label:
+        description: Label that hands a pull request to Smart Ship.
+        type: string
+        default: ship
+      repair:
+        description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
+        type: boolean
+        default: true
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        required: true
+      OPENAI_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  ship:
+    # One shepherd run at a time per repository. A sweep has no PR number and
+    # touches every labeled PR, so per-PR groups would let a sweep and an event
+    # run act on the same PR at once. Runs take about a minute; if GitHub
+    # replaces a queued run, the next sweep covers its PR.
+    concurrency:
+      group: smart-ship-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Mint the release app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }},burin-code
+
+      - name: Check out Smart Ship
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/burin-code
+          ref: ${{ inputs.burin-ref }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+
+      - name: Fetch Harn
+        uses: ./.github/actions/fetch-harn
+        with:
+          github-token: ${{ github.token }}
+          # One script runs per look; precompiling every pipeline costs minutes.
+          precompile: "false"
+
+      - name: Let git use the app token
+        uses: ./.github/actions/github-token-git-auth
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Download the PR agent
+        if: inputs.repair
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The newest burin binary CI built from main or the merge queue.
+          id="$(gh api "repos/burin-labs/burin-code/actions/artifacts?name=burin-linux&per_page=50" \
+            --jq '[.artifacts[] | select(.expired | not)
+                   | select(.workflow_run.head_branch == "main"
+                            or (.workflow_run.head_branch | startswith("gh-readonly-queue/main/")))][0].id')"
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::warning::no burin-linux artifact from main; repairs will hand back"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/burin-bin"
+          gh api "repos/burin-labs/burin-code/actions/artifacts/$id/zip" > "$RUNNER_TEMP/burin.zip"
+          unzip -q -o "$RUNNER_TEMP/burin.zip" -d "$RUNNER_TEMP/burin-bin"
+          chmod +x "$RUNNER_TEMP/burin-bin/burin"
+          echo "BURIN_HEADLESS_BIN=$RUNNER_TEMP/burin-bin/burin" >> "$GITHUB_ENV"
+
+      - name: Find the pull requests to look at
+        id: prs
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ inputs.ship-label }}
+        run: |
+          set -euo pipefail
+          event="$GITHUB_EVENT_PATH"
+          numbers="$(jq -r '
+            (.pull_request.number // empty),
+            (.workflow_run.pull_requests[]?.number // empty),
+            ((.workflow_run.head_branch // "") | (capture("^gh-readonly-queue/[^/]+/pr-(?<n>[0-9]+)-").n)?),
+            ((.merge_group.head_ref // "") | (capture("/pr-(?<n>[0-9]+)-").n)?)
+          ' "$event" | sort -u)"
+          # A sweep, or an event that names no PR, looks at every labeled one.
+          if [ -z "$numbers" ]; then
+            numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number')"
+          fi
+          echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
+          echo "Looking at: ${numbers:-none}"
+
+      - name: Shepherd
+        if: steps.prs.outputs.numbers != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ inputs.ship-label }}
+          NUMBERS: ${{ steps.prs.outputs.numbers }}
+          REPAIR: ${{ inputs.repair }}
+        run: |
+          set -uo pipefail
+          git config --global user.name "harn-release-bot[bot]"
+          git config --global user.email "harn-release-bot[bot]@users.noreply.github.com"
+          policy="$RUNNER_TEMP/ship.toml"
+          if [ "$REPAIR" != "true" ]; then
+            printf '[repair]\nconflict = false\nfailing = false\nreview = false\n' > "$policy"
+          else
+            : > "$policy"
+          fi
+          status=0
+          for n in $NUMBERS; do
+            echo "::group::$REPO#$n"
+            ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
+              --pr "$REPO#$n" --state github --ship-label "$LABEL" \
+              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
