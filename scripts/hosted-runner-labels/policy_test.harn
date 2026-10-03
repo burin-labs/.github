@@ -70,3 +70,24 @@ pipeline test_this_repository_selects_no_floating_label(harness: Harness) {
   )
   assert_eq(scan.findings, [])
 }
+
+pipeline test_nested_workflows_are_scanned_and_vendored_copies_are_not(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("hosted-runner-labels-")
+  const floating = "jobs:\n  publish:\n    runs-on: ubuntu-latest\n"
+  for path in [
+    ".github/workflows/ci.yml",
+    "sdks/python/.github/workflows/publish.yml",
+    "plans/.harn/package-generations/g/packages/p/.github/workflows/ci.yml",
+    "site/node_modules/pkg/.github/workflows/ci.yml",
+  ] {
+    harness.fs.mkdir(dirname(path_join(root, path)), true)
+    harness.fs.write_text(path_join(root, path), floating)
+  }
+  const scan = scan_repository(harness.fs, root)
+  harness.fs.delete(root, true)
+  assert_eq(scan.files, [".github/workflows/ci.yml", "sdks/python/.github/workflows/publish.yml"])
+  assert_eq(
+    scan.findings.map({ finding -> finding.path }),
+    [".github/workflows/ci.yml", "sdks/python/.github/workflows/publish.yml"],
+  )
+}

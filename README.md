@@ -385,10 +385,14 @@ canaried change tracked in
 
 `.github/actions/hosted-runner-labels` enforces the pin. It parses every
 `.github/workflows/*.yml` file and every `.github/actions/*/action.yml` file in
-the calling repository and fails on any string value that contains
+the calling repository, including nested `.github` directories such as an SDK
+subtree that is projected into its own repository, and fails on any string value
+that contains
 `ubuntu-latest`: a `runs-on` key, a matrix value, a reusable-workflow input
 default, or a routing expression. YAML comments are not values, so prose that
-mentions the label stays legal. A scan that finds no files fails, so an empty
+mentions the label stays legal. Copies under `.harn/` or `node_modules/`
+belong to another repository and are skipped. A scan that finds no files fails,
+so an empty
 census cannot pass as a clean one.
 
 ```yaml
