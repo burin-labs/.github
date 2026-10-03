@@ -362,6 +362,16 @@ critical-path allowance or an existing job budget. It also rejects missing or
 stale required-job entries, empty sentinel sets, invalid SLO ordering, and a
 same-topology observed baseline that is removed, tampered with, or loosened.
 
+The baseline read runs before `setup-harn` and requires an existing Node runtime
+with `fetch` and `AbortSignal.timeout`. It retries measured transient HTTP
+statuses at most three times per endpoint, with a 20-second request timeout and
+one 60-second deadline shared by every request and retry delay. A policy read
+that returns 404 requires authenticated commit identity and a complete,
+nonempty immutable tree census before the action treats the policy as absent.
+Permanent errors, truncated bodies, and unmeasured results fail the action.
+Only a complete policy body is published, by atomic replacement; the existing
+checker remains the owner of all budget rules.
+
 Runtime measurement belongs off the pull-request path. The organization-level
 observer runs every six hours and on demand. It uses Harn's
 `scripts/ci_walltime_report.harn` implementation and the existing release-app
