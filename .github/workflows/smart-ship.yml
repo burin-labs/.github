@@ -58,6 +58,8 @@ jobs:
         uses: ./.github/actions/fetch-harn
         with:
           github-token: ${{ github.token }}
+          # One script runs per look; precompiling every pipeline costs minutes.
+          precompile: "false"
 
       - name: Let git use the app token
         uses: ./.github/actions/github-token-git-auth
