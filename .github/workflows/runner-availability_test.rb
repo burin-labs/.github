@@ -257,5 +257,57 @@ Dir.mktmpdir("runner-availability-test") do |dir|
       abort "invalid pool policy was accepted: #{invalid}" if status.success?
     end
   end
+
+  # Per-host load for the big lane. Runners `-w<N>` on one machine share its
+  # cores, so one idle big runner can sit on a saturated host.
+  named = lambda do |name, status, busy, labels|
+    {id: name.hash.abs, name: name, status: status, busy: busy,
+     labels: labels.map { |label| {name: label} }}
+  end
+  big = ["self-hosted", "Linux", "X64", "stable", "big"]
+  small = ["self-hosted", "Linux", "X64", "stable"]
+  fleet = [
+    named.call("tornadough-w1", "online", true, big),
+    named.call("tornadough-w2", "online", false, big),
+    named.call("tornadough-w3", "online", true, small),
+    named.call("tornadough-w4", "offline", false, big),
+    # The negative control: no `-w<N>` suffix means the name is its own host.
+    named.call("lonely-box", "online", false, big),
+    named.call("smallhost-w1", "online", false, small),
+    named.call("mac-w1", "online", false, ["self-hosted", "macOS", "stable", "big"])
+  ]
+  fixture = File.join(dir, "runners.json")
+  output = File.join(dir, "output")
+  File.write(fixture, JSON.generate([{runners: fleet}]))
+  host_env = {"PATH" => "#{dir}:#{ENV.fetch('PATH')}", "GH_TOKEN" => "fixture",
+              "OWNER" => "fixture", "RUNNER_GROUPS" => "Default", "DEFAULT_TAG" => "stable",
+              "LINUX_TAG" => "stable", "LINUX_BIG_TAG" => "big", "LINUX_FETCH_TAG" => "fetch",
+              "LINUX_PROBE_TAG" => "", "MACOS_TAG" => "stable", "WINDOWS_TAG" => "stable",
+              "MINIMUM_ONLINE" => "1", "MINIMUM_ONLINE_BY_POOL" => "{}",
+              "SELFHOSTED_DISABLED" => "", "RUNNER_FIXTURE" => fixture,
+              "GITHUB_OUTPUT" => output, "TMPDIR" => dir}
+  File.write(output, "")
+  stdout, stderr, status = Open3.capture3(host_env, "bash", "-c", script)
+  abort "host census: detector failed: #{stdout} #{stderr}" unless status.success?
+  values = File.readlines(output).map { |line| line.strip.split("=", 2) }.to_h
+  big_lane = JSON.parse(values.fetch("capacity")).fetch("linux_big")
+  expected_hosts = {
+    "tornadough" => {"online" => 3, "busy" => 2, "idle_big" => 1},
+    "lonely-box" => {"online" => 1, "busy" => 0, "idle_big" => 1}
+  }
+  abort "host census: wrong hosts #{big_lane['hosts'].inspect}" unless big_lane["hosts"] == expected_hosts
+  abort "host census: lane counts changed #{big_lane}" unless big_lane.fetch("online") == 3 &&
+    big_lane.fetch("idle") == 2 && big_lane.fetch("measured")
+
+  # A retired lane was not counted, so it must not publish a host map that a
+  # caller could read as an empty, idle fleet.
+  File.write(output, "")
+  stdout, stderr, status = Open3.capture3(host_env.merge("SELFHOSTED_DISABLED" => "linux_big"), "bash", "-c", script)
+  abort "host census (retired): detector failed: #{stdout} #{stderr}" unless status.success?
+  values = File.readlines(output).map { |line| line.strip.split("=", 2) }.to_h
+  retired = JSON.parse(values.fetch("capacity")).fetch("linux_big")
+  abort "host census: retired lane published hosts #{retired}" if retired.key?("hosts")
 end
+unmeasured_big = JSON.parse(disabled_bump.fetch("capacity")).fetch("linux_big")
+abort "an unmeasured big lane must not publish hosts" if unmeasured_big.key?("hosts")
 puts "runner-availability decisions: shared, per-pool, and invalid-policy fixtures passed"
