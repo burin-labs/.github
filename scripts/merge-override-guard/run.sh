@@ -19,6 +19,7 @@ harn run \
   --grant head_sha=env:GUARD_HEAD_SHA,expose=GUARD_HEAD_SHA \
   --grant label=env:GUARD_LABEL,expose=GUARD_LABEL \
   --grant main_ci_workflow=env:GUARD_MAIN_CI_WORKFLOW,expose=GUARD_MAIN_CI_WORKFLOW \
+  --grant override_workflow_ref=env:GUARD_OVERRIDE_WORKFLOW_REF,expose=GUARD_OVERRIDE_WORKFLOW_REF \
   --grant github_output=env:GITHUB_OUTPUT,expose=GITHUB_OUTPUT \
   --grant github_step_summary=env:GITHUB_STEP_SUMMARY,expose=GITHUB_STEP_SUMMARY \
   --read-only-root "$package_root" \

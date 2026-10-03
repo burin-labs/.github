@@ -15,6 +15,10 @@ const GROUP_BASE = "cccccccccccccccccccccccccccccccccccccccc"
 
 const HEAD_SEEN = "2026-10-02T08:39:04Z"
 
+const CI_WORKFLOW = ".github/workflows/ci.yml"
+
+const OVERRIDE_WORKFLOW = ".github/workflows/merge-override-dispatch.yml"
+
 fn request(label: string = "force-merge", head: string = HEAD) -> Request {
   return {
     repository: "burin-labs/example",
@@ -22,6 +26,7 @@ fn request(label: string = "force-merge", head: string = HEAD) -> Request {
     head_sha: head,
     label: label,
     main_ci_workflow: "ci.yml",
+    override_workflow: OVERRIDE_WORKFLOW,
   }
 }
 
@@ -87,6 +92,58 @@ fn world(labels: list<string>, main_conclusion: string, head: string = HEAD) -> 
     + head_seen(head, HEAD_SEEN)
     + queue_runs("failure", [])
     + queue_runs("timed_out", [])
+    + head_checks(head, [])
+}
+
+/**
+ * The head's check runs, each a `[name, conclusion, workflow path]` triple;
+ * a nil conclusion is a check still running. Each check gets its own suite,
+ * tied to a workflow run on the head with that path.
+ */
+fn head_checks(head: string, checks: list) -> dict {
+  let runs = []
+  let check_runs = []
+  let suite = 500
+  for check in checks {
+    suite = suite + 1
+    runs = runs + [{id: suite + 1000, head_sha: head, check_suite_id: suite, path: check[2]}]
+    check_runs = check_runs
+      + [
+        {
+          name: check[0],
+          status: check[1] == nil ? "in_progress" : "completed",
+          conclusion: check[1],
+          started_at: "2026-10-02T09:10:00Z",
+          check_suite: {id: suite},
+        },
+      ]
+  }
+  return {
+    [REPO + "/actions/runs?head_sha=" + head + "&per_page=100&page=1"]: page("workflow_runs", runs),
+    [REPO + "/commits/" + head + "/check-runs?filter=latest&per_page=100&page=1"]: page(
+      "check_runs",
+      check_runs,
+    ),
+  }
+}
+
+/** The jobs of one default-branch CI run, each a `[name, conclusion]` pair. */
+fn main_jobs(run_id: int, jobs: list) -> dict {
+  return {
+    [REPO + "/actions/runs/" + to_string(run_id) + "/jobs?filter=latest&per_page=100&page=1"]: page(
+      "jobs",
+      jobs.map(
+        { job ->
+          {
+            name: job[0],
+            status: "completed",
+            conclusion: job[1],
+            started_at: "2026-10-02T10:01:00Z",
+          }
+        },
+      ),
+    ),
+  }
 }
 
 fn queue_failure(head_branch: string, created_at: string) -> dict {
@@ -324,4 +381,118 @@ pipeline test_only_queue_skipping_labels_are_guarded() {
     fn() { measure(reader({}).reader, request("bypass-ci")) },
     "not a queue-skipping label",
   )
+}
+
+pipeline test_force_merge_refuses_a_head_red_where_main_is_green() {
+  // The #9580 shape: main is red elsewhere, so an incident exists, but the
+  // head fails a census main passes. Landing it reds every later queue entry.
+  const responses = world([], "failure")
+    + head_checks(
+      HEAD,
+      [["Supply chain", "failure", CI_WORKFLOW], ["Lint", "success", CI_WORKFLOW]],
+    )
+    + main_jobs(900, [["Supply chain", "success"], ["Lint", "success"], ["Build", "failure"]])
+  const decision = verdict(responses)
+  assert_eq(decision.verdict, "refused")
+  assert(
+    decision.reason.contains("the head is red where the default branch is not"),
+    decision.reason,
+  )
+  assert(
+    decision.reason.contains("Supply chain (head failure; success in run 900"),
+    decision.reason,
+  )
+  assert(decision.retry.contains("only skips reds the default branch already has"), decision.retry)
+  assert(
+    decision.comparison.contains(
+      "| Supply chain | failure | success in run 900 on aaaaaaaaaaaa | new red |",
+    ),
+    decision.comparison,
+  )
+  assert(!decision.comparison.contains("Lint"), decision.comparison)
+}
+
+pipeline test_force_merge_allows_a_head_whose_only_reds_main_already_has() {
+  const responses = world([], "failure")
+    + head_checks(HEAD, [["Build", "failure", CI_WORKFLOW], ["Lint", "timed_out", CI_WORKFLOW]])
+    + main_jobs(900, [["Build", "failure"], ["Lint", "timed_out"]])
+  const decision = verdict(responses)
+  assert_eq(decision.verdict, "allowed")
+  assert(
+    decision.comparison.contains(
+      "| Build | failure | failure in run 900 on aaaaaaaaaaaa | inherited red |",
+    ),
+    decision.comparison,
+  )
+  assert(
+    decision.evidence.any({ line -> line.contains("2 failing, 0 not red on the default branch") }),
+  )
+}
+
+pipeline test_a_head_that_fixes_mains_red_has_nothing_to_compare() {
+  const responses = world([], "failure") + head_checks(HEAD, [["Build", "success", CI_WORKFLOW]])
+  const decision = verdict(responses)
+  assert_eq(decision.verdict, "allowed")
+  assert(
+    decision.comparison.contains("No completed check failed on the head."),
+    decision.comparison,
+  )
+}
+
+pipeline test_a_job_main_skipped_is_judged_by_the_newest_run_that_ran_it() {
+  const responses = world([], "failure")
+    + head_checks(HEAD, [["Heavy", "failure", CI_WORKFLOW]])
+    + main_jobs(900, [["Heavy", "skipped"]])
+    + main_runs(
+      PARENT,
+      [{id: 899, status: "completed", conclusion: "failure", created_at: "2026-10-02T09:00:00Z"}],
+    )
+    + main_jobs(899, [["Heavy", "failure"]])
+  const decision = verdict(responses)
+  assert_eq(decision.verdict, "allowed")
+  assert(decision.comparison.contains("failure in run 899 on bbbbbbbbbbbb"), decision.comparison)
+}
+
+pipeline test_a_job_main_never_ran_is_not_an_inherited_red() {
+  // Absence must not read as an inherited red: main cannot show this job red.
+  const responses = world([], "failure")
+    + head_checks(HEAD, [["Heavy", "failure", CI_WORKFLOW]])
+    + main_jobs(900, [["Heavy", "skipped"]])
+    + main_runs(PARENT, [])
+  const decision = verdict(responses)
+  assert_eq(decision.verdict, "refused")
+  assert(decision.reason.contains("did not run on the last 2 commits of main"), decision.reason)
+}
+
+pipeline test_a_failing_check_outside_main_ci_never_counts_as_inherited() {
+  const responses = world([], "failure")
+    + head_checks(
+      HEAD,
+      [
+        ["Review", "failure", ".github/workflows/review.yml"],
+        // Earlier refused override attempts post a failed check on the head too.
+        ["Apply merge override", "failure", OVERRIDE_WORKFLOW],
+        ["Still going", nil, CI_WORKFLOW],
+      ],
+    )
+  const decision = verdict(responses)
+  assert_eq(decision.verdict, "refused")
+  assert(
+    decision.reason.contains(
+      "Review (head failure; not a ci.yml job (.github/workflows/review.yml)",
+    ),
+    decision.reason,
+  )
+  assert(!decision.comparison.contains("Apply merge override"), decision.comparison)
+  assert(
+    decision.comparison.contains("Still running on the head, not compared: Still going."),
+    decision.comparison,
+  )
+}
+
+pipeline test_bypass_merge_queue_does_not_compare_head_checks_with_main() {
+  const responses = world([], "failure") + required_checks(HEAD, "success")
+  const decision = verdict(responses, request("bypass-merge-queue"))
+  assert_eq(decision.verdict, "allowed")
+  assert_eq(decision.comparison, "")
 }

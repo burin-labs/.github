@@ -10,14 +10,28 @@ fn required_env(env: HarnessEnv, name: string) -> string {
   return value
 }
 
+/**
+ * `github.workflow_ref` is `owner/repo/.github/workflows/file.yml@ref`; the
+ * Actions API names a run's workflow by the `.github/workflows/file.yml` part.
+ */
+fn workflow_path(workflow_ref: string) -> string {
+  const at = workflow_ref.split("@")[0]
+  const marker = ".github/workflows/"
+  if !at.contains(marker) {
+    throw "GUARD_OVERRIDE_WORKFLOW_REF is not a workflow ref: " + workflow_ref
+  }
+  return marker + at.split(marker)[1]
+}
+
 fn write_output(harness: Harness, name: string, value: string) {
   if !gha_write_output(harness, name, value) {
     throw "GITHUB_OUTPUT is not set, so " + name + " cannot reach the next step"
   }
 }
 
-fn summarize(harness: Harness, heading: string, lines: list<string>) {
+fn summarize(harness: Harness, heading: string, lines: list<string>, table: string = "") {
   const body = "## " + heading + "\n\n" + join(lines.map({ line -> "- " + line }), "\n") + "\n"
+    + (table == "" ? "" : "\n" + table + "\n")
   if !gha_append_summary(harness.env, harness.fs, body) {
     harness.stdio.println(body)
   }
@@ -31,6 +45,7 @@ fn main(harness: Harness) {
     head_sha: required_env(harness.env, "GUARD_HEAD_SHA"),
     label: label,
     main_ci_workflow: required_env(harness.env, "GUARD_MAIN_CI_WORKFLOW"),
+    override_workflow: workflow_path(required_env(harness.env, "GUARD_OVERRIDE_WORKFLOW_REF")),
   }
   let decision = nil
   try {
@@ -46,6 +61,7 @@ fn main(harness: Harness) {
     write_output(harness, "reason", reason)
     write_output(harness, "retry", "after GitHub is readable again, re-apply `" + label + "`.")
     write_output(harness, "founder_override", "false")
+    write_output(harness, "comparison", "")
     gha_error(harness.stdio, reason)
     summarize(harness, "Queue-bypass guard errored", [reason])
     harness.runtime.exit(1)
@@ -55,6 +71,7 @@ fn main(harness: Harness) {
   write_output(harness, "retry", decision.retry)
   write_output(harness, "founder_override", decision.founder_override ? "true" : "false")
   write_output(harness, "founder_actor", decision.founder_actor)
+  write_output(harness, "comparison", decision.comparison)
   if decision.founder_override {
     gha_warning(harness.stdio, "FOUNDER OVERRIDE: " + decision.reason)
     summarize(
@@ -68,11 +85,15 @@ fn main(harness: Harness) {
   for line in decision.evidence {
     harness.stdio.println("  " + line)
   }
+  if decision.comparison != "" {
+    harness.stdio.println(decision.comparison)
+  }
   if decision.verdict == "allowed" {
     summarize(
       harness,
       "Queue-bypass guard allowed `" + label + "`",
       [decision.reason] + decision.evidence,
+      decision.comparison,
     )
     return
   }
@@ -81,6 +102,7 @@ fn main(harness: Harness) {
     harness,
     "Queue-bypass guard refused `" + label + "`",
     [decision.reason, "retry: " + decision.retry] + decision.evidence,
+    decision.comparison,
   )
   harness.runtime.exit(1)
 }

@@ -557,7 +557,8 @@ workflow rejects non-admins and fork pull requests, then acts with the
   green. Skips the merge queue but does not override CI. An in-flight check is
   reported as in flight, not missing.
 - `force-merge`: publish successful `CI status`, then squash-merge immediately.
-  Skips CI proof and the merge queue.
+  Skips CI proof and the merge queue, but only for reds the default branch
+  already has (see the guard below).
 
 ### Queue-bypass guard
 
@@ -574,7 +575,20 @@ workflow rejects non-admins and fork pull requests, then acts with the
    new head clears an earlier rejection.
 
 `bypass-merge-queue` also needs every check the base branch's rulesets require
-to be green on the head. A refusal posts the reason and the retry path on the
+to be green on the head.
+
+`force-merge` also must not add a red to the default branch. Every check that
+completed without passing on the head must be red on the default branch: the
+newest default-branch push run of the main CI workflow that ran that same job
+(not skipped it), within the last 10 commits, concluded `failure` or
+`timed_out`. A check from another workflow or app, or a job the default
+branch has not run in that window, cannot be shown red there, so it is
+refused. A head that fixes the default branch's red is green on that job and
+has nothing to compare. Checks still running on the head are listed, not
+compared. The applied or refused audit comment carries the per-check
+comparison table.
+
+A refusal posts the reason and the retry path on the
 pull request. `bypass-ci` is not guarded; each use logs a warning in the run
 summary. The guard lives in `scripts/merge-override-guard/`.
 

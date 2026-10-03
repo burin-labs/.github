@@ -7,7 +7,10 @@
 # force-merge and bypass-merge-queue skip the merge queue, so the queue-bypass
 # guard (scripts/merge-override-guard) also requires a justifying incident (a
 # red default branch or a `release-blocker` label) and refuses a head the queue
-# already rejected. A hand-applied `founder-override` label skips the guard.
+# already rejected. force-merge additionally refuses unless every check failing
+# on the head is red on the default branch's newest run of that job, and the
+# override comment prints that comparison. A hand-applied `founder-override`
+# label skips the guard.
 
 name: Merge override
 
@@ -178,6 +181,9 @@ jobs:
           GUARD_HEAD_SHA: ${{ inputs.head-sha }}
           GUARD_LABEL: ${{ steps.request.outputs.label }}
           GUARD_MAIN_CI_WORKFLOW: ${{ inputs.main-ci-workflow }}
+          # In a reusable workflow `github.workflow_ref` names the caller, the
+          # dispatcher whose earlier refused attempts left checks on the head.
+          GUARD_OVERRIDE_WORKFLOW_REF: ${{ github.workflow_ref }}
         shell: bash
         run: bash scripts/merge-override-guard/run.sh
 
@@ -467,6 +473,7 @@ jobs:
           GUARD_VERDICT: ${{ steps.guard.outputs.verdict }}
           GUARD_REASON: ${{ steps.guard.outputs.reason }}
           GUARD_RETRY: ${{ steps.guard.outputs.retry }}
+          GUARD_COMPARISON: ${{ steps.guard.outputs.comparison }}
           FOUNDER_OVERRIDE: ${{ steps.guard.outputs.founder_override }}
           FOUNDER_ACTOR: ${{ steps.guard.outputs.founder_actor }}
           SWEEP_OUTCOME: ${{ steps.sweep.outcome }}
@@ -529,4 +536,8 @@ jobs:
               removed_labels: $removed_labels, actors: $actors,
               reason: $reason, retry_action: $retry_action, actions: $actions}')"
           body="$(printf '%s' "$payload" | ruby scripts/merge_override.rb terminal-audit-body)"
+          # force-merge: the per-check head-against-main comparison the guard decided on.
+          if [[ -n "${GUARD_COMPARISON:-}" ]]; then
+            body+=$'\n\n'"$GUARD_COMPARISON"
+          fi
           gh pr comment "$PR" --repo "$REPO" --body "$body"
