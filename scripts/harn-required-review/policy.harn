@@ -1,0 +1,132 @@
+pub const REPOSITORY = "burin-labs/harn"
+pub const RULESET_NAME = "review required (harn)"
+pub const RELEASE_APP_ID = 3472013
+
+/** One repository rule, layered over existing organization and queue rules. */
+pub fn desired_ruleset() -> dict {
+  return {
+    name: RULESET_NAME,
+    target: "branch",
+    enforcement: "active",
+    conditions: {ref_name: {include: ["~DEFAULT_BRANCH"], exclude: []}},
+    bypass_actors: [{actor_id: RELEASE_APP_ID, actor_type: "Integration", bypass_mode: "always"}],
+    rules: [{type: "pull_request", parameters: {
+      required_approving_review_count: 1,
+      dismiss_stale_reviews_on_push: true,
+      require_code_owner_review: false,
+      require_last_push_approval: false,
+      required_review_thread_resolution: true,
+      allowed_merge_methods: ["squash", "rebase"],
+    }}],
+  }
+}
+
+/** Read-back may contain server defaults, but every policy field must match. */
+fn contains_policy(actual: unknown, expected: unknown) -> bool {
+  if type_of(expected) == "dict" {
+    if type_of(actual) != "dict" {
+      return false
+    }
+    for key in keys(expected) {
+      if !contains_policy(actual[key], expected[key]) {
+        return false
+      }
+    }
+    return true
+  }
+  if type_of(expected) == "list" {
+    if type_of(actual) != "list" || len(actual) != len(expected) {
+      return false
+    }
+    let index = 0
+    for value in expected {
+      if !contains_policy(actual[index], value) {
+        return false
+      }
+      index = index + 1
+    }
+    return true
+  }
+  return actual == expected
+}
+
+fn census(rulesets: unknown) -> list {
+  if type_of(rulesets) != "list" || len(rulesets) == 0 {
+    throw "ruleset census is unread or empty"
+  }
+  let ids = []
+  for item in rulesets {
+    if type_of(item) != "dict" || type_of(item?.id) != "int" || item.id <= 0
+      || ids.contains(item.id) || type_of(item?.rules) != "list"
+      || len(item.rules) == 0 || type_of(item?.conditions) != "dict"
+      || type_of(item?.bypass_actors) != "list" {
+      throw "ruleset census is incomplete or repeats an identity"
+    }
+    if !((item.source_type == "Repository" && item.source == REPOSITORY)
+      || (item.source_type == "Organization" && item.source == "burin-labs")) {
+      throw "ruleset census has a different policy owner"
+    }
+    ids = ids + [item.id]
+  }
+  return rulesets
+}
+
+/** Keep the audited protections visible; no protection is inferred from an empty read. */
+pub fn verify_installed(rulesets: unknown, effective_rules: unknown, release_app: unknown) -> dict {
+  const measured = census(rulesets)
+  if release_app?.id != RELEASE_APP_ID || release_app?.slug != "harn-release-bot" {
+    throw "release incident App identity is unproven"
+  }
+  const matches = measured.filter({ item -> item.name == RULESET_NAME }).to_list()
+  if len(matches) != 1 || matches[0].source_type != "Repository"
+    || !contains_policy(matches[0], desired_ruleset()) {
+    throw "Harn review rule is missing, conflicting, or has drifted"
+  }
+  // Lists are exact, even where object fields permit server-added defaults.
+  const review = matches[0].rules
+  if len(review) != 1 || !contains_policy(review[0], desired_ruleset().rules[0]) {
+    throw "Harn review rule has conflicting review semantics"
+  }
+  if type_of(effective_rules) != "list" || len(effective_rules) == 0 {
+    throw "effective default-branch rules are unread or empty"
+  }
+  let missing = []
+  for kind in ["required_signatures", "required_linear_history", "deletion", "non_fast_forward",
+    "merge_queue", "required_status_checks"] {
+    if !effective_rules.any({ rule -> rule?.type == kind }) {
+      missing = missing + [kind]
+    }
+  }
+  if !effective_rules.any({ rule -> rule?.type == "pull_request"
+    && rule?.parameters?.required_approving_review_count >= 1 }) {
+    missing = missing + ["one approving review"]
+  }
+  if len(missing) > 0 {
+    throw "default-branch protection is incomplete: " + join(missing, ", ")
+  }
+  return {ruleset_id: matches[0].id, measured_rulesets: len(measured),
+    measured_effective_rules: len(effective_rules), pending: 0, failing: []}
+}
+
+fn protected_shape(item: dict) -> dict {
+  return {id: item.id, name: item.name, source: item.source, source_type: item.source_type,
+    target: item.target, enforcement: item.enforcement, conditions: item.conditions,
+    bypass_actors: item.bypass_actors, rules: item.rules}
+}
+
+/** Applying this rule must leave every other measured rule and bypass unchanged. */
+pub fn verify_transition(before: unknown, after: unknown) {
+  const old = census(before)
+  const current = census(after)
+  const previous = old.filter({ item -> item.name != RULESET_NAME }).to_list()
+  const retained = current.filter({ item -> item.name != RULESET_NAME }).to_list()
+  if len(previous) != len(retained) {
+    throw "unrelated ruleset census changed"
+  }
+  for item in previous {
+    const found = retained.filter({ candidate -> candidate.id == item.id }).to_list()
+    if len(found) != 1 || protected_shape(found[0]) != protected_shape(item) {
+      throw "unrelated protection changed: " + to_string(item.id)
+    }
+  }
+}

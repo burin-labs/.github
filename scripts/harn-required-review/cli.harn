@@ -1,0 +1,31 @@
+import { live_reader } from "../merge-override-guard/live.harn"
+import { snapshot } from "./measure.harn"
+import { desired_ruleset, verify_installed, verify_transition } from "./policy.harn"
+
+fn required(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name)
+  if value == nil || trim(value) == "" { throw name + " is required" }
+  return value
+}
+
+/** No mutation here: apply the reviewed JSON through GitHub, then verify it. */
+fn main(harness: Harness) {
+  const mode = required(harness.env, "REVIEW_RULESET_MODE")
+  if mode == "plan" {
+    harness.stdio.println(json_stringify(desired_ruleset()))
+    return
+  }
+  if mode != "snapshot" && mode != "verify" {
+    throw "REVIEW_RULESET_MODE must be plan, snapshot, or verify"
+  }
+  const current = snapshot(live_reader(harness.tools, required(harness.env, "GH_TOKEN"),
+    harness.fs.mkdtemp_in_workspace("harn-review-gh-")))
+  if mode == "snapshot" {
+    harness.stdio.println(json_stringify(current))
+    return
+  }
+  const before = json_parse(harness.fs.read_text(required(harness.env, "REVIEW_RULESET_BEFORE")))
+  verify_transition(before?.rulesets, current.rulesets)
+  const verification = verify_installed(current.rulesets, current.effective_rules, current.release_app)
+  harness.stdio.println(json_stringify({snapshot: current, verification: verification}))
+}
