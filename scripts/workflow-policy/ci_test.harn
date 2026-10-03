@@ -126,6 +126,7 @@ pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
     "reusable-pin-drift",
     "runner-availability",
     "runner-fleet-health",
+    "ship",
     "smart-ship",
   ]
   assert_eq(
