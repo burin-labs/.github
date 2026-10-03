@@ -110,6 +110,10 @@ jobs:
         run: actionlint
       - name: Test graph-derived Rust impact planning
         run: node --test .github/actions/rust-test-impact/plan.test.mjs
+      - name: Test immutable CI baseline bootstrap transport
+        run: |
+          node --version
+          node --test .github/actions/ci-latency-policy/read-baseline.test.mjs .github/actions/ci-latency-policy/action.test.mjs
       - name: Test exact-tree CI proof reuse
         run: bash .github/actions/exact-tree-ci-proof/run-tests.sh
       - name: Test shell actions
