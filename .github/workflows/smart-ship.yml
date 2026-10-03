@@ -99,8 +99,8 @@ jobs:
           numbers="$(jq -r '
             (.pull_request.number // empty),
             (.workflow_run.pull_requests[]?.number // empty),
-            (.workflow_run.head_branch // "" | capture("^gh-readonly-queue/[^/]+/pr-(?<n>[0-9]+)-")?.n // empty),
-            (.merge_group.head_ref // "" | capture("/pr-(?<n>[0-9]+)-")?.n // empty)
+            ((.workflow_run.head_branch // "") | (capture("^gh-readonly-queue/[^/]+/pr-(?<n>[0-9]+)-").n)?),
+            ((.merge_group.head_ref // "") | (capture("/pr-(?<n>[0-9]+)-").n)?)
           ' "$event" | sort -u)"
           # A sweep, or an event that names no PR, looks at every labeled one.
           if [ -z "$numbers" ]; then
