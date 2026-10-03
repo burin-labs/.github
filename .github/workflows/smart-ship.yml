@@ -34,6 +34,13 @@ permissions:
 
 jobs:
   ship:
+    # One shepherd run at a time per repository. A sweep has no PR number and
+    # touches every labeled PR, so per-PR groups would let a sweep and an event
+    # run act on the same PR at once. Runs take about a minute; if GitHub
+    # replaces a queued run, the next sweep covers its PR.
+    concurrency:
+      group: smart-ship-${{ github.repository }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
