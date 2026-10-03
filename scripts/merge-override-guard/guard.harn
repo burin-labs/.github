@@ -363,10 +363,58 @@ fn completed_main_run(
 }
 
 /**
+ * The newest completed merge-group run of the main CI workflow whose group
+ * head is this default-branch commit: the queue run that tested exactly the
+ * tree the default branch now holds. Jobs the push run skips run here.
+ */
+fn merged_group_run(
+  reader: Reader,
+  request: Request,
+  default_branch: string,
+  sha: string,
+) -> dict? {
+  const runs = counted_pages(
+    reader,
+    "repos/" + request.repository + "/actions/workflows/" + request.main_ci_workflow
+      + "/runs?head_sha="
+      + sha
+      + "&event=merge_group",
+    "workflow_runs",
+  )
+  if runs.any({ run -> run?.head_sha != sha }) {
+    throw request.main_ci_workflow + " merge-group runs for " + sha + " included another commit"
+  }
+  const prefix = "gh-readonly-queue/" + default_branch + "/"
+  return latest_by(
+    runs.filter(
+      { run -> run.status == "completed" && (run?.head_branch ?? "").starts_with(prefix) },
+    )
+      .to_list(),
+    "created_at",
+  )
+}
+
+fn completed_job(reader: Reader, request: Request, run: dict, check: string) -> dict? {
+  const jobs = counted_pages(
+    reader,
+    "repos/" + request.repository + "/actions/runs/" + to_string(run.id) + "/jobs?filter=latest",
+    "jobs",
+  )
+  return latest_by(
+    jobs.filter(
+      { job -> job?.name == check && job?.status == "completed" && job?.conclusion != "skipped" },
+    )
+      .to_list(),
+    "started_at",
+  )
+}
+
+/**
  * Where did `check` last run to a verdict on the default branch? Walks back
- * past commits whose run skipped or omitted the job, so a path-filtered push
- * does not hide the job's current state. Nothing found reads as "never shown
- * red", not as green.
+ * from the tip. On each commit the push run answers first; a job the push run
+ * skipped or omitted is read from the merge-group run that produced that
+ * commit, since jobs that run only in the merge queue never run on push.
+ * Nothing found reads as "never shown red", not as green.
  */
 fn main_job_state(reader: Reader, request: Request, default_branch: string, check: string) -> dict {
   const repo = "repos/" + request.repository
@@ -375,37 +423,35 @@ fn main_job_state(reader: Reader, request: Request, default_branch: string, chec
     repo + "/commits?sha=" + default_branch + "&per_page=" + to_string(MAIN_WALK_LIMIT),
   )
   for commit in commits {
-    const run = completed_main_run(reader, request, default_branch, commit.sha)
-    if run == nil {
-      continue
-    }
-    const jobs = counted_pages(
-      reader,
-      repo + "/actions/runs/" + to_string(run.id) + "/jobs?filter=latest",
-      "jobs",
-    )
-    const job = latest_by(
-      jobs.filter(
-        { job ->
-          job?.name == check && job?.status == "completed"
-            && job?.conclusion
-              != "skipped"
-        },
-      )
-        .to_list(),
-      "started_at",
-    )
-    if job != nil {
-      return {
-        red: RED.contains(job.conclusion),
-        detail: to_string(job.conclusion) + " in run " + to_string(run.id) + " on "
-          + short(commit.sha),
+    // The merge-group run is read only when the push run did not run the job.
+    for source in ["push", "merge_group"] {
+      const run = source == "push" ? completed_main_run(
+        reader,
+        request,
+        default_branch,
+        commit.sha,
+      ) : merged_group_run(reader, request, default_branch, commit.sha)
+      if run == nil {
+        continue
+      }
+      const candidate = {source: source, run: run}
+      const job = completed_job(reader, request, candidate.run, check)
+      if job != nil {
+        return {
+          red: RED.contains(job.conclusion),
+          detail: to_string(job.conclusion) + " in " + candidate.source + " run "
+            + to_string(candidate.run.id)
+            + " on "
+            + short(commit.sha),
+        }
       }
     }
   }
   return {
     red: false,
-    detail: "did not run on the last " + to_string(len(commits)) + " commits of " + default_branch,
+    detail: "no push or merge-group run on the last " + to_string(len(commits)) + " commits of "
+      + default_branch
+      + " ran it",
   }
 }
 

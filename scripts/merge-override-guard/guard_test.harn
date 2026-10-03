@@ -127,6 +127,17 @@ fn head_checks(head: string, checks: list) -> dict {
   }
 }
 
+/** Merge-group runs of the main CI workflow whose group head is `sha`. */
+fn group_runs(sha: string, runs: list) -> dict {
+  return {
+    [REPO + "/actions/workflows/ci.yml/runs?head_sha=" + sha
+      + "&event=merge_group&per_page=100&page=1"]: page(
+      "workflow_runs",
+      runs.map({ run -> run + {head_sha: sha} }),
+    ),
+  }
+}
+
 /** The jobs of one default-branch CI run, each a `[name, conclusion]` pair. */
 fn main_jobs(run_id: int, jobs: list) -> dict {
   return {
@@ -399,13 +410,13 @@ pipeline test_force_merge_refuses_a_head_red_where_main_is_green() {
     decision.reason,
   )
   assert(
-    decision.reason.contains("Supply chain (head failure; success in run 900"),
+    decision.reason.contains("Supply chain (head failure; success in push run 900"),
     decision.reason,
   )
   assert(decision.retry.contains("only skips reds the default branch already has"), decision.retry)
   assert(
     decision.comparison.contains(
-      "| Supply chain | failure | success in run 900 on aaaaaaaaaaaa | new red |",
+      "| Supply chain | failure | success in push run 900 on aaaaaaaaaaaa | new red |",
     ),
     decision.comparison,
   )
@@ -420,7 +431,7 @@ pipeline test_force_merge_allows_a_head_whose_only_reds_main_already_has() {
   assert_eq(decision.verdict, "allowed")
   assert(
     decision.comparison.contains(
-      "| Build | failure | failure in run 900 on aaaaaaaaaaaa | inherited red |",
+      "| Build | failure | failure in push run 900 on aaaaaaaaaaaa | inherited red |",
     ),
     decision.comparison,
   )
@@ -443,6 +454,7 @@ pipeline test_a_job_main_skipped_is_judged_by_the_newest_run_that_ran_it() {
   const responses = world([], "failure")
     + head_checks(HEAD, [["Heavy", "failure", CI_WORKFLOW]])
     + main_jobs(900, [["Heavy", "skipped"]])
+    + group_runs(TIP, [])
     + main_runs(
       PARENT,
       [{id: 899, status: "completed", conclusion: "failure", created_at: "2026-10-02T09:00:00Z"}],
@@ -450,7 +462,10 @@ pipeline test_a_job_main_skipped_is_judged_by_the_newest_run_that_ran_it() {
     + main_jobs(899, [["Heavy", "failure"]])
   const decision = verdict(responses)
   assert_eq(decision.verdict, "allowed")
-  assert(decision.comparison.contains("failure in run 899 on bbbbbbbbbbbb"), decision.comparison)
+  assert(
+    decision.comparison.contains("failure in push run 899 on bbbbbbbbbbbb"),
+    decision.comparison,
+  )
 }
 
 pipeline test_a_job_main_never_ran_is_not_an_inherited_red() {
@@ -458,10 +473,15 @@ pipeline test_a_job_main_never_ran_is_not_an_inherited_red() {
   const responses = world([], "failure")
     + head_checks(HEAD, [["Heavy", "failure", CI_WORKFLOW]])
     + main_jobs(900, [["Heavy", "skipped"]])
+    + group_runs(TIP, [])
     + main_runs(PARENT, [])
+    + group_runs(PARENT, [])
   const decision = verdict(responses)
   assert_eq(decision.verdict, "refused")
-  assert(decision.reason.contains("did not run on the last 2 commits of main"), decision.reason)
+  assert(
+    decision.reason.contains("no push or merge-group run on the last 2 commits of main ran it"),
+    decision.reason,
+  )
 }
 
 pipeline test_a_failing_check_outside_main_ci_never_counts_as_inherited() {
@@ -495,4 +515,46 @@ pipeline test_bypass_merge_queue_does_not_compare_head_checks_with_main() {
   const decision = verdict(responses, request("bypass-merge-queue"))
   assert_eq(decision.verdict, "allowed")
   assert_eq(decision.comparison, "")
+}
+
+pipeline test_a_queue_only_job_is_judged_by_the_merged_group_run_of_main() {
+  // The push run skips the heavy tier; the merge-group run that produced the
+  // tip ran it. A group on another base never counts as main evidence.
+  const responses = world([], "failure")
+    + head_checks(HEAD, [["Heavy", "failure", CI_WORKFLOW], ["Census", "failure", CI_WORKFLOW]])
+    + main_jobs(900, [["Heavy", "skipped"], ["Census", "skipped"]])
+    + group_runs(
+      TIP,
+      [
+        {
+          id: 950,
+          status: "completed",
+          conclusion: "failure",
+          head_branch: "gh-readonly-queue/main/pr-41-" + PARENT,
+          created_at: "2026-10-02T09:30:00Z",
+        },
+        {
+          id: 951,
+          status: "completed",
+          conclusion: "success",
+          head_branch: "gh-readonly-queue/release/pr-40-" + PARENT,
+          created_at: "2026-10-02T09:40:00Z",
+        },
+      ],
+    )
+    + main_jobs(950, [["Heavy", "failure"], ["Census", "success"]])
+  const decision = verdict(responses)
+  assert_eq(decision.verdict, "refused")
+  assert(
+    decision.comparison.contains(
+      "| Heavy | failure | failure in merge_group run 950 on aaaaaaaaaaaa | inherited red |",
+    ),
+    decision.comparison,
+  )
+  assert(
+    decision.comparison.contains(
+      "| Census | failure | success in merge_group run 950 on aaaaaaaaaaaa | new red |",
+    ),
+    decision.comparison,
+  )
 }

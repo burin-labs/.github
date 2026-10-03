@@ -578,11 +578,14 @@ workflow rejects non-admins and fork pull requests, then acts with the
 to be green on the head.
 
 `force-merge` also must not add a red to the default branch. Every check that
-completed without passing on the head must be red on the default branch: the
-newest default-branch push run of the main CI workflow that ran that same job
-(not skipped it), within the last 10 commits, concluded `failure` or
-`timed_out`. A check from another workflow or app, or a job the default
-branch has not run in that window, cannot be shown red there, so it is
+completed without passing on the head must be red on the default branch.
+The guard walks the last 10 default-branch commits from the tip and takes the
+newest run of the main CI workflow that ran that same job (not skipped it):
+on each commit the push run first, then the merge-group run whose group head
+is that commit, which covers jobs that run only in the merge queue. The job
+counts as red when that run's job concluded `failure` or `timed_out`, and the
+comparison names which source answered. A check from another workflow or app,
+or a job no such run ran in that window, cannot be shown red there, so it is
 refused. A head that fixes the default branch's red is green on that job and
 has nothing to compare. Checks still running on the head are listed, not
 compared. The applied or refused audit comment carries the per-check
