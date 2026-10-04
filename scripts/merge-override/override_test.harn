@@ -1,0 +1,363 @@
+import { assert_error_contains } from "std/testing"
+import { append_log, draft_record, finish_record, measure } from "./override.harn"
+import {
+  NO_REASON,
+  log_issue_title,
+  record_markdown,
+  resolve_request,
+  select_competing_runs,
+} from "./policy.harn"
+
+const REPO = "repos/burin-labs/example"
+
+const HEAD = "1111111111111111111111111111111111111111"
+
+const INPUT = {
+  repository: "burin-labs/example",
+  organization: "burin-labs",
+  pr: 42,
+  head_sha: HEAD,
+  run_url: "https://github.com/burin-labs/example/actions/runs/9",
+}
+
+fn labeled(id: int, label: string, actor: string, at: string = "2026-10-04T17:17:27Z") -> dict {
+  return {id: id, event: "labeled", label: {name: label}, actor: {login: actor}, created_at: at}
+}
+
+fn check(name: string, conclusion: string?) -> dict {
+  return conclusion == nil ? {
+    name: name,
+    status: "in_progress",
+    started_at: "2026-10-04T17:00:00Z",
+  } : {
+    name: name,
+    status: "completed",
+    conclusion: conclusion,
+    completed_at: "2026-10-04T17:00:00Z",
+  }
+}
+
+/**
+ * Burin-code #10156 on 2026-10-04: an admin labels a green, approved head
+ * while a scheduled workflow on the default branch is red. Only the paths the
+ * override may read exist; reading anything else (the default branch, its
+ * workflow runs) throws, so a test passing proves the decision never looks.
+ */
+fn world(overrides: dict = {}) -> dict {
+  return {
+    [REPO + "/issues/42"]: {labels: [{name: "bypass-merge-queue"}]},
+    [REPO + "/issues/42/events?per_page=100"]: [
+      [labeled(7, "bypass-merge-queue", "kennethsinder")],
+    ],
+    [REPO + "/pulls/42"]: {
+      title: "Unblock main",
+      html_url: "https://github.com/burin-labs/example/pull/42",
+      state: "open",
+      merged: false,
+      node_id: "PR_42",
+      head: {sha: HEAD, repo: {full_name: "burin-labs/example"}},
+      base: {repo: {full_name: "burin-labs/example"}},
+    },
+    "orgs/burin-labs/memberships/kennethsinder": {role: "admin"},
+    [REPO + "/collaborators/kennethsinder/permission"]: {permission: "admin"},
+    "orgs/burin-labs/memberships/contributor": {role: "member"},
+    [REPO + "/collaborators/contributor/permission"]: {permission: "write"},
+    graphql: {repository: {pullRequest: {reviewDecision: "APPROVED"}}},
+    [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
+      {check_runs: [check("CI status", "success"), check("lint", "success")]},
+    ],
+    [REPO + "/issues/42/comments?per_page=100"]: [
+      [
+        {
+          user: {login: "kennethsinder"},
+          body: "override: fixes the repin rehearsal deadlocking the queue",
+          created_at: "2026-10-04T17:16:00Z",
+        },
+      ],
+    ],
+  }
+    + overrides
+}
+
+fn fake(paths: dict) -> dict {
+  let sent = []
+  const read = fn(path) {
+    if !contains(keys(paths), path) {
+      throw "unexpected read " + path
+    }
+    return paths[path]
+  }
+  const gh = {
+    read: read,
+    pages: read,
+    send: fn(method, path, body) {
+      sent = sent + [{method: method, path: path, body: body}]
+      return paths[method + " " + path]
+    },
+    graphql: fn(_query, _variables) { return paths.graphql },
+  }
+  return {gh: gh, sent: fn() { return sent }}
+}
+
+fn decided(paths: dict) -> dict {
+  const facts = measure(fake(paths).gh, INPUT)
+  assert(facts != nil)
+  return draft_record(facts, INPUT, "2026-10-04T17:18:00Z")
+}
+
+pipeline test_an_admin_bypass_lands_a_green_head_without_reading_the_default_branch(
+  harness: Harness,
+) {
+  const result = decided(world())
+  assert_eq(result.decision.verdict, "proceed", to_string(result.decision.refusals))
+  assert_eq(result.decision.plan.merge, true)
+  assert_eq(result.decision.plan.cancel_workflows, false)
+  assert_eq(result.record.reason, "fixes the repin rehearsal deadlocking the queue")
+  assert_eq(result.record.reason_source, "comment")
+  assert_eq(result.record.warnings, [])
+}
+
+pipeline test_a_non_admin_label_is_refused(harness: Harness) {
+  const paths = world(
+    {
+      [REPO + "/issues/42/events?per_page=100"]: [
+        [labeled(7, "bypass-merge-queue", "contributor")],
+      ],
+    },
+  )
+  const result = decided(paths)
+  assert_eq(result.decision.verdict, "refused")
+  assert(
+    result.decision.refusals[0].contains("@contributor is not an organization or repository admin"),
+  )
+}
+
+pipeline test_an_unreadable_admin_role_refuses(harness: Harness) {
+  // No membership or permission paths for this login: both reads throw.
+  const paths = world(
+    {[REPO + "/issues/42/events?per_page=100"]: [[labeled(7, "force-merge", "stranger")]]},
+  )
+    + {[REPO + "/issues/42"]: {labels: [{name: "force-merge"}]}}
+  assert_eq(decided(paths).decision.verdict, "refused")
+}
+
+pipeline test_fork_moved_head_and_closed_pull_requests_are_refused(harness: Harness) {
+  const base = world()[REPO + "/pulls/42"]
+  for pull in [
+    base + {head: {sha: HEAD, repo: {full_name: "someone/fork"}}},
+    base
+      + {
+        head: {
+          sha: "2222222222222222222222222222222222222222",
+          repo: {full_name: "burin-labs/example"},
+        },
+      },
+    base + {state: "closed", merged: true},
+  ] {
+    assert_eq(decided(world({[REPO + "/pulls/42"]: pull})).decision.verdict, "refused")
+  }
+}
+
+pipeline test_required_approval_refuses_every_label_but_force_merge(harness: Harness) {
+  for label in ["bypass-merge-queue", "bypass-ci", "force-merge"] {
+    const paths = world(
+      {
+        [REPO + "/issues/42"]: {labels: [{name: label}]},
+        [REPO + "/issues/42/events?per_page=100"]: [[labeled(7, label, "kennethsinder")]],
+        graphql: {repository: {pullRequest: {reviewDecision: "REVIEW_REQUIRED"}}},
+      },
+    )
+    assert_eq(
+      decided(paths).decision.verdict,
+      label == "force-merge" ? "proceed" : "refused",
+      label,
+    )
+  }
+  // A base that requires no review reports a nil decision and never refuses.
+  const unrequired = world({graphql: {repository: {pullRequest: {reviewDecision: nil}}}})
+  assert_eq(decided(unrequired).decision.verdict, "proceed")
+}
+
+pipeline test_bypass_merge_queue_needs_green_ci_and_force_merge_records_red_as_a_warning(
+  harness: Harness,
+) {
+  const red = {
+    [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
+      {check_runs: [check("CI status", "failure"), check("Harn repin rehearsal", "failure")]},
+    ],
+  }
+  const refused = decided(world(red))
+  assert_eq(refused.decision.verdict, "refused")
+  assert(refused.decision.refusals[0].contains("use `force-merge`"))
+  const running = decided(
+    world(
+      {
+        [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
+          {check_runs: [check("CI status", nil)]},
+        ],
+      },
+    ),
+  )
+  assert_eq(running.decision.checks.ci_status, "in_flight")
+  assert_eq(running.decision.verdict, "refused")
+  const forced = decided(
+    world(
+      red
+        + {
+          [REPO + "/issues/42"]: {labels: [{name: "force-merge"}]},
+          [REPO + "/issues/42/events?per_page=100"]: [[labeled(7, "force-merge", "kennethsinder")]],
+        },
+    ),
+  )
+  assert_eq(forced.decision.verdict, "proceed")
+  assert_eq(
+    forced.decision.checks.failing,
+    ["CI status (failure)", "Harn repin rehearsal (failure)"],
+  )
+  assert(forced.decision.warnings[0].starts_with("head checks not passing"))
+}
+
+pipeline test_the_reason_is_the_actors_newest_override_comment_or_a_recorded_absence(
+  harness: Harness,
+) {
+  const comments = [
+    {user: {login: "kennethsinder"}, body: "override: older", created_at: "2026-10-04T17:00:00Z"},
+    {
+      user: {login: "kennethsinder"},
+      body: "Override: newer\nsecond line",
+      created_at: "2026-10-04T17:10:00Z",
+    },
+    {
+      user: {login: "contributor"},
+      body: "override: not the actor",
+      created_at: "2026-10-04T17:15:00Z",
+    },
+  ]
+  const found = decided(world({[REPO + "/issues/42/comments?per_page=100"]: [comments]}))
+  assert_eq(found.record.reason, "newer")
+  const none = decided(world({[REPO + "/issues/42/comments?per_page=100"]: [[]]}))
+  assert_eq(none.decision.verdict, "proceed")
+  assert_eq(none.record.reason, NO_REASON)
+  assert_eq(none.record.warnings, [NO_REASON])
+  const record = finish_record(
+    none.record,
+    {decide: "success", merge: "success"},
+    {merge_commit: "abc"},
+    "2026-10-04T17:19:00Z",
+  )
+  assert(
+    record_markdown(record).contains(
+      "@kennethsinder please reply with a one-line `override: <reason>`",
+    ),
+  )
+}
+
+pipeline test_attached_labels_resolve_to_the_strongest_and_keep_every_actor(harness: Harness) {
+  const request = resolve_request(
+    ["bypass-ci", "force-merge", "docs"],
+    [
+      labeled(1, "bypass-ci", "b-admin"),
+      labeled(2, "force-merge", "a-admin", "2026-10-04T17:00:00Z"),
+      {
+        id: 3,
+        event: "unlabeled",
+        label: {name: "force-merge"},
+        actor: {login: "bot"},
+        created_at: "2026-10-04T16:00:00Z",
+      },
+    ],
+  )
+  assert_eq(request.label, "force-merge")
+  assert_eq(request.actors, ["a-admin", "b-admin"])
+  assert_eq(request.label_events, {"bypass-ci": 1, "force-merge": 2})
+  assert_eq(resolve_request(["docs"], []).label, nil)
+  assert_error_contains(
+    { ->
+      resolve_request(
+        ["force-merge"],
+        [{id: 9, event: "unlabeled", label: {name: "force-merge"}, actor: {login: "x"}}],
+      )
+    },
+    "could not identify the actor",
+  )
+}
+
+pipeline test_competing_runs_exclude_the_override_and_a_short_census_throws(harness: Harness) {
+  const page = { runs -> [{total_count: len(runs), workflow_runs: runs}] }
+  let pages = {}
+  for status in ["requested", "queued", "waiting", "pending"] {
+    pages = pages + {[status]: page([])}
+  }
+  const selection = select_competing_runs(
+    9,
+    100,
+    pages
+      + {
+        in_progress: page(
+          [{id: 9, workflow_id: 100}, {id: 8, workflow_id: 100}, {id: 5, workflow_id: 200}],
+        ),
+      },
+  )
+  assert_eq(selection.competing_run_ids, [5])
+  assert_eq(selection.override_run_ids, [8])
+  assert_error_contains(
+    { ->
+      select_competing_runs(
+        9,
+        100,
+        pages + {in_progress: [{total_count: 2, workflow_runs: [{id: 5, workflow_id: 200}]}]},
+      )
+    },
+    "measured 1 of 2",
+  )
+}
+
+pipeline test_the_outcome_and_org_log_entry_cover_every_attempt(harness: Harness) {
+  const draft = decided(world()).record
+  const applied = finish_record(
+    draft,
+    {decide: "success", merge: "success", cleanup: "success"},
+    {merge_commit: "abc123", removed_labels: ["bypass-merge-queue"]},
+    "2026-10-04T17:19:00Z",
+  )
+  assert_eq(applied.outcome, "applied")
+  assert_eq(applied.merge_commit, "abc123")
+  const errored = finish_record(
+    draft,
+    {decide: "success", merge: "failure"},
+    {},
+    "2026-10-04T17:19:00Z",
+  )
+  assert_eq(errored.outcome, "errored")
+  assert(errored.error.contains("merge"))
+  const refused = finish_record(
+    draft + {refusals: ["no"]},
+    {decide: "failure"},
+    {},
+    "2026-10-04T17:19:00Z",
+  )
+  assert_eq(refused.outcome, "refused")
+  assert_eq(log_issue_title("2026-10-04T17:19:00Z"), "Merge overrides 2026-Q4")
+  assert_eq(log_issue_title("2027-03-31T23:59:00Z"), "Merge overrides 2027-Q1")
+  const listing = "repos/burin-labs/override-log/issues?labels=override-log&state=all&per_page=100"
+  // First override of the quarter opens the issue, then comments on it.
+  const empty = fake(
+    {
+      [listing]: [[{number: 3, title: "Merge overrides 2026-Q3"}]],
+      "POST repos/burin-labs/override-log/issues": {number: 4},
+      "POST repos/burin-labs/override-log/issues/4/comments": {html_url: "u"},
+    },
+  )
+  assert_eq(append_log(empty.gh, "burin-labs/override-log", applied), "u")
+  const sent = empty.sent()
+  assert_eq(sent[0].body.title, "Merge overrides 2026-Q4")
+  assert(sent[1].body.body.contains("\"merge_commit\":\"abc123\""))
+  assert(sent[1].body.body.starts_with("applied `bypass-merge-queue` on burin-labs/example#42"))
+  // Later overrides reuse it.
+  const existing = fake({[listing]: [[{number: 4, title: "Merge overrides 2026-Q4"}]]})
+  append_log(existing.gh, "burin-labs/override-log", applied)
+  assert_eq(
+    existing.sent().map({ call -> call.path }),
+    ["repos/burin-labs/override-log/issues/4/comments"],
+  )
+}

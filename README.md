@@ -543,103 +543,73 @@ markers and upstream naming schemes are left alone.
 
 ## Merge overrides
 
-Use these labels when the normal merge queue or required `CI status` check is
-the wrong tool for a rare, time-sensitive land. Labels are the trigger;
-organization or repository admin membership is the authority. The reusable
-workflow rejects non-admins and fork pull requests, then acts with the
+Use these labels when the merge queue or the required `CI status` check is the
+wrong tool for a rare, time-sensitive land. Labels are the trigger; organization
+or repository admin is the authority. The workflow acts with the
 `harn-release-bot` installation token (a ruleset bypass actor).
 
 - `bypass-ci`: cancel competing runs for the head SHA and publish a successful
   `CI status` check after those runs stop. Does not merge. If GitHub cannot
-  stop a run within two minutes, the override fails closed instead of racing
-  that run's final status.
-- `bypass-merge-queue`: squash-merge immediately when `CI status` is already
-  green. Skips the merge queue but does not override CI. An in-flight check is
-  reported as in flight, not missing.
-- `force-merge`: publish successful `CI status`, then squash-merge immediately.
-  Skips CI proof and the merge queue, but only for reds the default branch
-  already has (see the guard below).
+  stop a run within two minutes, the override fails instead of racing that
+  run's final status.
+- `bypass-merge-queue`: squash-merge the green head now, without the merge queue.
+- `force-merge`: cancel competing runs, publish a successful `CI status`, and
+  squash-merge now.
 
-### Queue-bypass guard
+### What refuses an override
 
-`force-merge` and `bypass-merge-queue` are refused unless both hold:
+The label is an admin's decision; the workflow does not ask for proof of an
+incident or read the default branch's health. `scripts/merge-override/` refuses
+only what is unsafe whoever asks, before any side effect:
 
-1. **An incident justifies skipping the queue.** Either the default branch is
-   red, meaning the newest default-branch commit with a completed push run of
-   the main CI workflow (`ci.yml` unless the caller passes
-   `main-ci-workflow`) concluded `failure` or `timed_out`; or the pull request
-   carries `release-blocker`, which belongs only on a pull request that
-   unblocks a release.
-2. **The queue has not already rejected this head.** No merge-group run for
-   the pull request failed after GitHub first saw its current head. Pushing a
-   new head clears an earlier rejection.
+| Refusal | Why it stays |
+| --- | --- |
+| A label actor is not an organization or repository admin, re-checked from the issue event that attached the label | Applying a label needs only triage; this is the authority check |
+| The head lives in a fork | The release app would merge code from outside the organization |
+| The head moved after the label was applied | The admin approved a different commit; the merge also pins the labeled SHA |
+| The pull request is not open | Nothing to merge |
+| Required approval is missing (GitHub `reviewDecision` is `REVIEW_REQUIRED` or `CHANGES_REQUESTED`), except for `force-merge` | The release app bypasses review rules; `force-merge` is the label that skips review too |
+| `bypass-merge-queue` on a head whose `CI status` is not green | That label promises CI passed; `force-merge` is the label that says it did not |
 
-`bypass-merge-queue` also needs every check the base branch's rulesets require
-to be green on the head.
-
-`force-merge` also must not add a red to the default branch. Every check that
-completed without passing on the head must be red on the default branch.
-The guard walks the last 10 default-branch commits from the tip and takes the
-newest run of the main CI workflow that ran that same job (not skipped it):
-on each commit the push run first, then the merge-group run whose group head
-is that commit, which covers jobs that run only in the merge queue. The job
-counts as red when that run's job concluded `failure` or `timed_out`, and the
-comparison names which source answered. A check from another workflow or app,
-or a job no such run ran in that window, cannot be shown red there, so it is
-refused. A head that fixes the default branch's red is green on that job and
-has nothing to compare. Checks still running on the head are listed, not
-compared. The applied or refused audit comment carries the per-check
-comparison table.
-
-A refusal posts the reason and the retry path on the
-pull request. `bypass-ci` is not guarded; each use logs a warning in the run
-summary. The guard lives in `scripts/merge-override-guard/`.
-
-**`founder-override` is the emergency escape.** Only the founder applies it,
-by hand; agents never apply it. Add it before the bypass label: with both
-attached, the guard is skipped, the run summary and audit comment say so, and
-the attempt consumes `founder-override` so the next bypass faces the guard
-again.
+Red checks on the head, checks still running, and a missing reason are
+warnings in the record, never refusals.
 
 Override attempts are serialized per pull request. If several labels are
 attached before an attempt starts, the workflow consumes them together and
-selects the strongest request: `force-merge`, then `bypass-merge-queue`, then
+selects the strongest: `force-merge`, then `bypass-merge-queue`, then
 `bypass-ci`. Its cancellation sweep excludes every run of the override
-dispatcher, so concurrent label events cannot cancel one another.
+dispatcher, so concurrent label events cannot cancel one another. The workflow
+removes each consumed label on every terminal path.
 
-### When to use an override
+### Reason and audit record
 
-- The default branch is red and this pull request fixes it forward.
-- This pull request unblocks a release; add `release-blocker` first.
-- Required CI is broken in a way you can fix forward on `main` within the same
-  working session.
+The reason is the newest pull request comment by the label actor that starts
+with `override:`, for example `override: fixes the repin rehearsal that
+deadlocks the queue`. Post it before applying the label. Without one the
+record says `no reason given` and the audit comment asks the actor to reply
+with one; the override never waits for it.
 
-### When not to use an override
+Every attempt, applied, refused, or errored, writes one record with who, which
+label, when, the pull request, the head SHA, the head's check states at decision
+time, the review decision, the reason, the outcome, the actions taken, and the
+merge commit:
 
-- Ordinary feature work, dependency bumps, or “CI is slow today.”
-- A merge-queue backlog or Actions spend alone; the guard refuses it.
-- A head the merge queue already rejected; fix it and push a new head.
-- Changes you cannot fix forward if they break `main`.
-- Pull requests from forks (the workflow refuses them).
+- as a comment on the pull request and in the run's step summary;
+- as one comment on the quarter's `Merge overrides YYYY-Qn` issue in the
+  private `burin-labs/override-log` repository, with the record as JSON.
 
-### How to apply
+The org log is an issue thread rather than a committed file because issue
+comments need no branch protection, never conflict between concurrent
+overrides, and survive deletion of the source pull request or branch. Export a
+quarter as JSON Lines for an auditor's change-management sample:
 
-1. Confirm you are an organization owner/admin or repository admin.
-2. On a same-repo PR, add the label whose meaning matches the intended action.
-3. Read the terminal audit comment. It records the selected request, every
-   consumed label, the re-checked actors, the actions taken, and whether the
-   attempt was applied, refused, or errored.
-4. The workflow removes each consumed label on every terminal path. A label
-   that remains attached therefore represents a pending or active attempt. For
-   a refusal or error, follow the audit comment's reason and re-apply the named
-   label to retry.
-
-Organization admins can also use GitHub’s “Bypass rules and merge” UI: the
-org-wide `main protection` ruleset grants `OrganizationAdmin` bypass in
-`pull_request` mode.
+```bash
+gh api --paginate "repos/burin-labs/override-log/issues/<N>/comments" \
+  --jq '.[].body | capture("```json\n(?<r>.*)\n```"; "s").r'
+```
 
 People and agents use these labels, not `gh pr merge --admin`. An admin merge
-skips the merge queue without an audit comment, and the queue is the only check
+skips the merge queue and leaves no record, and the queue is the only check
 that runs on the combined tree. GitHub ignores `-merge` in `.gitattributes`, so
 two pull requests that each regenerate one file can merge into a stale file
 (burin-labs/harn#8817). `burin-labs/harn`'s `merge queue` ruleset has no admin
@@ -651,8 +621,9 @@ Copy `templates/merge-override-dispatch.yml` to
 `.github/workflows/merge-override-dispatch.yml` and pin the reusable workflow
 to the full commit SHA of this repository that introduced or last changed
 `merge-override.yml`. Keep its `issues: write` permission: the reusable workflow
-uses the issue event history to re-check who applied every coalesced label and
-removes those labels at terminal completion. Create the labels once:
+reads the issue event history to re-check who applied every coalesced label,
+reads comments for the reason, and removes consumed labels. Pass the release
+app secrets: the merge and the org log both use it. Create the labels once:
 
 ```bash
 for name in bypass-ci bypass-merge-queue force-merge; do
@@ -661,11 +632,6 @@ for name in bypass-ci bypass-merge-queue force-merge; do
     --description "Privileged merge/CI override (org admin only)" \
     2>/dev/null || true
 done
-gh label create release-blocker --repo burin-labs/<repo> --color D93F0B \
-  --description "Unblocks a release; justifies a queue bypass" 2>/dev/null || true
-gh label create founder-override --repo burin-labs/<repo> --color 000000 \
-  --description "Founder only, by hand: skips the queue-bypass guard. \
-Agents never apply this." 2>/dev/null || true
 ```
 
 Public repositories stay in scope: applying a label still requires triage or

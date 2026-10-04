@@ -1,0 +1,71 @@
+import { command_output_tail, command_run } from "std/command"
+
+/** Everything the override asks of GitHub. Every call throws on failure. */
+pub type GitHub = {
+  /** One REST GET, parsed. */
+  read: fn(string) -> unknown,
+  /** A paginated REST GET as `--paginate --slurp` pages. */
+  pages: fn(string) -> list,
+  /** A REST write with a JSON body, parsed; an empty response is nil. */
+  send: fn(string, string, dict) -> unknown,
+  /** A GraphQL query with string variables, parsed `data`. */
+  graphql: fn(string, dict) -> unknown,
+}
+
+fn diagnostic(tools: HarnessTools, result: dict) -> string {
+  const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
+  const lines = trim(stderr).split("\n")
+  const text = trim(join(lines[max(0, len(lines) - 3):len(lines)], " "))
+  return text == "" ? "exit " + to_string(result?.exit_code) : text
+}
+
+/** gh keeps its config and caches under scratch, inside the sandbox's write roots. */
+pub fn live_github(
+  host: {fs: HarnessFs, tools: HarnessTools},
+  token: string,
+  scratch: string,
+) -> GitHub {
+  const env = {
+    GH_TOKEN: token,
+    GH_CONFIG_DIR: path_join(scratch, "config"),
+    XDG_CACHE_HOME: path_join(scratch, "cache"),
+    XDG_STATE_HOME: path_join(scratch, "state"),
+    XDG_DATA_HOME: path_join(scratch, "data"),
+    GH_PROMPT_DISABLED: "1",
+    GH_NO_UPDATE_NOTIFIER: "1",
+    NO_COLOR: "1",
+  }
+  const options = {capture: {max_inline_bytes: 20000000}, env: env, timeout_ms: 120000}
+  const tools = host.tools
+  const run = fn(argv, what) {
+    const result = command_run(tools, argv, options)
+    if !result.success {
+      throw what + " failed: " + diagnostic(tools, result)
+    }
+    return trim(result.stdout) == "" ? nil : json_parse(result.stdout)
+  }
+  let sequence = 0
+  return {
+    read: fn(path) { return run(["gh", "api", path], "GET " + path) },
+    pages: fn(path) {
+      const value = run(["gh", "api", "--paginate", "--slurp", path], "GET " + path)
+      if type_of(value) != "list" {
+        throw "GET " + path + " did not return pages"
+      }
+      return value
+    },
+    send: fn(method, path, body) {
+      sequence = sequence + 1
+      const input = path_join(scratch, "body-" + to_string(sequence) + ".json")
+      host.fs.write_text(input, json_stringify(body))
+      return run(["gh", "api", "-X", method, path, "--input", input], method + " " + path)
+    },
+    graphql: fn(query, variables) {
+      let argv = ["gh", "api", "graphql", "-f", "query=" + query]
+      for entry in variables.entries() {
+        argv = argv + ["-F", entry.key + "=" + to_string(entry.value)]
+      }
+      return run(argv, "GraphQL query")?.data
+    },
+  }
+}

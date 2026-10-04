@@ -227,10 +227,9 @@ pipeline test_override_waits_for_competing_runs_before_publishing(harness: Harne
   const publish = "Publish successful CI status check"
   assert(names.contains(cancel) && names.contains(publish))
   assert(names.index_of(cancel) < names.index_of(publish))
-  const command = step(steps, cancel).run
-  for required in ["gh run watch \"$run_id\"", "timeout 120", "run_status=\"$(gh api"] {
-    assert(command.contains(required), required)
-  }
+  // cancel_competing in scripts/merge-override waits for every cancelled run to complete.
+  assert_eq(step(steps, cancel).run, "bash scripts/merge-override/run.sh cancel")
+  assert(step(steps, publish)["if"].contains("steps.cancel.outcome != 'failure'"))
 }
 
 fn assert_override_token_scope(inputs: dict) {
@@ -258,7 +257,7 @@ pipeline test_override_merge_uses_repository_scoped_workflow_authority(harness: 
   assert_override_token_scope(token["with"])
   const merge = step(steps, "Squash-merge pull request")
   assert_eq(merge.env.GH_TOKEN, expression("steps.app-token.outputs.token"))
-  assert(merge.run.contains("gh api -X PUT"))
+  assert_eq(merge.run, "bash scripts/merge-override/run.sh merge")
   for damaged in [
     token["with"].removing("permission-workflows"),
     token["with"] + {"permission-workflows": "read"},

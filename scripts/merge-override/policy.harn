@@ -1,0 +1,476 @@
+/**
+ * Merge override policy: which attached label acts, who may apply it, what it
+ * does, and the audit record every attempt leaves.
+ *
+ * An override is an admin's decision. The policy refuses only what is unsafe
+ * whoever asks: a non-admin actor, a fork head, a head that moved after the
+ * label, a pull request that is no longer open, missing required approval
+ * (except `force-merge`), and `bypass-merge-queue` on a head whose `CI status`
+ * is not green, because that label promises CI passed and `force-merge` is the
+ * label that says it did not. Everything else (the default branch's health,
+ * other red checks, a missing reason) is recorded as a warning and never
+ * refuses.
+ *
+ * Every function here is pure; `measure` in decide.harn reads GitHub.
+ */
+pub const LABELS = ["bypass-ci", "bypass-merge-queue", "force-merge"]
+
+/** When several labels are attached at once, the strongest acts and all are consumed. */
+pub const LABEL_PRECEDENCE = ["force-merge", "bypass-merge-queue", "bypass-ci"]
+
+pub const ACTIVE_RUN_STATUSES = ["requested", "queued", "in_progress", "waiting", "pending"]
+
+pub const REQUIRED_CHECK = "CI status"
+
+pub const REASON_PREFIX = "override:"
+
+pub const NO_REASON = "no reason given"
+
+/** GitHub counts these conclusions as satisfying a required check. */
+const PASSING = ["success", "neutral", "skipped"]
+
+const BLOCKING_REVIEW = ["REVIEW_REQUIRED", "CHANGES_REQUESTED"]
+
+const LIST_CAP = 20
+
+pub type Request = {
+  label: string?,
+  labels: list<string>,
+  actors: list<string>,
+  /** Label name to the id of the issue event that attached it. */
+  label_events: dict,
+  /** Label name to that event's timestamp. */
+  labeled_at: dict,
+}
+
+pub type Actor = {login: string, membership_role: string, repository_permission: string}
+
+/** Everything the decision reads, measured once before any side effect. */
+pub type Facts = {
+  repository: string,
+  pr: int,
+  pr_title: string,
+  pr_url: string,
+  pr_state: string,
+  base_repository: string,
+  head_repository: string,
+  /** The head the label event saw. */
+  labeled_head_sha: string,
+  /** The head the pull request has now. */
+  current_head_sha: string,
+  request: Request,
+  actors: list<Actor>,
+  /** GraphQL `reviewDecision`; nil when the base requires no review. */
+  review_decision: string?,
+  check_runs: list,
+  comments: list,
+}
+
+pub type Plan = {cancel_workflows: bool, publish_ci_status: bool, merge: bool}
+
+pub type CheckSummary = {
+  ci_status: string,
+  total: int,
+  passing: int,
+  failing: list<string>,
+  pending: list<string>,
+}
+
+pub type Decision = {
+  verdict: string,
+  refusals: list<string>,
+  warnings: list<string>,
+  plan: Plan,
+  reason: string,
+  reason_source: string,
+  checks: CheckSummary,
+}
+
+fn latest_label_event(events: list, label: string) -> dict? {
+  let latest = nil
+  for event in events {
+    if event?.label?.name != label {
+      continue
+    }
+    if latest == nil
+      || [event?.created_at ?? "", event?.id ?? 0] > [latest?.created_at ?? "", latest?.id ?? 0] {
+      latest = event
+    }
+  }
+  return latest
+}
+
+/**
+ * Validate a `gh api --paginate --slurp` issue-event census: a non-empty list
+ * of pages, each a list of events with unique positive ids.
+ */
+pub fn issue_events_from_pages(pages: unknown) -> list {
+  if type_of(pages) != "list" || len(pages) == 0 {
+    throw "issue-event census must contain at least one page"
+  }
+  let events = []
+  for page in pages {
+    if type_of(page) != "list" {
+      throw "issue-event census page was not an array"
+    }
+    events = events + page
+  }
+  let ids = []
+  for event in events {
+    const id = event?.id
+    if type_of(id) != "int" || id <= 0 {
+      throw "issue-event census item omitted a positive event id"
+    }
+    if ids.contains(id) {
+      throw "issue-event census contained a duplicate event id"
+    }
+    ids = ids + [id]
+  }
+  return events
+}
+
+/**
+ * Resolve one serialized attempt from the labels attached when the run holds
+ * the per-PR lock. GitHub keeps one pending member of a concurrency group, so
+ * the surviving run consumes every attached label; issue events keep each
+ * label's actor even when the run that event created was replaced.
+ */
+pub fn resolve_request(attached: list, events: list) -> Request {
+  const labels = LABELS.filter({ label -> attached.contains(label) }).to_list()
+  if len(labels) == 0 {
+    return {label: nil, labels: [], actors: [], label_events: {}, labeled_at: {}}
+  }
+  let actors = []
+  let label_events = {}
+  let labeled_at = {}
+  for label in labels {
+    const latest = latest_label_event(events, label)
+    const login = latest?.actor?.login
+    if latest?.event != "labeled" || type_of(login) != "string" {
+      throw "could not identify the actor for attached label " + label
+    }
+    if !actors.contains(login) {
+      actors = actors + [login]
+    }
+    label_events = label_events + {[label]: latest.id}
+    labeled_at = labeled_at + {[label]: latest?.created_at ?? ""}
+  }
+  return {
+    label: LABEL_PRECEDENCE.filter({ label -> labels.contains(label) }).to_list()[0],
+    labels: labels,
+    actors: actors.sorted(),
+    label_events: label_events,
+    labeled_at: labeled_at,
+  }
+}
+
+pub fn plan(label: string) -> Plan {
+  if label == "bypass-ci" {
+    return {cancel_workflows: true, publish_ci_status: true, merge: false}
+  }
+  if label == "bypass-merge-queue" {
+    return {cancel_workflows: false, publish_ci_status: false, merge: true}
+  }
+  if label == "force-merge" {
+    return {cancel_workflows: true, publish_ci_status: true, merge: true}
+  }
+  throw "unknown override label: " + label
+}
+
+fn latest_check(runs: list, name: string) -> dict? {
+  let latest = nil
+  for run in runs {
+    if run?.name != name {
+      continue
+    }
+    const stamp = run?.completed_at ?? run?.started_at ?? ""
+    if latest == nil || stamp > (latest?.completed_at ?? latest?.started_at ?? "") {
+      latest = run
+    }
+  }
+  return latest
+}
+
+fn capped(names: list) -> list<string> {
+  const sorted = names.sorted()
+  if len(sorted) <= LIST_CAP {
+    return sorted
+  }
+  return sorted[0:LIST_CAP] + ["and " + to_string(len(sorted) - LIST_CAP) + " more"]
+}
+
+/** Head check states at decision time: the evidence an auditor asks for. */
+pub fn summarize_checks(check_runs: list) -> CheckSummary {
+  let names = []
+  for run in check_runs {
+    if !names.contains(run?.name) {
+      names = names + [run?.name]
+    }
+  }
+  let passing = 0
+  let failing = []
+  let pending = []
+  for name in names {
+    const run = latest_check(check_runs, name)
+    if run?.status != "completed" {
+      pending = pending + [name]
+    } else if PASSING.contains(run?.conclusion) {
+      passing = passing + 1
+    } else {
+      failing = failing + [name + " (" + to_string(run?.conclusion) + ")"]
+    }
+  }
+  const required = latest_check(check_runs, REQUIRED_CHECK)
+  const ci_status =
+    required == nil ? "missing" : required?.status != "completed" ? "in_flight" : to_string(
+    required?.conclusion ?? "unknown",
+  )
+  return {
+    ci_status: ci_status,
+    total: len(names),
+    passing: passing,
+    failing: capped(failing),
+    pending: capped(pending),
+  }
+}
+
+/**
+ * The newest comment by a label actor whose body starts with `override:`. The
+ * reason is that comment's first line after the prefix.
+ */
+pub fn override_reason(comments: list, actors: list) -> string? {
+  let latest = nil
+  for comment in comments {
+    const body = trim(comment?.body ?? "")
+    if !actors.contains(comment?.user?.login) || !body.lower().starts_with(REASON_PREFIX) {
+      continue
+    }
+    if latest == nil || (comment?.created_at ?? "") >= (latest?.created_at ?? "") {
+      latest = comment
+    }
+  }
+  if latest == nil {
+    return nil
+  }
+  const text = trim(trim(latest.body)[len(REASON_PREFIX):].split("\n")[0])
+  if text == "" {
+    return nil
+  }
+  return len(text) > 500 ? text[0:500] + "..." : text
+}
+
+fn is_admin(actor: Actor) -> bool {
+  return actor.membership_role == "admin" || actor.repository_permission == "admin"
+}
+
+/** Apply the policy. Refusals are the hard checks; warnings only reach the record. */
+pub fn decide(facts: Facts) -> Decision {
+  const label = facts.request.label
+  if label == nil {
+    throw "decide needs an active override request"
+  }
+  const checks = summarize_checks(facts.check_runs)
+  let refusals = []
+  for actor in facts.actors {
+    if !is_admin(actor) {
+      refusals = refusals
+        + [
+          "@" + actor.login + " is not an organization or repository admin (organization role "
+            + actor.membership_role
+            + ", repository permission "
+            + actor.repository_permission
+            + ")",
+        ]
+    }
+  }
+  if facts.head_repository != facts.base_repository {
+    refusals = refusals
+      + ["the head lives in fork " + facts.head_repository + ", not " + facts.base_repository]
+  }
+  if facts.pr_state != "open" {
+    refusals = refusals + ["the pull request is " + facts.pr_state + ", not open"]
+  }
+  if facts.current_head_sha != facts.labeled_head_sha {
+    refusals = refusals
+      + [
+        "the head moved from " + facts.labeled_head_sha[0:12] + " to "
+          + facts.current_head_sha[0:12]
+          + " after the label was applied",
+      ]
+  }
+  if label != "force-merge" && BLOCKING_REVIEW.contains(facts.review_decision) {
+    refusals = refusals
+      + [
+        "the base branch requires approval and the review decision is "
+          + to_string(facts.review_decision),
+      ]
+  }
+  if label == "bypass-merge-queue" && checks.ci_status != "success" {
+    refusals = refusals
+      + [
+        "`" + REQUIRED_CHECK + "` is " + checks.ci_status
+          + " on the head; `bypass-merge-queue` lands only a green head, so use `force-merge` to land it anyway",
+      ]
+  }
+  const reason = override_reason(facts.comments, facts.request.actors)
+  let warnings = []
+  if reason == nil {
+    warnings = warnings + [NO_REASON]
+  }
+  if len(checks.failing) > 0 {
+    warnings = warnings + ["head checks not passing: " + join(checks.failing, ", ")]
+  }
+  if len(checks.pending) > 0 {
+    warnings = warnings + ["head checks still running: " + join(checks.pending, ", ")]
+  }
+  return {
+    verdict: len(refusals) == 0 ? "proceed" : "refused",
+    refusals: refusals,
+    warnings: warnings,
+    plan: plan(label),
+    reason: reason ?? NO_REASON,
+    reason_source: reason == nil ? "none" : "comment",
+    checks: checks,
+  }
+}
+
+/**
+ * Select the active workflow runs on the head that a cancelling override must
+ * stop. `status_pages` maps each active status to a `--paginate --slurp`
+ * census; a census that cannot reach its own reported total throws instead of
+ * reading as "nothing to cancel". Runs of the override's own workflow are
+ * never competitors.
+ */
+pub fn select_competing_runs(
+  current_run_id: int,
+  current_workflow_id: int,
+  status_pages: dict,
+) -> dict {
+  if current_run_id <= 0 || current_workflow_id <= 0 {
+    throw "current run and workflow ids must be positive"
+  }
+  let by_id = {}
+  for status in ACTIVE_RUN_STATUSES {
+    const pages = status_pages[status]
+    if type_of(pages) != "list" || len(pages) == 0 {
+      throw status + " workflow-run census is missing"
+    }
+    let runs = []
+    let totals = []
+    for page in pages {
+      if type_of(page?.workflow_runs) != "list" || type_of(page?.total_count) != "int" {
+        throw status + " workflow-run census page omitted workflow_runs or total_count"
+      }
+      runs = runs + page.workflow_runs
+      if !totals.contains(page.total_count) {
+        totals = totals + [page.total_count]
+      }
+    }
+    if len(totals) != 1 {
+      throw status + " workflow-run census total_count changed during pagination"
+    }
+    if len(runs) != totals[0] {
+      throw status + " workflow-run census measured " + to_string(len(runs)) + " of "
+        + to_string(totals[0])
+        + " reported runs"
+    }
+    for run in runs {
+      if type_of(run?.id) != "int" || type_of(run?.workflow_id) != "int" {
+        throw status + " workflow-run census contained a run without ids"
+      }
+      // A run can advance between status queries; the later read wins.
+      by_id = by_id + {[to_string(run.id)]: run}
+    }
+  }
+  let competing = []
+  let siblings = []
+  for run in by_id.values() {
+    if run.workflow_id == current_workflow_id {
+      if run.id != current_run_id {
+        siblings = siblings + [run.id]
+      }
+    } else {
+      competing = competing + [run.id]
+    }
+  }
+  return {
+    competing_run_ids: competing.sorted(),
+    override_run_ids: siblings.sorted(),
+    pending_count: len(competing),
+    measured_run_count: len(by_id.keys()),
+  }
+}
+
+/** Calendar quarter of an ISO timestamp, the org log's issue key. */
+pub fn quarter(iso: string) -> string {
+  const month = to_int(iso[5:7])
+  return iso[0:4] + "-Q" + to_string((month - 1) / 3 + 1)
+}
+
+pub fn log_issue_title(iso: string) -> string {
+  return "Merge overrides " + quarter(iso)
+}
+
+fn bullet_list(items: list) -> string {
+  return len(items) == 0 ? "none" : join(items, "; ")
+}
+
+/** The PR comment and step summary for one attempt. */
+pub fn record_markdown(record: dict) -> string {
+  const heading = {applied: "applied", refused: "refused", errored: "errored"}[record.outcome]
+  const checks = record.checks
+  let lines = [
+    "### Merge override " + heading + ": `" + record.label + "`",
+    "",
+    "- Requested by: " + join(record.actors.map({ actor -> "@" + actor }), ", ") + " at "
+      + record.labeled_at,
+    "- Reason: " + record.reason,
+    "- Head: `" + record.head_sha + "`",
+    "- Checks on the head: `" + REQUIRED_CHECK + "` " + checks.ci_status + "; "
+      + to_string(checks.passing)
+      + " of "
+      + to_string(checks.total)
+      + " passing; failing: "
+      + bullet_list(checks.failing)
+      + "; running: "
+      + bullet_list(checks.pending),
+    "- Review decision: " + (record.review_decision ?? "no review required"),
+  ]
+  if len(record.refusals) > 0 {
+    lines = lines + ["- Refused because: " + join(record.refusals, "; ")]
+  }
+  if record.error != "" {
+    lines = lines + ["- Error: " + record.error]
+  }
+  lines = lines + ["- Actions: " + bullet_list(record.actions)]
+  if record.merge_commit != "" {
+    lines = lines + ["- Merge commit: `" + record.merge_commit + "`"]
+  }
+  if len(record.warnings) > 0 {
+    lines = lines + ["- Warnings: " + join(record.warnings, "; ")]
+  }
+  lines = lines + ["- Run: " + record.run_url]
+  if record.reason_source == "none" {
+    lines = lines
+      + [
+        "",
+        join(record.actors.map({ actor -> "@" + actor }), " ")
+          + " please reply with a one-line `override: <reason>` comment for the change record.",
+      ]
+  }
+  if record.outcome != "applied" {
+    lines = lines + ["", "Re-apply `" + record.label + "` once the cause above is fixed."]
+  }
+  return join(lines, "\n")
+}
+
+/** One org-log comment: a readable line plus the machine record. */
+pub fn log_entry_markdown(record: dict) -> string {
+  const summary = record.outcome + " `" + record.label + "` on " + record.repository + "#"
+    + to_string(record.pr)
+    + " by "
+    + join(record.actors.map({ actor -> "@" + actor }), ", ")
+    + ": "
+    + record.reason
+  return summary + "\n\n```json\n" + json_stringify(record) + "\n```"
+}

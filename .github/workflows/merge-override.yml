@@ -1,16 +1,17 @@
 # Reusable privileged override for bypass-ci / bypass-merge-queue / force-merge.
 #
-# Labels are the UX. Authority is re-checked from the issue event that attached
-# each consumed label: every actor must be an organization or repository admin,
-# and the pull request head must live in the base repository.
+# Labels are the UX; the label is an admin's decision and this workflow does
+# not second-guess it. Before any side effect, `decide` (scripts/merge-override)
+# refuses only what is unsafe whoever asks: an actor who is not an organization
+# or repository admin (re-checked from the issue event that attached each
+# label), a fork head, a head that moved after the label, a pull request that
+# is not open, required approval missing (except force-merge), and
+# bypass-merge-queue on a head whose `CI status` is not green. Everything else
+# is recorded as a warning.
 #
-# force-merge and bypass-merge-queue skip the merge queue, so the queue-bypass
-# guard (scripts/merge-override-guard) also requires a justifying incident (a
-# red default branch or a `release-blocker` label) and refuses a head the queue
-# already rejected. force-merge additionally refuses unless every check failing
-# on the head is red on the default branch's newest run of that job, and the
-# override comment prints that comparison. A hand-applied `founder-override`
-# label skips the guard.
+# Every attempt, applied, refused, or errored, leaves one audit record on the
+# pull request, in the step summary, and in the org log
+# (`log-repository`, one issue per quarter, one comment per attempt).
 
 name: Merge override
 
@@ -30,11 +31,11 @@ on:
         required: true
         type: number
       head-sha:
-        description: Pull request head commit SHA.
+        description: Pull request head commit SHA the label event saw.
         required: true
         type: string
       head-repository:
-        description: owner/name of the pull request head repository.
+        description: owner/name of the head repository the label event saw. The decision re-reads it from the pull request.
         required: true
         type: string
       organization:
@@ -42,23 +43,23 @@ on:
         required: false
         default: burin-labs
         type: string
-      main-ci-workflow:
-        description: File name of the workflow whose push runs say whether the default branch is red.
+      log-repository:
+        description: Private repository, in `organization`, that holds the org override log.
         required: false
-        default: ci.yml
+        default: override-log
         type: string
     secrets:
       RELEASE_APP_CLIENT_ID:
-        description: GitHub App client id for privileged merges.
+        description: GitHub App client id for privileged merges and the org log.
         required: false
       RELEASE_APP_PRIVATE_KEY:
-        description: GitHub App private key for privileged merges.
+        description: GitHub App private key for privileged merges and the org log.
         required: false
 
 permissions:
   contents: read
   pull-requests: write
-  # PR labels and their actor-bearing issue events use the Issues API.
+  # PR labels, comments, and their actor-bearing issue events use the Issues API.
   issues: write
   checks: write
   actions: write
@@ -73,6 +74,11 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  OVERRIDE_REPOSITORY: ${{ github.repository }}
+  OVERRIDE_ORGANIZATION: ${{ inputs.organization }}
+  OVERRIDE_PR: ${{ inputs.pr-number }}
+  OVERRIDE_HEAD_SHA: ${{ inputs.head-sha }}
+  OVERRIDE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
   apply:
@@ -87,267 +93,41 @@ jobs:
           repository: burin-labs/.github
           ref: ${{ fromJSON(toJSON(job)).workflow_sha || github.sha }}
 
-      - name: Resolve attached override request
-        id: request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ inputs.pr-number }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          labels_file="$(mktemp)"
-          event_pages_file="$(mktemp)"
-          chmod 600 "$labels_file" "$event_pages_file"
-          trap 'rm -f "$labels_file" "$event_pages_file"' EXIT
-          if ! gh api "repos/${REPO}/issues/${PR}" --jq '[.labels[].name]' > "$labels_file"; then
-            echo "::error::could not read attached override labels"
-            exit 1
-          fi
-          if ! gh api --paginate --slurp \
-            "repos/${REPO}/issues/${PR}/events?per_page=100" > "$event_pages_file"; then
-            echo "::error::could not read override label events"
-            exit 1
-          fi
-          if ! request="$(ruby scripts/merge_override.rb resolve-request \
-            "$labels_file" "$event_pages_file")"; then
-            echo "::error::could not resolve an override request from the measured labels and events"
-            exit 1
-          fi
-          label="$(jq -r '.label // ""' <<< "$request")"
-          {
-            echo "active=$([[ -n "$label" ]] && echo true || echo false)"
-            echo "label=${label}"
-            echo "labels=$(jq -c '.labels' <<< "$request")"
-            echo "actors=$(jq -c '.actors' <<< "$request")"
-            echo "label_events=$(jq -c '.label_events // {}' <<< "$request")"
-          } >> "$GITHUB_OUTPUT"
-          if [[ -n "$label" ]]; then
-            echo "Selected ${label}; consuming $(jq -c '.labels' <<< "$request")"
-          else
-            echo "No attached override labels remain; a serialized attempt already consumed this event."
-          fi
-
-      - name: Authorize every label actor and same-repo head
-        id: auth
-        if: steps.request.outputs.active == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ORG: ${{ inputs.organization }}
-          ACTORS_JSON: ${{ steps.request.outputs.actors }}
-          HEAD_REPOSITORY: ${{ inputs.head-repository }}
-          BASE_REPOSITORY: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          mapfile -t actors < <(jq -r '.[]' <<< "$ACTORS_JSON")
-          for actor in "${actors[@]}"; do
-            role="$(gh api "orgs/${ORG}/memberships/${actor}" --jq '.role' 2>/dev/null || true)"
-            permission="$(gh api "repos/${BASE_REPOSITORY}/collaborators/${actor}/permission" \
-              --jq '.permission' 2>/dev/null || true)"
-            payload="$(jq -cn \
-              --arg org "$ORG" --arg actor "$actor" \
-              --arg membership_role "${role:-none}" \
-              --arg repository_permission "${permission:-none}" \
-              --arg head_repository "$HEAD_REPOSITORY" \
-              --arg base_repository "$BASE_REPOSITORY" \
-              '{org: $org, actor: $actor, membership_role: $membership_role,
-                repository_permission: $repository_permission,
-                head_repository: $head_repository, base_repository: $base_repository}')"
-            if ! error="$(printf '%s' "$payload" | ruby scripts/merge_override.rb authorize 2>&1)"; then
-              reason="$(tr '\n' ' ' <<< "$error")"
-              echo "reason=${reason}" >> "$GITHUB_OUTPUT"
-              echo "::error::${reason}"
-              exit 1
-            fi
-          done
-          echo "reason=" >> "$GITHUB_OUTPUT"
-          echo "Authorized label actors: ${actors[*]}"
-
       - name: Set up exact Harn release
-        id: harn
-        if: steps.auth.outcome == 'success' && steps.request.outputs.label != 'bypass-ci'
         uses: burin-labs/harn/.github/actions/setup-harn@667a6bb60582e6fcb08abc74621c5fc89fb77703 # bounded release-asset retries
         with:
           version: 0.10.133
 
-      - name: Guard queue-skipping override
-        id: guard
-        if: steps.auth.outcome == 'success' && steps.request.outputs.label != 'bypass-ci'
+      # Measures every fact, then refuses or plans. Nothing has changed yet.
+      - name: Decide override
+        id: decide
         env:
           GH_TOKEN: ${{ github.token }}
-          GUARD_REPOSITORY: ${{ github.repository }}
-          GUARD_PR: ${{ inputs.pr-number }}
-          GUARD_HEAD_SHA: ${{ inputs.head-sha }}
-          GUARD_LABEL: ${{ steps.request.outputs.label }}
-          GUARD_MAIN_CI_WORKFLOW: ${{ inputs.main-ci-workflow }}
-          # In a reusable workflow `github.workflow_ref` names the caller, the
-          # dispatcher whose earlier refused attempts left checks on the head.
-          GUARD_OVERRIDE_WORKFLOW_REF: ${{ github.workflow_ref }}
-        shell: bash
-        run: bash scripts/merge-override-guard/run.sh
-
-      - name: Warn that bypass-ci is unguarded
-        if: steps.auth.outcome == 'success' && steps.request.outputs.label == 'bypass-ci'
-        shell: bash
-        run: |
-          set -euo pipefail
-          message="bypass-ci is not covered by the queue-bypass guard: it publishes a successful CI status without a justifying incident."
-          echo "::warning::${message}"
-          printf '## bypass-ci is unguarded\n\n%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
-
-      # Fail closed: a skipped guard (for example because Harn failed to
-      # install) must never read as an allowed one.
-      - name: Resolve cancellation policy
-        id: policy
-        if: >-
-          steps.auth.outcome == 'success' &&
-          (steps.request.outputs.label == 'bypass-ci' || steps.guard.outcome == 'success')
-        env:
-          LABEL: ${{ steps.request.outputs.label }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cancel="$(jq -cn --arg label "$LABEL" '{label: $label}' \
-            | ruby scripts/merge_override.rb cancellation-required)"
-          echo "cancel_workflows=${cancel}" >> "$GITHUB_OUTPUT"
+        run: bash scripts/merge-override/run.sh decide
 
       - name: Cancel competing workflow runs
-        id: sweep
-        if: steps.policy.outputs.cancel_workflows == 'true'
+        id: cancel
+        if: steps.decide.outcome == 'success' && steps.decide.outputs.cancel_workflows == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ inputs.head-sha }}
-          THIS_RUN: ${{ github.run_id }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "pending_count=unmeasured" >> "$GITHUB_OUTPUT"
-          echo "Competing pending runs: unmeasured"
-          run_pages_dir="$(mktemp -d)"
-          chmod 700 "$run_pages_dir"
-          trap 'rm -rf "$run_pages_dir"' EXIT
-          if ! current_workflow_id="$(gh api \
-            "repos/${REPO}/actions/runs/${THIS_RUN}" --jq '.workflow_id')"; then
-            echo "::error::could not read the current override workflow identity"
-            exit 1
-          fi
-          if [[ ! "$current_workflow_id" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::current override workflow identity was not a positive integer"
-            exit 1
-          fi
-          for status in requested queued in_progress waiting pending; do
-            if ! gh api --paginate --slurp \
-              "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&status=${status}&per_page=100" \
-              > "$run_pages_dir/${status}.json"; then
-              echo "::error::could not read ${status} workflow runs for the pull-request head"
-              exit 1
-            fi
-          done
-          if ! selection="$(ruby scripts/merge_override.rb select-runs \
-            "$THIS_RUN" "$current_workflow_id" "$run_pages_dir")"; then
-            echo "::error::could not select competing workflow runs from the measured pages"
-            exit 1
-          fi
-          pending_count="$(jq -r '.pending_count' <<< "$selection")"
-          echo "pending_count=${pending_count}" >> "$GITHUB_OUTPUT"
-          echo "Competing pending runs: ${pending_count}"
-          echo "Measured workflow runs: $(jq -r '.measured_run_count' <<< "$selection")"
-          echo "Active-status queries: $(jq -r '.query_count' <<< "$selection")"
-          echo "Excluded sibling override runs: $(jq -c '.override_run_ids' <<< "$selection")"
-          echo "Competing run IDs: $(jq -c '.competing_run_ids' <<< "$selection")"
-          mapfile -t run_ids < <(jq -r '.competing_run_ids[]' <<< "$selection")
-          for run_id in "${run_ids[@]}"; do
-            echo "Cancelling workflow run ${run_id}"
-            if ! gh api -X POST "repos/${REPO}/actions/runs/${run_id}/cancel" >/dev/null; then
-              run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" --jq .status)"
-              if [[ "$run_status" != "completed" ]]; then
-                echo "::error::could not cancel active workflow run ${run_id} (status ${run_status})"
-                exit 1
-              fi
-            fi
-          done
-          for run_id in "${run_ids[@]}"; do
-            echo "Waiting for workflow run ${run_id} to stop"
-            timeout 120 gh run watch "$run_id" --repo "$REPO" --exit-status \
-              >/dev/null 2>&1 || watch_status=$?
-            if [[ "${watch_status:-0}" -eq 124 ]]; then
-              echo "::error::workflow run ${run_id} did not stop within 120 seconds"
-              exit 1
-            fi
-            unset watch_status
-            run_status="$(gh api "repos/${REPO}/actions/runs/${run_id}" --jq .status)"
-            if [[ "$run_status" != "completed" ]]; then
-              echo "::error::workflow run ${run_id} watch ended with status ${run_status}"
-              exit 1
-            fi
-          done
-
-      - name: Resolve CI status state
-        id: ci
-        if: steps.policy.outcome == 'success' && (steps.sweep.outcome == 'success' || steps.sweep.outcome == 'skipped')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ inputs.head-sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          check_pages="$(gh api --paginate --slurp \
-            "repos/${REPO}/commits/${HEAD_SHA}/check-runs?per_page=100")"
-          state="$(jq '{check_runs: ([.[].check_runs] | add)}' <<< "$check_pages" \
-            | ruby scripts/merge_override.rb ci-state)"
-          echo "state=${state}" >> "$GITHUB_OUTPUT"
-          echo "Post-sweep CI status state: ${state}"
-
-      - name: Plan override actions
-        id: plan
-        if: steps.ci.outcome == 'success'
-        env:
-          LABEL: ${{ steps.request.outputs.label }}
-          CI_STATE: ${{ steps.ci.outputs.state }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          payload="$(jq -cn --arg label "$LABEL" --arg ci_status_state "$CI_STATE" \
-            '{label: $label, ci_status_state: $ci_status_state}')"
-          if ! plan="$(printf '%s' "$payload" | ruby scripts/merge_override.rb plan 2>&1)"; then
-            reason="$(tr '\n' ' ' <<< "$plan")"
-            echo "reason=${reason}" >> "$GITHUB_OUTPUT"
-            echo "::error::${reason}"
-            exit 1
-          fi
-          {
-            echo "reason="
-            echo "plan=${plan}"
-            echo "publish_ci_status=$(jq -r '.publish_ci_status' <<< "$plan")"
-            echo "merge=$(jq -r '.merge' <<< "$plan")"
-          } >> "$GITHUB_OUTPUT"
+          OVERRIDE_RUN_ID: ${{ github.run_id }}
+        run: bash scripts/merge-override/run.sh cancel
 
       - name: Publish successful CI status check
         id: publish
-        if: steps.plan.outputs.publish_ci_status == 'true'
+        if: >-
+          steps.decide.outcome == 'success' && steps.decide.outputs.publish_ci_status == 'true' &&
+          steps.cancel.outcome != 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ inputs.head-sha }}
-          LABEL: ${{ steps.request.outputs.label }}
-          ACTORS: ${{ steps.request.outputs.actors }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          actor_list="$(jq -r 'join(", @") | "@" + .' <<< "$ACTORS")"
-          gh api -X POST "repos/${REPO}/check-runs" \
-            -f name='CI status' -f head_sha="${HEAD_SHA}" \
-            -f status=completed -f conclusion=success \
-            -f 'output[title]=Merge override' \
-            -f "output[summary]=Published by merge override \`${LABEL}\` requested by ${actor_list}." >/dev/null
-          echo "Published successful CI status check for ${HEAD_SHA}"
+          OVERRIDE_RECORD: ${{ steps.decide.outputs.record }}
+        run: bash scripts/merge-override/run.sh publish
 
       - name: Mint release-app token for privileged merge
-        if: steps.plan.outputs.merge == 'true'
         id: app-token
+        if: >-
+          steps.decide.outcome == 'success' && steps.decide.outputs.merge == 'true' &&
+          steps.cancel.outcome != 'failure' && steps.publish.outcome != 'failure'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -361,183 +141,48 @@ jobs:
 
       - name: Squash-merge pull request
         id: merge
-        if: steps.plan.outputs.merge == 'true' && steps.app-token.outcome == 'success'
+        if: steps.app-token.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ inputs.pr-number }}
-          HEAD_SHA: ${{ inputs.head-sha }}
-          LABEL: ${{ steps.request.outputs.label }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          pr_node="$(gh api "repos/${REPO}/pulls/${PR}" --jq .node_id)"
-          # shellcheck disable=SC2016
-          dequeue_query='mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}'
-          gh api graphql -f query="$dequeue_query" -f id="$pr_node" >/dev/null 2>&1 || true
-          title="$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)"
-          gh api -X PUT "repos/${REPO}/pulls/${PR}/merge" \
-            -f merge_method=squash -f sha="${HEAD_SHA}" \
-            -f "commit_title=${title} (#${PR})" \
-            -f "commit_message=Merged with override label \`${LABEL}\`." >/dev/null
-          echo "Merged PR #${PR} via privileged squash merge"
+          OVERRIDE_RECORD: ${{ steps.decide.outputs.record }}
+        run: bash scripts/merge-override/run.sh merge
 
       - name: Remove consumed override labels
         id: cleanup
-        if: always()
+        if: always() && steps.decide.outputs.active == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ inputs.pr-number }}
-          ACTIVE: ${{ steps.request.outputs.active }}
-          LABELS_JSON: ${{ steps.request.outputs.labels }}
-          LABEL_EVENTS_JSON: ${{ steps.request.outputs.label_events }}
-          FOUNDER_OVERRIDE: ${{ steps.guard.outputs.founder_override }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$ACTIVE" != "true" ]]; then
-            echo 'removed_labels=[]' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # founder-override is single-use: once an attempt honors it, a later
-          # bypass label on this pull request must face the guard again.
-          if [[ "$FOUNDER_OVERRIDE" == "true" ]]; then
-            if ! gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/founder-override" >/dev/null 2>&1; then
-              echo "::error::could not remove the consumed founder-override label"
-              exit 1
-            fi
-            echo "Removed consumed label founder-override"
-          fi
-          labels_file="$(mktemp)"
-          event_pages_file="$(mktemp)"
-          chmod 600 "$labels_file" "$event_pages_file"
-          trap 'rm -f "$labels_file" "$event_pages_file"' EXIT
-          if ! gh api "repos/${REPO}/issues/${PR}" --jq '[.labels[].name]' > "$labels_file"; then
-            echo "::error::could not re-read attached override labels before cleanup"
-            exit 1
-          fi
-          if ! gh api --paginate --slurp \
-            "repos/${REPO}/issues/${PR}/events?per_page=100" > "$event_pages_file"; then
-            echo "::error::could not re-read override label events before cleanup"
-            exit 1
-          fi
-          if ! current="$(ruby scripts/merge_override.rb resolve-request \
-            "$labels_file" "$event_pages_file")"; then
-            echo "::error::could not resolve the current override request before cleanup"
-            exit 1
-          fi
-          removed='[]'
-          mapfile -t labels < <(jq -r '.[]' <<< "$LABELS_JSON")
-          for label in "${labels[@]}"; do
-            expected_event="$(jq -r --arg label "$label" '.[$label]' <<< "$LABEL_EVENTS_JSON")"
-            current_event="$(jq -r --arg label "$label" '.label_events[$label] // ""' <<< "$current")"
-            if [[ "$current_event" != "$expected_event" ]]; then
-              echo "Keeping ${label}: a newer label event superseded consumed event ${expected_event}."
-              continue
-            fi
-            removed_label=false
-            for attempt in 1 2 3; do
-              if gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/${label}" >/dev/null 2>&1; then
-                removed_label=true
-                break
-              fi
-              sleep "$attempt"
-            done
-            if [[ "$removed_label" != "true" ]]; then
-              echo "::error::could not remove consumed label ${label} after three attempts"
-              exit 1
-            fi
-            removed="$(jq -cn --argjson labels "$removed" --arg label "$label" '$labels + [$label]')"
-          done
-          echo "removed_labels=${removed}" >> "$GITHUB_OUTPUT"
-          echo "Removed consumed labels: ${removed}"
+          OVERRIDE_LABEL_EVENTS: ${{ steps.decide.outputs.label_events }}
+        run: bash scripts/merge-override/run.sh cleanup
 
-      - name: Audit terminal outcome
-        if: always()
+      # The org log lives in another private repository, so it needs its own
+      # token. A failed mint leaves the token empty and the record step red.
+      - name: Mint release-app token for the org log
+        id: log-token
+        if: always() && steps.decide.outputs.active != 'false'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.organization }}
+          repositories: ${{ inputs.log-repository }}
+          permission-issues: write
+
+      - name: Record override
+        if: always() && steps.decide.outputs.active != 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ inputs.pr-number }}
-          ACTIVE: ${{ steps.request.outputs.active }}
-          LABEL: ${{ steps.request.outputs.label }}
-          CONSUMED_LABELS_JSON: ${{ steps.request.outputs.labels }}
-          REMOVED_LABELS_JSON: ${{ steps.cleanup.outputs.removed_labels || '[]' }}
-          ACTORS_JSON: ${{ steps.request.outputs.actors }}
-          CANCEL: ${{ steps.policy.outputs.cancel_workflows }}
-          PENDING_COUNT: ${{ steps.sweep.outputs.pending_count }}
-          AUTH_OUTCOME: ${{ steps.auth.outcome }}
-          AUTH_REASON: ${{ steps.auth.outputs.reason }}
-          HARN_OUTCOME: ${{ steps.harn.outcome }}
-          GUARD_OUTCOME: ${{ steps.guard.outcome }}
-          GUARD_VERDICT: ${{ steps.guard.outputs.verdict }}
-          GUARD_REASON: ${{ steps.guard.outputs.reason }}
-          GUARD_RETRY: ${{ steps.guard.outputs.retry }}
-          GUARD_COMPARISON: ${{ steps.guard.outputs.comparison }}
-          FOUNDER_OVERRIDE: ${{ steps.guard.outputs.founder_override }}
-          FOUNDER_ACTOR: ${{ steps.guard.outputs.founder_actor }}
-          SWEEP_OUTCOME: ${{ steps.sweep.outcome }}
-          CI_OUTCOME: ${{ steps.ci.outcome }}
-          PLAN_OUTCOME: ${{ steps.plan.outcome }}
-          PLAN_REASON: ${{ steps.plan.outputs.reason }}
-          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
-          APP_TOKEN_OUTCOME: ${{ steps.app-token.outcome }}
-          MERGE_OUTCOME: ${{ steps.merge.outcome }}
-          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$ACTIVE" == "true" ]] || exit 0
-          status=applied
-          reason="Override completed successfully."
-          retry_action=""
-          if [[ "$AUTH_OUTCOME" == "failure" ]]; then
-            status=refused
-            reason="$AUTH_REASON"
-            retry_action="An organization or repository admin must re-apply \`$LABEL\`."
-          elif [[ "$GUARD_OUTCOME" == "failure" && "$GUARD_VERDICT" == "refused" ]]; then
-            status=refused
-            reason="$GUARD_REASON"
-            retry_action="${GUARD_RETRY^}"
-          elif [[ "$PLAN_OUTCOME" == "failure" ]]; then
-            status=refused
-            reason="$PLAN_REASON"
-            retry_action="Resolve the condition above, then re-apply \`$LABEL\`."
-          elif [[ "$HARN_OUTCOME" == "failure" || "$GUARD_OUTCOME" == "failure" || \
-                  "$SWEEP_OUTCOME" == "failure" || "$CI_OUTCOME" == "failure" || \
-                  "$PUBLISH_OUTCOME" == "failure" || "$APP_TOKEN_OUTCOME" == "failure" || \
-                  "$MERGE_OUTCOME" == "failure" || "$CLEANUP_OUTCOME" == "failure" ]]; then
-            status=errored
-            reason="The override stopped because a workflow step failed; inspect this run for the named failing step."
-            retry_action="After the failing service or step is healthy, re-apply \`$LABEL\`."
-          fi
-          actions=()
-          if [[ "$FOUNDER_OVERRIDE" == "true" ]]; then
-            actions+=("FOUNDER OVERRIDE: skipped the queue-bypass guard under \`founder-override\` applied by @${FOUNDER_ACTOR}")
-          fi
-          if [[ "$CANCEL" == "true" && "$SWEEP_OUTCOME" == "success" ]]; then
-            actions+=("cancelled ${PENDING_COUNT:-0} competing workflow run(s)")
-          fi
-          [[ "$PUBLISH_OUTCOME" == "success" ]] && actions+=("published a successful CI status check")
-          [[ "$MERGE_OUTCOME" == "success" ]] && actions+=("squash-merged the pull request directly")
-          action_text=""
-          for action in "${actions[@]}"; do
-            [[ -z "$action_text" ]] || action_text+="; "
-            action_text+="$action"
-          done
-          payload="$(jq -cn \
-            --arg status "$status" --arg label "$LABEL" \
-            --argjson consumed_labels "$CONSUMED_LABELS_JSON" \
-            --argjson removed_labels "$REMOVED_LABELS_JSON" \
-            --argjson actors "$ACTORS_JSON" \
-            --arg reason "$reason" --arg retry_action "$retry_action" \
-            --arg actions "$action_text" \
-            '{status: $status, label: $label, consumed_labels: $consumed_labels,
-              removed_labels: $removed_labels, actors: $actors,
-              reason: $reason, retry_action: $retry_action, actions: $actions}')"
-          body="$(printf '%s' "$payload" | ruby scripts/merge_override.rb terminal-audit-body)"
-          # force-merge: the per-check head-against-main comparison the guard decided on.
-          if [[ -n "${GUARD_COMPARISON:-}" ]]; then
-            body+=$'\n\n'"$GUARD_COMPARISON"
-          fi
-          gh pr comment "$PR" --repo "$REPO" --body "$body"
+          OVERRIDE_LOG_TOKEN: ${{ steps.log-token.outputs.token }}
+          OVERRIDE_LOG_REPOSITORY: ${{ inputs.organization }}/${{ inputs.log-repository }}
+          OVERRIDE_LABEL: ${{ inputs.label }}
+          OVERRIDE_ACTOR: ${{ inputs.actor }}
+          OVERRIDE_RECORD: ${{ steps.decide.outputs.record }}
+          OVERRIDE_CANCELLED: ${{ steps.cancel.outputs.cancelled }}
+          OVERRIDE_MERGE_COMMIT: ${{ steps.merge.outputs.merge_commit }}
+          OVERRIDE_REMOVED_LABELS: ${{ steps.cleanup.outputs.removed_labels }}
+          OVERRIDE_STEPS: >-
+            {"decide": "${{ steps.decide.outcome }}", "cancel": "${{ steps.cancel.outcome }}",
+            "publish": "${{ steps.publish.outcome }}", "merge_token": "${{ steps.app-token.outcome }}",
+            "merge": "${{ steps.merge.outcome }}", "cleanup": "${{ steps.cleanup.outcome }}"}
+        run: bash scripts/merge-override/run.sh record
