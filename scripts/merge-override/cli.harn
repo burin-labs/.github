@@ -1,0 +1,196 @@
+/**
+ * Merge override entrypoint: `harn run cli.harn -- <step>`, one call per
+ * workflow step. `decide` measures and decides before any side effect; the
+ * side-effect steps act on its outputs; `record` writes the audit record to
+ * the pull request, the step summary, and the org log for every attempt.
+ */
+import { gha_append_summary, gha_error, gha_warning, gha_write_output } from "std/gha"
+import { live_github } from "./github.harn"
+import {
+  Input,
+  append_log,
+  cancel_competing,
+  comment_on_pull,
+  draft_record,
+  fallback_record,
+  finish_record,
+  measure,
+  merge_pull,
+  publish_status,
+  remove_consumed_labels,
+} from "./override.harn"
+import { record_markdown } from "./policy.harn"
+
+fn env(vars: HarnessEnv, name: string) -> string {
+  return trim(vars.get(name) ?? "")
+}
+
+fn required(vars: HarnessEnv, name: string) -> string {
+  const value = env(vars, name)
+  if value == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn output(harness: Harness, name: string, value: string) {
+  if !gha_write_output(harness, name, value) {
+    throw "GITHUB_OUTPUT is not set, so " + name + " cannot reach the next step"
+  }
+}
+
+fn input(vars: HarnessEnv) -> Input {
+  return {
+    repository: required(vars, "OVERRIDE_REPOSITORY"),
+    organization: required(vars, "OVERRIDE_ORGANIZATION"),
+    pr: to_int(required(vars, "OVERRIDE_PR")),
+    head_sha: required(vars, "OVERRIDE_HEAD_SHA"),
+    run_url: env(vars, "OVERRIDE_RUN_URL"),
+  }
+}
+
+fn github(harness: Harness, token_env: string) {
+  return live_github(
+    {fs: harness.fs, tools: harness.tools},
+    required(harness.env, token_env),
+    harness.fs.mkdtemp_in_workspace("merge-override-gh-"),
+  )
+}
+
+fn decide_step(harness: Harness) {
+  const request = input(harness.env)
+  const facts = measure(github(harness, "GH_TOKEN"), request)
+  if facts == nil {
+    output(harness, "active", "false")
+    harness.stdio.println(
+      "No override label remains attached; an earlier serialized attempt consumed it.",
+    )
+    return
+  }
+  const drafted = draft_record(facts, request, harness.clock.date_iso())
+  const decision = drafted.decision
+  output(harness, "active", "true")
+  output(harness, "label", drafted.record.label)
+  output(harness, "label_events", json_stringify(facts.request.label_events))
+  output(harness, "record", json_stringify(drafted.record))
+  output(harness, "verdict", decision.verdict)
+  output(harness, "cancel_workflows", decision.plan.cancel_workflows ? "true" : "false")
+  output(harness, "publish_ci_status", decision.plan.publish_ci_status ? "true" : "false")
+  output(harness, "merge", decision.plan.merge ? "true" : "false")
+  for warning in decision.warnings {
+    gha_warning(harness.stdio, warning)
+  }
+  if decision.verdict == "refused" {
+    gha_error(
+      harness.stdio,
+      "`" + drafted.record.label + "` refused: " + join(decision.refusals, "; "),
+    )
+    harness.runtime.exit(1)
+  }
+  harness.stdio.println(
+    "`" + drafted.record.label + "` proceeds for " + join(facts.request.actors, ", "),
+  )
+}
+
+fn draft(vars: HarnessEnv) -> dict {
+  return json_parse(required(vars, "OVERRIDE_RECORD"))
+}
+
+fn cancel_step(harness: Harness) {
+  const count = cancel_competing(
+    github(harness, "GH_TOKEN"),
+    input(harness.env),
+    to_int(required(harness.env, "OVERRIDE_RUN_ID")),
+    { ms -> harness.clock.sleep_ms(ms) },
+  )
+  output(harness, "cancelled", to_string(count))
+}
+
+fn publish_step(harness: Harness) {
+  publish_status(github(harness, "GH_TOKEN"), input(harness.env), draft(harness.env))
+}
+
+fn merge_step(harness: Harness) {
+  const sha = merge_pull(github(harness, "GH_TOKEN"), input(harness.env), draft(harness.env))
+  output(harness, "merge_commit", sha)
+  harness.stdio.println("Merged as " + sha)
+}
+
+fn cleanup_step(harness: Harness) {
+  const removed = remove_consumed_labels(
+    github(harness, "GH_TOKEN"),
+    input(harness.env),
+    json_parse(required(harness.env, "OVERRIDE_LABEL_EVENTS")),
+  )
+  output(harness, "removed_labels", json_stringify(removed))
+}
+
+/**
+ * Write the record everywhere it belongs. The PR comment goes first; a log
+ * write that fails turns this step red but never undoes the override.
+ */
+fn record_step(harness: Harness) {
+  const request = input(harness.env)
+  const raw = env(harness.env, "OVERRIDE_RECORD")
+  const drafted = raw == "" ? fallback_record(
+    request,
+    required(harness.env, "OVERRIDE_LABEL"),
+    required(harness.env, "OVERRIDE_ACTOR"),
+    "the override could not measure its evidence; see the run",
+  ) : json_parse(raw)
+  const removed = env(harness.env, "OVERRIDE_REMOVED_LABELS")
+  const record = finish_record(
+    drafted,
+    json_parse(required(harness.env, "OVERRIDE_STEPS")),
+    {
+      cancelled: env(harness.env, "OVERRIDE_CANCELLED"),
+      merge_commit: env(harness.env, "OVERRIDE_MERGE_COMMIT"),
+      removed_labels: removed == "" ? [] : json_parse(removed),
+    },
+    harness.clock.date_iso(),
+  )
+  const body = record_markdown(record)
+  let failures = []
+  try {
+    comment_on_pull(github(harness, "GH_TOKEN"), request, body)
+  } catch (error) {
+    failures = failures + ["pull request comment: " + to_string(error)]
+  }
+  if !gha_append_summary(harness.env, harness.fs, body + "\n") {
+    harness.stdio.println(body)
+  }
+  try {
+    const url = append_log(
+      github(harness, "OVERRIDE_LOG_TOKEN"),
+      required(harness.env, "OVERRIDE_LOG_REPOSITORY"),
+      record,
+    )
+    harness.stdio.println("Org log entry: " + url)
+  } catch (error) {
+    failures = failures + ["org log: " + to_string(error)]
+  }
+  harness.stdio.println(json_stringify(record))
+  if len(failures) > 0 {
+    gha_error(harness.stdio, "the override record did not reach " + join(failures, "; "))
+    harness.runtime.exit(1)
+  }
+}
+
+fn main(harness: Harness) {
+  const step = len(argv) > 0 ? argv[0] : ""
+  if step == "decide" {
+    decide_step(harness)
+  } else if step == "cancel" {
+    cancel_step(harness)
+  } else if step == "publish" {
+    publish_step(harness)
+  } else if step == "merge" {
+    merge_step(harness)
+  } else if step == "cleanup" {
+    cleanup_step(harness)
+  } else if step == "record" {
+    record_step(harness)
+  } else {
+    throw "unknown merge override step: " + step
+  }
+}

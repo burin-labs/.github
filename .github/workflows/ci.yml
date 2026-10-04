@@ -30,7 +30,7 @@ jobs:
           harn test scripts/ci-runtime-evidence
           harn test scripts/release-promotion
           harn test scripts/release-repin
-          harn test scripts/merge-override-guard
+          harn test scripts/merge-override
           harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels
           bash .github/actions/local-workflow-checks/run_test.sh
@@ -140,7 +140,6 @@ jobs:
           ruby .github/workflows/runner-availability_test.rb
           ruby scripts/ci_latency_observer_test.rb
           ruby scripts/dependabot_waivers_test.rb
-          ruby scripts/merge_override_test.rb
           ruby scripts/reusable_pin_drift_test.rb
       - name: Check Dependabot config
         uses: ./.github/actions/check-dependabot-config
@@ -175,4 +174,4 @@ jobs:
           bash -n scripts/release-promotion/run.sh
           bash -n .github/actions/validate-candidate-manifest/run.sh
           bash -n scripts/release-repin/run.sh
-          bash -n scripts/merge-override-guard/run.sh
+          bash -n scripts/merge-override/run.sh

@@ -1,0 +1,345 @@
+/**
+ * The override's GitHub reads and writes, over a `GitHub` client so tests can
+ * replay a recorded world. Policy lives in policy.harn.
+ */
+import { GitHub } from "./github.harn"
+import {
+  Actor,
+  Facts,
+  REQUIRED_CHECK,
+  Request,
+  decide,
+  issue_events_from_pages,
+  log_entry_markdown,
+  log_issue_title,
+  resolve_request,
+  select_competing_runs,
+} from "./policy.harn"
+
+pub const LOG_LABEL = "override-log"
+
+const CANCEL_WAIT_MS = 120000
+
+const REVIEW_QUERY =
+  "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision}}}"
+
+const DEQUEUE_MUTATION =
+  "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}"
+
+pub type Input = {
+  repository: string,
+  organization: string,
+  pr: int,
+  head_sha: string,
+  run_url: string,
+}
+
+fn issue(input: Input) -> string {
+  return "repos/" + input.repository + "/issues/" + to_string(input.pr)
+}
+
+fn flat(pages: list) -> list {
+  let items = []
+  for page in pages {
+    if type_of(page) != "list" {
+      throw "paginated census page was not an array"
+    }
+    items = items + page
+  }
+  return items
+}
+
+/** The attached override request: labels on the PR and the events that attached them. */
+pub fn current_request(gh: GitHub, input: Input) -> Request {
+  const labels = (gh.read(issue(input))?.labels ?? []).map({ label -> label?.name })
+  return resolve_request(
+    labels,
+    issue_events_from_pages(gh.pages(issue(input) + "/events?per_page=100")),
+  )
+}
+
+/** A login's admin standing; an unreadable role reads as `none`, which refuses. */
+fn actor(gh: GitHub, input: Input, login: string) -> Actor {
+  const role = try {
+    gh.read("orgs/" + input.organization + "/memberships/" + login)?.role ?? "none"
+  } catch (error) {
+    "none"
+  }
+  const permission = try {
+    gh.read("repos/" + input.repository + "/collaborators/" + login + "/permission")?.permission
+      ?? "none"
+  } catch (error) {
+    "none"
+  }
+  return {login: login, membership_role: role, repository_permission: permission}
+}
+
+/** Measure everything the decision reads. Nil when no override label is attached. */
+pub fn measure(gh: GitHub, input: Input) -> Facts? {
+  const request = current_request(gh, input)
+  if request.label == nil {
+    return nil
+  }
+  const pull = gh.read("repos/" + input.repository + "/pulls/" + to_string(input.pr))
+  const owner_name = input.repository.split("/")
+  const review = gh.graphql(
+    REVIEW_QUERY,
+    {owner: owner_name[0], name: owner_name[1], number: input.pr},
+  )
+  return {
+    repository: input.repository,
+    pr: input.pr,
+    pr_title: to_string(pull?.title ?? ""),
+    pr_url: to_string(pull?.html_url ?? ""),
+    pr_state: pull?.merged == true ? "merged" : to_string(pull?.state ?? "unknown"),
+    base_repository: to_string(pull?.base?.repo?.full_name ?? input.repository),
+    head_repository: to_string(pull?.head?.repo?.full_name ?? "a deleted fork"),
+    labeled_head_sha: input.head_sha,
+    current_head_sha: to_string(pull?.head?.sha ?? ""),
+    request: request,
+    actors: request.actors.map({ login -> actor(gh, input, login) }),
+    review_decision: review?.repository?.pullRequest?.reviewDecision,
+    check_runs: flat(
+      gh.pages(
+        "repos/" + input.repository + "/commits/" + input.head_sha + "/check-runs?per_page=100",
+      )
+        .map({ page -> page?.check_runs ?? [] }),
+    ),
+    comments: flat(gh.pages(issue(input) + "/comments?per_page=100")),
+  }
+}
+
+/** The audit record before side effects; `finish_record` adds the outcome. */
+pub fn draft_record(facts: Facts, input: Input, now: string) -> dict {
+  const decision = decide(facts)
+  const label = facts.request.label ?? ""
+  return {
+    decision: decision,
+    record: {
+      schema: 1,
+      repository: input.repository,
+      pr: input.pr,
+      pr_title: facts.pr_title,
+      pr_url: facts.pr_url,
+      label: label,
+      labels: facts.request.labels,
+      actors: facts.request.actors,
+      labeled_at: facts.request.labeled_at[label] ?? "",
+      decided_at: now,
+      head_sha: input.head_sha,
+      review_decision: facts.review_decision,
+      checks: decision.checks,
+      reason: decision.reason,
+      reason_source: decision.reason_source,
+      refusals: decision.refusals,
+      warnings: decision.warnings,
+      run_url: input.run_url,
+    },
+  }
+}
+
+/** A record for an attempt whose decision never completed. */
+pub fn fallback_record(input: Input, label: string, actor: string, error: string) -> dict {
+  return {
+    schema: 1,
+    repository: input.repository,
+    pr: input.pr,
+    pr_title: "",
+    pr_url: "",
+    label: label,
+    labels: [label],
+    actors: [actor],
+    labeled_at: "",
+    decided_at: "",
+    head_sha: input.head_sha,
+    review_decision: nil,
+    checks: {ci_status: "unmeasured", total: 0, passing: 0, failing: [], pending: []},
+    reason: "unmeasured",
+    reason_source: "none",
+    refusals: [],
+    warnings: [],
+    run_url: input.run_url,
+    error: error,
+  }
+}
+
+/**
+ * Fold step results into the record. `steps` maps a step name to its outcome;
+ * a refusal outranks a failed step, and any failed step makes it `errored`.
+ */
+pub fn finish_record(draft: dict, steps: dict, effects: dict, now: string) -> dict {
+  let actions = []
+  if (effects?.cancelled ?? "") != "" {
+    actions = actions + ["cancelled " + effects.cancelled + " competing workflow run(s)"]
+  }
+  if steps?.publish == "success" {
+    actions = actions + ["published a successful `" + REQUIRED_CHECK + "` check"]
+  }
+  if (effects?.merge_commit ?? "") != "" {
+    actions = actions + ["squash-merged without the merge queue"]
+  }
+  const removed = effects?.removed_labels ?? []
+  if len(removed) > 0 {
+    actions = actions + ["removed " + join(removed.map({ label -> "`" + label + "`" }), ", ")]
+  }
+  const failed = steps.entries().filter({ entry -> entry.value == "failure" }).map(
+    { entry -> entry.key },
+  )
+    .to_list()
+    .sorted()
+  let error = draft?.error ?? ""
+  // A refusal fails the decide step on purpose; that is the outcome, not an error.
+  if error == "" && len(failed) > 0 && len(draft.refusals) == 0 {
+    error = "step(s) failed: " + join(failed, ", ") + "; see the run"
+  }
+  const outcome = len(draft.refusals) > 0 ? "refused" : error != "" ? "errored" : "applied"
+  return draft
+    + {
+      outcome: outcome,
+      error: error,
+      actions: actions,
+      merge_commit: effects?.merge_commit ?? "",
+      recorded_at: now,
+    }
+}
+
+/** Stop the active workflow runs on the head, other than this override's own. */
+pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int) -> nil) -> int {
+  const repo = "repos/" + input.repository
+  const workflow_id = gh.read(repo + "/actions/runs/" + to_string(run_id))?.workflow_id
+  if type_of(workflow_id) != "int" {
+    throw "could not read this override run's workflow id"
+  }
+  let status_pages = {}
+  for status in ["requested", "queued", "in_progress", "waiting", "pending"] {
+    status_pages = status_pages
+      + {
+        [status]: gh.pages(
+          repo + "/actions/runs?head_sha=" + input.head_sha + "&status=" + status + "&per_page=100",
+        ),
+      }
+  }
+  const selection = select_competing_runs(run_id, workflow_id, status_pages)
+  for id in selection.competing_run_ids {
+    try {
+      gh.send("POST", repo + "/actions/runs/" + to_string(id) + "/cancel", {})
+    } catch (error) {
+      if gh.read(repo + "/actions/runs/" + to_string(id))?.status != "completed" {
+        throw "could not cancel workflow run " + to_string(id) + ": " + to_string(error)
+      }
+    }
+  }
+  for id in selection.competing_run_ids {
+    let waited = 0
+    while gh.read(repo + "/actions/runs/" + to_string(id))?.status != "completed" {
+      if waited >= CANCEL_WAIT_MS {
+        throw "workflow run " + to_string(id) + " did not stop within "
+          + to_string(CANCEL_WAIT_MS / 1000)
+          + " seconds"
+      }
+      sleep_ms(5000)
+      waited = waited + 5000
+    }
+  }
+  return selection.pending_count
+}
+
+pub fn publish_status(gh: GitHub, input: Input, record: dict) {
+  gh.send(
+    "POST",
+    "repos/" + input.repository + "/check-runs",
+    {
+      name: REQUIRED_CHECK,
+      head_sha: input.head_sha,
+      status: "completed",
+      conclusion: "success",
+      output: {
+        title: "Merge override",
+        summary: "Published by merge override `" + record.label + "` requested by "
+          + join(record.actors.map({ login -> "@" + login }), ", ")
+          + ". Reason: "
+          + record.reason,
+      },
+    },
+  )
+}
+
+/**
+ * Squash-merge the exact labeled head; GitHub refuses if the head moved. Returns the merge commit.
+ */
+pub fn merge_pull(gh: GitHub, input: Input, record: dict) -> string {
+  const path = "repos/" + input.repository + "/pulls/" + to_string(input.pr)
+  const pull = gh.read(path)
+  try {
+    gh.graphql(DEQUEUE_MUTATION, {id: pull?.node_id})
+  } catch (error) {
+    // Not queued: nothing to dequeue.
+  }
+  const merged = gh.send(
+    "PUT",
+    path + "/merge",
+    {
+      merge_method: "squash",
+      sha: input.head_sha,
+      commit_title: to_string(pull?.title) + " (#" + to_string(input.pr) + ")",
+      commit_message: "Merged with override label `" + record.label + "` by "
+        + join(record.actors.map({ login -> "@" + login }), ", ")
+        + ".\nReason: "
+        + record.reason,
+    },
+  )
+  const sha = merged?.sha
+  if type_of(sha) != "string" || sha == "" {
+    throw "the merge response carried no commit"
+  }
+  return sha
+}
+
+/**
+ * Remove the labels this attempt consumed. A label re-applied after this
+ * attempt resolved (a newer event) belongs to the next attempt and stays.
+ */
+pub fn remove_consumed_labels(gh: GitHub, input: Input, label_events: dict) -> list<string> {
+  const current = current_request(gh, input)
+  let removed = []
+  for entry in label_events.entries() {
+    if current.label_events[entry.key] != entry.value {
+      continue
+    }
+    gh.send("DELETE", issue(input) + "/labels/" + entry.key, {})
+    removed = removed + [entry.key]
+  }
+  return removed.sorted()
+}
+
+/** Append the record to the quarter's issue in the org log, creating it on first use. */
+pub fn append_log(gh: GitHub, log_repository: string, record: dict) -> string {
+  const title = log_issue_title(record.recorded_at)
+  const repo = "repos/" + log_repository
+  const existing = flat(gh.pages(repo + "/issues?labels=" + LOG_LABEL + "&state=all&per_page=100"))
+    .filter({ item -> item?.title == title && item?.pull_request == nil })
+    .to_list()
+  let number = len(existing) > 0 ? existing.map({ item -> item.number }).sorted()[0] : nil
+  if number == nil {
+    number = gh.send(
+      "POST",
+      repo + "/issues",
+      {
+        title: title,
+        labels: [LOG_LABEL],
+        body:
+          "Every merge override attempt this quarter, written by the merge override workflow. One comment per attempt; do not edit or delete comments.",
+      },
+    )?.number
+  }
+  const comment = gh.send(
+    "POST",
+    repo + "/issues/" + to_string(number) + "/comments",
+    {body: log_entry_markdown(record)},
+  )
+  return comment?.html_url ?? ""
+}
+
+pub fn comment_on_pull(gh: GitHub, input: Input, body: string) {
+  gh.send("POST", issue(input) + "/comments", {body: body})
+}
