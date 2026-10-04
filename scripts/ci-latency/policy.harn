@@ -1,0 +1,237 @@
+import { validate } from "./baseline.harn"
+
+type Regeneration = {sampled_at: string, source: string, sample_count: int, observed_p90_ms: int}
+
+/** Validated workflow census, latency budgets, and measured ratchet evidence. */
+pub type Policy = {
+  schema_version: 1,
+  repository: string,
+  workflow: string,
+  event: string,
+  topology_epoch: string,
+  full_run_jobs: list<{name: string, match?: "exact" | "prefix"}>,
+  slo: {
+    warning_ms: int,
+    p90_ms: int,
+    hard_max_ms: int,
+    min_samples: int,
+    window_samples: int,
+    regenerated?: Regeneration,
+  },
+  required: {
+    aggregate_job: string,
+    critical_path_allowance_ms: int,
+    jobs: dict<string, {budget_ms: int}>,
+  },
+  observed_baseline?: unknown,
+}
+
+type Workflow = {jobs: dict<string, {needs?: string | list<string>}>}
+
+fn positive(value: int, field: string) {
+  if value <= 0 {
+    throw field + " must be a positive integer"
+  }
+}
+
+fn text(value: string, field: string) {
+  if trim(value) == "" {
+    throw field + " must be a non-empty string"
+  }
+}
+
+/** Decode and validate once before workflow and baseline policy decisions. */
+pub fn decode(raw: unknown) -> Policy {
+  if !schema_is(raw, Policy) {
+    throw "latency policy has an incomplete or invalid typed contract"
+  }
+  text(raw.repository, "repository")
+  text(raw.workflow, "workflow")
+  text(raw.event, "event")
+  const epoch = date_parse(raw.topology_epoch)
+  if len(raw.full_run_jobs) == 0 {
+    throw "full_run_jobs must be a non-empty list"
+  }
+  for sentinel in raw.full_run_jobs {
+    text(sentinel.name, "full_run_jobs.name")
+  }
+  const slo = raw.slo
+  positive(slo.warning_ms, "slo.warning_ms")
+  positive(slo.p90_ms, "slo.p90_ms")
+  positive(slo.hard_max_ms, "slo.hard_max_ms")
+  positive(slo.min_samples, "slo.min_samples")
+  positive(slo.window_samples, "slo.window_samples")
+  if !(slo.warning_ms < slo.p90_ms && slo.p90_ms < slo.hard_max_ms) {
+    throw "SLO thresholds must satisfy warning_ms < p90_ms < hard_max_ms"
+  }
+  if slo.min_samples > slo.window_samples {
+    throw "slo.min_samples cannot exceed slo.window_samples"
+  }
+  const regeneration = slo.regenerated
+  if regeneration != nil {
+    text(regeneration.sampled_at, "slo.regenerated.sampled_at")
+    text(regeneration.source, "slo.regenerated.source")
+    positive(regeneration.sample_count, "slo.regenerated.sample_count")
+    positive(regeneration.observed_p90_ms, "slo.regenerated.observed_p90_ms")
+    if date_parse(regeneration.sampled_at) < epoch {
+      throw "slo.regenerated.sampled_at predates topology_epoch"
+    }
+    if regeneration.sample_count < slo.min_samples {
+      throw "slo.regenerated.sample_count is below slo.min_samples"
+    }
+  }
+  text(raw.required.aggregate_job, "required.aggregate_job")
+  positive(raw.required.critical_path_allowance_ms, "required.critical_path_allowance_ms")
+  if len(raw.required.jobs) == 0 {
+    throw "required.jobs must be non-empty"
+  }
+  for id in keys(raw.required.jobs) {
+    text(id, "required.jobs key")
+    const job = raw.required.jobs[id]
+    if job == nil {
+      throw "required job has no latency budget"
+    }
+    positive(job.budget_ms, "required.jobs." + id + ".budget_ms")
+    if job.budget_ms > raw.required.critical_path_allowance_ms {
+      throw "declared critical path exceeds allowance: " + id
+    }
+  }
+  if keys(raw).contains("observed_baseline") {
+    validate(raw, raw.observed_baseline)
+  }
+  return raw
+}
+
+fn required_jobs(policy: Policy, raw: unknown) -> list<string> {
+  if !schema_is(raw, Workflow) {
+    throw "workflow has no typed job census"
+  }
+  const aggregate = raw.jobs[policy.required.aggregate_job]
+  if aggregate == nil {
+    throw "aggregate job is missing from workflow"
+  }
+  const needs = aggregate.needs
+  let required: list<string> = []
+  if type_of(needs) == "string" {
+    required = [needs]
+  } else if type_of(needs) == "list" {
+    required = needs
+  } else {
+    throw "aggregate job needs must be a string or list"
+  }
+  if len(required) == 0 {
+    throw "aggregate job has an empty required set"
+  }
+  for id in required {
+    if !keys(raw.jobs).contains(id) {
+      throw "aggregate job requires undefined job: " + id
+    }
+  }
+  return required.sorted()
+}
+
+fn regenerated_p90(observed: int) -> int {
+  const scaled = to_int(observed * 12 / 10)
+  return to_int((scaled + 5999) / 6000) * 6000
+}
+
+fn regenerated_warning(p90: int) -> int {
+  return to_int(to_int(p90 * 9 / 10) / 6000) * 6000
+}
+
+fn compare_slo(policy: Policy, baseline: Policy) {
+  const before = baseline.slo
+  const after = policy.slo
+  let p90_regenerated = false
+  if after.p90_ms > before.p90_ms {
+    const receipt = after.regenerated
+    if receipt == nil {
+      throw "slo.p90_ms may only decrease without a slo.regenerated receipt"
+    }
+    if after.p90_ms != regenerated_p90(receipt.observed_p90_ms) {
+      throw "slo.p90_ms is not the receipt's derivation"
+    }
+    p90_regenerated = true
+  }
+  if after.warning_ms > before.warning_ms
+    && (!p90_regenerated || after.warning_ms != regenerated_warning(after.p90_ms)) {
+    throw "slo.warning_ms may only decrease unless regenerated with p90_ms"
+  }
+  if after.hard_max_ms > before.hard_max_ms {
+    throw "slo.hard_max_ms may only decrease"
+  }
+}
+
+fn compare_observed(policy: Policy, baseline: Policy) {
+  const old_observed = baseline.observed_baseline
+  const new_observed = policy.observed_baseline
+  if old_observed != nil && new_observed == nil {
+    throw "observed_baseline cannot be removed"
+  }
+  if old_observed != nil && new_observed != nil
+    && policy.topology_epoch == baseline.topology_epoch {
+    const old_limits = validate(baseline, old_observed)
+    const new_limits = validate(policy, new_observed)
+    // Both wire variants expose the same ratchet facts after reproduction.
+    if type_of(old_observed) != "dict" || type_of(new_observed) != "dict" {
+      throw "unmeasured observed baseline"
+    }
+    for metric in ["p50_ms", "p90_ms", "max_ms"] {
+      if new_observed.wall[metric] > old_observed.wall[metric] {
+        throw "observed_baseline may only tighten: " + metric
+      }
+    }
+    if new_limits.p90_regression_limit_ms > old_limits.p90_regression_limit_ms
+      || new_limits.max_regression_limit_ms > old_limits.max_regression_limit_ms {
+      throw "observed_baseline may only tighten: regression limit moved upward"
+    }
+  }
+}
+
+fn compare(policy: Policy, baseline: Policy) {
+  if policy.repository != baseline.repository {
+    throw "policy repository changed"
+  }
+  if policy.workflow != baseline.workflow || policy.event != baseline.event {
+    throw "workflow or event changes require a new policy"
+  }
+  compare_slo(policy, baseline)
+  compare_observed(policy, baseline)
+  if policy.required.critical_path_allowance_ms > baseline.required.critical_path_allowance_ms {
+    throw "critical-path allowance may only decrease"
+  }
+  for id in keys(baseline.required.jobs) {
+    const old_job = baseline.required.jobs[id]
+    const new_job = policy.required.jobs[id]
+    if old_job != nil && new_job != nil && new_job.budget_ms > old_job.budget_ms {
+      throw "job budget may only decrease: " + id
+    }
+  }
+}
+
+/** Check a complete required-job census and the immutable down-only baseline. */
+pub fn check(
+  policy: Policy,
+  workflow: unknown,
+  baseline: Policy? = nil,
+  repository: string? = nil,
+) {
+  if repository != nil && policy.repository != repository {
+    throw "policy repository does not match caller"
+  }
+  const observed = required_jobs(policy, workflow)
+  const declared = keys(policy.required.jobs).sorted()
+  for id in observed {
+    if !declared.contains(id) {
+      throw "required jobs have no latency budget: " + id
+    }
+  }
+  for id in declared {
+    if !observed.contains(id) {
+      throw "latency budgets no longer feed the aggregate: " + id
+    }
+  }
+  if baseline != nil {
+    compare(policy, baseline)
+  }
+}

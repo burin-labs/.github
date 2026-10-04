@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const action = dirname(fileURLToPath(import.meta.url));
 const steps = JSON.parse(execFileSync("ruby", ["-ryaml", "-rjson", "-e",
-  "puts JSON.generate(YAML.safe_load(File.read(ARGV[0]))['runs']['steps'])", join(action, "action.yml")], { encoding: "utf8" }));
+  "puts JSON.generate(YAML.safe_load(File.read(ARGV[0]))['runs']['steps'])", join(action, "action.yml")], { encoding: "utf8" })).filter(step => typeof step.run === "string");
 const sha = "a".repeat(40);
 const policy = {
   schema_version: 1, repository: "burin-labs/example", workflow: "ci.yml", event: "merge_group",
@@ -17,14 +17,14 @@ const policy = {
   required: { aggregate_job: "status", critical_path_allowance_ms: 600000, jobs: { build: { budget_ms: 500000 } } },
 };
 
-async function fixture(callback) {
+async function fixture(callback, sample = policy, workflow = "jobs:\n  build: {}\n  status:\n    needs: [build]\n") {
   const root = await mkdtemp(join(tmpdir(), "baseline-action-test-"));
   try {
-    await writeFile(join(root, "policy.json"), JSON.stringify(policy));
-    await writeFile(join(root, "workflow.yml"), "jobs:\n  build: {}\n  status:\n    needs: [build]\n");
+    await writeFile(join(root, "policy.json"), JSON.stringify(sample));
+    await writeFile(join(root, "workflow.yml"), workflow);
     const preload = join(root, "transport.mjs");
     await writeFile(preload, `
-      const policy = ${JSON.stringify(policy)};
+      const policy = ${JSON.stringify(sample)};
       const sha = ${JSON.stringify(sha)}, tree = 'b'.repeat(40);
       let count = 0;
       globalThis.fetch = async (_url, options) => {
@@ -44,7 +44,7 @@ async function fixture(callback) {
       };
     `);
     const env = { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
-      GITHUB_ACTION_PATH: action, GITHUB_REPOSITORY: policy.repository, BASELINE_SHA: sha,
+      GITHUB_ACTION_PATH: action, GITHUB_WORKSPACE: root, GITHUB_REPOSITORY: sample.repository, BASELINE_SHA: sha,
       GH_TOKEN: "fixture-token", POLICY_PATH: "policy.json", WORKFLOW_PATH: "workflow.yml",
       RUNNER_TEMP: root, GITHUB_OUTPUT: join(root, "output"), BASELINE_STATE: "", BASELINE_FILE: "" };
     const run = (step, extra = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", step.run],
@@ -53,7 +53,7 @@ async function fixture(callback) {
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
-test("actual action recovers503, emits usable atomic baseline and reaches unchanged budget checker", async () => {
+test("actual action recovers503, emits usable atomic baseline and reaches typed budget checker", async () => {
   await fixture(async ({ root, run }) => {
     const read = run(steps[0], { FIXTURE_MODE: "recover" });
     assert.equal(read.status, 0, read.stderr);
@@ -72,9 +72,57 @@ test("actual action recovers503, emits usable atomic baseline and reaches unchan
     await writeFile(join(root, "policy.json"), JSON.stringify(loosened));
     const refused = run(steps[1], env);
     assert.equal(refused.status, 1);
-    assert.match(refused.stderr, /budget may only decrease/);
+    assert.match(`${refused.stdout}${refused.stderr}`, /budget may only decrease/);
     assert.ok(!`${read.stdout}${read.stderr}${checked.stdout}${checked.stderr}`.includes("fixture-token"));
   });
+});
+
+test("actual sandboxed action accepts both immutable production writer contracts and refuses a forged writer", async () => {
+  for (const name of ["burin-4854778", "harn-773f11e"]) {
+    const sample = JSON.parse(await readFile(join(action, "../../fixtures/ci-latency-policy", `${name}.json`), "utf8"));
+    const workflow = await readFile(join(action, "../../fixtures/ci-latency-policy", `${name}.yml`), "utf8");
+    await fixture(async ({ root, run }) => {
+      const read = run(steps[0]);
+      assert.equal(read.status, 0, read.stderr);
+      const outputs = Object.fromEntries((await readFile(join(root, "output"), "utf8")).trim().split("\n").map(line => {
+        const split = line.indexOf("="); return [line.slice(0, split), line.slice(split + 1)];
+      }));
+      const env = { BASELINE_STATE: outputs.state, BASELINE_FILE: outputs["baseline-path"] };
+      const checked = run(steps[1], env);
+      assert.equal(checked.status, 0, `${name}: ${checked.stdout}${checked.stderr}`);
+      const census = JSON.parse(checked.stdout.trim().split("\n").at(-1));
+      assert.equal(census.requiredJobCount, Object.keys(sample.required.jobs).length);
+      assert.ok(census.requiredJobCount > 0);
+      assert.equal(census.pendingCount, 0);
+      assert.deepEqual(census.failingNames, []);
+      const forged = structuredClone(sample);
+      forged.observed_baseline.generator = "forged-ci-baseline-v1";
+      await writeFile(join(root, "policy.json"), JSON.stringify(forged));
+      const refused = run(steps[1], env);
+      assert.equal(refused.status, 1, name);
+      assert.match(refused.stdout, /unknown schema, writer/);
+      assert.doesNotMatch(refused.stdout, /CI latency policy: OK/);
+    }, sample, workflow);
+  }
+});
+
+test("installed observer writer is mechanically checked by the authoritative Harn projection", async () => {
+  const runs = [957000, 1052000, 1067000, 760000, 1061000].map((wall_ms, index) => {
+    const started = Date.parse("2026-08-27T06:00:00Z") - index * 3600000;
+    return { id: 100 - index, wall_ms, event: policy.event, conclusion: "success",
+      started_at: new Date(started).toISOString(), completed_at: new Date(started + wall_ms).toISOString(),
+      head_sha: (index + 1).toString(16).padStart(40, "0") };
+  });
+  const writer = spawnSync("ruby", ["-rjson", "-r", join(action, "ci_latency_baseline.rb"), "-e",
+    "sample = JSON.parse(STDIN.read); puts JSON.generate(CiLatencyBaseline.derive(sample.fetch('policy'), sample.fetch('runs')))"],
+    { input: JSON.stringify({ policy, runs }), encoding: "utf8" });
+  assert.equal(writer.status, 0, writer.stderr);
+  const sample = { ...policy, observed_baseline: JSON.parse(writer.stdout) };
+  await fixture(async ({ run }) => {
+    const checked = run(steps[1], { BASELINE_SHA: "" });
+    assert.equal(checked.status, 0, `${checked.stdout}${checked.stderr}`);
+    assert.match(checked.stdout, /CI latency policy: OK/);
+  }, sample);
 });
 
 test("actual CLI failure leaves neither outputs nor a replacement baseline", async () => {
