@@ -64,7 +64,13 @@ fn world(overrides: dict = {}) -> dict {
     [REPO + "/collaborators/contributor/permission"]: {permission: "write"},
     graphql: {repository: {pullRequest: {reviewDecision: "APPROVED"}}},
     [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
-      {check_runs: [check("CI status", "success"), check("lint", "success")]},
+      {
+        check_runs: [
+          check("CI status", "success"),
+          check("lint", "success"),
+          check("Dispatch merge override / Apply merge override", nil),
+        ],
+      },
     ],
     [REPO + "/issues/42/comments?per_page=100"]: [
       [
@@ -115,6 +121,7 @@ pipeline test_an_admin_bypass_lands_a_green_head_without_reading_the_default_bra
   assert_eq(result.record.reason, "fixes the repin rehearsal deadlocking the queue")
   assert_eq(result.record.reason_source, "comment")
   assert_eq(result.record.warnings, [])
+  assert_eq(result.record.checks.total, 2)
 }
 
 pipeline test_a_non_admin_label_is_refused(harness: Harness) {

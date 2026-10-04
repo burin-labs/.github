@@ -199,10 +199,17 @@ fn capped(names: list) -> list<string> {
   return sorted[0:LIST_CAP] + ["and " + to_string(len(sorted) - LIST_CAP) + " more"]
 }
 
+/** The override's own job, which is always running while it decides and red after a refusal. */
+pub const OVERRIDE_JOB = "Apply merge override"
+
 /** Head check states at decision time: the evidence an auditor asks for. */
 pub fn summarize_checks(check_runs: list) -> CheckSummary {
   let names = []
   for run in check_runs {
+    const name = to_string(run?.name)
+    if name == OVERRIDE_JOB || name.ends_with("/ " + OVERRIDE_JOB) {
+      continue
+    }
     if !names.contains(run?.name) {
       names = names + [run?.name]
     }
