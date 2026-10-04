@@ -133,6 +133,7 @@ jobs:
           LABEL: ${{ inputs.ship-label }}
           NUMBERS: ${{ steps.prs.outputs.numbers }}
           REPAIR: ${{ inputs.repair }}
+          BURIN_REF: ${{ inputs.burin-ref }}
         run: |
           set -uo pipefail
           git config --global user.name "harn-release-bot[bot]"
@@ -142,6 +143,20 @@ jobs:
           policy="$RUNNER_TEMP/ship.toml"
           gh api "repos/$REPO/contents/.github/smart-ship.toml" --jq '.content' 2>/dev/null \
             | base64 -d > "$policy" 2>/dev/null || : > "$policy"
+          # Until the shepherd script is on the chosen burin-code ref, the label
+          # still lands the change: hand each open labeled PR to the merge queue.
+          if [ ! -f scripts/smart-ship.harn ]; then
+            echo "::notice::Smart Ship is not on burin-code@${BURIN_REF} yet; queueing labeled PRs for merge instead"
+            status=0
+            for n in $NUMBERS; do
+              state="$(gh pr view "$n" -R "$REPO" --json state --jq .state)"
+              if [ "$state" != "OPEN" ]; then
+                continue
+              fi
+              gh pr merge "$n" -R "$REPO" --squash --auto || status=1
+            done
+            exit $status
+          fi
           extra=()
           if [ "$REPAIR" != "true" ]; then
             extra+=(--no-repair)
