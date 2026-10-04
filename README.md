@@ -562,14 +562,20 @@ The label is an admin's decision; the workflow does not ask for proof of an
 incident or read the default branch's health. `scripts/merge-override/` refuses
 only what is unsafe whoever asks, before any side effect:
 
-| Refusal | Why it stays |
-| --- | --- |
-| A label actor is not an organization or repository admin, re-checked from the issue event that attached the label | Applying a label needs only triage; this is the authority check |
-| The head lives in a fork | The release app would merge code from outside the organization |
-| The head moved after the label was applied | The admin approved a different commit; the merge also pins the labeled SHA |
-| The pull request is not open | Nothing to merge |
-| Required approval is missing (GitHub `reviewDecision` is `REVIEW_REQUIRED` or `CHANGES_REQUESTED`), except for `force-merge` | The release app bypasses review rules; `force-merge` is the label that skips review too |
-| `bypass-merge-queue` on a head whose `CI status` is not green | That label promises CI passed; `force-merge` is the label that says it did not |
+- A label actor is not an organization or repository admin, re-checked from
+  the issue event that attached the label. Applying a label needs only triage;
+  this is the authority check.
+- The head lives in a fork. The release app would merge code from outside the
+  organization.
+- The head moved after the label was applied. The admin approved a different
+  commit; the merge also pins the labeled SHA.
+- The pull request is not open. There is nothing to merge.
+- Required approval is missing (GitHub's `reviewDecision` is
+  `REVIEW_REQUIRED` or `CHANGES_REQUESTED`), except for `force-merge`. The
+  release app bypasses review rules; `force-merge` is the label that skips
+  review too.
+- `bypass-merge-queue` on a head whose `CI status` is not green. That label
+  promises CI passed; `force-merge` is the label that says it did not.
 
 Red checks on the head, checks still running, and a missing reason are
 warnings in the record, never refusals.
