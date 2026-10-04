@@ -1,0 +1,96 @@
+import { derive, validate } from "./baseline.harn"
+import { Policy, decode } from "./policy.harn"
+
+fn policy(fs: HarnessFs, name: string) -> Policy {
+  const raw = json_parse(fs.read_text("../../.github/fixtures/ci-latency-policy/" + name + ".json"))
+  return decode(raw)
+}
+
+pipeline test_real_burin_writer_and_measured_jobs_reproduce(harness: Harness) {
+  const current = policy(harness.fs, "burin-4854778")
+  const limits = validate(current, current.observed_baseline)
+  assert_eq(limits.baseline_p90_ms, current.observed_baseline.wall.p90_ms)
+  assert(len(current.observed_baseline.job_runs) > 0)
+  let tampered = current.observed_baseline
+  tampered.required_jobs.jobs[0].p90_ms = tampered.required_jobs.jobs[0].p90_ms + 1
+  const refused = try {
+    validate(current, tampered)
+  }
+  assert(is_err(refused))
+}
+
+pipeline test_real_generic_harn_writer_reproduces(harness: Harness) {
+  const current = policy(harness.fs, "harn-773f11e")
+  const limits = validate(current, current.observed_baseline)
+  assert_eq(limits.baseline_p90_ms, current.observed_baseline.wall.p90_ms)
+}
+
+pipeline test_wrong_writer_and_missing_evidence_are_refused(harness: Harness) {
+  const current = policy(harness.fs, "burin-4854778")
+  let wrong = current.observed_baseline
+  wrong.generator = "unrelated-baseline-v1"
+  assert(
+    is_err(
+      try {
+        validate(current, wrong)
+      },
+    ),
+  )
+  let partial = current.observed_baseline
+  partial.runs = []
+  assert(
+    is_err(
+      try {
+        validate(current, partial)
+      },
+    ),
+  )
+}
+
+pipeline test_writer_refuses_unqualified_provenance_before_generating_a_verdict(harness: Harness) {
+  const current = policy(harness.fs, "harn-773f11e")
+  const baseline = current.observed_baseline
+  let failed = baseline.runs
+  failed[0].conclusion = "failure"
+  assert(
+    is_err(
+      try {
+        derive(current, failed, "shared-v2")
+      },
+    ),
+  )
+  let duplicate = baseline.runs
+  duplicate[1].id = duplicate[0].id
+  assert(
+    is_err(
+      try {
+        derive(current, duplicate, "shared-v2")
+      },
+    ),
+  )
+  let unsigned = baseline.runs
+  unsigned[0].head_sha = ""
+  assert(
+    is_err(
+      try {
+        derive(current, unsigned, "shared-v2")
+      },
+    ),
+  )
+  let inconsistent = baseline.runs
+  inconsistent[0].wall_ms = inconsistent[0].wall_ms + 1
+  assert(
+    is_err(
+      try {
+        derive(current, inconsistent, "shared-v2")
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        derive(current, [], "shared-v2")
+      },
+    ),
+  )
+}

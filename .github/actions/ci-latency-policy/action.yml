@@ -20,6 +20,10 @@ inputs:
     description: Read-only token used to fetch the policy at baseline-sha.
     required: false
     default: ""
+  harn-version:
+    description: Exact released Harn runtime for the shared typed policy contract.
+    required: false
+    default: "0.10.155"
 
 runs:
   using: composite
@@ -34,7 +38,12 @@ runs:
         POLICY_PATH: ${{ inputs.policy }}
       run: node "$GITHUB_ACTION_PATH/read-baseline.mjs"
 
-    - name: Check declared CI latency contract
+    - name: Set up typed policy runtime
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f # bounded release-asset retries
+      with:
+        version: ${{ inputs.harn-version }}
+
+    - name: Validate declared CI latency contract
       shell: bash
       env:
         BASELINE_SHA: ${{ inputs.baseline-sha }}
@@ -45,24 +54,4 @@ runs:
         BASELINE_FILE: ${{ steps.baseline.outputs.baseline-path }}
       run: |
         set -euo pipefail
-        baseline_args=()
-        if [ -n "$BASELINE_SHA" ]; then
-          case "$BASELINE_STATE" in
-            found)
-              if [ -z "$BASELINE_FILE" ] || [ ! -s "$BASELINE_FILE" ]; then
-                echo "::error::Measured baseline file is missing; refusing policy validation"
-                exit 1
-              fi
-              baseline_args=(--baseline "$BASELINE_FILE") ;;
-            absent)
-              echo "::notice::Complete immutable tree confirms no baseline policy at ${BASELINE_SHA}" ;;
-            *)
-              echo "::error::Baseline decision is unmeasured; refusing policy validation"
-              exit 1 ;;
-          esac
-        fi
-        ruby "$GITHUB_ACTION_PATH/check_ci_latency_policy.rb" \
-          --policy "$POLICY_PATH" \
-          --workflow "$WORKFLOW_PATH" \
-          --repository "$GITHUB_REPOSITORY" \
-          "${baseline_args[@]}"
+        bash "$GITHUB_ACTION_PATH/run.sh"

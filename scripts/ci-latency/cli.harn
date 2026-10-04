@@ -1,0 +1,47 @@
+import { check, decode } from "./policy.harn"
+
+fn required(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name)
+  if value == nil || value == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn main(harness: Harness) {
+  try {
+    const workspace = required(harness.env, "GITHUB_WORKSPACE")
+    const policy = decode(
+      json_parse(harness.fs.read_text(path_join(workspace, required(harness.env, "POLICY_PATH")))),
+    )
+    const workflow = yaml_parse(
+      harness.fs.read_text(path_join(workspace, required(harness.env, "WORKFLOW_PATH"))),
+    )
+    const sha = harness.env.get("BASELINE_SHA") ?? ""
+    let baseline = nil
+    if sha != "" {
+      const state = required(harness.env, "BASELINE_STATE")
+      if state == "found" {
+        const baseline_path = required(harness.env, "BASELINE_FILE")
+        baseline = decode(json_parse(harness.fs.read_text(baseline_path)))
+      } else if state != "absent" {
+        throw "baseline decision is unmeasured; refusing policy validation"
+      }
+    }
+    check(policy, workflow, baseline, required(harness.env, "GITHUB_REPOSITORY"))
+    harness.stdio.println(
+      "CI latency policy: OK (" + to_string(len(policy.required.jobs)) + " required jobs, "
+        + to_string(policy.required.critical_path_allowance_ms)
+        + "ms allowance)",
+    )
+    harness.stdio.println(
+      json_stringify(
+        {pendingCount: 0, failingNames: [], requiredJobCount: len(policy.required.jobs)},
+      ),
+    )
+  } catch (error) {
+    harness.stdio.println("CI latency policy: refusing policy validation: " + to_string(error))
+    harness.stdio.println(json_stringify({pendingCount: 1, failingNames: ["ci-latency-policy"]}))
+    harness.runtime.exit(1)
+  }
+}

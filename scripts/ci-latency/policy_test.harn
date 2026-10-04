@@ -1,0 +1,290 @@
+import { Run, derive } from "./baseline.harn"
+import { Policy, check, decode } from "./policy.harn"
+
+const WORKFLOW = {jobs: {build: {}, status: {needs: ["build"]}}}
+
+fn fixture() -> Policy {
+  const policy = decode(
+    {
+      schema_version: 1,
+      repository: "burin-labs/example",
+      workflow: "ci.yml",
+      event: "merge_group",
+      topology_epoch: "2026-08-08T00:00:00Z",
+      full_run_jobs: [{name: "Build", match: "exact"}],
+      slo: {
+        warning_ms: 540000,
+        p90_ms: 600000,
+        hard_max_ms: 900000,
+        min_samples: 5,
+        window_samples: 5,
+      },
+      required: {
+        aggregate_job: "status",
+        critical_path_allowance_ms: 600000,
+        jobs: {build: {budget_ms: 500000}},
+      },
+    },
+  )
+  check(policy, WORKFLOW, policy, policy.repository)
+  return policy
+}
+
+pipeline test_complete_census_refuses_missing_stale_and_undefined_jobs() {
+  const policy = fixture()
+  assert(
+    is_err(
+      try {
+        check(policy, {jobs: {build: {}, extra: {}, status: {needs: ["build", "extra"]}}})
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        check(policy, {jobs: {build: {}, status: {needs: ["missing"]}}})
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        check(policy, {jobs: {build: {}, status: {needs: []}}})
+      },
+    ),
+  )
+  let stale = policy
+  stale.required.jobs.extra = {budget_ms: 1000}
+  assert(
+    is_err(
+      try {
+        check(stale, WORKFLOW)
+      },
+    ),
+  )
+}
+
+pipeline test_down_only_allowance_budget_identity_and_hard_max() {
+  const baseline = fixture()
+  let tighter = baseline
+  tighter.required.jobs.build.budget_ms = 490000
+  check(tighter, WORKFLOW, baseline)
+  let budget = baseline
+  budget.required.jobs.build.budget_ms = 510000
+  assert(
+    is_err(
+      try {
+        check(budget, WORKFLOW, baseline)
+      },
+    ),
+  )
+  let allowance = baseline
+  allowance.required.critical_path_allowance_ms = 610000
+  assert(
+    is_err(
+      try {
+        check(allowance, WORKFLOW, baseline)
+      },
+    ),
+  )
+  let maximum = baseline
+  maximum.slo.hard_max_ms = 910000
+  assert(
+    is_err(
+      try {
+        check(maximum, WORKFLOW, baseline)
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        check(baseline, WORKFLOW, baseline, "burin-labs/unrelated")
+      },
+    ),
+  )
+  let event = baseline
+  event.event = "push"
+  assert(
+    is_err(
+      try {
+        check(event, WORKFLOW, baseline)
+      },
+    ),
+  )
+}
+
+pipeline test_regeneration_requires_exact_derivation_and_valid_samples() {
+  const baseline = fixture()
+  let regenerated = baseline
+  regenerated.slo.p90_ms = 840000
+  regenerated.slo.warning_ms = 756000
+  regenerated.slo.regenerated = {
+    sampled_at: "2026-08-09T00:00:00Z",
+    source: "fixture",
+    sample_count: 10,
+    observed_p90_ms: 700000,
+  }
+  check(decode(regenerated), WORKFLOW, baseline)
+  let wrong = regenerated
+  wrong.slo.p90_ms = 846000
+  assert(
+    is_err(
+      try {
+        check(decode(wrong), WORKFLOW, baseline)
+      },
+    ),
+  )
+  let undersampled = regenerated
+  undersampled.slo.regenerated = {
+    sampled_at: "2026-08-09T00:00:00Z",
+    source: "fixture",
+    sample_count: 1,
+    observed_p90_ms: 700000,
+  }
+  assert(
+    is_err(
+      try {
+        decode(undersampled)
+      },
+    ),
+  )
+  let old = regenerated
+  old.slo.regenerated = {
+    sampled_at: "2026-08-07T00:00:00Z",
+    source: "fixture",
+    sample_count: 10,
+    observed_p90_ms: 700000,
+  }
+  assert(
+    is_err(
+      try {
+        decode(old)
+      },
+    ),
+  )
+  let warning = regenerated
+  warning.slo.warning_ms = 762000
+  assert(
+    is_err(
+      try {
+        check(decode(warning), WORKFLOW, baseline)
+      },
+    ),
+  )
+  let missing = baseline
+  missing.slo.p90_ms = 840000
+  assert(
+    is_err(
+      try {
+        check(decode(missing), WORKFLOW, baseline)
+      },
+    ),
+  )
+}
+
+pipeline test_sampling_policy_requires_measured_nonempty_sets() {
+  const baseline = fixture()
+  let inverted = baseline
+  inverted.slo.warning_ms = inverted.slo.p90_ms
+  assert(
+    is_err(
+      try {
+        decode(inverted)
+      },
+    ),
+  )
+  let empty = baseline
+  empty.full_run_jobs = []
+  assert(
+    is_err(
+      try {
+        decode(empty)
+      },
+    ),
+  )
+  let no_budget = baseline
+  no_budget.required.jobs = {}
+  assert(
+    is_err(
+      try {
+        decode(no_budget)
+      },
+    ),
+  )
+  let undersampled = baseline
+  undersampled.slo.min_samples = 6
+  assert(
+    is_err(
+      try {
+        decode(undersampled)
+      },
+    ),
+  )
+}
+
+fn observed(policy: Policy, wall_ms: int) -> Policy {
+  let runs: list<Run> = []
+  for id in [1, 2, 3, 4, 5] {
+    runs = runs
+      + [
+        {
+          id: id,
+          wall_ms: wall_ms,
+          event: policy.event,
+          conclusion: "success",
+          started_at: "2026-08-09T00:00:00Z",
+          completed_at: date_format(
+            date_parse("2026-08-09T00:00:00Z") + wall_ms / 1000,
+            "%Y-%m-%dT%H:%M:%SZ",
+          ),
+          head_sha: "1111111111111111111111111111111111111111",
+        },
+      ]
+  }
+  let measured = policy
+  measured.observed_baseline = derive(policy, runs, "shared-v2")
+  return decode(measured)
+}
+
+pipeline test_observed_baseline_removal_loosened_metrics_and_topology_reset() {
+  const policy = fixture()
+  const measured = observed(policy, 500000)
+  check(measured, WORKFLOW)
+  assert(
+    is_err(
+      try {
+        check(policy, WORKFLOW, measured)
+      },
+    ),
+  )
+  const slower = observed(policy, 510000)
+  assert(
+    is_err(
+      try {
+        check(slower, WORKFLOW, measured)
+      },
+    ),
+  )
+  let reset = policy
+  reset.topology_epoch = "2026-08-09T00:00:00Z"
+  check(observed(reset, 510000), WORKFLOW, measured)
+  // Changing topology does not authorize deleting the measured evidence.
+  assert(
+    is_err(
+      try {
+        check(reset, WORKFLOW, measured)
+      },
+    ),
+  )
+}
+
+pipeline test_real_consumers_are_valid_policy_contracts(harness: Harness) {
+  for name in ["burin-4854778", "harn-773f11e"] {
+    const raw = json_parse(
+      harness.fs.read_text("../../.github/fixtures/ci-latency-policy/" + name + ".json"),
+    )
+    const policy = decode(raw)
+    assert(len(policy.required.jobs) > 0)
+  }
+}

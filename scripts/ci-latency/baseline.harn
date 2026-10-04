@@ -1,0 +1,325 @@
+/** Wire versions of the two installed writers, with one reproduction owner. */
+pub type BaselineFormat = "shared-v2" | "burin-v1" | "burin-v2"
+
+/** A completed workflow run with immutable source and measured timestamps. */
+pub type Run = {
+  id: int,
+  wall_ms: int,
+  event: string,
+  conclusion: string,
+  started_at: string,
+  completed_at: string,
+  head_sha: string,
+}
+
+/** One named job's measured execution interval and terminal conclusion. */
+pub type Job = {
+  name: string,
+  wall_ms: int,
+  conclusion: string,
+  started_at: string,
+  completed_at: string,
+}
+
+/** Per-job evidence associated with a workflow run identifier. */
+pub type JobRun = {id: int, jobs: list<Job>}
+
+/** The policy facts that select and constrain a measured baseline window. */
+pub type SamplingPolicy = {
+  event: string,
+  topology_epoch: string,
+  slo: {p90_ms: int, hard_max_ms: int, min_samples: int, window_samples: int},
+}
+
+/** Common regression facts exposed only after complete evidence reproduction. */
+pub type BaselineLimits = {
+  baseline_p90_ms: int,
+  baseline_max_ms: int,
+  p90_regression_limit_ms: int,
+  max_regression_limit_ms: int,
+  sampled_at: string,
+}
+
+type Header = {schema_version: int, generator: string}
+
+type Evidence = {runs: list<Run>, job_runs?: list<JobRun>}
+
+type SharedBaseline = {
+  schema_version: 2,
+  generator: "ci-latency-baseline-v2",
+  topology_epoch: string,
+  runs: list<Run>,
+  wall: {
+    sample_count: int,
+    p50_ms: int,
+    p90_ms: int,
+    max_ms: int,
+    p90_regression_limit_ms: int,
+    max_regression_limit_ms: int,
+  },
+}
+
+type JobObservation = {name: string, sample_count: int, p90_ms: int, max_ms: int}
+
+type BurinBaseline = {
+  schema_version: 2,
+  generator: "burin-ci-latency-baseline-v1",
+  topology_epoch: string,
+  product_target_ms: int,
+  runs: list<Run>,
+  job_runs: list<JobRun>,
+  wall: {sample_count: int, p50_ms: int, p90_ms: int, max_ms: int, regression_limit_ms: int},
+  required_jobs: {status: string, reason: string, sample_runs: int, jobs: list<JobObservation>},
+}
+
+type LegacyBurinBaseline = {
+  schema_version: 1,
+  generator: "burin-ci-latency-baseline-v1",
+  topology_epoch: string,
+  product_target_ms: int,
+  runs: list<Run>,
+  wall: {sample_count: int, p50_ms: int, p90_ms: int, max_ms: int, regression_limit_ms: int},
+  required_jobs: {status: string, reason: string},
+}
+
+fn format(raw: unknown) -> BaselineFormat {
+  if schema_is(raw, SharedBaseline) {
+    return "shared-v2"
+  }
+  if schema_is(raw, BurinBaseline) {
+    return "burin-v2"
+  }
+  if schema_is(raw, LegacyBurinBaseline) {
+    return "burin-v1"
+  }
+  if schema_is(raw, Header) {
+    throw "observed_baseline has an unknown schema, writer, or incomplete evidence"
+  }
+  throw "observed_baseline must carry a typed writer contract"
+}
+
+pub fn percentile(values: list<int>, fraction: float) -> int {
+  if len(values) == 0 {
+    throw "baseline requires at least one sample"
+  }
+  if fraction <= 0 || fraction > 1 {
+    throw "invalid percentile fraction"
+  }
+  const sorted = values.sorted()
+  const value = sorted[max(0, to_int(ceil(fraction * len(sorted))) - 1)]
+  if value == nil {
+    throw "percentile did not select a measured sample"
+  }
+  return value
+}
+
+pub fn regression_limit(value: int) -> int {
+  // Integer ceiling preserves the writer's exact millisecond projection.
+  return max(to_int((value * 110 + 99) / 100), value + 60000)
+}
+
+fn duration(started: string, completed: string) -> int {
+  const start = date_parse(started)
+  const end = date_parse(completed)
+  const measured = to_int(round((end - start) * 1000))
+  if measured <= 0 {
+    throw "baseline timestamps did not measure a positive duration"
+  }
+  return measured
+}
+
+fn provenance(run: Run, policy: SamplingPolicy, writer: BaselineFormat) {
+  if run.id <= 0 || run.wall_ms <= 0 {
+    throw "baseline samples require positive id and wall_ms"
+  }
+  if run.event != policy.event {
+    throw "baseline sample does not match policy event"
+  }
+  if run.conclusion != "success" && (writer == "shared-v2" || run.conclusion != "failure") {
+    throw "baseline sample is not a qualifying completed run"
+  }
+  if !regex_match("^[0-9a-f]{40}$", run.head_sha) {
+    throw "baseline sample lacks commit provenance"
+  }
+  if date_parse(run.started_at) < date_parse(policy.topology_epoch) {
+    throw "baseline sample predates topology_epoch"
+  }
+  if duration(run.started_at, run.completed_at) != run.wall_ms {
+    throw "baseline run wall_ms disagrees with timestamps"
+  }
+}
+
+fn window(policy: SamplingPolicy, runs: list<Run>, writer: BaselineFormat) -> list<Run> {
+  if policy.slo.min_samples <= 0 || policy.slo.window_samples < policy.slo.min_samples {
+    throw "invalid baseline sampling window"
+  }
+  // The installed shared writer sorts; Burin's sampler supplies its window.
+  // Preserve both contracts until their callers deliberately migrate formats.
+  let selected: list<Run> = runs
+  if writer == "shared-v2" {
+    selected = runs.sort_by(fn(run) { return [date_parse(run.started_at), run.id] }).reversed()
+  }
+  selected = selected.take(policy.slo.window_samples)
+  if len(selected) < policy.slo.min_samples {
+    throw "observed_baseline has too few samples"
+  }
+  let ids: list<int> = []
+  for run in selected {
+    provenance(run, policy, writer)
+    if ids.contains(run.id) {
+      throw "baseline contains duplicate run id"
+    }
+    ids = ids + [run.id]
+  }
+  return selected
+}
+
+fn job_window(runs: list<JobRun>) -> list<JobRun> {
+  let selected: list<JobRun> = []
+  let ids: list<int> = []
+  for run in runs {
+    if run.id <= 0 || ids.contains(run.id) {
+      throw "invalid or duplicate per-job run id"
+    }
+    let jobs: list<Job> = []
+    let names: list<string> = []
+    for job in run.jobs {
+      if job.name == "" {
+        throw "per-job evidence requires a job name"
+      }
+      if job.conclusion != "success" && job.conclusion != "failure" {
+        continue
+      }
+      if names.contains(job.name) {
+        throw "per-job evidence contains duplicate job name"
+      }
+      if duration(job.started_at, job.completed_at) != job.wall_ms {
+        throw "job wall_ms disagrees with timestamps"
+      }
+      names = names + [job.name]
+      jobs = jobs + [job]
+    }
+    if len(jobs) > 0 {
+      ids = ids + [run.id]
+      selected = selected + [{id: run.id, jobs: jobs}]
+    }
+  }
+  return selected
+}
+
+fn job_observations(runs: list<JobRun>) -> dict {
+  if len(runs) == 0 {
+    return {
+      status: "unmeasured",
+      reason: "no sampled run carried per-job timings",
+      sample_runs: 0,
+      jobs: [],
+    }
+  }
+  let durations: dict<string, list<int>> = {}
+  for run in runs {
+    for job in run.jobs {
+      durations[job.name] = (durations[job.name] ?? []) + [job.wall_ms]
+    }
+  }
+  let jobs: list<JobObservation> = []
+  for name in keys(durations).sorted() {
+    const values = durations[name]
+    if values == nil {
+      throw "job observation has no measured samples"
+    }
+    jobs = jobs
+      + [
+        {
+          name: name,
+          sample_count: len(values),
+          p90_ms: percentile(values, 0.9),
+          max_ms: percentile(values, 1.0),
+        },
+      ]
+  }
+  return {status: "measured", reason: "", sample_runs: len(runs), jobs: jobs}
+}
+
+/** Generate all evidence fields; callers cannot supply aggregate verdicts. */
+pub fn derive(
+  policy: SamplingPolicy,
+  runs: list<Run>,
+  writer: BaselineFormat,
+  jobs: list<JobRun> = [],
+) -> dict {
+  const selected = window(policy, runs, writer)
+  const values = selected.map(fn(run) { return run.wall_ms })
+  const p50 = percentile(values, 0.5)
+  const p90 = percentile(values, 0.9)
+  const maximum = percentile(values, 1.0)
+  let wall = {sample_count: len(selected), p50_ms: p50, p90_ms: p90, max_ms: maximum}
+  if writer == "shared-v2" {
+    wall.p90_regression_limit_ms = regression_limit(p90)
+    wall.max_regression_limit_ms = regression_limit(maximum)
+    return {
+      schema_version: 2,
+      generator: "ci-latency-baseline-v2",
+      topology_epoch: policy.topology_epoch,
+      runs: selected,
+      wall: wall,
+    }
+  }
+  wall.regression_limit_ms = min(regression_limit(p90), policy.slo.hard_max_ms)
+  let result = {
+    schema_version: 1,
+    generator: "burin-ci-latency-baseline-v1",
+    topology_epoch: policy.topology_epoch,
+    product_target_ms: policy.slo.p90_ms,
+    runs: selected,
+    wall: wall,
+    required_jobs: {
+      status: "unmeasured",
+      reason: "the run-level observer does not fetch per-required-job timings",
+    },
+  }
+  if writer == "burin-v2" {
+    const measured_jobs = job_window(jobs)
+    result.schema_version = 2
+    result.job_runs = measured_jobs
+    result.required_jobs = job_observations(measured_jobs)
+  }
+  return result
+}
+
+/** Validate the complete wire projection before exposing common ratchet facts. */
+pub fn validate(policy: SamplingPolicy, raw: unknown) -> BaselineLimits {
+  const writer = format(raw)
+  if !schema_is(raw, Evidence) {
+    throw "observed_baseline has incomplete run evidence"
+  }
+  const runs = raw.runs
+  let jobs: list<JobRun> = []
+  if writer == "burin-v2" {
+    const job_runs = raw.job_runs
+    if job_runs == nil {
+      throw "observed_baseline has incomplete job evidence"
+    }
+    jobs = job_runs
+  }
+  const expected = derive(policy, runs, writer, jobs)
+  if raw != expected {
+    throw "observed_baseline is not the generated projection of its runs and jobs"
+  }
+  const wall = expected.wall
+  let sampled_at = ""
+  for run in runs {
+    if run.completed_at > sampled_at {
+      sampled_at = run.completed_at
+    }
+  }
+  return {
+    baseline_p90_ms: wall.p90_ms,
+    baseline_max_ms: wall.max_ms,
+    p90_regression_limit_ms: writer == "shared-v2" ? wall.p90_regression_limit_ms : wall
+      .regression_limit_ms,
+    max_regression_limit_ms: writer == "shared-v2" ? wall
+      .max_regression_limit_ms : regression_limit(wall.max_ms),
+    sampled_at: sampled_at,
+  }
+}
