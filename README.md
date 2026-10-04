@@ -611,7 +611,7 @@ quarter as JSON Lines for an auditor's change-management sample:
 
 ```bash
 gh api --paginate "repos/burin-labs/override-log/issues/<N>/comments" \
-  --jq '.[].body | capture("```json\n(?<r>.*)\n```"; "s").r'
+  --jq '.[].body | capture("```json\n(?<r>.*)\n```").r'
 ```
 
 People and agents use these labels, not `gh pr merge --admin`. An admin merge
