@@ -3,16 +3,28 @@ pub type LaunchProfile = {
   mode: string,
   bundle_root: string,
   ledger_root: string,
+  command_path: string,
   argv: list<string>,
 }
 
 // Filled only after the guard's fail-closed and identity prerequisites qualify.
 pub const QUALIFIED_GUARD_PY_SHA256 = ""
 
-pub fn verify_installed_guard(fs: HarnessFs, bundle: string) {
+/** Bootstrap reports directory identity; policy rejects redirected grants. */
+pub fn verify_control_directories(profile: LaunchProfile, bundle: string, ledger: string) {
+  if bundle != profile.bundle_root || ledger != profile.ledger_root {
+    throw "trusted review-rule directories must exist at their canonical installed paths"
+  }
+}
+
+pub fn require_qualified_guard() {
   if QUALIFIED_GUARD_PY_SHA256 == "" {
     throw "trusted review-rule launch awaits a qualified fail-closed GitHub guard"
   }
+}
+
+pub fn verify_installed_guard(fs: HarnessFs, bundle: string) {
+  require_qualified_guard()
   if sha256(fs.read_bytes(path_join(bundle, "gh_budget.py"))) != QUALIFIED_GUARD_PY_SHA256 {
     throw "installed GitHub budget guard differs from the qualified source"
   }
@@ -28,8 +40,8 @@ pub fn launch_profile(source_root: string, home: string, mode: string) -> Launch
     throw "REVIEW_RULESET_MODE must be plan, snapshot, or verify"
   }
   for path in [source_root, home] {
-    if !path.starts_with("/") || path.contains("\n") || path.contains("\r") {
-      throw "trusted launcher roots must be absolute single-line paths"
+    if !path.starts_with("/") || path.contains("\n") || path.contains("\r") || path.contains(":") {
+      throw "trusted launcher roots must be absolute paths without line or PATH delimiters"
     }
   }
   const bundle = path_join(home, ".local/share/gh-budget")
@@ -44,6 +56,7 @@ pub fn launch_profile(source_root: string, home: string, mode: string) -> Launch
     mode: mode,
     bundle_root: bundle,
     ledger_root: ledger,
+    command_path: bundle + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
     argv: args + [path_join(source_root, "scripts/harn-required-review/cli.harn")],
   }
 }
