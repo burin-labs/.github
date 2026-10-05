@@ -1,0 +1,69 @@
+import { launch_profile, verify_control_source } from "./launch-profile.harn"
+
+fn refused(action: fn() -> any) {
+  let caught = false
+  try {
+    action()
+  } catch (error) {
+    caught = true
+  }
+  assert(caught, "the negative control must refuse")
+}
+
+pipeline test_arbitrary_modes_and_multiline_or_relative_roots_are_refused(harness: Harness) {
+  refused(fn() { launch_profile("/reviewed/repo", "/control/home", "agent") })
+  refused(fn() { launch_profile("relative", "/control/home", "snapshot") })
+  refused(fn() { launch_profile("/reviewed/repo", "/control/home\n--no-sandbox", "verify") })
+}
+
+pipeline test_plan_receives_no_shared_state_or_network_grants(harness: Harness) {
+  const profile = launch_profile("/reviewed/repo", "/control/home", "plan")
+  assert_eq(
+    profile.argv,
+    ["run", "--standalone", "/reviewed/repo/scripts/harn-required-review/cli.harn"],
+  )
+}
+
+pipeline test_only_exact_control_bundle_and_ledger_receive_process_grants(harness: Harness) {
+  const profile = launch_profile("/reviewed/repo", "/control/home", "snapshot")
+  assert_eq(profile.bundle_root, "/control/home/.local/share/gh-budget")
+  assert_eq(profile.ledger_root, "/control/home/.local/state/gh-budget")
+  assert_eq(
+    profile.argv,
+    [
+      "run",
+      "--standalone",
+      "--sandbox-read-root",
+      profile.bundle_root,
+      "--sandbox-write-root",
+      profile.ledger_root,
+      "--allow-process-network",
+      "/reviewed/repo/scripts/harn-required-review/cli.harn",
+    ],
+  )
+}
+
+pipeline test_current_control_sources_match_the_reviewed_seal(harness: Harness) {
+  const root = path_join(harness.fs.cwd(), "../..")
+  verify_control_source(harness.fs, root)
+}
+
+pipeline test_changed_executable_source_is_refused_before_dispatch(harness: Harness) {
+  const root = path_join(harness.fs.cwd(), "../..")
+  const scratch = harness.fs.mkdtemp_in_workspace("review-source-seal-")
+  for path in [
+    "scripts/harn-required-review/cli.harn",
+    "scripts/harn-required-review/measure.harn",
+    "scripts/harn-required-review/policy.harn",
+    "scripts/merge-override/github.harn",
+  ] {
+    harness.fs.mkdir(dirname(path_join(scratch, path)), true)
+    harness.fs.write_bytes(path_join(scratch, path), harness.fs.read_bytes(path_join(root, path)))
+  }
+  verify_control_source(harness.fs, scratch)
+  harness.fs.write_text(
+    path_join(scratch, "scripts/harn-required-review/cli.harn"),
+    "fn main(harness: Harness) {}\n",
+  )
+  refused(fn() { verify_control_source(harness.fs, scratch) })
+}
