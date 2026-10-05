@@ -56,6 +56,13 @@ effort:
     color: "d93f0b"
     description: Multi-day or multi-PR
 
+# Smart Ship reconciles this one control label before every sweep. Other
+# taxonomy entries remain additive reference data applied by each repository.
+delivery:
+  - name: ship
+    color: "0e8a16"
+    description: Ship this pull request with the Smart Ship shepherd
+
 reused-unprefixed:
   # Already exist as GitHub defaults or prior art in harn/burin-code. Reuse
   # these instead of inventing a type/* or size/* prefix for them.

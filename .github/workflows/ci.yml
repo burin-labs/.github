@@ -31,6 +31,7 @@ jobs:
           harn test scripts/release-promotion
           harn test scripts/release-repin
           harn test scripts/merge-override
+          harn test scripts/smart-ship-label
           harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels
           bash .github/actions/local-workflow-checks/run_test.sh

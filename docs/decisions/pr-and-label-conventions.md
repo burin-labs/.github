@@ -81,13 +81,14 @@ prefixes instead; nothing published favors one over the other.
 There is no `type/*` prefix because GitHub's own defaults already carry that
 fact. `type/bug` next to `bug` would be two labels for one thing.
 
-Nothing syncs `.github/labels.yml`. GitHub does not inherit labels from an
-organization's `.github` repository, and
+GitHub does not inherit labels from an organization's `.github` repository, and
 [organization default labels](https://docs.github.com/en/organizations/managing-organization-settings/managing-default-labels-for-repositories-in-your-organization)
 apply only to newly created repositories, not existing ones. The file is
-reference. If we ever want it applied mechanically, the only maintained action
-for it is `crazy-max/ghaction-github-labeler`, and its delete behavior is on by
-default, which would violate the never-delete-a-label rule on first run.
+reference for the shared taxonomy. Smart Ship reconciles only its own `ship`
+control from the `delivery` section before discovery. Keeping that narrow
+mutation in the workflow that consumes the label avoids a general sync system,
+and it never deletes labels. The general maintained label action enables delete
+behavior by default, which would violate the never-delete rule on first run.
 
 ## Contributor guidance lives in every repository, not only here
 
