@@ -34,6 +34,7 @@ jobs:
           harn test scripts/smart-ship-label
           harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels
+          harn test scripts/harn-required-review
           bash .github/actions/local-workflow-checks/run_test.sh
       # Dogfooding: the same action product repositories call, on the Harn
       # release the shared action above already installed.
