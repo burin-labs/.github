@@ -8,7 +8,8 @@ pub type LaunchProfile = {
 }
 
 // Filled only after the guard's fail-closed and identity prerequisites qualify.
-pub const QUALIFIED_GUARD_PY_SHA256 = ""
+pub const QUALIFIED_GUARD_PY_SHA256 =
+  "60682964e8bb58fff431977d8aa3b7d088c0bd6bd00fb8c1b49100c424423098"
 
 /** Bootstrap reports directory identity; policy rejects redirected grants. */
 pub fn verify_control_directories(profile: LaunchProfile, bundle: string, ledger: string) {
