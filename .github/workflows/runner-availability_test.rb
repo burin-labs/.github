@@ -27,6 +27,9 @@ script = job.fetch("steps").find { |step| step["id"] == "detect" }.fetch("run")
 inputs = triggers.fetch("workflow_call").fetch("inputs")
 probe_input = inputs.fetch("linux_probe_runner_tag")
 abort "#{path}: Linux probe input must default to empty" unless probe_input.fetch("default") == ""
+fetch_base_input = inputs.fetch("linux_fetch_base_runner_tag")
+abort "#{path}: fetch base input must preserve the stable-pool default" unless
+  fetch_base_input.fetch("default") == "harn-ci-stable"
 
 # `selfhosted_disabled` is deliberately published once, before any exit path,
 # precisely so the early exits do not each have to remember it. Every other
@@ -84,7 +87,8 @@ def rehearse(script, env)
     base = {
       "GITHUB_OUTPUT" => output_path, "GH_TOKEN" => "", "OWNER" => "burin-labs",
       "DEFAULT_TAG" => "harn-ci", "LINUX_TAG" => "harn-ci", "LINUX_BIG_TAG" => "harn-ci-big",
-      "LINUX_FETCH_TAG" => "harn-fetch-ok", "LINUX_PROBE_TAG" => "", "MACOS_TAG" => "harn-ci",
+      "LINUX_FETCH_BASE_TAG" => "harn-ci-stable", "LINUX_FETCH_TAG" => "harn-fetch-ok",
+      "LINUX_PROBE_TAG" => "", "MACOS_TAG" => "harn-ci",
       "WINDOWS_TAG" => "harn-ci", "RUNNER_GROUPS" => "Default", "SELFHOSTED_DISABLED" => "",
       "MINIMUM_ONLINE" => "1", "MINIMUM_ONLINE_BY_POOL" => "{}"
     }
@@ -221,7 +225,8 @@ Dir.mktmpdir("runner-availability-test") do |dir|
     File.write(output, "")
     env = {"PATH" => "#{dir}:#{ENV.fetch('PATH')}", "GH_TOKEN" => "fixture",
            "OWNER" => "fixture", "RUNNER_GROUPS" => "Default", "DEFAULT_TAG" => "stable",
-           "LINUX_TAG" => "stable", "LINUX_BIG_TAG" => "big", "LINUX_FETCH_TAG" => "fetch",
+           "LINUX_TAG" => "stable", "LINUX_BIG_TAG" => "big", "LINUX_FETCH_BASE_TAG" => "stable",
+           "LINUX_FETCH_TAG" => "fetch",
            "LINUX_PROBE_TAG" => "identity", "MACOS_TAG" => "stable", "WINDOWS_TAG" => "stable",
            "MINIMUM_ONLINE" => "3", "MINIMUM_ONLINE_BY_POOL" => "{}",
            "SELFHOSTED_DISABLED" => "", "RUNNER_FIXTURE" => fixture,
@@ -239,6 +244,22 @@ Dir.mktmpdir("runner-availability-test") do |dir|
       abort "starvation must be named" unless stdout.include?("FLEET_RUNNER_LABEL_STARVED")
     end
     next unless name == "minimum met"
+
+    # A caller-selected base pool owns the conjunction. A healthy runner from
+    # the default stable pool must not inflate an isolated burst pool's count.
+    burst = runner.call(20, "online", false, ["self-hosted", "Linux", "burst", "fetch"])
+    stable = runner.call(21, "online", false, ["self-hosted", "Linux", "stable", "fetch"])
+    File.write(fixture, JSON.generate([{runners: [burst, stable]}]))
+    File.write(output, "")
+    _, stderr, status = Open3.capture3(
+      env.merge("LINUX_FETCH_BASE_TAG" => "burst", "MINIMUM_ONLINE" => "1"),
+      "bash", "-c", script
+    )
+    abort "caller-selected fetch pool failed: #{stderr}" unless status.success?
+    values = File.readlines(output).map { |line| line.strip.split("=", 2) }.to_h
+    fetch_lane = JSON.parse(values.fetch("capacity")).fetch("linux_fetch")
+    abort "caller-selected fetch pool counted the wrong runners: #{fetch_lane}" unless
+      fetch_lane.fetch("online") == 1 && fetch_lane.fetch("idle") == 1 && values.fetch("linux_fetch") == "true"
 
     macs = (4..5).map { |id| runner.call(id, "online", false, ["self-hosted", "macOS", "stable"]) }
     File.write(fixture, JSON.generate([{runners: runners + macs}]))
@@ -281,7 +302,8 @@ Dir.mktmpdir("runner-availability-test") do |dir|
   File.write(fixture, JSON.generate([{runners: fleet}]))
   host_env = {"PATH" => "#{dir}:#{ENV.fetch('PATH')}", "GH_TOKEN" => "fixture",
               "OWNER" => "fixture", "RUNNER_GROUPS" => "Default", "DEFAULT_TAG" => "stable",
-              "LINUX_TAG" => "stable", "LINUX_BIG_TAG" => "big", "LINUX_FETCH_TAG" => "fetch",
+              "LINUX_TAG" => "stable", "LINUX_BIG_TAG" => "big", "LINUX_FETCH_BASE_TAG" => "stable",
+              "LINUX_FETCH_TAG" => "fetch",
               "LINUX_PROBE_TAG" => "", "MACOS_TAG" => "stable", "WINDOWS_TAG" => "stable",
               "MINIMUM_ONLINE" => "1", "MINIMUM_ONLINE_BY_POOL" => "{}",
               "SELFHOSTED_DISABLED" => "", "RUNNER_FIXTURE" => fixture,
