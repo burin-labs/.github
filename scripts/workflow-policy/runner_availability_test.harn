@@ -1,0 +1,81 @@
+fn root(fs: HarnessFs) -> string {
+  return path_normalize(path_join(fs.cwd(), "../.."))
+}
+
+fn workflow(fs: HarnessFs) -> any {
+  return yaml_parse(fs.read_text(path_join(root(fs), ".github/workflows/runner-availability.yml")))
+}
+
+fn runner(name: string, busy: bool, producer: bool) -> any {
+  let labels = ["self-hosted", "Linux", "X64", "harn-ci-stable", "harn-fetch-ok"]
+  if producer {
+    labels = labels + ["harn-ci-producer"]
+  }
+  return {
+    id: name,
+    name: name,
+    status: "online",
+    busy: busy,
+    labels: labels.map({ label -> {name: label} }),
+  }
+}
+
+pipeline test_optional_linux_pool_reports_its_physical_host_load(harness: Harness) {
+  const detect = workflow(harness.fs).jobs.detect.steps.find({ item -> item?.id == "detect" }).run
+  const temporary = harness.fs.mkdtemp_in_workspace("runner-availability-hosts")
+  const fixture = path_join(temporary, "runners.json")
+  const output = path_join(temporary, "github-output")
+  const gh = path_join(temporary, "gh")
+  let runners = []
+  for index in range(1, 11) {
+    const name = "hetzner-1-w" + to_string(index)
+    runners = runners + [runner(name, index != 4, index == 4 || index == 5)]
+  }
+  harness.fs.write_text(fixture, json_stringify([{runners: runners}]))
+  harness.fs.write_text(output, "")
+  harness.fs.write_text(
+    gh,
+    "#!/usr/bin/env bash\ncase \"$*\" in\n"
+      + "  *runner-groups/1/runners*) cat \"$RUNNER_FIXTURE\" ;;\n"
+      + "  *runner-groups*) echo '[{\"runner_groups\":[{\"name\":\"Default\",\"id\":1}]}]' ;;\n"
+      + "  *) exit 91 ;;\nesac\n",
+  )
+  const chmod = harness.process.run({program: "/bin/chmod", args: ["755", gh]})
+  assert(chmod.success, "fixture GitHub client must be executable")
+  const result = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: ["-e", "-o", "pipefail", "-c", detect],
+      cwd: root(harness.fs),
+      env: {
+        PATH: temporary + ":" + to_string(harness.env.get("PATH") ?? ""),
+        GH_TOKEN: "fixture",
+        OWNER: "fixture",
+        RUNNER_GROUPS: "Default",
+        DEFAULT_TAG: "harn-ci-stable",
+        LINUX_TAG: "harn-ci-stable",
+        LINUX_BIG_TAG: "harn-ci-big",
+        LINUX_FETCH_BASE_TAG: "harn-ci-stable",
+        LINUX_FETCH_TAG: "harn-fetch-ok",
+        LINUX_PROBE_TAG: "harn-ci-producer",
+        MACOS_TAG: "harn-ci",
+        WINDOWS_TAG: "harn-ci",
+        MINIMUM_ONLINE: "1",
+        MINIMUM_ONLINE_BY_POOL: "{}",
+        SELFHOSTED_DISABLED: "",
+        RUNNER_FIXTURE: fixture,
+        GITHUB_OUTPUT: output,
+        TMPDIR: temporary,
+      },
+      timeout_ms: 30000,
+    },
+  )
+  assert(result.success, "real detector failed: " + result.stdout + result.stderr)
+  const line = harness.fs.read_text(output).split("\n").find(
+    { item -> item.starts_with("capacity=") },
+  )
+  assert(line != nil, "detector must publish its typed capacity census")
+  const capacity = json_parse(line.substring(len("capacity=")))
+  assert_eq(capacity.linux_probe.hosts, {"hetzner-1": {online: 10, busy: 9, idle_big: 1}})
+  assert_eq(capacity.linux_fetch.hosts, {"hetzner-1": {online: 10, busy: 9, idle_big: 1}})
+}
