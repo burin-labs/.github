@@ -1,4 +1,4 @@
-pub type Reader = {api: fn(string) -> unknown}
+pub type Reader = {read: fn(string) -> unknown}
 
 /** Exhaust the REST list and hydrate each identity before trusting the census. */
 pub fn snapshot(reader: Reader) -> dict {
@@ -7,7 +7,7 @@ pub fn snapshot(reader: Reader) -> dict {
   let complete = false
   let page = 1
   while page <= 10 {
-    const batch = reader.api(
+    const batch = reader.read(
       repo + "/rulesets?includes_parents=true&per_page=100&page=" + to_string(page),
     )
     if type_of(batch) != "list" {
@@ -29,7 +29,7 @@ pub fn snapshot(reader: Reader) -> dict {
     if type_of(summary?.id) != "int" || summary.id <= 0 || ids.contains(summary.id) {
       throw "ruleset page has missing or duplicate identity"
     }
-    const detail = reader.api(repo + "/rulesets/" + to_string(summary.id))
+    const detail = reader.read(repo + "/rulesets/" + to_string(summary.id))
     if type_of(detail) != "dict" || detail?.id != summary.id || detail?.name != summary?.name
       || detail?.source != summary?.source
       || detail?.source_type != summary?.source_type {
@@ -40,7 +40,7 @@ pub fn snapshot(reader: Reader) -> dict {
   }
   return {
     rulesets: rulesets,
-    effective_rules: reader.api(repo + "/rules/branches/main"),
-    release_app: reader.api("apps/harn-release-bot"),
+    effective_rules: reader.read(repo + "/rules/branches/main"),
+    release_app: reader.read("apps/harn-release-bot"),
   }
 }

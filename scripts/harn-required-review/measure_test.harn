@@ -27,7 +27,7 @@ pipeline test_all_pages_and_details_are_read(harness: Harness) {
   }
   const measured = snapshot(
     {
-      api: fn(path) {
+      read: fn(path) {
         paths = paths + [path]
         if path.ends_with("page=1") {
           return first
@@ -55,12 +55,12 @@ pipeline test_all_pages_and_details_are_read(harness: Harness) {
 
 pipeline test_unread_partial_duplicate_and_changed_hydration_refuse(harness: Harness) {
   for batch in [nil, [], [summary(1), summary(1)]] {
-    refused(fn() { snapshot({api: fn(path) { return batch }}) })
+    refused(fn() { snapshot({read: fn(path) { return batch }}) })
   }
   refused(
     fn() { snapshot(
       {
-        api: fn(path) {
+        read: fn(path) {
           if path.contains("?") {
             return [summary(1)]
           }
@@ -73,5 +73,5 @@ pipeline test_unread_partial_duplicate_and_changed_hydration_refuse(harness: Har
   for id in range(1, 101) {
     full = full + [summary(id)]
   }
-  refused(fn() { snapshot({api: fn(path) { return full }}) })
+  refused(fn() { snapshot({read: fn(path) { return full }}) })
 }

@@ -1,4 +1,4 @@
-import { live_reader } from "../merge-override-guard/live.harn"
+import { live_github } from "../merge-override/github.harn"
 import { snapshot } from "./measure.harn"
 import { desired_ruleset, verify_installed, verify_transition } from "./policy.harn"
 
@@ -21,8 +21,8 @@ fn main(harness: Harness) {
     throw "REVIEW_RULESET_MODE must be plan, snapshot, or verify"
   }
   const current = snapshot(
-    live_reader(
-      harness.tools,
+    live_github(
+      {fs: harness.fs, tools: harness.tools},
       required(harness.env, "GH_TOKEN"),
       harness.fs.mkdtemp_in_workspace("harn-review-gh-"),
     ),
