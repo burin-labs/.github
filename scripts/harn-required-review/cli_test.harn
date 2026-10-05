@@ -1,0 +1,17 @@
+import { command_run } from "std/command"
+import { desired_ruleset } from "./policy.harn"
+
+pipeline test_actual_cli_generates_the_reviewed_plan_without_credentials(harness: Harness) {
+  const result = command_run(
+    harness.tools,
+    {
+      argv: ["harn", "run", "cli.harn"],
+      cwd: harness.fs.cwd(),
+      env_mode: "replace",
+      env: {REVIEW_RULESET_MODE: "plan", PATH: to_string(harness.env.get("PATH") ?? "")},
+    },
+  )
+  assert(result.success, result.stderr)
+  assert_eq(result.exit_code, 0)
+  assert_eq(json_parse(result.stdout), desired_ruleset())
+}
