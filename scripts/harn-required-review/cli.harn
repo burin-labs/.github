@@ -22,7 +22,7 @@ fn main(harness: Harness) {
   }
   const current = snapshot(
     live_github(
-      pick(harness, ["fs", "tools"]),
+      {fs: harness.fs, tools: harness.tools},
       required(harness.env, "GH_TOKEN"),
       harness.fs.mkdtemp_in_workspace("harn-review-gh-"),
     ),
