@@ -47,7 +47,7 @@ pipeline test_shadow_path_entry_cannot_receive_the_control_command(harness: Harn
     {
       argv: ["harn", "run", "--standalone", probe],
       env_mode: "replace",
-      env: {PATH: shadow + ":" + profile.command_path},
+      env: {PATH: shadow + ":" + profile.command_path, HOME: home},
     },
   )
   assert_eq(trim(unsafe.stdout), "SHADOW_REACHED")
@@ -56,7 +56,7 @@ pipeline test_shadow_path_entry_cannot_receive_the_control_command(harness: Harn
     {
       argv: ["harn", "run", "--standalone", probe],
       env_mode: "replace",
-      env: {PATH: profile.command_path},
+      env: {PATH: profile.command_path, HOME: home},
     },
   )
   assert(safe.success, safe.stderr)
