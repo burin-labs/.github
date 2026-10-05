@@ -21,7 +21,10 @@ fn runner(name: string, busy: bool, producer: bool) -> any {
 }
 
 pipeline test_optional_linux_pool_reports_its_physical_host_load(harness: Harness) {
-  const detect = workflow(harness.fs).jobs.detect.steps.find({ item -> item?.id == "detect" }).run
+  const bootstrap = workflow(harness.fs).jobs.detect
+  assert_eq(bootstrap["runs-on"], "ubuntu-24.04")
+  assert(bootstrap?.needs == nil, "the first probe cannot depend on its own capacity measurement")
+  const detect = bootstrap.steps.find({ item -> item?.id == "detect" }).run
   const temporary = harness.fs.mkdtemp_in_workspace("runner-availability-hosts")
   const fixture = path_join(temporary, "runners.json")
   const output = path_join(temporary, "github-output")

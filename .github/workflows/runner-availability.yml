@@ -234,11 +234,10 @@ permissions:
 jobs:
   detect:
     name: Detect self-hosted runner availability
-    # The probe is a few API reads that finish in seconds, so the per-job
-    # minimum bill is nearly all of its cost. The 1 vCPU runner bills a third
-    # of ubuntu-24.04, and its 15-minute job cap is far above this job's own
-    # 5-minute limit. The minutes bill to the calling repository.
-    runs-on: ubuntu-slim
+    # This first probe must run before callers can select owned capacity.
+    # Use the established standard hosted bootstrap independently of its
+    # own output; an unallocated slim probe stranded idle owned runners.
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       # Promote to job env so step-level `if:` can gate on secret presence; the
