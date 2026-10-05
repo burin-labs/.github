@@ -1,6 +1,6 @@
 import {
   launch_profile,
-  verify_control_source,
+  snapshot_control_source,
   verify_installed_guard,
 } from "./launch-profile.harn"
 
@@ -14,11 +14,12 @@ fn main(harness: Harness) {
     to_string(harness.env.get("HOME") ?? ""),
     to_string(harness.env.get("REVIEW_RULESET_MODE") ?? ""),
   )
-  verify_control_source(harness.fs, root)
   if profile.mode != "plan" {
     verify_installed_guard(harness.fs, profile.bundle_root)
   }
-  for argument in profile.argv {
+  const snapshot = snapshot_control_source(harness.fs, root)
+  const dispatch = launch_profile(snapshot, to_string(harness.env.get("HOME") ?? ""), profile.mode)
+  for argument in dispatch.argv {
     harness.stdio.println(argument)
   }
 }

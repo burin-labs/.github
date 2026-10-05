@@ -7,6 +7,7 @@ if (($#)); then
 fi
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 readonly runtime="$(command -v harn)"
+cd "$root"
 readonly plan="$(mktemp "${TMPDIR:-/tmp}/harn-review-launch.XXXXXX")"
 trap 'rm -f "$plan"' EXIT
 "$runtime" run --standalone --read-only-root "$HOME/.local/share/gh-budget" \

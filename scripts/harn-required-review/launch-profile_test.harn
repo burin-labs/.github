@@ -1,4 +1,8 @@
-import { launch_profile, verify_control_source } from "./launch-profile.harn"
+import {
+  launch_profile,
+  snapshot_control_source,
+  verify_control_source,
+} from "./launch-profile.harn"
 
 fn refused(action: fn() -> any) {
   let caught = false
@@ -61,9 +65,11 @@ pipeline test_changed_executable_source_is_refused_before_dispatch(harness: Harn
     harness.fs.write_bytes(path_join(scratch, path), harness.fs.read_bytes(path_join(root, path)))
   }
   verify_control_source(harness.fs, scratch)
+  const measured_snapshot = snapshot_control_source(harness.fs, scratch)
   harness.fs.write_text(
     path_join(scratch, "scripts/harn-required-review/cli.harn"),
     "fn main(harness: Harness) {}\n",
   )
   refused(fn() { verify_control_source(harness.fs, scratch) })
+  verify_control_source(harness.fs, measured_snapshot)
 }
