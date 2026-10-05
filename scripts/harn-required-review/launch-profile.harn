@@ -1,0 +1,105 @@
+pub type LaunchProfile = {
+  source_root: string,
+  mode: string,
+  bundle_root: string,
+  ledger_root: string,
+  command_path: string,
+  argv: list<string>,
+}
+
+// Filled only after the guard's fail-closed and identity prerequisites qualify.
+pub const QUALIFIED_GUARD_PY_SHA256 =
+  "60682964e8bb58fff431977d8aa3b7d088c0bd6bd00fb8c1b49100c424423098"
+
+/** Bootstrap reports directory identity; policy rejects redirected grants. */
+pub fn verify_control_directories(profile: LaunchProfile, bundle: string, ledger: string) {
+  if bundle != profile.bundle_root || ledger != profile.ledger_root {
+    throw "trusted review-rule directories must exist at their canonical installed paths"
+  }
+}
+
+pub fn require_qualified_guard() {
+  if QUALIFIED_GUARD_PY_SHA256 == "" {
+    throw "trusted review-rule launch awaits a qualified fail-closed GitHub guard"
+  }
+}
+
+pub fn verify_installed_guard(fs: HarnessFs, bundle: string) {
+  require_qualified_guard()
+  if sha256(fs.read_bytes(path_join(bundle, "gh_budget.py"))) != QUALIFIED_GUARD_PY_SHA256 {
+    throw "installed GitHub budget guard differs from the qualified source"
+  }
+  if sha256(fs.read_bytes(path_join(bundle, "gh")))
+    != "4f506a78a6388302aae5aea26cf65e38f1f80a0a2597ae7b6265be6eb23c4d8d" {
+    throw "installed GitHub budget entrypoint differs from the qualified source"
+  }
+}
+
+/** Only this deterministic control command receives these process grants. */
+pub fn launch_profile(source_root: string, home: string, mode: string) -> LaunchProfile {
+  if mode != "plan" && mode != "snapshot" && mode != "verify" {
+    throw "REVIEW_RULESET_MODE must be plan, snapshot, or verify"
+  }
+  for path in [source_root, home] {
+    if !path.starts_with("/") || path.contains("\n") || path.contains("\r") || path.contains(":") {
+      throw "trusted launcher roots must be absolute paths without line or PATH delimiters"
+    }
+  }
+  const bundle = path_join(home, ".local/share/gh-budget")
+  const ledger = path_join(home, ".local/state/gh-budget")
+  let args = ["run", "--standalone"]
+  if mode != "plan" {
+    args = args
+      + ["--sandbox-read-root", bundle, "--sandbox-write-root", ledger, "--allow-process-network"]
+  }
+  return {
+    source_root: source_root,
+    mode: mode,
+    bundle_root: bundle,
+    ledger_root: ledger,
+    command_path: bundle + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    argv: args + [path_join(source_root, "scripts/harn-required-review/cli.harn")],
+  }
+}
+
+const CONTROL_SOURCES = {
+  "scripts/harn-required-review/cli.harn":
+    "0a53d3464684d2aa929ec731c8addbf1442f7e5581224a3fcad161b3cdeec28a",
+  "scripts/harn-required-review/measure.harn":
+    "20865341d64321daf27a73c4c04f51560e456b37fd11d6e173ab266f71e14931",
+  "scripts/harn-required-review/policy.harn":
+    "a34a7c5f935cd6ba5235b9a751fa71af10d0d1fc9ffda22b9bd3c9a429f04af7",
+  "scripts/merge-override/github.harn":
+    "02749d57ca9e80fef98555d1a37d8910d53547e476e052b98b8e63a041f6d5dc",
+}
+
+type VerifiedSource = {path: string, content: bytes}
+
+fn control_bytes(fs: HarnessFs, root: string) -> list<VerifiedSource> {
+  let verified: list<VerifiedSource> = []
+  for source in CONTROL_SOURCES.entries() {
+    const content = fs.read_bytes(path_join(root, source.key))
+    if sha256(content) != source.value {
+      throw "trusted review-rule source seal mismatch: " + source.key
+    }
+    verified = verified + [{path: source.key, content: content}]
+  }
+  return verified
+}
+
+/** A source change needs a reviewed seal update before privileged dispatch. */
+pub fn verify_control_source(fs: HarnessFs, root: string) {
+  control_bytes(fs, root)
+}
+
+/** Dispatch the measured bytes, without reopening the mutable checkout. */
+pub fn snapshot_control_source(fs: HarnessFs, root: string) -> string {
+  const verified = control_bytes(fs, root)
+  const snapshot = fs.mkdtemp_in_workspace("review-control-source-")
+  for source in verified {
+    const target = path_join(snapshot, source.path)
+    fs.mkdir(dirname(target), true)
+    fs.write_bytes(target, source.content)
+  }
+  return snapshot
+}
