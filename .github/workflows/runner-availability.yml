@@ -91,6 +91,14 @@ on:
         type: string
         default: harn-fetch-ok
         required: false
+      linux_fetch_base_runner_tag:
+        description: >-
+          Base pool label combined with linux_fetch_runner_tag. Defaults to the
+          stable Linux pool; callers with an isolated fetch-heavy pool may name
+          that pool without copying the detector.
+        type: string
+        default: harn-ci-stable
+        required: false
       linux_probe_runner_tag:
         description: >-
           Optional Linux label for a caller-owned pool or host whose online
@@ -271,6 +279,7 @@ jobs:
           DEFAULT_TAG: ${{ inputs.runner_tag }}
           LINUX_TAG: ${{ inputs.linux_runner_tag }}
           LINUX_BIG_TAG: ${{ inputs.linux_big_runner_tag }}
+          LINUX_FETCH_BASE_TAG: ${{ inputs.linux_fetch_base_runner_tag }}
           LINUX_FETCH_TAG: ${{ inputs.linux_fetch_runner_tag }}
           LINUX_PROBE_TAG: ${{ inputs.linux_probe_runner_tag }}
           MACOS_TAG: ${{ inputs.macos_runner_tag }}
@@ -659,7 +668,7 @@ jobs:
           fi
 
           # Fetch-healthy Linux capacity is also a strict subset: the runner
-          # must carry the stable Linux tag AND the fetch-health capability
+          # must carry the caller-selected base pool tag AND the fetch-health capability
           # tag. The fleet probe adds/removes that capability from the box's
           # runners after a timed release-asset check, so a degraded path
           # drops out of this lane while staying visible to plain `linux`.
@@ -670,8 +679,8 @@ jobs:
             echo "::notice::runner-availability linux_fetch=false (pinned to GitHub-hosted by CI_SELFHOSTED_DISABLED; capacity not measured)"
             record_capacity linux_fetch 0 0 false
           else
-            fetch_count="$(count_matching Linux "$LINUX_TAG" idle "$LINUX_FETCH_TAG")"
-            fetch_online="$(count_matching Linux "$LINUX_TAG" any "$LINUX_FETCH_TAG")"
+            fetch_count="$(count_matching Linux "$LINUX_FETCH_BASE_TAG" idle "$LINUX_FETCH_TAG")"
+            fetch_online="$(count_matching Linux "$LINUX_FETCH_BASE_TAG" any "$LINUX_FETCH_TAG")"
             if [ "$fetch_count" -gt 0 ] && pool_eligible linux_fetch "$fetch_online" true; then
               fetch_available=true
             else
@@ -679,7 +688,7 @@ jobs:
             fi
             echo "linux_fetch=$fetch_available" >> "$GITHUB_OUTPUT"
             record_capacity linux_fetch "$fetch_online" "$fetch_count" true
-            echo "::notice::runner-availability linux_fetch=$fetch_available (${fetch_count} idle of ${fetch_online} online Linux ${LINUX_TAG}+${LINUX_FETCH_TAG} runner(s))"
+            echo "::notice::runner-availability linux_fetch=$fetch_available (${fetch_count} idle of ${fetch_online} online Linux ${LINUX_FETCH_BASE_TAG}+${LINUX_FETCH_TAG} runner(s))"
           fi
 
           # Some health checks target one physical pool rather than a shared
