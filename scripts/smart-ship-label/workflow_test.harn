@@ -1,5 +1,5 @@
 import { read_yaml } from "std/fs"
-import { ship_label } from "./policy.harn"
+import { CONTROL_POLICY_SOURCE, control_policy_source, ship_label } from "./policy.harn"
 
 fn expression(value: string) -> string {
   return "$" + "{{ " + value + " }}"
@@ -15,8 +15,7 @@ pipeline test_shared_workflow_reconciles_its_canonical_label_before_discovery(ha
   const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
   const steps = workflow.jobs.ship.steps
   const checkout = named(steps, "Check out the Smart Ship control policy")
-  assert_eq(checkout["with"].repository, "burin-labs/.github")
-  assert_eq(checkout["with"].ref, expression("github.workflow_sha"))
+  assert_eq(control_policy_source(checkout["with"]), CONTROL_POLICY_SOURCE)
   assert_eq(checkout["with"].path, ".smart-ship-runner")
   assert_eq(checkout["with"]["persist-credentials"], false)
   const reconcile_step = named(steps, "Reconcile the Smart Ship control label")
@@ -29,4 +28,23 @@ pipeline test_shared_workflow_reconciles_its_canonical_label_before_discovery(ha
   const discovery_index = steps.index_of(named(steps, "Find the pull requests to look at"))
   assert(reconcile_index >= 0 && reconcile_index < discovery_index)
   assert_eq(ship_label(read_yaml(harness.fs, "../../.github/labels.yml")).name, "ship")
+}
+
+pipeline test_wrong_repository_or_caller_revision_is_refused() {
+  assert_eq(control_policy_source(CONTROL_POLICY_SOURCE), CONTROL_POLICY_SOURCE)
+  for checkout in [
+    {repository: "example/consumer", ref: CONTROL_POLICY_SOURCE.ref},
+    {repository: CONTROL_POLICY_SOURCE.repository, ref: expression("github.workflow_sha")},
+    {repository: CONTROL_POLICY_SOURCE.repository, ref: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {repository: CONTROL_POLICY_SOURCE.repository},
+    nil,
+  ] {
+    const refusal = try {
+      control_policy_source(checkout)
+      ""
+    } catch (error) {
+      to_string(error)
+    }
+    assert(refusal.contains("control policy source"), refusal)
+  }
 }

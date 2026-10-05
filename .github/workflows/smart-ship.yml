@@ -72,7 +72,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: burin-labs/.github
-          ref: ${{ github.workflow_sha }}
+          # Repository-qualified source, checked by the typed control policy.
+          # github.workflow_sha identifies the caller, not this org repository.
+          ref: 8ab5eb88533595579e9e79d556d719593a26a728
           path: .smart-ship-runner
           persist-credentials: false
 
