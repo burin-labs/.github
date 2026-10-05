@@ -68,6 +68,26 @@ jobs:
           # One script runs per look; precompiling every pipeline costs minutes.
           precompile: "false"
 
+      - name: Check out the Smart Ship control policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/.github
+          ref: ${{ github.workflow_sha }}
+          path: .smart-ship-runner
+          persist-credentials: false
+
+      - name: Reconcile the Smart Ship control label
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          ./scripts/harnw run --no-sandbox \
+            .smart-ship-runner/scripts/smart-ship-label/cli.harn -- \
+            --repo "$REPO" \
+            --label "${{ inputs.ship-label }}" \
+            --registry .smart-ship-runner/.github/labels.yml
+          rm -rf -- "$GITHUB_WORKSPACE/.smart-ship-runner"
+
       - name: Let git use the app token
         uses: ./.github/actions/github-token-git-auth
         with:

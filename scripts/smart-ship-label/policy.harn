@@ -1,0 +1,100 @@
+import { GitHub } from "../merge-override/github.harn"
+
+pub type LabelSpec = {name: string, color: string, description: string}
+
+fn text(value: unknown, field: string) -> string {
+  if type_of(value) != "string" || trim(to_string(value)) == "" {
+    throw "Smart Ship label " + field + " must be a non-empty string"
+  }
+  return trim(to_string(value))
+}
+
+/** Read the one label Smart Ship owns from the canonical org taxonomy. */
+pub fn ship_label(registry: unknown) -> LabelSpec {
+  if type_of(registry) != "dict" || type_of(registry?.delivery) != "list" {
+    throw "label registry must declare a delivery list"
+  }
+  const entries = registry.delivery.filter(
+    fn(entry) { return type_of(entry) == "dict" && trim(to_string(entry?.name ?? "")) == "ship" },
+  )
+  if len(entries) != 1 {
+    throw "label registry must declare exactly one delivery label named ship; found "
+      + to_string(len(entries))
+  }
+  const entry = entries[0]
+  const color = text(entry?.color, "color").to_lower()
+  if len(regex_captures("^[0-9a-f]{6}$", color) ?? []) != 1 {
+    throw "Smart Ship label color must be six lowercase hexadecimal digits"
+  }
+  return {name: "ship", color: color, description: text(entry?.description, "description")}
+}
+
+fn labels(github: GitHub, repository: string) -> list<dict> {
+  const pages = github.pages("repos/" + repository + "/labels?per_page=100")
+  if len(pages) == 0 {
+    throw "GitHub label census returned no pages"
+  }
+  let result = []
+  for page in pages {
+    if type_of(page) != "list" {
+      throw "GitHub label census returned a non-list page"
+    }
+    for label in page {
+      if type_of(label) != "dict" {
+        throw "GitHub label census returned a non-object label"
+      }
+      result = result + [label]
+    }
+  }
+  return result
+}
+
+fn matching(census: list<dict>, name: string) -> list<dict> {
+  return census.filter(fn(label) { return to_string(label?.name ?? "") == name }).to_list()
+}
+
+fn exact(label: dict, spec: LabelSpec) -> bool {
+  return to_string(label?.name ?? "") == spec.name
+    && to_string(label?.color ?? "").to_lower() == spec.color
+    && to_string(label?.description ?? "") == spec.description
+}
+
+/**
+ * Create or repair Smart Ship's one control label, then read the full census
+ * back. Absence is trusted only after a non-null paginated API response.
+ */
+pub fn reconcile(github: GitHub, repository: string, spec: LabelSpec) -> dict {
+  if len(regex_captures("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repository) ?? []) != 1 {
+    throw "repository must be owner/name"
+  }
+  const before = labels(github, repository)
+  const found = matching(before, spec.name)
+  if len(found) > 1 {
+    throw "GitHub label census returned duplicate ship labels"
+  }
+  let state = "exact"
+  if len(found) == 0 {
+    github.send("POST", "repos/" + repository + "/labels", spec)
+    state = "created"
+  } else if !exact(found[0] ?? {}, spec) {
+    github.send(
+      "PATCH",
+      "repos/" + repository + "/labels/ship",
+      {new_name: spec.name, color: spec.color, description: spec.description},
+    )
+    state = "updated"
+  }
+  const after = labels(github, repository)
+  const verified = matching(after, spec.name)
+  if len(verified) != 1 || !exact(verified[0] ?? {}, spec) {
+    throw "Smart Ship label read-back is not exact; matching=" + to_string(len(verified))
+  }
+  return {
+    state: state,
+    label: spec.name,
+    census_before: len(before),
+    census_after: len(after),
+    matching_after: len(verified),
+    pending: 0,
+  }
+}

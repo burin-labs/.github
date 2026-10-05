@@ -867,13 +867,15 @@ shares, plus the unprefixed labels (`bug`, `enhancement`, `epic`,
 repository-specific: each repository derives its own area labels from its
 directory map.
 
-Nothing syncs this file. GitHub does not inherit labels from an organization's
-`.github` repository, and no workflow here writes labels to other
-repositories. The file is reference that a person or an agent applies by hand.
+Shared taxonomy entries remain reference data that a person or agent applies
+additively. GitHub does not inherit labels from an organization's `.github`
+repository. The `delivery/ship` control is the narrow exception: the shared
+Smart Ship workflow reads its exact metadata from this file and creates or
+repairs that label before it discovers pull requests. It never deletes labels.
 Copy the shared categories into a repository's own `.github/labels.yml` rather
-than re-deriving them, and rename an existing label (`area:foo` to
-`area/foo`) instead of deleting and recreating it, so every issue and pull
-request already carrying it stays labeled.
+than re-deriving them, and rename an existing label (`area:foo` to `area/foo`)
+instead of deleting and recreating it, so every issue and pull request already
+carrying it stays labeled.
 
 `docs/decisions/pr-and-label-conventions.md` records why these conventions
 look the way they do, and which alternatives were rejected.

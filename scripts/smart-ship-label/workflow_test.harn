@@ -1,0 +1,32 @@
+import { read_yaml } from "std/fs"
+import { ship_label } from "./policy.harn"
+
+fn expression(value: string) -> string {
+  return "$" + "{{ " + value + " }}"
+}
+
+fn named(steps: list, name: string) -> dict {
+  const matches = steps.filter(fn(step) { return step?.name == name }).to_list()
+  assert_eq(len(matches), 1, name)
+  return matches[0] ?? {}
+}
+
+pipeline test_shared_workflow_reconciles_its_canonical_label_before_discovery(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const steps = workflow.jobs.ship.steps
+  const checkout = named(steps, "Check out the Smart Ship control policy")
+  assert_eq(checkout["with"].repository, "burin-labs/.github")
+  assert_eq(checkout["with"].ref, expression("github.workflow_sha"))
+  assert_eq(checkout["with"].path, ".smart-ship-runner")
+  assert_eq(checkout["with"]["persist-credentials"], false)
+  const reconcile_step = named(steps, "Reconcile the Smart Ship control label")
+  assert_eq(reconcile_step.env.GH_TOKEN, expression("steps.app.outputs.token"))
+  assert_eq(reconcile_step.env.REPO, expression("github.repository"))
+  assert(reconcile_step.run.contains("scripts/smart-ship-label/cli.harn"))
+  assert(reconcile_step.run.contains("--label \"" + expression("inputs.ship-label") + "\""))
+  assert(reconcile_step.run.contains("--registry .smart-ship-runner/.github/labels.yml"))
+  const reconcile_index = steps.index_of(reconcile_step)
+  const discovery_index = steps.index_of(named(steps, "Find the pull requests to look at"))
+  assert(reconcile_index >= 0 && reconcile_index < discovery_index)
+  assert_eq(ship_label(read_yaml(harness.fs, "../../.github/labels.yml")).name, "ship")
+}
