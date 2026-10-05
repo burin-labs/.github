@@ -205,8 +205,8 @@ on:
           the per-host counts let a caller see that.
           The host is the runner name with a trailing `-w<N>` removed, `online`
           and `busy` count every online Linux runner on that host, and
-          `idle_big` counts its idle runners matching the selected pool. Only hosts
-          with at least one online big-tagged runner appear. `hosts` is absent
+          `idle_big` counts its idle runners matching the selected pool. Only
+          hosts with an online runner selected by that pool appear. `hosts` is absent
           whenever `measured` is false.
         value: ${{ jobs.detect.outputs.capacity }}
       probe_state:
