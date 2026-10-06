@@ -77,7 +77,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up exact Harn release
-        uses: burin-labs/harn/.github/actions/setup-harn@4bb2bb878cfa985904e53b6675791f1fa6acf8c5 # bounded release-asset retries
+        uses: burin-labs/harn/.github/actions/setup-harn@68ab397be4c1b7eece1743e0f8824840e05c2fa2 # bounded release-asset retries
         with:
           version: 0.10.133
 
