@@ -43,12 +43,21 @@ permissions:
 
 jobs:
   ship:
-    # One shepherd run at a time per repository. A sweep has no PR number and
-    # touches every labeled PR, so per-PR groups would let a sweep and an event
-    # run act on the same PR at once. Runs take about a minute; if GitHub
-    # replaces a queued run, the next sweep covers its PR.
+    # A run woken by an event about one PR queues behind earlier runs for that
+    # PR; every other run (schedule, dispatch, workflow_run, merge_group) is a
+    # sweep and queues behind earlier sweeps. GitHub keeps one pending run per
+    # group and a newer one replaces it, so with one group per repository the
+    # PR events replaced the sweeps meant to recover them. Now an event cancels
+    # only an older pending run for its own PR, and a sweep only an older
+    # pending sweep, which the replacing sweep covers. A sweep and an event run
+    # can still be live together, so the shepherd itself keeps one actor per
+    # PR: before acting, a run lists the caller workflow's unfinished runs and
+    # leaves the PR to an earlier one that covers it (burin-code
+    # scripts/lib/ship/github.harn `single_actor`).
     concurrency:
-      group: smart-ship-${{ github.repository }}
+      group: >-
+        smart-ship-${{ github.repository }}-${{ github.event.pull_request.number
+        && format('pr-{0}', github.event.pull_request.number) || 'sweep' }}
       cancel-in-progress: false
     # Private callers are billed per hosted minute, so they may hand in an
     # owned runner; the hosted runner stays the default and the fallback.
