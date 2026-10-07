@@ -64,3 +64,19 @@ pipeline test_wrong_repository_or_caller_revision_is_refused() {
     assert(refusal.contains("control policy source"), refusal)
   }
 }
+
+pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const input = workflow.on.workflow_call.inputs["owned-runner"]
+  assert_eq(input.type, "string")
+  assert_eq(input["default"], "")
+  const runs_on = workflow.jobs.ship["runs-on"]
+  // Hosted is both the default and the fallback, and an owned runner needs a
+  // caller on the private allowlist: a public repository's run must never
+  // land on an owned host, whatever it passes.
+  assert(runs_on.ends_with("|| 'ubuntu-24.04' }}"), runs_on)
+  const listed = regex_captures("contains\\(fromJSON\\('(\\[[^']*\\])'\\), github\\.repository\\)", runs_on)
+  assert_eq(len(listed), 1, runs_on)
+  assert_eq(json_parse(listed[0].groups[0]), ["burin-labs/burin-code", "burin-labs/harn-cloud"])
+  assert(runs_on.contains("inputs.owned-runner != '' && contains("), runs_on)
+}

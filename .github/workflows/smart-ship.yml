@@ -21,6 +21,15 @@ on:
         description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
         type: boolean
         default: true
+      owned-runner:
+        description: >-
+          JSON label array of an owned runner for this run, chosen by the
+          caller from its own availability probe; empty keeps the hosted
+          runner. Honored only for the private repositories listed at the
+          job's runs-on: a public caller always runs on the free hosted
+          runner, so no owned host runs on behalf of a public repository.
+        type: string
+        default: ""
     secrets:
       RELEASE_APP_CLIENT_ID:
         required: true
@@ -41,7 +50,9 @@ jobs:
     concurrency:
       group: smart-ship-${{ github.repository }}
       cancel-in-progress: false
-    runs-on: ubuntu-24.04
+    # Private callers are billed per hosted minute, so they may hand in an
+    # owned runner; the hosted runner stays the default and the fallback.
+    runs-on: ${{ inputs.owned-runner != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && fromJSON(inputs.owned-runner) || 'ubuntu-24.04' }}
     timeout-minutes: 40
     steps:
       - name: Mint the release app token
