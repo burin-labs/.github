@@ -182,6 +182,8 @@ jobs:
           # Read the checked-out packageManager pin; repair worktrees own
           # dependency installation through their repository setup policy.
           run_install: false
+          # Owned runners share a home directory, but each job owns its temp directory.
+          dest: ${{ runner.temp }}/smart-ship-pnpm
 
       - name: Shepherd
         if: steps.prs.outputs.numbers != ''

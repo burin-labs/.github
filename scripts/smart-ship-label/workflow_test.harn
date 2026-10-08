@@ -22,6 +22,7 @@ pipeline test_repair_bootstrap_provisions_the_declared_package_manager(harness: 
   // The action reads packageManager from the checked-out repository instead
   // of duplicating a version here or installing its controller dependencies.
   assert_eq(package_manager["with"].run_install, false)
+  assert_eq(package_manager["with"].dest, expression("runner.temp") + "/smart-ship-pnpm")
   assert_eq(package_manager["with"]?.version, nil)
   assert(steps.index_of(node) < steps.index_of(package_manager))
   assert(steps.index_of(package_manager) < steps.index_of(shepherd))
