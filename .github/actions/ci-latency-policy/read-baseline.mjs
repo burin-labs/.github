@@ -89,11 +89,23 @@ export async function readBaseline(request, {
   const token = required(request.token, "github-token");
   const deadline = now() + totalTimeoutMs;
   let attempts = 0;
+  async function waitForRetry(attempt, retryAfter) {
+    let delay = attempt * 1000;
+    if (retryAfter !== null) {
+      if (!/^[0-9]+$/.test(retryAfter)) throw new Error("immutable baseline Retry-After is unmeasured; pending=1");
+      delay = Math.max(delay, Number(retryAfter) * 1000);
+    }
+    if (!Number.isSafeInteger(delay) || delay >= deadline - now()) {
+      throw new Error("immutable baseline retry cannot fit its deadline; pending=1");
+    }
+    await sleep(delay);
+  }
   async function get(endpoint, accept) {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const remaining = deadline - now();
       if (remaining <= 0) throw new Error("immutable baseline deadline exhausted; pending=1");
       let response;
+      attempts += 1;
       try {
         response = await fetch(`https://api.github.com/repos/${source.repository}/${endpoint}`, {
           headers: { Accept: accept, Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
@@ -101,9 +113,12 @@ export async function readBaseline(request, {
           signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(remaining, requestTimeoutMs)))),
         });
       } catch {
-        throw new Error("immutable baseline transport is unmeasured; pending=1");
+        if (attempt === maxAttempts) {
+          throw new Error(`immutable baseline transport exhausted ${attempt} attempts; pending=1`);
+        }
+        await waitForRetry(attempt, null);
+        continue;
       }
-      attempts += 1;
       if (!Number.isInteger(response?.status) || response.status < 100 || response.status > 599 ||
           typeof response.headers?.get !== "function") {
         throw new Error("immutable baseline HTTP status is unmeasured; pending=1");
@@ -113,16 +128,7 @@ export async function readBaseline(request, {
       if (attempt === maxAttempts) {
         throw new Error(`immutable baseline HTTP ${response.status} exhausted ${attempt} attempts; pending=1`);
       }
-      let delay = attempt * 1000;
-      const retryAfter = response.headers.get("retry-after");
-      if (retryAfter !== null) {
-        if (!/^[0-9]+$/.test(retryAfter)) throw new Error("immutable baseline Retry-After is unmeasured; pending=1");
-        delay = Math.max(delay, Number(retryAfter) * 1000);
-      }
-      if (!Number.isSafeInteger(delay) || delay >= deadline - now()) {
-        throw new Error("immutable baseline retry cannot fit its deadline; pending=1");
-      }
-      await sleep(delay);
+      await waitForRetry(attempt, response.headers.get("retry-after"));
     }
     throw new Error("immutable baseline attempts are unmeasured; pending=1");
   }
