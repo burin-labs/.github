@@ -196,14 +196,17 @@ on:
           caller that treats 0 as "busy" would repeat the conflation this
           detector exists to prevent. Gate on `measured` before reading counts.
 
-          A measured `linux_big` also carries `hosts`, keyed by physical host,
-          each `{online, busy, idle_big}`. Several runners share one machine
-          (`tornadough-w1` through `-w6` are one host), so an idle runner can
-          sit on a saturated host; the per-host counts let a caller see that.
+          Measured `linux_big`, `linux_fetch`, and `linux_probe` pools also
+          carry `hosts`, keyed by physical host, each
+          `{online, busy, idle_big}`. `idle_big` is the historical field name;
+          for every pool it counts idle runners selected by that pool's label
+          contract. Several runners share one machine (`tornadough-w1` through
+          `-w6` are one host), so an idle runner can sit on a saturated host;
+          the per-host counts let a caller see that.
           The host is the runner name with a trailing `-w<N>` removed, `online`
           and `busy` count every online Linux runner on that host, and
-          `idle_big` counts its idle runners carrying the big tag. Only hosts
-          with at least one online big-tagged runner appear. `hosts` is absent
+          `idle_big` counts its idle runners matching the selected pool. Only
+          hosts with an online runner selected by that pool appear. `hosts` is absent
           whenever `measured` is false.
         value: ${{ jobs.detect.outputs.capacity }}
       probe_state:
@@ -231,11 +234,10 @@ permissions:
 jobs:
   detect:
     name: Detect self-hosted runner availability
-    # The probe is a few API reads that finish in seconds, so the per-job
-    # minimum bill is nearly all of its cost. The 1 vCPU runner bills a third
-    # of ubuntu-24.04, and its 15-minute job cap is far above this job's own
-    # 5-minute limit. The minutes bill to the calling repository.
-    runs-on: ubuntu-slim
+    # This first probe must run before callers can select owned capacity.
+    # Use the established standard hosted bootstrap independently of its
+    # own output; an unallocated slim probe stranded idle owned runners.
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       # Promote to job env so step-level `if:` can gate on secret presence; the
@@ -595,6 +597,33 @@ jobs:
             fi
           }
 
+          # Project one Linux subset onto physical hosts. The optional second
+          # tag makes conjunction-owned pools such as linux_fetch use the same
+          # grouping and load census as single-label pools. Keep idle_big as
+          # the compatibility spelling consumed by existing callers.
+          record_linux_pool_hosts() {
+            local lane="$1" primary_tag="$2" secondary_tag="${3:-}" hosts
+            hosts="$(echo "$runner_list" | jq -c \
+              --arg primary "$primary_tag" --arg secondary "$secondary_tag" '
+              [ .runners[]
+                | select(.status == "online")
+                | select(any(.labels[].name; . == "Linux"))
+                | {host: (.name | sub("-w[0-9]+$"; "")), busy: (.busy == true),
+                   selected: (any(.labels[].name; . == $primary)
+                     and ($secondary == "" or any(.labels[].name; . == $secondary)))}
+              ]
+              | group_by(.host)
+              | map(select(any(.[]; .selected)))
+              | map({key: .[0].host, value: {
+                  online: length,
+                  busy: (map(select(.busy)) | length),
+                  idle_big: (map(select(.selected and (.busy | not))) | length)}})
+              | from_entries')"
+            capacity="$(jq -c --arg lane "$lane" --argjson hosts "$hosts" \
+              '.[$lane].hosts = $hosts' <<< "$capacity")"
+            echo "::notice::runner-availability ${lane} hosts=${hosts}"
+          }
+
           for os_label in Linux Windows macOS; do
             tag="$DEFAULT_TAG"
             case "$os_label" in
@@ -645,26 +674,7 @@ jobs:
             echo "linux_big=$big_available" >> "$GITHUB_OUTPUT"
             record_capacity linux_big "$big_online" "$big_count" true
             echo "::notice::runner-availability linux_big=$big_available (${big_count} idle of ${big_online} online Linux ${LINUX_BIG_TAG} runner(s))"
-            # Runner idleness overstates capacity when several runners share a
-            # machine, so publish load per physical host beside the lane counts.
-            # The host is the runner name minus a trailing `-w<N>`; a name
-            # without that suffix is its own host.
-            big_hosts="$(echo "$runner_list" | jq -c --arg tag "$LINUX_BIG_TAG" '
-              [ .runners[]
-                | select(.status == "online")
-                | select(any(.labels[].name; . == "Linux"))
-                | {host: (.name | sub("-w[0-9]+$"; "")), busy: (.busy == true),
-                   big: any(.labels[].name; . == $tag)}
-              ]
-              | group_by(.host)
-              | map(select(any(.[]; .big)))
-              | map({key: .[0].host, value: {
-                  online: length,
-                  busy: (map(select(.busy)) | length),
-                  idle_big: (map(select(.big and (.busy | not))) | length)}})
-              | from_entries')"
-            capacity="$(jq -c --argjson hosts "$big_hosts" '.linux_big.hosts = $hosts' <<< "$capacity")"
-            echo "::notice::runner-availability linux_big hosts=${big_hosts}"
+            record_linux_pool_hosts linux_big "$LINUX_BIG_TAG"
           fi
 
           # Fetch-healthy Linux capacity is also a strict subset: the runner
@@ -688,6 +698,7 @@ jobs:
             fi
             echo "linux_fetch=$fetch_available" >> "$GITHUB_OUTPUT"
             record_capacity linux_fetch "$fetch_online" "$fetch_count" true
+            record_linux_pool_hosts linux_fetch "$LINUX_FETCH_BASE_TAG" "$LINUX_FETCH_TAG"
             echo "::notice::runner-availability linux_fetch=$fetch_available (${fetch_count} idle of ${fetch_online} online Linux ${LINUX_FETCH_BASE_TAG}+${LINUX_FETCH_TAG} runner(s))"
           fi
 
@@ -713,6 +724,7 @@ jobs:
               echo "linux_probe=false" >> "$GITHUB_OUTPUT"
             fi
             record_capacity linux_probe "$probe_online" "$probe_count" true
+            record_linux_pool_hosts linux_probe "$LINUX_PROBE_TAG"
             echo "::notice::runner-availability linux_probe=$([ "$probe_count" -gt 0 ] && echo true || echo false) (${probe_count} idle of ${probe_online} online Linux ${LINUX_PROBE_TAG} runner(s))"
           fi
 

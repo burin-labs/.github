@@ -1,0 +1,50 @@
+import {
+  launch_profile,
+  require_qualified_guard,
+  snapshot_control_source,
+  verify_control_directories,
+  verify_control_source,
+  verify_installed_guard,
+} from "./launch-profile.harn"
+
+fn main(harness: Harness) {
+  if len(argv) != 2 || (argv[1] != "preflight" && argv[1] != "dispatch") {
+    throw "trusted launch planner requires its fixed repository root and phase"
+  }
+  const root = argv[0]
+  const profile = launch_profile(
+    root,
+    to_string(harness.env.get("REVIEW_CONTROL_HOME_CANONICAL") ?? ""),
+    to_string(harness.env.get("REVIEW_RULESET_MODE") ?? ""),
+  )
+  if profile.mode != "plan" {
+    verify_control_directories(
+      profile,
+      to_string(harness.env.get("REVIEW_CONTROL_BUNDLE_CANONICAL") ?? ""),
+      to_string(harness.env.get("REVIEW_CONTROL_LEDGER_CANONICAL") ?? ""),
+    )
+    require_qualified_guard()
+  }
+  if argv[1] == "preflight" {
+    verify_control_source(harness.fs, root)
+    if profile.mode != "plan" {
+      harness.stdio.println("--read-only-root")
+      harness.stdio.println(profile.bundle_root)
+    }
+    return
+  }
+  if profile.mode != "plan" {
+    verify_installed_guard(harness.fs, profile.bundle_root)
+  }
+  const snapshot = snapshot_control_source(harness.fs, root)
+  const dispatch = launch_profile(
+    snapshot,
+    to_string(harness.env.get("REVIEW_CONTROL_HOME_CANONICAL") ?? ""),
+    profile.mode,
+  )
+  harness.stdio.println(dispatch.ledger_root)
+  harness.stdio.println(dispatch.command_path)
+  for argument in dispatch.argv {
+    harness.stdio.println(argument)
+  }
+}

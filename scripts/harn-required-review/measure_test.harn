@@ -1,0 +1,77 @@
+import { snapshot } from "./measure.harn"
+
+fn refused(action: fn() -> any) {
+  let caught = false
+  try {
+    action()
+  } catch (error) {
+    caught = true
+  }
+  assert(caught, "the negative control must refuse")
+}
+
+fn summary(id: int) -> dict {
+  return {
+    id: id,
+    name: "rule " + to_string(id),
+    source: "burin-labs/harn",
+    source_type: "Repository",
+  }
+}
+
+pipeline test_all_pages_and_details_are_read(harness: Harness) {
+  let paths = []
+  let first = []
+  for id in range(1, 101) {
+    first = first + [summary(id)]
+  }
+  const measured = snapshot(
+    {
+      read: fn(path) {
+        paths = paths + [path]
+        if path.ends_with("page=1") {
+          return first
+        }
+        if path.ends_with("page=2") {
+          return [summary(101)]
+        }
+        if path.contains("/rulesets/") {
+          return summary(to_int(path.split("/")[-1])) + {rules: [{type: "merge_queue"}]}
+        }
+        if path.ends_with("/rules/branches/main") {
+          return [{type: "required_signatures"}]
+        }
+        if path == "apps/harn-release-bot" {
+          return {id: 3472013, slug: "harn-release-bot"}
+        }
+        throw "unexpected read: " + path
+      },
+    },
+  )
+  assert_eq(len(measured.rulesets), 101)
+  assert_eq(len(paths), 105)
+  assert(paths.contains("repos/burin-labs/harn/rulesets/101"))
+}
+
+pipeline test_unread_partial_duplicate_and_changed_hydration_refuse(harness: Harness) {
+  for batch in [nil, [], [summary(1), summary(1)]] {
+    refused(fn() { snapshot({read: fn(path) { return batch }}) })
+  }
+  refused(
+    fn() { snapshot(
+      {
+        read: fn(path) {
+          if path.contains("?") {
+            return [summary(1)]
+          }
+          return summary(2)
+        },
+      },
+    ) },
+  )
+  let full = []
+  for id in range(1, 101) {
+    full = full + [summary(id)]
+  }
+  refused(fn() { snapshot({read: fn(path) { return full }}) })
+}

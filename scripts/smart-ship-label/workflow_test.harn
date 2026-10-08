@@ -1,5 +1,5 @@
 import { read_yaml } from "std/fs"
-import { ship_label } from "./policy.harn"
+import { CONTROL_POLICY_SOURCE, control_policy_source, ship_label } from "./policy.harn"
 
 fn expression(value: string) -> string {
   return "$" + "{{ " + value + " }}"
@@ -11,12 +11,27 @@ fn named(steps: list, name: string) -> dict {
   return matches[0] ?? {}
 }
 
+pipeline test_repair_bootstrap_provisions_the_declared_package_manager(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const steps = workflow.jobs.ship.steps
+  const node = named(steps, "Set up Node")
+  const package_manager = named(steps, "Set up the repair package manager")
+  const shepherd = named(steps, "Shepherd")
+  assert_eq(package_manager["if"], "inputs.repair && steps.prs.outputs.numbers != ''")
+  assert_eq(package_manager.uses, "pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413")
+  // The action reads packageManager from the checked-out repository instead
+  // of duplicating a version here or installing its controller dependencies.
+  assert_eq(package_manager["with"].run_install, false)
+  assert_eq(package_manager["with"]?.version, nil)
+  assert(steps.index_of(node) < steps.index_of(package_manager))
+  assert(steps.index_of(package_manager) < steps.index_of(shepherd))
+}
+
 pipeline test_shared_workflow_reconciles_its_canonical_label_before_discovery(harness: Harness) {
   const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
   const steps = workflow.jobs.ship.steps
   const checkout = named(steps, "Check out the Smart Ship control policy")
-  assert_eq(checkout["with"].repository, "burin-labs/.github")
-  assert_eq(checkout["with"].ref, expression("github.workflow_sha"))
+  assert_eq(control_policy_source(checkout["with"]), CONTROL_POLICY_SOURCE)
   assert_eq(checkout["with"].path, ".smart-ship-runner")
   assert_eq(checkout["with"]["persist-credentials"], false)
   const reconcile_step = named(steps, "Reconcile the Smart Ship control label")
@@ -29,4 +44,39 @@ pipeline test_shared_workflow_reconciles_its_canonical_label_before_discovery(ha
   const discovery_index = steps.index_of(named(steps, "Find the pull requests to look at"))
   assert(reconcile_index >= 0 && reconcile_index < discovery_index)
   assert_eq(ship_label(read_yaml(harness.fs, "../../.github/labels.yml")).name, "ship")
+}
+
+pipeline test_wrong_repository_or_caller_revision_is_refused() {
+  assert_eq(control_policy_source(CONTROL_POLICY_SOURCE), CONTROL_POLICY_SOURCE)
+  for checkout in [
+    {repository: "example/consumer", ref: CONTROL_POLICY_SOURCE.ref},
+    {repository: CONTROL_POLICY_SOURCE.repository, ref: expression("github.workflow_sha")},
+    {repository: CONTROL_POLICY_SOURCE.repository, ref: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {repository: CONTROL_POLICY_SOURCE.repository},
+    nil,
+  ] {
+    const refusal = try {
+      control_policy_source(checkout)
+      ""
+    } catch (error) {
+      to_string(error)
+    }
+    assert(refusal.contains("control policy source"), refusal)
+  }
+}
+
+pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const input = workflow.on.workflow_call.inputs["owned-runner"]
+  assert_eq(input.type, "string")
+  assert_eq(input["default"], "")
+  const runs_on = workflow.jobs.ship["runs-on"]
+  // Hosted is both the default and the fallback, and an owned runner needs a
+  // caller on the private allowlist: a public repository's run must never
+  // land on an owned host, whatever it passes.
+  assert(runs_on.ends_with("|| 'ubuntu-24.04' }}"), runs_on)
+  const listed = regex_captures("contains\\(fromJSON\\('(\\[[^']*\\])'\\), github\\.repository\\)", runs_on)
+  assert_eq(len(listed), 1, runs_on)
+  assert_eq(json_parse(listed[0].groups[0]), ["burin-labs/burin-code", "burin-labs/harn-cloud"])
+  assert(runs_on.contains("inputs.owned-runner != '' && contains("), runs_on)
 }

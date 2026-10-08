@@ -2,6 +2,25 @@ import { GitHub } from "../merge-override/github.harn"
 
 pub type LabelSpec = {name: string, color: string, description: string}
 
+pub type ControlPolicySource = {repository: string, ref: string}
+
+// This immutable org revision contains the control script and label registry.
+// A reusable workflow's github.workflow_sha belongs to its caller repository.
+pub const CONTROL_POLICY_SOURCE: ControlPolicySource = {
+  repository: "burin-labs/.github",
+  ref: "8ab5eb88533595579e9e79d556d719593a26a728",
+}
+
+/** Normalize the workflow projection at the repository/revision boundary. */
+pub fn control_policy_source(checkout: unknown) -> ControlPolicySource {
+  if type_of(checkout) != "dict"
+    || checkout?.repository != CONTROL_POLICY_SOURCE.repository
+    || checkout?.ref != CONTROL_POLICY_SOURCE.ref {
+    throw "control policy source must bind the org repository to its immutable revision"
+  }
+  return CONTROL_POLICY_SOURCE
+}
+
 fn text(value: unknown, field: string) -> string {
   if type_of(value) != "string" || trim(to_string(value)) == "" {
     throw "Smart Ship label " + field + " must be a non-empty string"

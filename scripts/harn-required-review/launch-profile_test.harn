@@ -1,0 +1,125 @@
+import { command_run } from "std/command"
+import {
+  launch_profile,
+  snapshot_control_source,
+  verify_control_directories,
+  verify_control_source,
+} from "./launch-profile.harn"
+
+fn refused(action: fn() -> any) {
+  let caught = false
+  try {
+    action()
+  } catch (error) {
+    caught = true
+  }
+  assert(caught, "the negative control must refuse")
+}
+
+pipeline test_arbitrary_modes_and_multiline_or_relative_roots_are_refused(harness: Harness) {
+  refused(fn() { launch_profile("/reviewed/repo", "/control/home", "agent") })
+  refused(fn() { launch_profile("relative", "/control/home", "snapshot") })
+  refused(fn() { launch_profile("/reviewed/repo", "/control/home\n--no-sandbox", "verify") })
+  refused(fn() { launch_profile("/reviewed/repo", "/control/home:/shadow", "snapshot") })
+}
+
+pipeline test_shadow_path_entry_cannot_receive_the_control_command(harness: Harness) {
+  const home = harness.fs.mkdtemp_in_workspace("review-path-shadow-")
+  const bundle = path_join(home, ".local/share/gh-budget")
+  const shadow = path_join(home, ".local/bin")
+  harness.fs.mkdir(bundle, true)
+  harness.fs.mkdir(shadow, true)
+  harness.fs.write_text(path_join(bundle, "gh"), "#!/bin/sh\nprintf 'BUNDLE_REACHED\\n'\n")
+  harness.fs.write_text(path_join(shadow, "gh"), "#!/bin/sh\nprintf 'SHADOW_REACHED\\n'\n")
+  const ready = command_run(
+    harness.tools,
+    ["/bin/chmod", "+x", path_join(bundle, "gh"), path_join(shadow, "gh")],
+  )
+  assert(ready.success, ready.stderr)
+  const profile = launch_profile("/reviewed/repo", home, "snapshot")
+  const probe = path_join(home, "path-probe.harn")
+  harness.fs.write_text(
+    probe,
+    "import { command_run } from \"std/command\"\nfn main(harness: Harness) { const result = command_run(harness.tools, [\"gh\", \"--version\"]); assert(result.success, result.stderr); harness.stdio.println(trim(result.stdout)) }\n",
+  )
+  const unsafe = command_run(
+    harness.tools,
+    {
+      argv: ["harn", "run", "--standalone", probe],
+      env_mode: "replace",
+      env: {PATH: shadow + ":" + profile.command_path, HOME: home},
+    },
+  )
+  assert_eq(trim(unsafe.stdout), "SHADOW_REACHED")
+  const safe = command_run(
+    harness.tools,
+    {
+      argv: ["harn", "run", "--standalone", probe],
+      env_mode: "replace",
+      env: {PATH: profile.command_path, HOME: home},
+    },
+  )
+  assert(safe.success, safe.stderr)
+  assert_eq(trim(safe.stdout), "BUNDLE_REACHED")
+}
+
+pipeline test_redirected_control_directories_cannot_widen_the_grant(harness: Harness) {
+  const profile = launch_profile("/reviewed/repo", "/control/home", "snapshot")
+  verify_control_directories(profile, profile.bundle_root, profile.ledger_root)
+  refused(fn() { verify_control_directories(profile, "/control/home", profile.ledger_root) })
+  refused(fn() { verify_control_directories(profile, profile.bundle_root, "/control/home") })
+}
+
+pipeline test_plan_receives_no_shared_state_or_network_grants(harness: Harness) {
+  const profile = launch_profile("/reviewed/repo", "/control/home", "plan")
+  assert_eq(
+    profile.argv,
+    ["run", "--standalone", "/reviewed/repo/scripts/harn-required-review/cli.harn"],
+  )
+}
+
+pipeline test_only_exact_control_bundle_and_ledger_receive_process_grants(harness: Harness) {
+  const profile = launch_profile("/reviewed/repo", "/control/home", "snapshot")
+  assert_eq(profile.bundle_root, "/control/home/.local/share/gh-budget")
+  assert_eq(profile.ledger_root, "/control/home/.local/state/gh-budget")
+  assert_eq(
+    profile.argv,
+    [
+      "run",
+      "--standalone",
+      "--sandbox-read-root",
+      profile.bundle_root,
+      "--sandbox-write-root",
+      profile.ledger_root,
+      "--allow-process-network",
+      "/reviewed/repo/scripts/harn-required-review/cli.harn",
+    ],
+  )
+}
+
+pipeline test_current_control_sources_match_the_reviewed_seal(harness: Harness) {
+  const root = path_join(harness.fs.cwd(), "../..")
+  verify_control_source(harness.fs, root)
+}
+
+pipeline test_changed_executable_source_is_refused_before_dispatch(harness: Harness) {
+  const root = path_join(harness.fs.cwd(), "../..")
+  const scratch = harness.fs.mkdtemp_in_workspace("review-source-seal-")
+  for path in [
+    "scripts/harn-required-review/cli.harn",
+    "scripts/harn-required-review/measure.harn",
+    "scripts/harn-required-review/policy.harn",
+    "scripts/merge-override/github.harn",
+  ] {
+    harness.fs.mkdir(dirname(path_join(scratch, path)), true)
+    harness.fs.write_bytes(path_join(scratch, path), harness.fs.read_bytes(path_join(root, path)))
+  }
+  verify_control_source(harness.fs, scratch)
+  const measured_snapshot = snapshot_control_source(harness.fs, scratch)
+  harness.fs.write_text(
+    path_join(scratch, "scripts/harn-required-review/cli.harn"),
+    "fn main(harness: Harness) {}\n",
+  )
+  refused(fn() { verify_control_source(harness.fs, scratch) })
+  verify_control_source(harness.fs, measured_snapshot)
+}

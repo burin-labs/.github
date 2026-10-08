@@ -21,6 +21,15 @@ on:
         description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
         type: boolean
         default: true
+      owned-runner:
+        description: >-
+          JSON label array of an owned runner for this run, chosen by the
+          caller from its own availability probe; empty keeps the hosted
+          runner. Honored only for the private repositories listed at the
+          job's runs-on: a public caller always runs on the free hosted
+          runner, so no owned host runs on behalf of a public repository.
+        type: string
+        default: ""
     secrets:
       RELEASE_APP_CLIENT_ID:
         required: true
@@ -34,14 +43,25 @@ permissions:
 
 jobs:
   ship:
-    # One shepherd run at a time per repository. A sweep has no PR number and
-    # touches every labeled PR, so per-PR groups would let a sweep and an event
-    # run act on the same PR at once. Runs take about a minute; if GitHub
-    # replaces a queued run, the next sweep covers its PR.
+    # A run woken by an event about one PR queues behind earlier runs for that
+    # PR; every other run (schedule, dispatch, workflow_run, merge_group) is a
+    # sweep and queues behind earlier sweeps. GitHub keeps one pending run per
+    # group and a newer one replaces it, so with one group per repository the
+    # PR events replaced the sweeps meant to recover them. Now an event cancels
+    # only an older pending run for its own PR, and a sweep only an older
+    # pending sweep, which the replacing sweep covers. A sweep and an event run
+    # can still be live together, so the shepherd itself keeps one actor per
+    # PR: before acting, a run lists the caller workflow's unfinished runs and
+    # leaves the PR to an earlier one that covers it (burin-code
+    # scripts/lib/ship/github.harn `single_actor`).
     concurrency:
-      group: smart-ship-${{ github.repository }}
+      group: >-
+        smart-ship-${{ github.repository }}-${{ github.event.pull_request.number
+        && format('pr-{0}', github.event.pull_request.number) || 'sweep' }}
       cancel-in-progress: false
-    runs-on: ubuntu-24.04
+    # Private callers are billed per hosted minute, so they may hand in an
+    # owned runner; the hosted runner stays the default and the fallback.
+    runs-on: ${{ inputs.owned-runner != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && fromJSON(inputs.owned-runner) || 'ubuntu-24.04' }}
     timeout-minutes: 40
     steps:
       - name: Mint the release app token
@@ -72,7 +92,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: burin-labs/.github
-          ref: ${{ github.workflow_sha }}
+          # Repository-qualified source, checked by the typed control policy.
+          # github.workflow_sha identifies the caller, not this org repository.
+          ref: 8ab5eb88533595579e9e79d556d719593a26a728
           path: .smart-ship-runner
           persist-credentials: false
 
@@ -152,6 +174,14 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .node-version
+
+      - name: Set up the repair package manager
+        if: inputs.repair && steps.prs.outputs.numbers != ''
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          # Read the checked-out packageManager pin; repair worktrees own
+          # dependency installation through their repository setup policy.
+          run_install: false
 
       - name: Shepherd
         if: steps.prs.outputs.numbers != ''
