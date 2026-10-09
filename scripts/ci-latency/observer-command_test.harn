@@ -1,6 +1,6 @@
-import { command_run } from "std/command"
+import { command_result_ok, command_run } from "std/command"
 import { with_temp_dir } from "std/testing"
-import { observer_command_options } from "./observer-cli.harn"
+import { observer_command_options, observer_command_result } from "./observer-cli.harn"
 
 pipeline test_observer_passes_only_explicit_read_only_token() {
   for args in [["gh", "api", "fixture"], ["harn", "run", "fixture.harn"]] {
@@ -8,6 +8,7 @@ pipeline test_observer_passes_only_explicit_read_only_token() {
     assert_eq(options.env, {GH_TOKEN: "fixture-read-only-token"})
     assert_eq(options.env_mode, "patch")
     assert_eq(options.timeout_ms, 600000)
+    assert_eq(options.max_inline_bytes, 8388608)
     assert_eq(observer_command_options(nil, args).env, {})
     assert_eq(observer_command_options("", args).env, {})
   }
@@ -46,4 +47,58 @@ pipeline test_observer_token_reaches_the_actual_child(harness: Harness) {
       assert_eq(absent.exit_code, 73)
     },
   )
+}
+
+pipeline test_observer_parses_a_complete_large_child_json(harness: Harness) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const child = path_join(work, "gh")
+      const data = path_join(work, "census.json")
+      const rows = range(0, 3000).map(
+        { id -> {id: id, created_at: "2026-10-09T00:00:00Z", conclusion: "success"} },
+      )
+        .to_list()
+      harness.fs.write_text(data, json_stringify({workflow_runs: rows}))
+      harness.fs.write_text(child, "#!/bin/sh\ncat \"$2\"\n")
+      assert(harness.process.run({program: "chmod", args: ["700", child]}).success)
+      const result = command_run(
+        harness.tools,
+        [child, "api", data],
+        observer_command_options(nil, ["gh", "api", "fixture"]),
+      )
+      assert(result.success)
+      assert_eq(json_parse(observer_command_result(result).stdout), {workflow_runs: rows})
+      const clipped = command_run(
+        harness.tools,
+        [child, "api", data],
+        {...observer_command_options(nil, ["gh", "api", "fixture"]), max_inline_bytes: 32},
+      )
+      assert(
+        is_err(
+          try {
+            observer_command_result(clipped)
+          },
+        ),
+      )
+    },
+  )
+}
+
+pipeline test_observer_requires_measured_complete_capture_even_for_valid_json() {
+  const valid = command_result_ok("{}", {stdout_truncated: false, timed_out: false})
+  assert_eq(observer_command_result(valid).stdout, "{}")
+  for result in [
+    command_result_ok("{}"),
+    valid + {stdout_truncated: true},
+    valid + {timed_out: true},
+  ] {
+    assert(
+      is_err(
+        try {
+          observer_command_result(result)
+        },
+      ),
+    )
+  }
 }

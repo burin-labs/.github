@@ -1,11 +1,25 @@
 import { parse, parser } from "std/cli/argparse"
-import { command_run } from "std/command"
+import { CommandResult, command_run } from "std/command"
 import {
   OBSERVER_REPOSITORIES,
   observation_succeeded,
   observation_summary,
 } from "./observer-contract.harn"
-import { ObserverAdapters, ObserverLocations, observe_repository } from "./observer-runner.harn"
+import {
+  ObserverAdapters,
+  ObserverCommand,
+  ObserverLocations,
+  observe_repository,
+} from "./observer-runner.harn"
+
+type ObserverCapture = {stdout_truncated: bool, timed_out: bool}
+
+pub fn observer_command_result(result: CommandResult) -> ObserverCommand {
+  const capture = schema_expect(result, schema_of(ObserverCapture))
+  require !capture.stdout_truncated, "observer JSON output exceeded the bounded capture"
+  require !capture.timed_out, "observer command timed out before a complete report"
+  return {stdout: result.stdout, stderr: result.stderr, success: result.success}
+}
 
 pub fn observer_command_options(token: string?, args: list<string>) -> dict {
   require len(args) >= 2, "observer command is incomplete"
@@ -16,6 +30,7 @@ pub fn observer_command_options(token: string?, args: list<string>) -> dict {
   // Pass only this workflow's read-only token to its API reader and measurement engine.
   return {
     timeout_ms: 600000,
+    max_inline_bytes: 8388608,
     env_mode: "patch",
     env: token == nil || token == "" ? {} : {GH_TOKEN: token},
   }
@@ -99,7 +114,7 @@ fn main(harness: Harness) -> int {
     run: fn(args) {
       const result = command_run(harness.tools, args, observer_command_options(token, args))
       require result != nil, "observer command did not return a measured result"
-      return {stdout: result.stdout, stderr: result.stderr, success: result.success}
+      return observer_command_result(result)
     },
     sleep_ms: fn(ms) { harness.clock.sleep_ms(ms) },
     now: fn() { return harness.clock.date_iso() },
