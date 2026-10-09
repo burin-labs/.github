@@ -74,12 +74,7 @@ fn current_registration(env: HarnessEnv, source: ProofSource) -> Registration {
 }
 
 fn resolve(harness: Harness) {
-  const source = live_source(
-    harness.net,
-    harness.fs,
-    harness.tools,
-    required(harness.env, "GH_TOKEN"),
-  )
+  const source = live_source(harness.net, harness.fs, required(harness.env, "GH_TOKEN"))
   const current = current_registration(harness.env, source)
   if !["merge_group", "push"].contains(current.event) {
     throw "event has no supported execution-scope reuse contract"

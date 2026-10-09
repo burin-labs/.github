@@ -359,6 +359,10 @@ pub fn admit_jobs(
   compatible_execution(current, producer, recorded)
   qualified_artifact(artifact, producer)
   coherent_jobs(jobs, declared, producer)
+  if current.event == "push"
+    && jobs.any({ job -> !["success", "skipped"].contains(job.conclusion) }) {
+    throw "main push requires a successful complete job census"
+  }
   const registrar = successful_registrar(recorded, jobs)
   const selected = selected_jobs(current, jobs, artifact, registrar)
   return {

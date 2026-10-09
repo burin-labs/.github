@@ -283,10 +283,20 @@ pipeline test_push_and_cache_writer_policy_remain_strict() {
     event: "push",
     identity: {...registration().identity, commit: "d".repeat(40)},
   }
+  const successful = jobs().map({ job -> {...job, conclusion: "success"} }).to_list()
   assert_eq(
-    admit(current, {...producer(), conclusion: "success"}, registered(), jobs(), 3).producer.runId,
+    admit(current, {...producer(), conclusion: "success"}, registered(), successful, 3).producer
+      .runId,
     10,
   )
+  for conclusion in ["cancelled", "failure"] {
+    const fixture = jobs()
+    const inconsistent = [fixture[0], fixture[1], {...fixture[2], conclusion: conclusion}]
+    assert_error_contains(
+      fn() { admit(current, {...producer(), conclusion: "success"}, registered(), inconsistent, 3) },
+      "successful complete job census",
+    )
+  }
   assert(!reuse_gate("push", true, true, false))
   assert(!reuse_gate("merge_group", true, true, true))
   assert(reuse_gate("merge_group", true, true, false))

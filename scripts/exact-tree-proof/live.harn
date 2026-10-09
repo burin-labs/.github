@@ -1,4 +1,3 @@
-import { command_run } from "std/command"
 import { Artifact, Registration, closed } from "./contract.harn"
 import { ProofSource } from "./reader.harn"
 
@@ -52,7 +51,6 @@ pub fn registration_from_archive(fs: HarnessFs, path: string, digest: string) ->
 fn download_registration(
   net: HarnessNet,
   fs: HarnessFs,
-  tools: HarnessTools,
   token: string,
   repo: string,
   artifact: Artifact,
@@ -64,8 +62,7 @@ fn download_registration(
   const directory = fs.mkdtemp_in_workspace("exact-tree-registration-")
   const path = directory + "/registration.zip"
   defer {
-    command_run(tools, ["rm", "-f", "--", path])
-    command_run(tools, ["rmdir", "--", directory])
+    fs.delete(directory)
   }
   const response = net.download(
     API_ROOT + "/repos/" + repo + "/actions/artifacts/"
@@ -81,21 +78,10 @@ fn download_registration(
   return registration_from_archive(fs, path, artifact.digest)
 }
 
-pub fn live_source(
-  net: HarnessNet,
-  fs: HarnessFs,
-  tools: HarnessTools,
-  token: string,
-) -> ProofSource {
+pub fn live_source(net: HarnessNet, fs: HarnessFs, token: string) -> ProofSource {
   return {
     json: fn(endpoint) { return json(net, token, endpoint) },
-    registration: fn(repo, artifact) { return download_registration(
-      net,
-      fs,
-      tools,
-      token,
-      repo,
-      artifact,
-    ) },
+    registration:
+      fn(repo, artifact) { return download_registration(net, fs, token, repo, artifact) },
   }
 }
