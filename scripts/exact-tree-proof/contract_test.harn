@@ -1,0 +1,321 @@
+import { assert_error_contains } from "std/testing"
+import {
+  Job,
+  ProofReceipt,
+  RegisteredArtifact,
+  Registration,
+  Run,
+  admit_jobs,
+  execution_scope,
+  reuse_gate,
+} from "./contract.harn"
+
+type FixtureJobs = list<Job>
+
+/** Decode deliberately mutated fixtures without weakening the production's typed interface. */
+fn admit(
+  current: unknown,
+  producer: unknown,
+  registered: unknown,
+  jobs: unknown,
+  declared: int,
+) -> ProofReceipt {
+  return admit_jobs(
+    schema_expect(current, schema_of(Registration)),
+    schema_expect(producer, schema_of(Run)),
+    schema_expect(registered, schema_of(RegisteredArtifact)),
+    schema_expect(jobs, schema_of(FixtureJobs)),
+    declared,
+  )
+}
+
+fn registration() -> Registration {
+  return {
+    schema: "burin.exact_tree_proof_registration.v1",
+    repository: "acme/product",
+    workflow: "ci.yml",
+    identity: {commit: "a".repeat(40), tree: "b".repeat(40), workflowBlob: "c".repeat(40)},
+    event: "merge_group",
+    runId: 20,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register execution scope",
+    scope: execution_scope(
+      {
+        schema: "burin.exact_tree_execution_scope.v1",
+        inputs: [{name: "selection", value: "rust"}],
+        jobs: [
+          {
+            name: "Rust",
+            inputs: [{name: "packages", value: "core,tui"}],
+            requiredSteps: ["Test selected packages"],
+          },
+        ],
+      },
+      ["Rust"],
+    ),
+  }
+}
+
+fn producer() -> Run {
+  return {
+    id: 10,
+    run_attempt: 1,
+    head_sha: "d".repeat(40),
+    event: "merge_group",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "cancelled",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+}
+
+fn registered() -> RegisteredArtifact {
+  const current = registration()
+  const raw = {
+    registration: {...current, runId: 10, identity: {...current.identity, commit: "d".repeat(40)}},
+    artifact: {
+      id: 101,
+      name: "exact-tree-inputs-10-1",
+      size_in_bytes: 300,
+      expired: false,
+      digest: "sha256:" + "e".repeat(64),
+      created_at: "2026-10-09T10:00:00Z",
+      workflow_run: {id: 10, head_sha: "d".repeat(40)},
+    },
+  }
+  return schema_expect(raw, schema_of(RegisteredArtifact))
+}
+
+fn jobs() -> list<Job> {
+  const base = {
+    run_id: 10,
+    run_attempt: 1,
+    head_sha: "d".repeat(40),
+    status: "completed",
+    conclusion: "success",
+    started_at: "2026-10-09T10:00:02Z",
+    completed_at: "2026-10-09T10:00:03Z",
+  }
+  return [
+    {
+      ...base,
+      id: 1,
+      name: "Changes",
+      started_at: "2026-10-09T09:59:00Z",
+      completed_at: "2026-10-09T10:00:01Z",
+      steps: [{name: "Register execution scope", status: "completed", conclusion: "success"}],
+    },
+    {
+      ...base,
+      id: 2,
+      name: "Rust",
+      steps: [{name: "Test selected packages", status: "completed", conclusion: "success"}],
+    },
+    {...base, id: 3, name: "Calibration", conclusion: "cancelled", steps: []},
+  ]
+}
+
+pipeline test_successful_selected_jobs_survive_unrelated_cancelled_workflow() {
+  const receipt = admit(registration(), producer(), registered(), jobs(), 3)
+  assert_eq(
+    receipt.selectedJobs,
+    [{id: 2, name: "Rust", requiredSteps: ["Test selected packages"]}],
+  )
+  assert_eq(
+    receipt.census,
+    {
+      declared: 3,
+      observed: 3,
+      selected: 1,
+      selectedPending: 0,
+      selectedBad: 0,
+      pending: [],
+      bad: [{name: "Calibration", conclusion: "cancelled"}],
+    },
+  )
+  assert_eq(receipt.producer.commit, "d".repeat(40))
+}
+
+pipeline test_identical_tree_with_different_plan_or_event_refuses() {
+  const current = registration()
+  const record = registered()
+  const changed = {
+    ...record,
+    registration: {
+      ...record.registration,
+      scope: {
+        ...current.scope,
+        jobs: [{...current.scope.jobs[0], inputs: [{name: "packages", value: "core"}]}],
+      },
+    },
+  }
+  assert_error_contains(fn() { admit(current, producer(), changed, jobs(), 3) }, "scope mismatch")
+  for event in ["workflow_dispatch", "pull_request", "push"] {
+    assert_error_contains(
+      fn() { admit({...current, event: event}, producer(), record, jobs(), 3) },
+      event == "push" ? "successful whole queue" : "event mismatch",
+    )
+  }
+  assert_error_contains(
+    fn() { admit(current, {...producer(), event: "workflow_dispatch"}, record, jobs(), 3) },
+    "attempt mismatch",
+  )
+}
+
+pipeline test_complete_census_attempt_source_and_execution_are_required() {
+  const fixture = jobs()
+  assert_error_contains(
+    fn() { admit(registration(), producer(), registered(), fixture, 4) },
+    "incomplete",
+  )
+  const duplicate_jobs = [fixture[0], fixture[1], fixture[1]]
+  assert_error_contains(
+    fn() { admit(registration(), producer(), registered(), duplicate_jobs, 3) },
+    "duplicate",
+  )
+  for mutation in [{run_attempt: 2}, {head_sha: "f".repeat(40)}] {
+    assert_error_contains(
+      fn() { admit(
+        registration(),
+        producer(),
+        registered(),
+        [fixture[0], {...fixture[1], ...mutation}, fixture[2]],
+        3,
+      ) },
+      "mixed attempt",
+    )
+  }
+  for conclusion in ["skipped", "failure", "cancelled"] {
+    assert_error_contains(
+      fn() { admit(
+        registration(),
+        producer(),
+        registered(),
+        [fixture[0], {...fixture[1], conclusion: conclusion}, fixture[2]],
+        3,
+      ) },
+      "required job",
+    )
+    const step = {name: "Test selected packages", status: "completed", conclusion: conclusion}
+    assert_error_contains(
+      fn() { admit(
+        registration(),
+        producer(),
+        registered(),
+        [fixture[0], {...fixture[1], steps: [step]}, fixture[2]],
+        3,
+      ) },
+      "required proof step",
+    )
+  }
+}
+
+pipeline test_registration_must_finish_before_selected_execution() {
+  const fixture = jobs()
+  assert_error_contains(
+    fn() { admit(
+      registration(),
+      producer(),
+      registered(),
+      [{...fixture[0], completed_at: "2026-10-09T10:00:04Z"}, fixture[1], fixture[2]],
+      3,
+    ) },
+    "registered before",
+  )
+  assert_error_contains(
+    fn() { admit(
+      registration(),
+      producer(),
+      registered(),
+      [{...fixture[0], steps: []}, fixture[1], fixture[2]],
+      3,
+    ) },
+    "registration step",
+  )
+  const record = registered()
+  for mutation in [{expired: true}, {size_in_bytes: 0}, {name: "wrong"}, {digest: ""}] {
+    assert_error_contains(
+      fn() { admit(
+        registration(),
+        producer(),
+        {...record, artifact: {...record.artifact, ...mutation}},
+        fixture,
+        3,
+      ) },
+      "unqualified",
+    )
+  }
+}
+
+pipeline test_unknown_scope_and_incomplete_step_obligations_refuse() {
+  const scope = registration().scope
+  const fixed = {...scope, jobs: [{...scope.jobs[0], inputs: []}]}
+  assert_eq(execution_scope(fixed, ["Rust"]).jobs[0]?.inputs, [])
+  for raw in [
+    {...scope, schema: "old"},
+    {...scope, unexpected: true},
+    {...scope, jobs: []},
+    {...scope, jobs: [{...scope.jobs[0], requiredSteps: []}]},
+    {...scope, jobs: [scope.jobs[0], scope.jobs[0]]},
+  ] {
+    assert(
+      is_err(
+        try {
+          execution_scope(raw, ["Rust"])
+        },
+      ),
+    )
+  }
+  assert(
+    is_err(
+      try {
+        execution_scope(scope, ["Rust", "Swift"])
+      },
+    ),
+  )
+}
+
+pipeline test_push_and_cache_writer_policy_remain_strict() {
+  const current = {
+    ...registration(),
+    event: "push",
+    identity: {...registration().identity, commit: "d".repeat(40)},
+  }
+  const successful = jobs().map({ job -> {...job, conclusion: "success"} }).to_list()
+  assert_eq(
+    admit(current, {...producer(), conclusion: "success"}, registered(), successful, 3).producer
+      .runId,
+    10,
+  )
+  for conclusion in ["cancelled", "failure"] {
+    const fixture = jobs()
+    const inconsistent = [fixture[0], fixture[1], {...fixture[2], conclusion: conclusion}]
+    assert_error_contains(
+      fn() { admit(current, {...producer(), conclusion: "success"}, registered(), inconsistent, 3) },
+      "successful complete job census",
+    )
+  }
+  assert(!reuse_gate("push", true, true, false))
+  assert(!reuse_gate("merge_group", true, true, true))
+  assert(reuse_gate("merge_group", true, true, false))
+  assert(!reuse_gate("workflow_dispatch", true, false, false))
+  assert(!reuse_gate("merge_group", false, false, false))
+}
+
+pipeline test_inconsistent_terminal_run_records_refuse() {
+  for conclusion in [nil, "unknown"] {
+    const incomplete = {...producer(), conclusion: conclusion}
+    assert_error_contains(
+      fn() { admit(registration(), incomplete, registered(), jobs(), 3) },
+      "recognized terminal conclusion",
+    )
+  }
+  const fixture = jobs()
+  const pending = [fixture[0], fixture[1], {...fixture[2], status: "in_progress", conclusion: nil}]
+  assert_error_contains(
+    fn() { admit(registration(), producer(), registered(), pending, 3) },
+    "active jobs",
+  )
+}

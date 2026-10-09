@@ -1,0 +1,54 @@
+pipeline test_real_bootstrap_without_registered_scope_is_unmeasured(harness: Harness) {
+  const temporary = harness.fs.mkdtemp_in_workspace("exact-tree-launcher-")
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const output = path_join(temporary, "github-output")
+  harness.fs.write_text(output, "")
+  const result = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: [".github/actions/exact-tree-ci-proof/run.sh"],
+      cwd: root,
+      env: {
+        PATH: to_string(harness.env.get("PATH") ?? ""),
+        GH_TOKEN: "fixture-token",
+        GITHUB_ACTION_PATH: path_join(root, ".github/actions/exact-tree-ci-proof"),
+        GITHUB_WORKSPACE: root,
+        GITHUB_OUTPUT: output,
+        EXACT_TREE_EVENT: "merge_group",
+        EXACT_TREE_COMMIT: "a".repeat(40),
+        EXACT_TREE_REPOSITORY: "acme/product",
+        EXACT_TREE_WORKFLOW: "ci.yml",
+        EXACT_TREE_REQUIRED_JOBS: "[\"Rust\"]",
+        EXACT_TREE_SCOPE: "",
+        EXACT_TREE_REGISTRAR_JOB: "Changes",
+        EXACT_TREE_REGISTRAR_STEP: "Register scope",
+        EXACT_TREE_RUN_ID: "20",
+        EXACT_TREE_ATTEMPT: "1",
+        EXACT_TREE_CACHE_REFRESH: "false",
+        EXACT_TREE_QUEUE_WRITES_CACHE: "false",
+      },
+      timeout_ms: 30000,
+    },
+  )
+  assert(result.success, result.stdout + result.stderr)
+  assert(result.stdout.contains("Execution scope is unmeasured"))
+  const lines = trim(harness.fs.read_text(output)).split("\n")
+  assert_eq(len(lines), 12)
+  for entry in [
+    {offset: 0, name: "proven", value: "false"},
+    {offset: 3, name: "reuse", value: "false"},
+    {offset: 6, name: "census", value: "null"},
+  ] {
+    const header = lines[entry.offset].split("<<")
+    assert_eq(header[0], entry.name)
+    assert_eq(lines[entry.offset + 1], entry.value)
+    assert_eq(lines[entry.offset + 2], header[1])
+  }
+  const discovery_header = lines[9].split("<<")
+  assert_eq(discovery_header[0], "discovery")
+  assert_eq(lines[11], discovery_header[1])
+  assert_eq(
+    json_parse(lines[10]),
+    {reason: "scope_unmeasured", probed: nil, reads: nil, budget: 24},
+  )
+}

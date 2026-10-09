@@ -1,0 +1,87 @@
+import { Artifact, Registration, closed } from "./contract.harn"
+import { ProofSource } from "./reader.harn"
+
+const API_ROOT = "https://api.github.com"
+
+const MAX_REGISTRATION_BYTES = 1048576
+
+fn options(token: string, limit: int) -> dict {
+  return {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: "Bearer " + token,
+      "X-GitHub-Api-Version": "2026-03-10",
+      "User-Agent": "burin-exact-tree-proof",
+    },
+    timeout_ms: 5000,
+    retry: {max: 0},
+    follow_redirects: true,
+    max_redirects: 5,
+    max_response_bytes: limit,
+  }
+}
+
+fn json(net: HarnessNet, token: string, endpoint: string) -> unknown {
+  const response = net.get(API_ROOT + endpoint, options(token, 33554432))
+  if !response.ok {
+    throw "GitHub proof read failed with HTTP " + to_string(response.status)
+  }
+  return json_parse(response.body)
+}
+
+/** Verify the actual GitHub archive bytes before reading its one closed typed document. */
+pub fn registration_from_archive(fs: HarnessFs, path: string, digest: string) -> unknown {
+  const archive = fs.read_bytes(path)
+  if len(archive) == 0 || len(archive) > MAX_REGISTRATION_BYTES {
+    throw "registration archive exceeds its compressed byte bound"
+  }
+  if !regex_match("^sha256:[0-9a-f]{64}$", digest)
+    || "sha256:" + sha256(archive) != digest {
+    throw "registration archive digest mismatch"
+  }
+  const entries = zip_extract(archive, {max_decompressed_bytes: MAX_REGISTRATION_BYTES})
+  if len(entries) != 1 || entries[0].path != "registration.json" {
+    throw "registration archive must contain exactly its typed document"
+  }
+  const raw = json_parse(bytes_to_string(entries[0].content))
+  schema_expect(raw, closed(schema_of(Registration)))
+  return raw
+}
+
+fn download_registration(
+  net: HarnessNet,
+  fs: HarnessFs,
+  token: string,
+  repo: string,
+  artifact: Artifact,
+) -> unknown {
+  if artifact.id <= 0 || artifact.expired || artifact.size_in_bytes <= 0
+    || artifact.size_in_bytes > MAX_REGISTRATION_BYTES {
+    throw "registration artifact cannot be downloaded safely"
+  }
+  const directory = fs.mkdtemp_in_workspace("exact-tree-registration-")
+  const path = directory + "/registration.zip"
+  defer {
+    fs.delete(directory)
+  }
+  const response = net.download(
+    API_ROOT + "/repos/" + repo + "/actions/artifacts/"
+      + to_string(artifact.id)
+      + "/zip",
+    path,
+    options(token, MAX_REGISTRATION_BYTES),
+  )
+  if !response.ok || response.bytes_written <= 0
+    || response.bytes_written > MAX_REGISTRATION_BYTES {
+    throw "registration artifact download failed or exceeded its bound"
+  }
+  return registration_from_archive(fs, path, artifact.digest)
+}
+
+pub fn live_source(net: HarnessNet, fs: HarnessFs, token: string) -> ProofSource {
+  return {
+    json: fn(endpoint) { return json(net, token, endpoint) },
+    registration:
+      fn(repo, artifact) { return download_registration(net, fs, token, repo, artifact) },
+  }
+}

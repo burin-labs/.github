@@ -37,6 +37,12 @@ jobs:
           harn test scripts/harn-required-review
           harn test scripts/review-dispatch
           bash .github/actions/local-workflow-checks/run_test.sh
+      - name: Set up the exact-tree proof runtime
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        with:
+          version: "0.10.159"
+      - name: Test exact-tree CI proof reuse
+        run: harn test scripts/exact-tree-proof
       # Dogfooding: the same action product repositories call, on the Harn
       # release the shared action above already installed.
       - name: Check hosted runner labels
@@ -117,8 +123,6 @@ jobs:
         run: |
           node --version
           node --test .github/actions/ci-latency-policy/read-baseline.test.mjs .github/actions/ci-latency-policy/action.test.mjs
-      - name: Test exact-tree CI proof reuse
-        run: bash .github/actions/exact-tree-ci-proof/run-tests.sh
       - name: Test shell actions
         run: bash .github/actions/pr-title-check/check_test.sh
       - name: Require reusable package smoke
@@ -163,12 +167,7 @@ jobs:
           bash -n .github/actions/ci-runtime-evidence/run.sh
           bash -n .github/actions/ci-latency-policy/run.sh
           bash -n .github/actions/pr-title-check/check.sh
-          bash -n .github/actions/exact-tree-ci-proof/gate.sh
-          bash -n .github/actions/exact-tree-ci-proof/workflow-proof.sh
-          bash -n .github/actions/exact-tree-ci-proof/merge-group-proof.sh
-          bash -n .github/actions/exact-tree-ci-proof/pr-tree-proof.sh
-          bash -n .github/actions/exact-tree-ci-proof/resolve.sh
-          bash -n .github/actions/exact-tree-ci-proof/run-tests.sh
+          bash -n .github/actions/exact-tree-ci-proof/run.sh
           bash -n scripts/ci-routing.sh
           bash -n scripts/runner-fleet-health.sh
           bash -n scripts/reusable-pin-drift.sh

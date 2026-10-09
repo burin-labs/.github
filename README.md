@@ -55,32 +55,58 @@ the pull request; this keeps shallow checkouts fast without weakening coverage.
 ## Exact-tree CI proof reuse
 
 `burin-labs/.github/.github/actions/exact-tree-ci-proof` is the organization-owned
-fail-closed adapter for skipping already-proven jobs on a merge group or landing
-push when the git tree matches the source pull request. Repositories name the
-required jobs and a cache-contract refresh bit; they do not copy the GitHub API
-helpers.
+adapter for reusing completed jobs in a queue run. You provide a plan with the
+actual package choices, command inputs, and required successful steps. The
+action saves that plan before your selected jobs start. A later queue run can
+reuse those jobs only when its Git tree, workflow file, and plan match.
 
-Source pull requests produce proof. Merge groups and `main` pushes consume it
-only when every named job concluded `success` (not `skipped`). A
-cache-contract change keeps the push writer running. Restore-only merge
-groups (the default) still reuse: a rebuild there produces nothing.
-Pass `merge-group-writes-cache: "true"` when the merge-group job persists a
-cache, such as a sticky disk. Lookups fail closed.
+An unrelated failed or canceled job does not discard successful selected jobs.
+The reader requires a complete, unique job census from one attempt. Each named
+job and required step must have run and succeeded. The downloaded plan must
+match its archive digest and the producer's Git objects. Old runs without a
+saved plan cannot qualify. See the [typed proof owner](scripts/exact-tree-proof/contract.harn).
+
+A `main` push also requires the whole queue workflow to have succeeded at the
+exact commit. Review and authorization gates still run. A cache change keeps
+push writers running. Set `merge-group-writes-cache: "true"` when queue jobs
+save a cache. Restore-only queue jobs can reuse proof across a cache change.
+Unknown or partial reads run the selected jobs.
 
 ```yaml
-- id: rust-proof
+- name: Register Rust execution scope
+  id: rust-proof
   uses: burin-labs/.github/.github/actions/exact-tree-ci-proof@<full-commit-sha>
   with:
     workflow-file: ci.yml
     required-jobs: >-
       ["Rust TUI fast fmt, clippy & test","Rust TUI harn-linked clippy, test & build"]
+    execution-scope: ${{ steps.selection.outputs.rust_execution_scope }}
+    registrar-job: Changes
+    registrar-step: Register Rust execution scope
     cache-refresh-required: ${{ steps.filter.outputs.rust_cache_contract }}
     merge-group-writes-cache: "true"
     event-name: ${{ github.event_name }}
     commit-sha: ${{ github.sha }}
-    event-path: ${{ github.event_path }}
     github-token: ${{ github.token }}
 ```
+
+The `execution-scope` value uses schema `burin.exact_tree_execution_scope.v1`.
+Its `inputs` is a nonempty list of unique `{name, value}` string pairs. Its
+`jobs` names exactly the required job set. Each job has its own
+`inputs` and unique nonempty `requiredSteps`. A job with no variable command
+inputs can use an empty input list. Build this value from your actual
+selection outputs. Never include secrets. Register it after selection and
+before all selected jobs. `registrar-job` and `registrar-step` must match the
+job and step names reported by GitHub, including the action's uploads.
+
+The action returns `proven`, `reuse`, a typed `receipt` path, and `census` JSON.
+An unmeasured census is `null`. Qualified proof reports observed and declared
+job counts, selected pending and failing counts, and unrelated failing names.
+It preserves the producer's commit identity rather than relabeling old output.
+The separate `discovery` output reports the lookup reason and read count.
+Lookup checks at most eight recent candidates with a 24-read budget and a
+30-second deadline between reads. Each network read has a five-second timeout.
+Budget exhaustion runs the selected jobs.
 
 ## Reusable workflows
 

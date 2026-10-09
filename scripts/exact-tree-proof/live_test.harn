@@ -1,0 +1,105 @@
+import { read_yaml } from "std/fs"
+import { assert_error_contains } from "std/testing"
+import { registration_from_archive } from "./live.harn"
+
+fn document() -> dict {
+  return {
+    schema: "burin.exact_tree_proof_registration.v1",
+    repository: "acme/product",
+    workflow: "ci.yml",
+    identity: {commit: "a".repeat(40), tree: "b".repeat(40), workflowBlob: "c".repeat(40)},
+    event: "merge_group",
+    runId: 10,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register scope",
+    scope: {
+      schema: "burin.exact_tree_execution_scope.v1",
+      inputs: [{name: "mode", value: "full"}],
+      jobs: [{name: "Rust", inputs: [{name: "packages", value: "core"}], requiredSteps: ["Test"]}],
+    },
+  }
+}
+
+pipeline test_actual_archive_digest_and_closed_document_are_required(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("exact-tree-archive-controls-")
+  const path = directory + "/registration.zip"
+  const archive = zip_create([{path: "registration.json", content: json_stringify(document())}])
+  harness.fs.write_bytes(path, archive)
+  const digest = "sha256:" + sha256(archive)
+  assert_eq(registration_from_archive(harness.fs, path, digest), document())
+  assert_error_contains(
+    fn() { registration_from_archive(harness.fs, path, "sha256:" + "f".repeat(64)) },
+    "digest mismatch",
+  )
+  const wrong = zip_create(
+    [{path: "registration.json", content: json_stringify({...document(), extra: true})}],
+  )
+  harness.fs.write_bytes(path, wrong)
+  assert(
+    is_err(
+      try {
+        registration_from_archive(harness.fs, path, "sha256:" + sha256(wrong))
+      },
+    ),
+  )
+  const unrelated = zip_create([{path: "other.json", content: "{}"}])
+  harness.fs.write_bytes(path, unrelated)
+  assert_error_contains(
+    fn() { registration_from_archive(harness.fs, path, "sha256:" + sha256(unrelated)) },
+    "exactly its typed document",
+  )
+  const oversized = zip_create([{path: "registration.json", content: "x".repeat(1048577)}])
+  assert(len(oversized) < 1048576)
+  harness.fs.write_bytes(path, oversized)
+  assert_error_contains(
+    fn() { registration_from_archive(harness.fs, path, "sha256:" + sha256(oversized)) },
+    "max_decompressed_bytes",
+  )
+  const two = zip_create(
+    [
+      {path: "registration.json", content: json_stringify(document())},
+      {path: "registration.jsox", content: json_stringify(document())},
+    ],
+  )
+  const duplicate = bytes_from_hex(
+    replace(
+      bytes_to_hex(two),
+      bytes_to_hex(bytes_from_string("registration.jsox")),
+      bytes_to_hex(bytes_from_string("registration.json")),
+    ),
+  )
+  harness.fs.write_bytes(path, duplicate)
+  assert_error_contains(
+    fn() { registration_from_archive(harness.fs, path, "sha256:" + sha256(duplicate)) },
+    "duplicate members",
+  )
+}
+
+pipeline test_composite_projects_scope_and_persists_attempt_bound_receipts(harness: Harness) {
+  const action = read_yaml(harness.fs, "../../.github/actions/exact-tree-ci-proof/action.yml", nil)
+  const steps = action.runs.steps
+  assert_eq(
+    steps[0].uses,
+    "burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f",
+  )
+  assert_eq(steps[0]["with"].version, "0.10.159")
+  assert_eq(steps[1].env.EXACT_TREE_SCOPE, "$" + "{{ inputs.execution-scope }}")
+  assert_eq(steps[1].env.EXACT_TREE_RUN_ID, "$" + "{{ github.run_id }}")
+  assert_eq(steps[1].env.EXACT_TREE_ATTEMPT, "$" + "{{ github.run_attempt }}")
+  assert_eq(steps[1].run, "bash \"$GITHUB_ACTION_PATH/run.sh\"")
+  assert_eq(steps[2].uses, "actions/upload-artifact@043fb03d56e00e183e2e6339d5e92c33c6f43d1a")
+  assert_eq(steps[2]["with"].name, "$" + "{{ steps.resolve.outputs.registration-name }}")
+  assert_eq(steps[2]["with"]["if-no-files-found"], "error")
+  assert_eq(steps[2]["with"]["retention-days"], 3)
+  assert_eq(
+    steps[3]["with"].name,
+    "exact-tree-proof-" + "$" + "{{ github.run_id }}-" + "$" + "{{ github.run_attempt }}",
+  )
+  const bootstrap = harness.fs.read_text("../../.github/actions/exact-tree-ci-proof/run.sh")
+  assert(bootstrap.contains("harn run"))
+  assert(bootstrap.contains("--read-only-root \"$package_root\""))
+  assert(bootstrap.contains("--write-root \"$workspace\""))
+  assert(bootstrap.contains("GITHUB_OUTPUT=\"$staged_output\""))
+  assert(!bootstrap.contains("gh api"))
+}

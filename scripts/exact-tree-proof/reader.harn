@@ -1,0 +1,242 @@
+import {
+  Artifact,
+  Identity,
+  Job,
+  ProofReceipt,
+  Registration,
+  Run,
+  admit_jobs,
+  closed,
+  qualified_artifact,
+  registration_artifact_name,
+  sha,
+} from "./contract.harn"
+
+/** Artifact transport verifies the downloaded archive digest before decoding its registration. */
+pub type ProofSource = {json: fn(string) -> unknown, registration: fn(string, Artifact) -> unknown}
+
+pub type JobCensus = {declared: int, jobs: list<Job>}
+
+type CommitObject = {sha: string, tree: {sha: string}}
+
+type FileObject = {type: string, sha: string}
+
+type JobsPage = {total_count: int, jobs: list<Job>}
+
+type ArtifactsPage = {total_count: int, artifacts: list<Artifact>}
+
+type RunsPage = {total_count: int, workflow_runs: list<Run>}
+
+pub fn repository(value: string) -> string {
+  if !regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", value) {
+    throw "invalid repository identity"
+  }
+  return value
+}
+
+pub fn workflow(value: string) -> string {
+  if !regex_match("^[A-Za-z0-9_-]+\\.ya?ml$", value) {
+    throw "invalid workflow filename"
+  }
+  return value
+}
+
+/** Read identities from GitHub's commit and file objects, never from the receipt's claim alone. */
+pub fn identity(source: ProofSource, repo: string, file: string, commit: string) -> Identity {
+  const prefix = "/repos/" + repository(repo)
+  const target = sha(commit)
+  const object = schema_expect(
+    source.json(prefix + "/git/commits/" + target),
+    schema_of(CommitObject),
+  )
+  if object.sha != target {
+    throw "Git commit lookup returned a different source"
+  }
+  const contents = schema_expect(
+    source.json(prefix + "/contents/.github/workflows/" + workflow(file) + "?ref=" + target),
+    schema_of(FileObject),
+  )
+  if contents.type != "file" {
+    throw "workflow lookup did not return a file"
+  }
+  return {commit: target, tree: sha(object.tree.sha), workflowBlob: sha(contents.sha)}
+}
+
+/** Every job comes from one explicit attempt; partial pages and repeated identities refuse. */
+pub fn job_census(source: ProofSource, repo: string, run: Run) -> JobCensus {
+  let jobs: list<Job> = []
+  let declared = -1
+  for page in range(1, 102) {
+    const endpoint = "/repos/" + repository(repo) + "/actions/runs/" + to_string(run.id)
+      + "/attempts/"
+      + to_string(run.run_attempt)
+      + "/jobs?per_page=100&page="
+      + to_string(page)
+    const result = schema_expect(source.json(endpoint), schema_of(JobsPage))
+    if result.total_count <= 0 || (declared != -1 && declared != result.total_count)
+      || result.total_count > 10000
+      || len(result.jobs) == 0
+      || len(result.jobs) > 100 {
+      throw "incomplete or changing attempt job census"
+    }
+    declared = result.total_count
+    jobs = jobs + result.jobs
+    if len(jobs.map({ job -> job.id }).unique()) != len(jobs) || len(jobs) > declared {
+      throw "duplicate or excess attempt job census"
+    }
+    if len(jobs) == declared {
+      return {declared: declared, jobs: jobs}
+    }
+  }
+  throw "attempt job census exceeded its bound"
+}
+
+fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifact {
+  let artifacts: list<Artifact> = []
+  let declared = -1
+  for page in range(1, 102) {
+    const endpoint = "/repos/" + repository(repo) + "/actions/runs/" + to_string(run.id)
+      + "/artifacts?per_page=100&page="
+      + to_string(page)
+    const result = schema_expect(source.json(endpoint), schema_of(ArtifactsPage))
+    if result.total_count < 0 || (declared != -1 && declared != result.total_count)
+      || result.total_count > 10000
+      || len(result.artifacts) > 100 {
+      throw "changing or excessive artifact census"
+    }
+    declared = result.total_count
+    artifacts = artifacts + result.artifacts
+    if len(artifacts.map({ artifact -> artifact.id }).unique()) != len(artifacts)
+      || len(artifacts) > declared {
+      throw "duplicate or excess artifact census"
+    }
+    if len(artifacts) == declared {
+      const named = artifacts.filter(
+        { artifact -> artifact.name == registration_artifact_name(run.id, run.run_attempt) },
+      )
+        .to_list()
+      if len(named) != 1 {
+        throw "registration artifact missing or ambiguous"
+      }
+      return named[0]
+    }
+    if len(result.artifacts) == 0 {
+      throw "incomplete artifact census"
+    }
+  }
+  throw "artifact census exceeded its bound"
+}
+
+/** Qualify an explicit producer before admitting its selected proof obligations. */
+pub fn read_proof(source: ProofSource, current: Registration, producer: Run) -> ProofReceipt {
+  const artifact = registration_artifact(source, current.repository, producer)
+  qualified_artifact(artifact, producer)
+  const actual = identity(source, current.repository, current.workflow, producer.head_sha)
+  if actual.tree != current.identity.tree || actual.workflowBlob != current.identity.workflowBlob {
+    throw "producer Git tree or workflow differs"
+  }
+  const raw = source.registration(current.repository, artifact)
+  schema_expect(raw, closed(schema_of(Registration)))
+  const recorded = schema_expect(raw, schema_of(Registration))
+  if recorded.identity != actual {
+    throw "registration does not match the producer's actual Git objects"
+  }
+  const census = job_census(source, current.repository, producer)
+  return admit_jobs(
+    current,
+    producer,
+    {artifact: artifact, registration: recorded},
+    census.jobs,
+    census.declared,
+  )
+}
+
+/** Search a bounded completed queue history; unknown receipts are ineligible, never green. */
+pub type Discovery = {proof: ProofReceipt?, probed: int, reads: int, budget: int, reason: string}
+
+type BudgetSource = {source: ProofSource, reads: fn() -> int, exhausted: fn() -> bool}
+
+fn bounded_source(source: ProofSource, now: fn() -> int) -> BudgetSource {
+  let reads = 0
+  let memo = {}
+  const expires_at = now() + 30000
+  const take = fn() {
+    if reads >= 24 || now() >= expires_at {
+      throw "proof discovery budget exhausted"
+    }
+    reads = reads + 1
+  }
+  return {
+    source: {
+      json: fn(endpoint) {
+        if memo[endpoint] != nil {
+          return memo[endpoint]
+        }
+        take()
+        const result = source.json(endpoint)
+        memo = memo + {[endpoint]: result}
+        return result
+      },
+      registration: fn(repo, artifact) {
+        take()
+        return source.registration(repo, artifact)
+      },
+    },
+    reads: fn() { return reads },
+    exhausted: fn() { return reads >= 24 || now() >= expires_at },
+  }
+}
+
+pub fn discover(source: ProofSource, current: Registration, now: fn() -> int) -> Discovery {
+  const bounded = bounded_source(source, now)
+  let probed = 0
+  if !["push", "merge_group"].contains(current.event) {
+    return {proof: nil, probed: 0, reads: 0, budget: 24, reason: "unsupported_event"}
+  }
+  const endpoint = "/repos/" + repository(current.repository) + "/actions/workflows/"
+    + workflow(current.workflow)
+    + "/runs?event=merge_group&status=completed&per_page=100&page=1"
+  const history = try {
+    schema_expect(bounded.source.json(endpoint), schema_of(RunsPage))
+  }
+  if is_err(history) {
+    return {proof: nil, probed: 0, reads: bounded.reads(), budget: 24, reason: "history_unmeasured"}
+  }
+  const result = unwrap(history)
+  if result.total_count < 0 || len(result.workflow_runs) > 100
+    || len(result.workflow_runs) > result.total_count
+    || len(result.workflow_runs.map({ run -> run.id }).unique()) != len(result.workflow_runs)
+    || (result.total_count > 0 && len(result.workflow_runs) == 0) {
+    return {proof: nil, probed: 0, reads: bounded.reads(), budget: 24, reason: "history_incomplete"}
+  }
+  for producer in result.workflow_runs {
+    if producer.id == current.runId || producer.event != "merge_group"
+      || producer.status != "completed" {
+      continue
+    }
+    if probed >= 8 || bounded.exhausted() {
+      break
+    }
+    probed = probed + 1
+    const proof = try {
+      read_proof(bounded.source, current, producer)
+    }
+    if is_ok(proof) {
+      return {
+        proof: unwrap(proof),
+        probed: probed,
+        reads: bounded.reads(),
+        budget: 24,
+        reason: "qualified",
+      }
+    }
+  }
+  const exhausted = probed >= 8 || bounded.exhausted()
+  return {
+    proof: nil,
+    probed: probed,
+    reads: bounded.reads(),
+    budget: 24,
+    reason: exhausted ? "discovery_budget_exhausted" : "no_qualified_registration",
+  }
+}
