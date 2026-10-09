@@ -93,7 +93,7 @@ runs:
       run: bash "$GITHUB_ACTION_PATH/run.sh"
     - name: Register exact execution scope
       if: ${{ steps.resolve.outputs.registration != '' }}
-      uses: actions/upload-artifact@043fb03d56e00e183e2e6339d5e92c33c6f43d1a
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: ${{ steps.resolve.outputs.registration-name }}
         path: ${{ steps.resolve.outputs.registration }}
@@ -101,7 +101,7 @@ runs:
         retention-days: 3
     - name: Preserve qualified job proof
       if: ${{ steps.resolve.outputs.receipt != '' }}
-      uses: actions/upload-artifact@043fb03d56e00e183e2e6339d5e92c33c6f43d1a
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: exact-tree-proof-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ steps.resolve.outputs.receipt }}
