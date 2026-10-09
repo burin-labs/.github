@@ -18,7 +18,7 @@ fn main(harness: Harness) {
   const number = to_int(number_text)
   const scratch = harness.fs.mkdtemp_in_workspace("review-dispatch-")
   const github = live_github(
-    pick(harness, ["fs", "tools"]),
+    {fs: harness.fs, tools: harness.tools},
     required(harness.env, "GH_TOKEN"),
     scratch,
   )
