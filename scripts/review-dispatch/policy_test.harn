@@ -1,0 +1,105 @@
+import { read_yaml } from "std/fs"
+import { assert_error_contains } from "std/testing"
+import { dispatch, resolve } from "./policy.harn"
+
+const REPOSITORY = "burin-labs/.github"
+
+const HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const PULL = {
+  number: 183,
+  state: "open",
+  draft: false,
+  user: {type: "User", login: "burin-labs-agent"},
+  base: {repo: {full_name: REPOSITORY}},
+  head: {sha: HEAD, repo: {full_name: REPOSITORY}},
+}
+
+pipeline test_trusted_live_head_dispatches_only_exact_review_inputs() {
+  const request = resolve(REPOSITORY, 183, PULL)
+  assert_eq(request, {repository: REPOSITORY, number: 183, head_sha: HEAD})
+  let calls = []
+  const github = {
+    read: fn(_path) {
+      throw "dispatch must not read with its write credential"
+    },
+    pages: fn(_path) { return [] },
+    graphql: fn(_query, _vars) { return nil },
+    send: fn(method, path, body) {
+      calls = calls + [{method: method, path: path, body: body}]
+      return nil
+    },
+  }
+  if request == nil {
+    throw "positive control was not reached"
+  }
+  dispatch(github, request)
+  assert_eq(
+    calls,
+    [
+      {
+        method: "POST",
+        path: "repos/burin-labs/burin-code/actions/workflows/burin-review.yml/dispatches",
+        body: {ref: "main", inputs: {repository: REPOSITORY, pr: "183", head_sha: HEAD}},
+      },
+    ],
+  )
+}
+
+pipeline test_fork_draft_bot_closed_and_unread_heads_never_become_requests() {
+  for pull in [
+    PULL + {head: {sha: HEAD, repo: {full_name: "example/fork"}}},
+    PULL + {draft: true},
+    PULL + {draft: nil},
+    PULL + {state: "closed"},
+    PULL + {user: {type: "Bot", login: "dependabot[bot]"}},
+    PULL + {user: {type: "User", login: "pretend[bot]"}},
+    PULL + {user: nil},
+  ] {
+    assert_eq(resolve(REPOSITORY, 183, pull), nil)
+  }
+  for pull in [
+    nil,
+    {},
+    PULL + {number: 184},
+    PULL + {base: nil},
+    PULL + {head: {sha: "main", repo: {full_name: REPOSITORY}}},
+  ] {
+    assert_error_contains({ -> resolve(REPOSITORY, 183, pull) }, "review request")
+  }
+}
+
+pipeline test_workflow_uses_trusted_base_and_mints_only_a_scoped_eligible_token(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/review-dispatch.yml")
+  assert_eq(workflow.permissions, {})
+  assert_eq(
+    workflow.on.pull_request_target.types,
+    ["opened", "reopened", "ready_for_review", "synchronize"],
+  )
+  assert_eq(workflow.on.workflow_dispatch.inputs["pull-request"].required, true)
+  const job = workflow.jobs.dispatch
+  assert_eq(job.permissions, {contents: "read", "pull-requests": "read"})
+  assert_eq(
+    job["if"],
+    "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+  )
+  const steps = job.steps
+  const checkout = steps[0]
+  const expression_start = "$" + "{{ "
+  assert_eq(
+    checkout["with"].ref,
+    expression_start + "github.event.pull_request.base.sha || github.sha }}",
+  )
+  assert_eq(checkout["with"]["persist-credentials"], false)
+  const mint = steps.filter({ step -> step?.id == "app" }).to_list()[0]
+  assert_eq(mint["if"], "steps.request.outputs.eligible == 'true'")
+  assert_eq(mint["with"].repositories, "burin-code")
+  assert_eq(mint["with"]["permission-actions"], "write")
+  const submit = steps[len(steps) - 1]
+  assert_eq(submit["if"], mint["if"])
+  assert_eq(submit.env.HEAD_SHA, expression_start + "steps.request.outputs.head_sha }}")
+  assert(
+    steps.index_of(mint)
+      > steps.index_of(steps.filter({ step -> step?.id == "request" }).to_list()[0]),
+  )
+}

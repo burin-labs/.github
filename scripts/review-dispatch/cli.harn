@@ -1,0 +1,48 @@
+import { live_github } from "../merge-override/github.harn"
+import { dispatch, resolve } from "./policy.harn"
+
+fn required(env: HarnessEnv, name: string) -> string {
+  const value = trim(env.get(name) ?? "")
+  if value == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn main(harness: Harness) {
+  const repository = required(harness.env, "TARGET_REPOSITORY")
+  const number_text = required(harness.env, "PR_NUMBER")
+  if !regex_match("^[1-9][0-9]{0,8}$", number_text) {
+    throw "invalid pull request number"
+  }
+  const number = to_int(number_text)
+  const scratch = harness.fs.mkdtemp_in_workspace("review-dispatch-")
+  const github = live_github(
+    pick(harness, ["fs", "tools"]),
+    required(harness.env, "GH_TOKEN"),
+    scratch,
+  )
+  if argv == ["resolve"] {
+    const request = resolve(
+      repository,
+      number,
+      github.read("repos/" + repository + "/pulls/" + number_text),
+    )
+    const output = required(harness.env, "GITHUB_OUTPUT")
+    harness.fs.append(
+      output,
+      request == nil ? "eligible=false\n" : "eligible=true\nhead_sha=" + request.head_sha + "\n",
+    )
+    harness.stdio.println(json_stringify({eligible: request != nil, request: request}))
+  } else if argv == ["dispatch"] {
+    const head = required(harness.env, "HEAD_SHA")
+    if !regex_match("^[0-9a-f]{40}$", head) {
+      throw "invalid head SHA"
+    }
+    const request = {repository: repository, number: number, head_sha: head}
+    dispatch(github, request)
+    harness.stdio.println(json_stringify({requested: request}))
+  } else {
+    throw "expected resolve or dispatch"
+  }
+}
