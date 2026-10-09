@@ -15,7 +15,7 @@ fn options(token: string, limit: int) -> dict {
       "User-Agent": "burin-exact-tree-proof",
     },
     timeout_ms: 5000,
-    retry: {max: 1},
+    retry: {max: 0},
     follow_redirects: true,
     max_redirects: 5,
     max_response_bytes: limit,
