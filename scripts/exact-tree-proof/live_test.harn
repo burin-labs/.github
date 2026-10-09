@@ -88,7 +88,9 @@ pipeline test_composite_projects_scope_and_persists_attempt_bound_receipts(harne
   assert_eq(steps[1].env.EXACT_TREE_RUN_ID, "$" + "{{ github.run_id }}")
   assert_eq(steps[1].env.EXACT_TREE_ATTEMPT, "$" + "{{ github.run_attempt }}")
   assert_eq(steps[1].run, "bash \"$GITHUB_ACTION_PATH/run.sh\"")
-  assert_eq(steps[2].uses, "actions/upload-artifact@043fb03d56e00e183e2e6339d5e92c33c6f43d1a")
+  for step in [steps[2], steps[3]] {
+    assert_eq(step.uses, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+  }
   assert_eq(steps[2]["with"].name, "$" + "{{ steps.resolve.outputs.registration-name }}")
   assert_eq(steps[2]["with"]["if-no-files-found"], "error")
   assert_eq(steps[2]["with"]["retention-days"], 3)
