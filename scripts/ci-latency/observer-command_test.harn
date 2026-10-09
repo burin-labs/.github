@@ -1,0 +1,49 @@
+import { command_run } from "std/command"
+import { with_temp_dir } from "std/testing"
+import { observer_command_options } from "./observer-cli.harn"
+
+pipeline test_observer_passes_only_explicit_read_only_token() {
+  for args in [["gh", "api", "fixture"], ["harn", "run", "fixture.harn"]] {
+    const options = observer_command_options("fixture-read-only-token", args)
+    assert_eq(options.env, {GH_TOKEN: "fixture-read-only-token"})
+    assert_eq(options.env_mode, "patch")
+    assert_eq(options.timeout_ms, 600000)
+    assert_eq(observer_command_options(nil, args).env, {})
+    assert_eq(observer_command_options("", args).env, {})
+  }
+  for args in [[], ["gh"], ["gh", "pr", "merge"], ["sh", "fixture"]] {
+    assert(
+      is_err(
+        try {
+          observer_command_options("fixture-read-only-token", args)
+        },
+      ),
+    )
+  }
+}
+
+pipeline test_observer_token_reaches_the_actual_child(harness: Harness) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const child = path_join(work, "gh")
+      harness.fs.write_text(
+        child,
+        "#!/bin/sh\n[ \"$GH_TOKEN\" = fixture-read-only-token ] || exit 73\nprintf '%s\\n' '{\"authenticated\":true}'\n",
+      )
+      const permissions = harness.process.run({program: "chmod", args: ["700", child]})
+      assert(permissions.success)
+      const options = observer_command_options("fixture-read-only-token", ["gh", "api", "fixture"])
+      const result = command_run(harness.tools, [child, "api", "fixture"], options)
+      assert(result.success, "child failed: " + to_string(result.exit_code) + " " + result.stderr)
+      assert_eq(json_parse(result.stdout), {authenticated: true})
+      const absent = command_run(
+        harness.tools,
+        [child, "api", "fixture"],
+        {timeout_ms: 1000, env_mode: "patch", env: {}},
+      )
+      assert(!absent.success)
+      assert_eq(absent.exit_code, 73)
+    },
+  )
+}

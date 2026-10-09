@@ -7,6 +7,20 @@ import {
 } from "./observer-contract.harn"
 import { ObserverAdapters, ObserverLocations, observe_repository } from "./observer-runner.harn"
 
+pub fn observer_command_options(token: string?, args: list<string>) -> dict {
+  require len(args) >= 2, "observer command is incomplete"
+  require (args[0] == "gh" && args[1] == "api")
+    || (args[0] == "harn" && args[1] == "run"),
+    "observer command is outside the read-only adapter"
+  // Credential-shaped variables are deliberately absent from child environments.
+  // Pass only this workflow's read-only token to its API reader and measurement engine.
+  return {
+    timeout_ms: 600000,
+    env_mode: "patch",
+    env: token == nil || token == "" ? {} : {GH_TOKEN: token},
+  }
+}
+
 fn receipt_details(receipt: dict) -> string {
   if receipt.error != nil {
     return to_string(receipt.error)
@@ -80,9 +94,10 @@ fn main(harness: Harness) -> int {
   }
   harness.fs.mkdir(locations.reports, true)
   harness.fs.mkdir(locations.policies, true)
+  const token = harness.env.get("GH_TOKEN")
   const adapters: ObserverAdapters = {
     run: fn(args) {
-      const result = command_run(harness.tools, args, {timeout_ms: 600000})
+      const result = command_run(harness.tools, args, observer_command_options(token, args))
       require result != nil, "observer command did not return a measured result"
       return {stdout: result.stdout, stderr: result.stderr, success: result.success}
     },
