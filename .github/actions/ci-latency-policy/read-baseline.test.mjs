@@ -60,6 +60,15 @@ test("exhausted 503 refuses after exactly three attempts", async () => {
   assert.deepEqual(source.delays, [1000, 2000]);
 });
 
+test("one dropped baseline transport is retried before refusing the gate", async () => {
+  const source = transport([new Error("connection dropped"), response(200, policy)]);
+  const result = await readBaseline(request, source.options);
+  assert.equal(result.state, "found");
+  assert.equal(result.attempts, 2);
+  assert.equal(source.calls.length, 2);
+  assert.deepEqual(source.delays, [1000]);
+});
+
 test("permanent 403 refuses once with no retry or published output", async () => {
   const source = transport([response(403)]);
   await assert.rejects(readBaseline(request, source.options), /HTTP 403; pending=1/);
@@ -80,8 +89,15 @@ test("interrupted and malformed 200 bodies refuse without retry", async () => {
   }
 });
 
-test("transport and status absence refuse rather than count as initial policy", async () => {
-  for (const reply of [new Error("unreadable transport"), {}, { status: 0 }]) {
+test("transport exhaustion refuses after exactly three attempts", async () => {
+  const source = transport([new Error("dropped"), new Error("dropped"), new Error("dropped")]);
+  await assert.rejects(readBaseline(request, source.options), /transport exhausted 3 attempts; pending=1/);
+  assert.equal(source.calls.length, 3);
+  assert.deepEqual(source.delays, [1000, 2000]);
+});
+
+test("status absence refuses rather than count as initial policy", async () => {
+  for (const reply of [{}, { status: 0 }]) {
     const source = transport([reply]);
     await assert.rejects(readBaseline(request, source.options), /unmeasured/);
     assert.equal(source.calls.length, 1);
