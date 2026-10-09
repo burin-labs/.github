@@ -173,20 +173,17 @@ pipeline test_observer_retains_coverage_and_read_only_permissions(harness: Harne
   assert_eq(app["permission-actions"], "read")
   assert_eq(app["permission-contents"], "read")
   const run = step(job.steps, "Observe full CI runs").run
-  assert(run.contains("ruby scripts/ci_latency_observer.rb"))
+  assert(run.contains("harn run --no-sandbox scripts/ci-latency/observer-cli.harn --"))
   assert(run.contains("exit \"$observer_status\""))
-  const runner = read(harness.fs, "scripts/ci_latency_observer.rb")
-  for required in [
-    "REPOSITORIES = [\".github\", \"harn\", \"burin-code\", \"harn-cloud\"].freeze",
-    "\"--json\", \"--check\"",
-    "status=completed&per_page=#{FULL_RUN_CANDIDATE_LIMIT}",
-    "FULL_RUN_CANDIDATE_LIMIT = 100",
-    "\"breaching_repositories\"",
-    "\"pending_repositories\"",
-    "File.join(@reports, \"org-summary.json\")",
-  ] {
-    assert(runner.contains(required), required)
-  }
+  assert_eq(step(job.steps, "Install Harn")["with"].version, "0.10.159")
+  const engine = step(job.steps, "Check out the Harn measurement engine")["with"]
+  assert_eq(engine.repository, "burin-labs/harn")
+  assert(regex_match("^[0-9a-f]{40}$", engine.ref))
+  assert_eq(engine["persist-credentials"], false)
+  const artifact = step(job.steps, "Upload compact reports")
+  assert_eq(artifact.if, "always() && steps.observe.outputs.reports != ''")
+  assert_eq(artifact["with"]["if-no-files-found"], "error")
+  assert_eq(artifact["with"]["retention-days"], 7)
 }
 
 pipeline test_ci_preserves_lint_title_and_owner_tests(harness: Harness) {
