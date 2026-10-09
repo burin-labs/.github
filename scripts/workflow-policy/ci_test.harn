@@ -124,6 +124,7 @@ pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
     "register-package-release",
     "repin",
     "reusable-pin-drift",
+    "review-dispatch",
     "runner-availability",
     "runner-fleet-health",
     "ship",

@@ -1,0 +1,42 @@
+import { GitHub } from "../merge-override/github.harn"
+
+pub type Request = {repository: string, number: int, head_sha: string}
+
+/** Refuse unread, closed, fork, draft, and bot-authored heads before minting a token. */
+pub fn resolve(repository: string, number: int, pull: unknown) -> Request? {
+  if !regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repository) || number <= 0 {
+    throw "invalid review request identity"
+  }
+  if type_of(pull) != "dict" || pull?.number != number
+    || pull?.base?.repo?.full_name != repository {
+    throw "review request could not be measured"
+  }
+  if pull?.state != "open" || pull?.draft != false
+    || pull?.head?.repo?.full_name != repository
+    || pull?.user?.type != "User"
+    || trim(pull?.user?.login ?? "") == ""
+    || (pull?.user?.login ?? "").ends_with("[bot]") {
+    return nil
+  }
+  const head = pull?.head?.sha
+  if type_of(head) != "string" || !regex_match("^[0-9a-f]{40}$", head) {
+    throw "review request has no usable head SHA"
+  }
+  return {repository: repository, number: number, head_sha: head}
+}
+
+/** The receiver owns admission, deduplication, and all model spending limits. */
+pub fn dispatch(github: GitHub, request: Request) {
+  github.send(
+    "POST",
+    "repos/burin-labs/burin-code/actions/workflows/burin-review.yml/dispatches",
+    {
+      ref: "main",
+      inputs: {
+        repository: request.repository,
+        pr: to_string(request.number),
+        head_sha: request.head_sha,
+      },
+    },
+  )
+}
