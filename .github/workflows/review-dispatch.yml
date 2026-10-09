@@ -1,0 +1,61 @@
+name: Automatic review dispatch
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] only trusted base code executes; never checks out a pull request head
+    types: [opened, reopened, ready_for_review, synchronize]
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: Pull request number whose current head should be reviewed.
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: review-dispatch-${{ github.event.pull_request.number || inputs.pull-request }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Request an automatic review
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      TARGET_REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull-request }}
+    steps:
+      - name: Check out trusted dispatcher code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f # bounded release-asset retries
+        with:
+          version: 0.10.133
+      - name: Resolve the current eligible head
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/review-dispatch/run.sh resolve
+      - name: Mint a token that can only request reviews
+        id: app
+        if: steps.request.outputs.eligible == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: burin-code
+          permission-actions: write
+      - name: Request a review of the measured head
+        if: steps.request.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          HEAD_SHA: ${{ steps.request.outputs.head_sha }}
+        run: bash scripts/review-dispatch/run.sh dispatch

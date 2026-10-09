@@ -1,0 +1,61 @@
+/** Run the real launcher and private entrypoint on the workflow's pinned runtime. */
+pipeline test_launcher_resolves_and_dispatches_with_its_actual_sandbox_grants(harness: Harness) {
+  const temporary = harness.fs.mkdtemp_in_workspace("review-dispatch-launcher-")
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const fixture = path_join(temporary, "pull.json")
+  const output = path_join(temporary, "github-output")
+  const receipt = path_join(temporary, "request.json")
+  const gh = path_join(temporary, "gh")
+  const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  harness.fs.write_text(
+    fixture,
+    json_stringify(
+      {
+        number: 184,
+        state: "open",
+        draft: false,
+        user: {type: "User", login: "burin-labs-agent"},
+        base: {repo: {full_name: "burin-labs/.github"}},
+        head: {sha: head, repo: {full_name: "burin-labs/.github"}},
+      },
+    ),
+  )
+  harness.fs.write_text(output, "")
+  harness.fs.write_text(
+    gh,
+    "#!/bin/sh\nif [ \"$2\" = \"-X\" ]; then\n"
+      + "cat \"$6\" > "
+      + json_stringify(receipt)
+      + "\n"
+      + "else\ncat "
+      + json_stringify(fixture)
+      + "\nfi\n",
+  )
+  assert(harness.process.run({program: "/bin/chmod", args: ["755", gh]}).success)
+  const env = {
+    PATH: temporary + ":" + to_string(harness.env.get("PATH") ?? ""),
+    GH_TOKEN: "fixture-token",
+    TARGET_REPOSITORY: "burin-labs/.github",
+    PR_NUMBER: "184",
+    HEAD_SHA: head,
+    GITHUB_OUTPUT: output,
+    GITHUB_WORKSPACE: root,
+  }
+  for phase in ["resolve", "dispatch"] {
+    const result = harness.process.run(
+      {
+        program: "/bin/bash",
+        args: ["scripts/review-dispatch/run.sh", phase],
+        cwd: root,
+        env: env,
+        timeout_ms: 30000,
+      },
+    )
+    assert(result.success, phase + ": " + result.stdout + result.stderr)
+  }
+  assert_eq(harness.fs.read_text(output), "eligible=true\nhead_sha=" + head + "\n")
+  assert_eq(
+    json_parse(harness.fs.read_text(receipt)),
+    {ref: "main", inputs: {repository: "burin-labs/.github", pr: "184", head_sha: head}},
+  )
+}
