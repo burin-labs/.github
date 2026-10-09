@@ -1,0 +1,198 @@
+import { Registration, Run } from "./contract.harn"
+import { ProofSource, discover } from "./reader.harn"
+
+fn current() -> Registration {
+  return {
+    schema: "burin.exact_tree_proof_registration.v1",
+    repository: "acme/product",
+    workflow: "ci.yml",
+    identity: {commit: "a".repeat(40), tree: "b".repeat(40), workflowBlob: "c".repeat(40)},
+    event: "merge_group",
+    runId: 200,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register scope",
+    scope: {
+      schema: "burin.exact_tree_execution_scope.v1",
+      inputs: [{name: "mode", value: "full"}],
+      jobs: [{name: "Rust", inputs: [{name: "packages", value: "core"}], requiredSteps: ["Test"]}],
+    },
+  }
+}
+
+fn producer(id: int) -> Run {
+  return {
+    id: id,
+    run_attempt: 1,
+    head_sha: "d".repeat(40),
+    event: "merge_group",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "cancelled",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+}
+
+pipeline test_unknown_historical_contracts_need_only_eight_artifact_probes() {
+  let calls: list<string> = []
+  const source: ProofSource = {
+    json: fn(endpoint) {
+      calls = calls + [endpoint]
+      if endpoint.contains("/workflows/") {
+        return {
+          total_count: 100,
+          workflow_runs: range(1, 101).map({ id -> producer(id) }).to_list(),
+        }
+      }
+      assert(endpoint.contains("/artifacts?"))
+      return {total_count: 0, artifacts: []}
+    },
+    registration: fn(_repo, _artifact) {
+      throw "unexpected archive read"
+    },
+  }
+  const result = discover(source, current(), fn() { return 0 })
+  assert_eq(
+    result,
+    {proof: nil, probed: 8, reads: 9, budget: 24, reason: "discovery_budget_exhausted"},
+  )
+  assert_eq(len(calls), 9)
+  assert(
+    calls.every({ endpoint -> !endpoint.contains("/git/") && !endpoint.contains("/contents/") }),
+  )
+}
+
+pipeline test_discovery_expiry_stops_reads_and_reports_unmeasured_proof() {
+  let ticks = 0
+  let reads = 0
+  const source: ProofSource = {
+    json: fn(_endpoint) {
+      reads = reads + 1
+      return {total_count: 1, workflow_runs: [producer(1)]}
+    },
+    registration: fn(_repo, _artifact) {
+      throw "unexpected archive read"
+    },
+  }
+  const result = discover(
+    source,
+    current(),
+    fn() {
+      ticks = ticks + 1
+      return ticks * 15000
+    },
+  )
+  assert_eq(result.reason, "discovery_budget_exhausted")
+  assert_eq(result.proof, nil)
+  assert_eq(result.reads, 1)
+  assert_eq(result.probed, 0)
+  assert_eq(reads, 1)
+}
+
+pipeline test_history_failure_is_not_a_measured_zero() {
+  const source: ProofSource = {
+    json: fn(_endpoint) {
+      throw "fixture HTTP failure"
+    },
+    registration: fn(_repo, _artifact) {
+      throw "unexpected archive read"
+    },
+  }
+  const result = discover(source, current(), fn() { return 0 })
+  assert_eq(result.reason, "history_unmeasured")
+  assert_eq(result.reads, 1)
+  assert_eq(result.proof, nil)
+}
+
+pipeline test_large_artifact_censuses_cannot_exceed_the_read_budget() {
+  let calls = 0
+  const source: ProofSource = {
+    json: fn(endpoint) {
+      calls = calls + 1
+      if endpoint.contains("/workflows/") {
+        return {
+          total_count: 100,
+          workflow_runs: range(1, 101).map({ id -> producer(id) }).to_list(),
+        }
+      }
+      assert(endpoint.contains("/artifacts?"))
+      const offset = endpoint.ends_with("page=1") ? 0 : endpoint.ends_with("page=2") ? 100 : 200
+      return {
+        total_count: 300,
+        artifacts: range(offset + 1, offset + 101).map(
+          { id ->
+            {
+              id: id,
+              name: "unrelated-" + to_string(id),
+              size_in_bytes: 1,
+              expired: false,
+              digest: "sha256:" + "e".repeat(64),
+              created_at: "2026-10-09T10:00:00Z",
+              workflow_run: {id: 1, head_sha: "d".repeat(40)},
+            }
+          },
+        )
+          .to_list(),
+      }
+    },
+    registration: fn(_repo, _artifact) {
+      throw "unexpected archive read"
+    },
+  }
+  const result = discover(source, current(), fn() { return 0 })
+  assert_eq(result.proof, nil)
+  assert_eq(result.reason, "discovery_budget_exhausted")
+  assert_eq(result.reads, 24)
+  assert_eq(calls, 24)
+}
+
+pipeline test_shared_source_objects_are_read_once_across_candidates() {
+  let calls: list<string> = []
+  let archives = 0
+  const source: ProofSource = {
+    json: fn(endpoint) {
+      calls = calls + [endpoint]
+      if endpoint.contains("/actions/workflows/") {
+        return {total_count: 2, workflow_runs: [producer(1), producer(2)]}
+      }
+      if endpoint.contains("/git/commits/") {
+        return {sha: "d".repeat(40), tree: {sha: "b".repeat(40)}}
+      }
+      if endpoint.contains("/contents/") {
+        return {type: "file", sha: "c".repeat(40)}
+      }
+      assert(endpoint.contains("/artifacts?"))
+      const id = endpoint.contains("/runs/1/") ? 1 : 2
+      return {
+        total_count: 1,
+        artifacts: [
+          {
+            id: id,
+            name: "exact-tree-inputs-" + to_string(id) + "-1",
+            size_in_bytes: 100,
+            expired: false,
+            digest: "sha256:" + "e".repeat(64),
+            created_at: "2026-10-09T10:00:00Z",
+            workflow_run: {id: id, head_sha: "d".repeat(40)},
+          },
+        ],
+      }
+    },
+    registration: fn(_repo, artifact) {
+      archives = archives + 1
+      const claim = current()
+      return {
+        ...claim,
+        runId: artifact.id,
+        identity: {commit: "d".repeat(40), tree: "f".repeat(40), workflowBlob: "c".repeat(40)},
+      }
+    },
+  }
+  const result = discover(source, current(), fn() { return 0 })
+  assert_eq(result.reason, "no_qualified_registration")
+  assert_eq(result.reads, 7)
+  assert_eq(archives, 2)
+  assert_eq(calls.filter({ endpoint -> endpoint.contains("/git/commits/") }).count(), 1)
+  assert_eq(calls.filter({ endpoint -> endpoint.contains("/contents/") }).count(), 1)
+}

@@ -1,0 +1,396 @@
+pub const SCOPE_SCHEMA = "burin.exact_tree_execution_scope.v1"
+
+pub const REGISTRATION_SCHEMA = "burin.exact_tree_proof_registration.v1"
+
+pub const RECEIPT_SCHEMA = "burin.exact_tree_job_proof.v1"
+
+pub type PlanInput = {name: string, value: string}
+
+pub type JobScope = {name: string, inputs: list<PlanInput>, requiredSteps: list<string>}
+
+pub type ExecutionScope = {schema: string, inputs: list<PlanInput>, jobs: list<JobScope>}
+
+pub type Identity = {commit: string, tree: string, workflowBlob: string}
+
+pub type Registration = {
+  schema: string,
+  repository: string,
+  workflow: string,
+  identity: Identity,
+  event: string,
+  runId: int,
+  attempt: int,
+  registrarJob: string,
+  registrarStep: string,
+  scope: ExecutionScope,
+}
+
+pub type Run = {
+  id: int,
+  run_attempt: int,
+  head_sha: string,
+  event: string,
+  path: string,
+  status: string,
+  conclusion: string?,
+  repository: {full_name: string},
+  head_repository: {full_name: string},
+}
+
+pub type Step = {name: string, status: string, conclusion: string?}
+
+pub type Job = {
+  id: int,
+  run_id: int,
+  run_attempt: int,
+  head_sha: string,
+  name: string,
+  status: string,
+  conclusion: string?,
+  started_at: string?,
+  completed_at: string?,
+  steps: list<Step>,
+}
+
+pub type Artifact = {
+  id: int,
+  name: string,
+  size_in_bytes: int,
+  expired: bool,
+  digest: string,
+  created_at: string,
+  workflow_run: {id: int, head_sha: string},
+}
+
+pub type RegisteredArtifact = {artifact: Artifact, registration: Registration}
+
+pub type SelectedJob = {id: int, name: string, requiredSteps: list<string>}
+
+pub type JobFailure = {name: string, conclusion: string?}
+
+pub type Census = {
+  declared: int,
+  observed: int,
+  selected: int,
+  selectedPending: int,
+  selectedBad: int,
+  pending: list<string>,
+  bad: list<JobFailure>,
+}
+
+pub type ProofReceipt = {
+  schema: string,
+  current: Registration,
+  producer: {
+    runId: int,
+    attempt: int,
+    commit: string,
+    tree: string,
+    workflowBlob: string,
+    event: string,
+    conclusion: string?,
+  },
+  registrationArtifact: {id: int, digest: string},
+  selectedJobs: list<SelectedJob>,
+  census: Census,
+}
+
+/** Derive closed wire schemas from the types rather than copying their field lists. */
+pub fn closed(schema: dict) -> dict {
+  if schema.type == "dict" && schema?.properties != nil {
+    let properties = {}
+    for name in schema.properties.keys() {
+      properties = properties + {[name]: closed(schema.properties[name])}
+    }
+    return {...schema, properties: properties, additionalProperties: false}
+  }
+  if schema.type == "list" {
+    return {...schema, items: closed(schema.items)}
+  }
+  return schema
+}
+
+pub fn registration_artifact_name(run_id: int, attempt: int) -> string {
+  return "exact-tree-inputs-" + to_string(run_id) + "-" + to_string(attempt)
+}
+
+pub fn sha(value: string) -> string {
+  if !regex_match("^[0-9a-f]{40}$", value) {
+    throw "invalid Git identity"
+  }
+  return value
+}
+
+fn names(values: list<string>, description: string) -> list<string> {
+  if len(values) == 0 || len(values) > 256 || len(values.unique()) != len(values)
+    || values.any(
+      { value ->
+        trim(value) == "" || value != trim(value) || len(value) > 512
+          || regex_match("[\\r\\n]", value)
+      },
+    ) {
+    throw description + " must be nonempty and unique"
+  }
+  return values.sorted()
+}
+
+fn inputs(values: list<PlanInput>) -> list<PlanInput> {
+  if len(values) == 0 {
+    return []
+  }
+  names(values.map({ value -> value.name }), "execution input names")
+  if values.any({ value -> len(value.value) > 65536 }) {
+    throw "execution input exceeds its bound"
+  }
+  return values.sorted_by({ value -> value.name }).map(
+    { value -> {name: value.name, value: value.value} },
+  )
+    .to_list()
+}
+
+/** The caller supplies its actual nonsecret execution plan, not a source-only label. */
+pub fn execution_scope(raw: unknown, required: list<string>) -> ExecutionScope {
+  if len(json_stringify(raw)) > 524288 {
+    throw "execution scope exceeds its wire bound"
+  }
+  schema_expect(raw, closed(schema_of(ExecutionScope)))
+  const scope = schema_expect(raw, schema_of(ExecutionScope))
+  if scope.schema != SCOPE_SCHEMA {
+    throw "unsupported execution scope schema"
+  }
+  if len(scope.inputs) == 0 {
+    throw "global execution plan must be nonempty"
+  }
+  const requested = names(required, "required jobs")
+  if names(scope.jobs.map({ job -> job.name }), "scoped jobs") != requested {
+    throw "execution scope must cover exactly the requested jobs"
+  }
+  return {
+    schema: SCOPE_SCHEMA,
+    inputs: inputs(scope.inputs),
+    jobs: scope.jobs.sorted_by({ job -> job.name }).map(
+      { job ->
+        {
+          name: job.name,
+          inputs: inputs(job.inputs),
+          requiredSteps: names(job.requiredSteps, "required successful steps"),
+        }
+      },
+    )
+      .to_list(),
+  }
+}
+
+pub fn reuse_gate(
+  event: string,
+  proven: bool,
+  cache_refresh: bool,
+  queue_writes_cache: bool,
+) -> bool {
+  if !proven {
+    return false
+  }
+  if event == "push" {
+    return !cache_refresh
+  }
+  return event == "merge_group" && !(cache_refresh && queue_writes_cache)
+}
+
+fn current_identity(current: Registration, producer: Run) {
+  if current.schema != REGISTRATION_SCHEMA || current.runId <= 0 || current.attempt <= 0
+    || producer.id <= 0
+    || producer.run_attempt <= 0
+    || trim(current.registrarJob) == ""
+    || trim(current.registrarStep) == ""
+    || current.scope.jobs.any({ job -> job.name == current.registrarJob }) {
+    throw "invalid current registration or producer identity"
+  }
+  sha(current.identity.commit)
+  sha(current.identity.tree)
+  sha(current.identity.workflowBlob)
+}
+
+fn producer_identity(current: Registration, producer: Run, recorded: Registration) {
+  if recorded.schema != REGISTRATION_SCHEMA || recorded.repository != current.repository
+    || recorded.workflow != current.workflow
+    || recorded.identity.tree != current.identity.tree
+    || recorded.identity.workflowBlob != current.identity.workflowBlob
+    || recorded.identity.commit != producer.head_sha
+    || recorded.runId != producer.id
+    || recorded.attempt != producer.run_attempt
+    || recorded.event != producer.event
+    || producer.repository.full_name != current.repository
+    || producer.head_repository.full_name != current.repository
+    || producer.path != ".github/workflows/" + current.workflow
+    || producer.status != "completed" {
+    throw "producer source, workflow, repository or attempt mismatch"
+  }
+  sha(recorded.identity.commit)
+  sha(recorded.identity.tree)
+  sha(recorded.identity.workflowBlob)
+}
+
+fn compatible_execution(current: Registration, producer: Run, recorded: Registration) {
+  if ![
+    "success",
+    "failure",
+    "cancelled",
+    "neutral",
+    "skipped",
+    "stale",
+    "timed_out",
+    "action_required",
+    "startup_failure",
+  ]
+    .contains(producer.conclusion) {
+    throw "producer has no recognized terminal conclusion"
+  }
+  if current.event == "push" {
+    if producer.event != "merge_group" || producer.conclusion != "success"
+      || recorded.identity.commit != current.identity.commit {
+      throw "main push requires a successful whole queue workflow at the exact commit"
+    }
+  } else if current.event != "merge_group" || producer.event != current.event {
+    throw "producer event mismatch"
+  }
+  const required = current.scope.jobs.map({ job -> job.name })
+  if execution_scope(current.scope, required) != current.scope {
+    throw "current execution scope is not normalized"
+  }
+  const scope = execution_scope(recorded.scope, required)
+  if scope != current.scope || recorded.registrarJob != current.registrarJob
+    || recorded.registrarStep != current.registrarStep {
+    throw "producer execution scope mismatch"
+  }
+}
+
+pub fn qualified_artifact(artifact: Artifact, producer: Run) {
+  if artifact.id <= 0
+    || artifact.name != registration_artifact_name(producer.id, producer.run_attempt)
+    || artifact.expired
+    || artifact.size_in_bytes <= 0
+    || artifact.size_in_bytes > 1048576
+    || !regex_match("^sha256:[0-9a-f]{64}$", artifact.digest)
+    || artifact.workflow_run.id != producer.id
+    || artifact.workflow_run.head_sha != producer.head_sha {
+    throw "unqualified registration artifact"
+  }
+}
+
+fn coherent_jobs(jobs: list<Job>, declared: int, producer: Run) {
+  if declared <= 0 || len(jobs) != declared
+    || len(jobs.map({ job -> job.id }).unique()) != declared {
+    throw "incomplete or duplicate attempt job census"
+  }
+  for job in jobs {
+    if job.id <= 0 || job.run_id != producer.id || job.run_attempt != producer.run_attempt
+      || job.head_sha != producer.head_sha {
+      throw "mixed attempt or source job census"
+    }
+    if job.status != "completed" {
+      throw "completed producer contains active jobs"
+    }
+  }
+}
+
+fn successful_registrar(recorded: Registration, jobs: list<Job>) -> Job {
+  const registrars = jobs.filter({ job -> job.name == recorded.registrarJob }).to_list()
+  if len(registrars) != 1 || registrars[0].status != "completed"
+    || registrars[0].conclusion != "success"
+    || registrars[0].completed_at == nil {
+    throw "registration job did not complete successfully"
+  }
+  const registration_steps = registrars[0].steps.filter(
+    { step -> step.name == recorded.registrarStep },
+  )
+    .to_list()
+  if len(registration_steps) != 1 || registration_steps[0].status != "completed"
+    || registration_steps[0].conclusion != "success" {
+    throw "registration step did not fire successfully"
+  }
+  return registrars[0]
+}
+
+fn selected_jobs(
+  current: Registration,
+  jobs: list<Job>,
+  artifact: Artifact,
+  registrar: Job,
+) -> list<SelectedJob> {
+  const registered_at = date_parse(artifact.created_at)
+  const registrar_completed = date_parse(registrar.completed_at)
+  let selected: list<SelectedJob> = []
+  for expected in current.scope.jobs {
+    const matches = jobs.filter({ job -> job.name == expected.name }).to_list()
+    if len(matches) != 1 || matches[0].status != "completed" || matches[0].conclusion != "success"
+      || matches[0].started_at == nil
+      || matches[0].completed_at == nil {
+      throw "required job missing, duplicate, pending, skipped or unsuccessful: " + expected.name
+    }
+    const job = matches[0]
+    const started = date_parse(job.started_at)
+    if started < registered_at || started < registrar_completed
+      || date_parse(job.completed_at) < started {
+      throw "execution contract was not registered before the selected job"
+    }
+    for name in expected.requiredSteps {
+      const steps = job.steps.filter({ step -> step.name == name }).to_list()
+      if len(steps) != 1 || steps[0].status != "completed" || steps[0].conclusion != "success" {
+        throw "required proof step did not fire successfully: " + expected.name + "/" + name
+      }
+    }
+    selected = selected + [{id: job.id, name: job.name, requiredSteps: expected.requiredSteps}]
+  }
+  return selected
+}
+
+/** Admit one coherent successful job set; unrelated terminal failures stay visible. */
+pub fn admit_jobs(
+  current: Registration,
+  producer: Run,
+  registered: RegisteredArtifact,
+  jobs: list<Job>,
+  declared: int,
+) -> ProofReceipt {
+  const recorded = registered.registration
+  const artifact = registered.artifact
+  current_identity(current, producer)
+  producer_identity(current, producer, recorded)
+  compatible_execution(current, producer, recorded)
+  qualified_artifact(artifact, producer)
+  coherent_jobs(jobs, declared, producer)
+  if current.event == "push"
+    && jobs.any({ job -> !["success", "skipped"].contains(job.conclusion) }) {
+    throw "main push requires a successful complete job census"
+  }
+  const registrar = successful_registrar(recorded, jobs)
+  const selected = selected_jobs(current, jobs, artifact, registrar)
+  return {
+    schema: RECEIPT_SCHEMA,
+    current: current,
+    producer: {
+      runId: producer.id,
+      attempt: producer.run_attempt,
+      commit: recorded.identity.commit,
+      tree: recorded.identity.tree,
+      workflowBlob: recorded.identity.workflowBlob,
+      event: producer.event,
+      conclusion: producer.conclusion,
+    },
+    registrationArtifact: pick(artifact, ["id", "digest"]),
+    selectedJobs: selected,
+    census: {
+      declared: declared,
+      observed: len(jobs),
+      selected: len(selected),
+      selectedPending: 0,
+      selectedBad: 0,
+      pending: jobs.filter({ job -> job.status != "completed" }).map({ job -> job.name }).to_list(),
+      bad: jobs.filter(
+        { job -> job.status == "completed" && !["success", "skipped"].contains(job.conclusion) },
+      )
+        .map({ job -> pick(job, ["name", "conclusion"]) })
+        .to_list(),
+    },
+  }
+}

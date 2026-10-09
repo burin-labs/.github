@@ -1,0 +1,146 @@
+import { write_json } from "std/fs"
+import { gha_write_output } from "std/gha"
+import {
+  REGISTRATION_SCHEMA,
+  Registration,
+  Run,
+  execution_scope,
+  registration_artifact_name,
+  reuse_gate,
+} from "./contract.harn"
+import { live_source } from "./live.harn"
+import { ProofSource, discover, identity, repository, workflow } from "./reader.harn"
+
+fn required(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name) ?? ""
+  if trim(value) == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn boolean(env: HarnessEnv, name: string) -> bool {
+  const value = required(env, name)
+  if !["true", "false"].contains(value) {
+    throw name + " must be true or false"
+  }
+  return value == "true"
+}
+
+fn output(harness: Harness, name: string, value: unknown) {
+  if !gha_write_output(harness, name, value) {
+    throw "could not write exact-tree proof output"
+  }
+}
+
+fn current_registration(env: HarnessEnv, source: ProofSource) -> Registration {
+  const repo = repository(required(env, "EXACT_TREE_REPOSITORY"))
+  const file = workflow(required(env, "EXACT_TREE_WORKFLOW"))
+  const run_id = to_int(required(env, "EXACT_TREE_RUN_ID"))
+  const attempt = to_int(required(env, "EXACT_TREE_ATTEMPT"))
+  if run_id <= 0 || attempt <= 0 {
+    throw "invalid current run or attempt"
+  }
+  const run = schema_expect(
+    source.json(
+      "/repos/" + repo + "/actions/runs/" + to_string(run_id)
+        + "/attempts/"
+        + to_string(attempt),
+    ),
+    schema_of(Run),
+  )
+  const commit = required(env, "EXACT_TREE_COMMIT")
+  const event = required(env, "EXACT_TREE_EVENT")
+  if run.id != run_id || run.run_attempt != attempt || run.head_sha != commit
+    || run.event != event
+    || run.repository.full_name != repo
+    || run.head_repository.full_name != repo
+    || run.path != ".github/workflows/" + file {
+    throw "current workflow context differs from the authenticated run"
+  }
+  const requested = json_parse(required(env, "EXACT_TREE_REQUIRED_JOBS"))
+  return {
+    schema: REGISTRATION_SCHEMA,
+    repository: repo,
+    workflow: file,
+    identity: identity(source, repo, file, commit),
+    event: event,
+    runId: run_id,
+    attempt: attempt,
+    registrarJob: required(env, "EXACT_TREE_REGISTRAR_JOB"),
+    registrarStep: required(env, "EXACT_TREE_REGISTRAR_STEP"),
+    scope: execution_scope(json_parse(required(env, "EXACT_TREE_SCOPE")), requested),
+  }
+}
+
+fn resolve(harness: Harness) {
+  const source = live_source(harness.net, harness.fs, required(harness.env, "GH_TOKEN"))
+  const current = current_registration(harness.env, source)
+  if !["merge_group", "push"].contains(current.event) {
+    throw "event has no supported execution-scope reuse contract"
+  }
+  if current.event == "merge_group" {
+    const directory = harness.fs.mkdtemp_in_workspace("exact-tree-inputs-")
+    const path = directory + "/registration.json"
+    write_json(harness.fs, path, current, {pretty: true, trailing_newline: true})
+    output(harness, "registration", path)
+    output(harness, "registration-name", registration_artifact_name(current.runId, current.attempt))
+  }
+  const discovery = discover(source, current, fn() { return harness.clock.now_ms() })
+  output(
+    harness,
+    "discovery",
+    json_stringify(pick(discovery, ["probed", "reads", "budget", "reason"])),
+  )
+  const proof = discovery.proof
+  if proof == nil {
+    harness.stdio.println("No qualified execution-scope proof; selected jobs will run.")
+    return
+  }
+  const directory = harness.fs.mkdtemp_in_workspace("exact-tree-proof-")
+  const path = directory + "/proof.json"
+  write_json(harness.fs, path, proof, {pretty: true, trailing_newline: true})
+  output(harness, "receipt", path)
+  output(harness, "census", json_stringify(proof.census))
+  output(harness, "proven", true)
+  output(
+    harness,
+    "reuse",
+    reuse_gate(
+      current.event,
+      true,
+      boolean(harness.env, "EXACT_TREE_CACHE_REFRESH"),
+      boolean(harness.env, "EXACT_TREE_QUEUE_WRITES_CACHE"),
+    ),
+  )
+}
+
+fn main(harness: Harness) {
+  harness.net.egress_policy({default: "allow", block_private: "private"})
+  output(harness, "proven", false)
+  output(harness, "reuse", false)
+  output(harness, "census", "null")
+  const has_scope = trim(harness.env.get("EXACT_TREE_SCOPE") ?? "") != ""
+  output(
+    harness,
+    "discovery",
+    json_stringify(
+      {
+        reason: has_scope ? "context_unmeasured" : "scope_unmeasured",
+        probed: nil,
+        reads: nil,
+        budget: 24,
+      },
+    ),
+  )
+  if !has_scope {
+    harness.stdio.println("Execution scope is unmeasured; selected jobs will run.")
+    return
+  }
+  try {
+    resolve(harness)
+  } catch (_error) {
+    // Diagnostics never expose API responses, tokens, or caller-provided plan values.
+    harness.stdio.println("Execution-scope proof could not be qualified; selected jobs will run.")
+  }
+}

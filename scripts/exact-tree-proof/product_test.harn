@@ -1,0 +1,143 @@
+import { assert_error_contains } from "std/testing"
+import { Registration, Run } from "./contract.harn"
+import { registration_from_archive } from "./live.harn"
+import { ProofSource, read_proof } from "./reader.harn"
+
+pipeline test_reader_reaches_actual_archive_and_selected_job_proof(harness: Harness) {
+  const current: Registration = {
+    schema: "burin.exact_tree_proof_registration.v1",
+    repository: "acme/product",
+    workflow: "ci.yml",
+    identity: {commit: "d".repeat(40), tree: "b".repeat(40), workflowBlob: "c".repeat(40)},
+    event: "merge_group",
+    runId: 20,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register scope",
+    scope: {
+      schema: "burin.exact_tree_execution_scope.v1",
+      inputs: [{name: "mode", value: "selected"}],
+      jobs: [
+        {
+          name: "Rust",
+          inputs: [{name: "packages", value: "core"}],
+          requiredSteps: ["Test selected"],
+        },
+      ],
+    },
+  }
+  const recorded = {
+    ...current,
+    runId: 10,
+    attempt: 2,
+    identity: {...current.identity, commit: "a".repeat(40)},
+  }
+  const producer: Run = {
+    id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    event: "merge_group",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "cancelled",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+  const directory = harness.fs.mkdtemp_in_workspace("exact-tree-reader-product-")
+  const path = directory + "/registration.zip"
+  const archive = zip_create([{path: "registration.json", content: json_stringify(recorded)}])
+  harness.fs.write_bytes(path, archive)
+  const artifact = {
+    id: 101,
+    name: "exact-tree-inputs-10-2",
+    size_in_bytes: len(archive),
+    expired: false,
+    digest: "sha256:" + sha256(archive),
+    created_at: "2026-10-09T10:00:00Z",
+    workflow_run: {id: 10, head_sha: "a".repeat(40)},
+  }
+  const base = {
+    run_id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    status: "completed",
+    conclusion: "success",
+    started_at: "2026-10-09T10:00:02Z",
+    completed_at: "2026-10-09T10:00:03Z",
+  }
+  const rows = [
+    {
+      ...base,
+      id: 1,
+      name: "Changes",
+      completed_at: "2026-10-09T10:00:01Z",
+      steps: [{name: "Register scope", status: "completed", conclusion: "success"}],
+    },
+    {
+      ...base,
+      id: 2,
+      name: "Rust",
+      steps: [{name: "Test selected", status: "completed", conclusion: "success"}],
+    },
+    {...base, id: 3, name: "Calibration", conclusion: "cancelled", steps: []},
+  ]
+  const pages = {
+    ["/repos/acme/product/git/commits/" + "a".repeat(40)]: {
+      sha: "a".repeat(40),
+      tree: {sha: "b".repeat(40)},
+    },
+    ["/repos/acme/product/contents/.github/workflows/ci.yml?ref=" + "a".repeat(40)]: {
+      type: "file",
+      sha: "c".repeat(40),
+    },
+    "/repos/acme/product/actions/runs/10/artifacts?per_page=100&page=1": {
+      total_count: 1,
+      artifacts: [artifact],
+    },
+    "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=1": {
+      total_count: 3,
+      jobs: rows,
+    },
+  }
+  const transport: ProofSource = {
+    json: fn(endpoint) {
+      if pages[endpoint] == nil {
+        throw "unexpected fixture endpoint"
+      }
+      return pages[endpoint]
+    },
+    registration: fn(repo, item) {
+      assert_eq(repo, "acme/product")
+      assert_eq(item.id, 101)
+      return registration_from_archive(harness.fs, path, item.digest)
+    },
+  }
+  const proof = read_proof(transport, current, producer)
+  assert_eq(proof.census.observed, 3)
+  assert_eq(proof.selectedJobs.map({ job -> job.id }), [2])
+  assert_eq(proof.census.bad, [{name: "Calibration", conclusion: "cancelled"}])
+  const changed = {
+    ...current,
+    scope: {
+      ...current.scope,
+      jobs: [{...current.scope.jobs[0], inputs: [{name: "packages", value: "tui"}]}],
+    },
+  }
+  const changed_registration = schema_expect(changed, schema_of(Registration))
+  assert_error_contains(
+    fn() { read_proof(transport, changed_registration, producer) },
+    "scope mismatch",
+  )
+  const tampered = zip_create(
+    [
+      {
+        path: "registration.json",
+        content: json_stringify(
+          {...recorded, identity: {...recorded.identity, tree: "f".repeat(40)}},
+        ),
+      },
+    ],
+  )
+  harness.fs.write_bytes(path, tampered)
+  assert_error_contains(fn() { read_proof(transport, current, producer) }, "digest mismatch")
+}
