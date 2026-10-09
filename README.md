@@ -379,7 +379,11 @@ installation token with `actions: read` and `contents: read`. It runs on this
 public repository's standard Linux runner, so observing private repositories
 does not consume their hosted-runner minutes. The observer executes no code or
 artifacts from measured workflow runs. It emits a job summary, retains compact
-JSON reports for seven days. Product-target misses are first-class target-debt
+JSON reports for seven days. The shared Harn baseline validator reproduces
+both installed writers, including Burin's measured per-job evidence. The
+observer independently checks the latest successful full-run job census;
+its summary names pending, stale, and unreadable repositories separately.
+Product-target misses are first-class target-debt
 receipts and remain visible without making every schedule red. The observer
 fails on a sustained p90 regression past the reproducible observed baseline or
 one run past its max-latency regression fuse. Missing, stale, invalid, or empty

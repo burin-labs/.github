@@ -1,0 +1,266 @@
+import { with_temp_dir } from "std/testing"
+import {
+  FreshnessProbe,
+  ObserverAdapters,
+  ObserverCommand,
+  observe_repository,
+  observer_jobs,
+  observer_json,
+  probe_full_success,
+  reconcile_freshness,
+} from "./observer-runner.harn"
+import { Policy, decode } from "./policy.harn"
+
+fn current_policy(fs: HarnessFs) -> Policy {
+  return decode(
+    json_parse(fs.read_text("../../.github/fixtures/ci-latency-policy/harn-773f11e.json")),
+  )
+}
+
+fn response(value: unknown, success: bool = true) -> ObserverCommand {
+  return {stdout: json_stringify(value), stderr: success ? "" : "fixture failure", success: success}
+}
+
+fn sequence(fs: HarnessFs, work: string, responses: list<ObserverCommand>) -> ObserverAdapters {
+  fs.write_text(path_join(work, "calls"), "0")
+  fs.write_text(path_join(work, "sleeps"), "")
+  return {
+    run: fn(args) {
+      const index = unwrap(to_int(fs.read_text(path_join(work, "calls"))))
+      fs.write_text(path_join(work, "calls"), to_string(index + 1))
+      fs.write_text(path_join(work, "args-" + to_string(index)), json_stringify(args))
+      return unwrap(responses[index])
+    },
+    sleep_ms: fn(ms) {
+      const file = path_join(work, "sleeps")
+      fs.write_text(file, fs.read_text(file) + to_string(ms) + "\n")
+    },
+    now: fn() { return "2026-10-09T00:00:00Z" },
+  }
+}
+
+fn probe(id: int?, error: string? = nil) -> FreshnessProbe {
+  return {
+    observed_at: "2026-10-09T00:00:00Z",
+    query: "fixture",
+    candidate_limit: 100,
+    candidate_count: 1,
+    eligible_candidate_count: 1,
+    inspected_count: 1,
+    truncated: false,
+    selected_run: id == nil ? nil : {id: id, created_at: "2026-10-09T00:00:00Z"},
+    inspected_candidates: [],
+    error: error,
+  }
+}
+
+pipeline test_transport_recovers_and_refuses_exhausted_reads(harness: Harness) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const failed = {stdout: "unreadable", stderr: "HTTP503", success: false}
+      const recovered = sequence(harness.fs, work, [failed, response({measured: 7})])
+      assert_eq(observer_json(recovered, ["gh", "api", "fixture"]), {measured: 7})
+      assert_eq(harness.fs.read_text(path_join(work, "calls")), "2")
+      assert_eq(harness.fs.read_text(path_join(work, "sleeps")), "5000\n")
+      const exhausted = sequence(harness.fs, work, [failed, failed, failed])
+      assert(
+        is_err(
+          try {
+            observer_json(exhausted, ["gh", "api", "fixture"])
+          },
+        ),
+      )
+      assert_eq(harness.fs.read_text(path_join(work, "calls")), "3")
+      assert_eq(harness.fs.read_text(path_join(work, "sleeps")), "5000\n10000\n")
+      const breach = sequence(harness.fs, work, [response({evaluation: {ok: false}}, false)])
+      assert_eq(observer_json(breach, ["harn", "run", "fixture"], false), {evaluation: {ok: false}})
+      assert_eq(harness.fs.read_text(path_join(work, "calls")), "1")
+    },
+  )
+}
+
+pipeline test_job_census_refuses_empty_partial_and_changing_pages() {
+  const job = {name: "Build", status: "completed", conclusion: "success"}
+  assert_eq(len(observer_jobs([{total_count: 2, jobs: [job]}, {total_count: 2, jobs: [job]}])), 2)
+  for raw in [
+    nil,
+    [],
+    [{total_count: 0, jobs: []}],
+    [{total_count: 2, jobs: [job]}],
+    [{total_count: 2, jobs: [job]}, {total_count: 3, jobs: [job]}],
+  ] {
+    assert(
+      is_err(
+        try {
+          observer_jobs(raw)
+        },
+      ),
+    )
+  }
+}
+
+pipeline test_independent_probe_orders_runs_and_requires_actual_successful_sentinels(
+  harness: Harness,
+) {
+  const policy = current_policy(harness.fs)
+  const jobs = policy.full_run_jobs.map(
+    fn(sentinel) { return {name: sentinel.name, status: "completed", conclusion: "success"} },
+  )
+    .to_list()
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const adapters = sequence(
+        harness.fs,
+        work,
+        [
+          response(
+            {
+              workflow_runs: [
+                {id: 900, created_at: "2026-10-08T00:00:00Z", conclusion: "success"},
+                {id: 7, created_at: "2026-10-09T00:00:00Z", conclusion: "success"},
+                {id: 8, created_at: "2026-10-09T00:00:00Z", conclusion: "success"},
+              ],
+            },
+          ),
+          response([{total_count: len(jobs), jobs: jobs}]),
+        ],
+      )
+      const result = probe_full_success(adapters, policy)
+      assert_eq(unwrap(result.selected_run).id, 8)
+      assert_eq(result.inspected_count, 1)
+      assert_eq(result.error, nil)
+      const args = json_parse(harness.fs.read_text(path_join(work, "args-1")))
+      assert(args.contains("--paginate") && args.contains("--slurp"))
+      assert(unwrap(args[-1]).contains("/runs/8/jobs?per_page=100"))
+      const partial = sequence(
+        harness.fs,
+        work,
+        [
+          response(
+            {workflow_runs: [{id: 8, created_at: "2026-10-09T00:00:00Z", conclusion: "success"}]},
+          ),
+          response([{total_count: len(jobs) + 1, jobs: jobs}]),
+        ],
+      )
+      assert(unwrap(probe_full_success(partial, policy).error).contains("partial"))
+      const empty = sequence(harness.fs, work, [response({workflow_runs: []})])
+      const absent = probe_full_success(empty, policy)
+      assert_eq(absent.candidate_count, 0)
+      assert_eq(absent.selected_run, nil)
+      assert_eq(absent.error, nil)
+    },
+  )
+}
+
+pipeline test_exhausted_full_run_window_stays_unknown(harness: Harness) {
+  const policy = current_policy(harness.fs)
+  const runs = range(1, 101).map(
+    fn(id) { return {id: id, created_at: "2026-10-09T00:00:00Z", conclusion: "success"} },
+  )
+    .to_list()
+  const wrong_jobs = [{name: "unrelated", status: "completed", conclusion: "success"}]
+  const pages = response([{total_count: 1, jobs: wrong_jobs}])
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const adapters = sequence(
+        harness.fs,
+        work,
+        [response({workflow_runs: runs})]
+          + range(0, 100).map(fn(_) { return pages }).to_list(),
+      )
+      const result = probe_full_success(adapters, policy)
+      assert_eq(result.inspected_count, 100)
+      assert_eq(result.selected_run, nil)
+      assert(result.truncated)
+      assert(unwrap(result.error).contains("exhausted"))
+    },
+  )
+}
+
+pipeline test_semantic_retry_requires_two_matching_reads_and_preserves_probe_failure(
+  harness: Harness,
+) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const adapters = sequence(harness.fs, work, [])
+      const measured = {id: 7, created_at: "2026-10-09T00:00:00Z"}
+      const recovered = reconcile_freshness(adapters, measured, probe(8), fn() { return probe(7) })
+      assert_eq(unwrap(recovered.expected).id, 7)
+      assert_eq(len(recovered.probes), 3)
+      assert_eq(recovered.error, nil)
+      const stale = reconcile_freshness(adapters, measured, probe(8), fn() { return probe(8) })
+      assert_eq(unwrap(stale.expected).id, 8)
+      const failed = reconcile_freshness(
+        adapters,
+        measured,
+        probe(nil, "unreadable"),
+        fn() {
+          throw "must not retry semantic reads after failed probe"
+        },
+      )
+      assert_eq(failed.error, "unreadable")
+      assert_eq(len(failed.probes), 1)
+      const unstable = reconcile_freshness(
+        adapters,
+        measured,
+        probe(8),
+        fn() { return probe(nil, "unreadable") },
+      )
+      assert(unstable.error != nil)
+    },
+  )
+}
+
+pipeline test_runner_preserves_threshold_failure_as_a_measured_report(harness: Harness) {
+  const policy = current_policy(harness.fs)
+  const jobs = policy.full_run_jobs.map(
+    fn(sentinel) { return {name: sentinel.name, status: "completed", conclusion: "success"} },
+  )
+    .to_list()
+  const report = {
+    schema_version: 2,
+    policy: policy,
+    qualifying_runs: [{id: 8, created_at: "2026-10-09T00:00:00Z"}],
+    wall: {count: 1},
+    evaluation: {
+      status: "hard_max_breach",
+      ok: false,
+      current: {count: 1, p90_ms: 1, max_ms: 999999999},
+      previous: {count: 0, p90_ms: 0, max_ms: 0},
+    },
+  }
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const adapters = sequence(
+        harness.fs,
+        work,
+        [
+          response(policy),
+          response(
+            {workflow_runs: [{id: 8, created_at: "2026-10-09T00:00:00Z", conclusion: "success"}]},
+          ),
+          response([{total_count: len(jobs), jobs: jobs}]),
+          response(report, false),
+        ],
+      )
+      const receipt = observe_repository(
+        harness.fs,
+        adapters,
+        "harn",
+        {reports: work, policies: work, harn_script: "fixture-engine.harn"},
+      )
+      assert_eq(receipt.status, "policy_breach")
+      assert_eq(receipt.sample_count, 1)
+      assert_eq(receipt.breaches[0].metric, "evaluation.current.max_ms")
+      const persisted = json_parse(harness.fs.read_text(path_join(work, "harn.json")))
+      assert_eq(persisted.observer.status, "policy_breach")
+      assert_eq(persisted.freshness_probes[0].selected_run.id, 8)
+      assert_eq(harness.fs.read_text(path_join(work, "calls")), "4")
+    },
+  )
+}
