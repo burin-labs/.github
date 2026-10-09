@@ -42,15 +42,15 @@ jobs:
         with:
           repository: burin-labs/harn
           # Updated only after the owning Harn change is integrated on main.
-          ref: 143608ec8fe14341464728ebdf5860b03cc1b9c7
+          ref: b5f92c0874e93fa9f0b35d241213b8e8efa619c0
           path: .harn/ci-latency-harn
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
 
       - name: Install Harn
-        uses: burin-labs/harn/.github/actions/setup-harn@68ab397be4c1b7eece1743e0f8824840e05c2fa2 # bounded release-asset retries
+        uses: burin-labs/harn/.github/actions/setup-harn@6e286870227a91f701d7f5ff05a3ec54a39ac478 # certified v0.10.159
         with:
-          version: 0.10.64
+          version: 0.10.159
 
       - name: Observe full CI runs
         id: observe
@@ -66,7 +66,7 @@ jobs:
           policies="$GITHUB_WORKSPACE/.harn/ci-latency-policies"
           mkdir -p "$reports" "$policies"
           set +e
-          ruby scripts/ci_latency_observer.rb \
+          harn run --no-sandbox scripts/ci-latency/observer-cli.harn -- \
             --reports "$reports" \
             --policies "$policies" \
             --harn-script .harn/ci-latency-harn/scripts/ci_walltime_report.harn \

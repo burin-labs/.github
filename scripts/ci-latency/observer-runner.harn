@@ -1,0 +1,282 @@
+import {
+  ObservedRun,
+  classify_observation,
+  newest_run,
+  observer_error,
+} from "./observer-contract.harn"
+import { Policy, decode } from "./policy.harn"
+
+pub type ObserverCommand = {stdout: string, stderr: string, success: bool}
+
+pub type ObserverLocations = {reports: string, policies: string, harn_script: string}
+
+pub type ObserverAdapters = {
+  run: fn(list<string>) -> ObserverCommand,
+  sleep_ms: fn(int) -> nil,
+  now: fn() -> string,
+}
+
+type ApiRun = {id: int, created_at: string, conclusion: string?}
+
+type Job = {name: string, status: string, conclusion: string?}
+
+type JobPage = {total_count: int, jobs: list<Job>}
+
+type JobPages = list<JobPage>
+
+type RunCensus = {workflow_runs: list<ApiRun>}
+
+type QualifyingRunCensus = {qualifying_runs: list<ObservedRun>}
+
+pub type FreshnessProbe = {
+  observed_at: string,
+  query: string,
+  candidate_limit: int,
+  candidate_count: int,
+  eligible_candidate_count: int,
+  inspected_count: int,
+  truncated: bool,
+  selected_run: ObservedRun?,
+  inspected_candidates: list<dict>,
+  error: string?,
+}
+
+/** Transport retries never turn unreadable JSON or a failed API call into an empty read. */
+pub fn observer_json(
+  adapters: ObserverAdapters,
+  args: list<string>,
+  require_success: bool = true,
+) -> unknown {
+  let diagnostic = "command did not run"
+  for attempt in range(0, 3) {
+    const result = adapters.run(args)
+    const parsed = try {
+      json_parse(result.stdout)
+    }
+    if (!require_success || result.success) && is_ok(parsed) {
+      return unwrap(parsed)
+    }
+    diagnostic = result.stderr == "" ? "command returned no valid JSON" : result.stderr
+    if attempt < 2 {
+      adapters.sleep_ms((attempt + 1) * 5000)
+    }
+  }
+  throw diagnostic
+}
+
+pub fn missing_observer_sentinels(jobs: list<Job>, policy: Policy) -> list<string> {
+  return policy.full_run_jobs.filter(
+    { sentinel ->
+      !jobs.any(
+        { job ->
+          job.status == "completed" && job.conclusion == "success"
+            && ((sentinel.match ?? "exact") == "prefix" ? starts_with(job.name, sentinel.name) : job
+              .name
+              == sentinel.name)
+        },
+      )
+    },
+  )
+    .map({ sentinel -> (sentinel.match ?? "exact") + ":" + sentinel.name })
+    .to_list()
+}
+
+/** A paginated exact job census, including the measured non-null total. */
+pub fn observer_jobs(raw: unknown) -> list<Job> {
+  require schema_is(raw, JobPages), "freshness job census is not a typed page list"
+  require len(raw) > 0, "freshness job census is absent"
+  const total = unwrap(raw[0]).total_count
+  require total > 0, "freshness job census measured zero jobs"
+  let jobs: list<Job> = []
+  for page in raw {
+    require page.total_count == total, "freshness job census changed between pages"
+    jobs = jobs + page.jobs
+  }
+  require len(jobs) == total, "freshness job census is partial"
+  return jobs
+}
+
+pub fn probe_full_success(adapters: ObserverAdapters, policy: Policy) -> FreshnessProbe {
+  const query = "/repos/" + policy.repository + "/actions/workflows/" + policy.workflow
+    + "/runs?event="
+    + policy.event
+    + "&status=completed&per_page=100"
+  let probe: FreshnessProbe = {
+    observed_at: adapters.now(),
+    query: query,
+    candidate_limit: 100,
+    candidate_count: 0,
+    eligible_candidate_count: 0,
+    inspected_count: 0,
+    truncated: false,
+    selected_run: nil,
+    inspected_candidates: [],
+    error: nil,
+  }
+  try {
+    const raw = observer_json(adapters, ["gh", "api", query])
+    require schema_is(raw, RunCensus), "freshness run census is malformed"
+    const eligible = raw.workflow_runs.filter(
+      { run ->
+        run.conclusion == "success"
+          && date_parse(run.created_at) >= date_parse(policy.topology_epoch)
+      },
+    )
+      .sort_by(fn(run) { return [date_parse(run.created_at), run.id] })
+      .reversed()
+    probe = probe
+      + {
+        candidate_count: len(raw.workflow_runs),
+        eligible_candidate_count: len(eligible),
+        truncated: len(raw.workflow_runs) >= 100,
+      }
+    for run in eligible {
+      require run.id > 0, "freshness run lacks a valid identity"
+      const jobs = observer_jobs(
+        observer_json(
+          adapters,
+          [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            "/repos/" + policy.repository + "/actions/runs/" + to_string(run.id)
+              + "/jobs?per_page=100",
+          ],
+        ),
+      )
+      const missing = missing_observer_sentinels(jobs, policy)
+      probe = probe
+        + {
+          inspected_count: probe.inspected_count + 1,
+          inspected_candidates: probe.inspected_candidates
+            + [{id: run.id, created_at: run.created_at, missing_sentinels: missing}],
+        }
+      if len(missing) == 0 {
+        return probe + {selected_run: {id: run.id, created_at: run.created_at}}
+      }
+    }
+    return probe
+      + {
+        error:
+          probe.truncated ? "freshness candidate window exhausted before a full-coverage success" : nil,
+      }
+  } catch (error) {
+    return probe + {error: to_string(error)}
+  }
+}
+
+pub fn reconcile_freshness(
+  adapters: ObserverAdapters,
+  measured: ObservedRun?,
+  initial: FreshnessProbe,
+  probe: fn() -> FreshnessProbe,
+) -> {expected: ObservedRun?, probes: list<FreshnessProbe>, error: string?} {
+  let probes = [initial]
+  if initial.error != nil {
+    return {expected: nil, probes: probes, error: initial.error}
+  }
+  if initial.selected_run?.id == measured?.id {
+    return {expected: initial.selected_run, probes: probes, error: nil}
+  }
+  for attempt in range(0, 2) {
+    adapters.sleep_ms((attempt + 1) * 5000)
+    probes = probes + [probe()]
+  }
+  const first = unwrap(probes[1])
+  const second = unwrap(probes[2])
+  if first.error == nil && second.error == nil
+    && first.selected_run?.id == second.selected_run?.id {
+    return {expected: second.selected_run, probes: probes, error: nil}
+  }
+  return {
+    expected: nil,
+    probes: probes,
+    error: "independent freshness probe did not stabilize after three semantic reads",
+  }
+}
+
+pub fn observe_repository(
+  fs: HarnessFs,
+  adapters: ObserverAdapters,
+  name: string,
+  locations: ObserverLocations,
+) -> dict {
+  const repository = "burin-labs/" + name
+  const report_path = path_join(locations.reports, (name == ".github" ? "github" : name) + ".json")
+  try {
+    const raw_policy = observer_json(
+      adapters,
+      [
+        "gh",
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw+json",
+        "/repos/" + repository + "/contents/.github/ci-latency.json?ref=main",
+      ],
+    )
+    const policy = decode(raw_policy)
+    require policy.repository == repository, "fetched policy names a different repository"
+    const policy_path = path_join(locations.policies, name + ".json")
+    fs.write_text(policy_path, json_stringify(raw_policy) + "\n")
+    const initial = probe_full_success(adapters, policy)
+    // A valid threshold-breach report has a nonzero process exit. Preserve it.
+    const report = observer_json(
+      adapters,
+      [
+        "harn",
+        "run",
+        "--no-sandbox",
+        locations.harn_script,
+        "--",
+        "--policy",
+        policy_path,
+        "--limit",
+        "100",
+        "--json",
+        "--check",
+      ],
+      false,
+    )
+    require schema_is(report, QualifyingRunCensus), "measurement lacks qualifying run census"
+    const freshness = reconcile_freshness(
+      adapters,
+      newest_run(report.qualifying_runs),
+      initial,
+      fn() { return probe_full_success(adapters, policy) },
+    )
+    const receipt = classify_observation(report, policy, freshness.expected, freshness.error)
+    fs.write_text(
+      report_path,
+      json_stringify(
+        report
+          + {
+            freshness_probes: freshness.probes,
+            observer: receipt,
+            observer_result: ["stale", "observer_error"].contains(receipt.status) ? "fail" : "pass",
+            policy_result: receipt.status,
+          },
+      )
+        + "\n",
+    )
+    return receipt
+  } catch (error) {
+    const receipt = observer_error(repository, to_string(error))
+    fs.write_text(
+      report_path,
+      json_stringify(
+        {
+          schema_version: 2,
+          policy: {repository: repository},
+          evaluation: {status: "observer_error", ok: false},
+          wall: {count: 0},
+          observer: receipt,
+          observer_result: "fail",
+          policy_result: "unknown",
+        },
+      )
+        + "\n",
+    )
+    return receipt
+  }
+}

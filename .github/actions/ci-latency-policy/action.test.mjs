@@ -113,16 +113,20 @@ test("installed observer writer is mechanically checked by the authoritative Har
       started_at: new Date(started).toISOString(), completed_at: new Date(started + wall_ms).toISOString(),
       head_sha: (index + 1).toString(16).padStart(40, "0") };
   });
-  const writer = spawnSync("ruby", ["-rjson", "-r", join(action, "ci_latency_baseline.rb"), "-e",
-    "sample = JSON.parse(STDIN.read); puts JSON.generate(CiLatencyBaseline.derive(sample.fetch('policy'), sample.fetch('runs')))"],
-    { input: JSON.stringify({ policy, runs }), encoding: "utf8" });
-  assert.equal(writer.status, 0, writer.stderr);
-  const sample = { ...policy, observed_baseline: JSON.parse(writer.stdout) };
-  await fixture(async ({ run }) => {
+  await fixture(async ({ root, run }) => {
+    const input = join(root, "writer-input.json");
+    await writeFile(input, JSON.stringify({ policy, runs }));
+    const writer = spawnSync("harn", ["run", "--no-sandbox",
+      join(action, "../../../scripts/ci-latency/baseline-writer.harn"), "--", input],
+      { encoding: "utf8" });
+    assert.equal(writer.status, 0, writer.stderr);
+    await writeFile(join(root, "policy.json"), JSON.stringify({
+      ...policy, observed_baseline: JSON.parse(writer.stdout),
+    }));
     const checked = run(steps[1], { BASELINE_SHA: "" });
     assert.equal(checked.status, 0, `${checked.stdout}${checked.stderr}`);
     assert.match(checked.stdout, /CI latency policy: OK/);
-  }, sample);
+  });
 });
 
 test("actual CLI failure leaves neither outputs nor a replacement baseline", async () => {
