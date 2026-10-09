@@ -178,3 +178,4 @@ jobs:
           bash -n .github/actions/validate-candidate-manifest/run.sh
           bash -n scripts/release-repin/run.sh
           bash -n scripts/merge-override/run.sh
+          bash -n scripts/review-dispatch/run.sh

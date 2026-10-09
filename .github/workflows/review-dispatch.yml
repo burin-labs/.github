@@ -42,7 +42,7 @@ jobs:
         id: request
         env:
           GH_TOKEN: ${{ github.token }}
-        run: harn run scripts/review-dispatch/cli.harn -- resolve
+        run: bash scripts/review-dispatch/run.sh resolve
       - name: Mint a token that can only request reviews
         id: app
         if: steps.request.outputs.eligible == 'true'
@@ -58,4 +58,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           HEAD_SHA: ${{ steps.request.outputs.head_sha }}
-        run: harn run scripts/review-dispatch/cli.harn -- dispatch
+        run: bash scripts/review-dispatch/run.sh dispatch
