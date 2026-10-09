@@ -1,8 +1,8 @@
 name: Reuse an exact-tree CI proof
 description: >-
   Fail-closed reuse of named required jobs when a merge group or landing push
-  has the same git tree as an already-green source pull request. Callers keep
-  writing cache on cache-contract changes.
+  has the same Git tree, workflow, and registered execution scope as successful
+  selected jobs in a completed queue attempt. Cache writers keep running.
 
 inputs:
   workflow-file:
@@ -11,6 +11,18 @@ inputs:
   required-jobs:
     description: JSON array of job names that constitute proof.
     required: true
+  execution-scope:
+    description: Closed typed JSON plan containing actual inputs and successful step obligations.
+    required: false
+    default: ""
+  registrar-job:
+    description: Actual API job name that registers the contract before selected jobs start.
+    required: false
+    default: ""
+  registrar-step:
+    description: Actual API step name containing this action, including its artifact upload.
+    required: false
+    default: ""
   cache-refresh-required:
     description: '"true" keeps the jobs running so a cache-contract change can write.'
     required: false
@@ -29,10 +41,6 @@ inputs:
   commit-sha:
     description: Full 40-character commit SHA for this run.
     required: true
-  event-path:
-    description: Path to the GitHub event payload (github.event_path).
-    required: false
-    default: ""
   repository:
     description: owner/name. Defaults to github.repository.
     required: false
@@ -48,21 +56,54 @@ outputs:
   reuse:
     description: '"true" when callers should skip the proven jobs.'
     value: ${{ steps.resolve.outputs.reuse }}
+  receipt:
+    description: Typed qualified job-proof receipt path, empty when unmeasured.
+    value: ${{ steps.resolve.outputs.receipt }}
+  census:
+    description: Complete attempt and selected-job census JSON, or null when unmeasured.
+    value: ${{ steps.resolve.outputs.census }}
+  discovery:
+    description: Bounded discovery reason and probe/read counts, separate from job measurement.
+    value: ${{ steps.resolve.outputs.discovery }}
 
 runs:
   using: composite
   steps:
+    - name: Set up Harn
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+      with:
+        version: "0.10.159"
     - name: Resolve exact-tree CI proof reuse
       id: resolve
       shell: bash
       env:
-        EVENT_NAME: ${{ inputs.event-name }}
-        COMMIT_SHA: ${{ inputs.commit-sha }}
-        EVENT_PATH: ${{ inputs.event-path }}
-        REPOSITORY: ${{ inputs.repository }}
-        WORKFLOW_FILE: ${{ inputs.workflow-file }}
-        REQUIRED_JOBS: ${{ inputs.required-jobs }}
-        CACHE_REFRESH_REQUIRED: ${{ inputs.cache-refresh-required }}
-        MERGE_GROUP_WRITES_CACHE: ${{ inputs.merge-group-writes-cache }}
+        EXACT_TREE_EVENT: ${{ inputs.event-name }}
+        EXACT_TREE_COMMIT: ${{ inputs.commit-sha }}
+        EXACT_TREE_REPOSITORY: ${{ inputs.repository }}
+        EXACT_TREE_WORKFLOW: ${{ inputs.workflow-file }}
+        EXACT_TREE_REQUIRED_JOBS: ${{ inputs.required-jobs }}
+        EXACT_TREE_SCOPE: ${{ inputs.execution-scope }}
+        EXACT_TREE_REGISTRAR_JOB: ${{ inputs.registrar-job }}
+        EXACT_TREE_REGISTRAR_STEP: ${{ inputs.registrar-step }}
+        EXACT_TREE_RUN_ID: ${{ github.run_id }}
+        EXACT_TREE_ATTEMPT: ${{ github.run_attempt }}
+        EXACT_TREE_CACHE_REFRESH: ${{ inputs.cache-refresh-required }}
+        EXACT_TREE_QUEUE_WRITES_CACHE: ${{ inputs.merge-group-writes-cache }}
         GH_TOKEN: ${{ inputs.github-token }}
-      run: bash "$GITHUB_ACTION_PATH/resolve.sh"
+      run: bash "$GITHUB_ACTION_PATH/run.sh"
+    - name: Register exact execution scope
+      if: ${{ steps.resolve.outputs.registration != '' }}
+      uses: actions/upload-artifact@043fb03d56e00e183e2e6339d5e92c33c6f43d1a
+      with:
+        name: ${{ steps.resolve.outputs.registration-name }}
+        path: ${{ steps.resolve.outputs.registration }}
+        if-no-files-found: error
+        retention-days: 3
+    - name: Preserve qualified job proof
+      if: ${{ steps.resolve.outputs.receipt != '' }}
+      uses: actions/upload-artifact@043fb03d56e00e183e2e6339d5e92c33c6f43d1a
+      with:
+        name: exact-tree-proof-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.resolve.outputs.receipt }}
+        if-no-files-found: error
+        retention-days: 3

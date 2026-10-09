@@ -205,10 +205,12 @@ pipeline test_ci_preserves_lint_title_and_owner_tests(harness: Harness) {
     step(steps, "Test graph-derived Rust impact planning").run,
     "node --test .github/actions/rust-test-impact/plan.test.mjs",
   )
+  const local_steps = workflow(harness, "ci").jobs["local-check-contract"].steps
   assert_eq(
-    step(steps, "Test exact-tree CI proof reuse").run,
-    "bash .github/actions/exact-tree-ci-proof/run-tests.sh",
+    step(local_steps, "Test exact-tree CI proof reuse").run,
+    "harn test scripts/exact-tree-proof",
   )
+  assert_eq(step(local_steps, "Set up the exact-tree proof runtime")["with"].version, "0.10.159")
   const title = step(steps, "Check PR title and description")
   assert_eq(title.uses, "./.github/actions/pr-title-check")
   assert(title["if"].contains("github.event_name == 'pull_request'"))

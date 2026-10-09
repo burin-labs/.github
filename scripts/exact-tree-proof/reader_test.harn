@@ -1,0 +1,129 @@
+import { assert_error_contains } from "std/testing"
+import { Run } from "./contract.harn"
+import { ProofSource, identity, job_census } from "./reader.harn"
+
+fn run() -> Run {
+  return {
+    id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    event: "merge_group",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "cancelled",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+}
+
+fn job(id: int) -> dict {
+  return {
+    id: id,
+    run_id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    name: "job " + to_string(id),
+    status: "completed",
+    conclusion: "success",
+    started_at: nil,
+    completed_at: nil,
+    steps: [],
+  }
+}
+
+fn source(pages: dict) -> ProofSource {
+  return {
+    json: fn(endpoint) {
+      if pages[endpoint] == nil {
+        throw "unexpected fixture endpoint " + endpoint
+      }
+      return pages[endpoint]
+    },
+    registration: fn(_repo, _artifact) {
+      throw "unexpected artifact download"
+    },
+  }
+}
+
+const FIRST = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=1"
+
+const SECOND = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=2"
+
+pipeline test_complete_explicit_attempt_pages_are_measured() {
+  const census = job_census(
+    source({[FIRST]: {total_count: 2, jobs: [job(1)]}, [SECOND]: {total_count: 2, jobs: [job(2)]}}),
+    "acme/product",
+    run(),
+  )
+  assert_eq(census.declared, 2)
+  assert_eq(census.jobs.map({ value -> value.id }), [1, 2])
+}
+
+pipeline test_empty_partial_duplicate_and_changing_census_refuse() {
+  for response in [
+    {total_count: 0, jobs: []},
+    {total_count: 1, jobs: []},
+    {total_count: 1, jobs: [job(1), job(2)]},
+  ] {
+    assert(
+      is_err(
+        try {
+          job_census(source({[FIRST]: response}), "acme/product", run())
+        },
+      ),
+    )
+  }
+  for response in [
+    {total_count: 2, jobs: []},
+    {total_count: 2, jobs: [job(1)]},
+    {total_count: 3, jobs: [job(2)]},
+  ] {
+    assert(
+      is_err(
+        try {
+          job_census(
+            source({[FIRST]: {total_count: 2, jobs: [job(1)]}, [SECOND]: response}),
+            "acme/product",
+            run(),
+          )
+        },
+      ),
+    )
+  }
+  assert_error_contains(
+    fn() { job_census(source({}), "acme/product", run()) },
+    "unexpected fixture endpoint",
+  )
+}
+
+pipeline test_git_objects_not_receipt_claims_define_source_identity() {
+  const commit = "a".repeat(40)
+  const commit_endpoint = "/repos/acme/product/git/commits/" + commit
+  const file_endpoint = "/repos/acme/product/contents/.github/workflows/ci.yml?ref=" + commit
+  const pages = {
+    [commit_endpoint]: {sha: commit, tree: {sha: "b".repeat(40)}},
+    [file_endpoint]: {type: "file", sha: "c".repeat(40)},
+  }
+  assert_eq(
+    identity(source(pages), "acme/product", "ci.yml", commit),
+    {commit: commit, tree: "b".repeat(40), workflowBlob: "c".repeat(40)},
+  )
+  assert_error_contains(
+    fn() { identity(
+      source({...pages, [commit_endpoint]: {sha: "d".repeat(40), tree: {sha: "b".repeat(40)}}}),
+      "acme/product",
+      "ci.yml",
+      commit,
+    ) },
+    "different source",
+  )
+  assert_error_contains(
+    fn() { identity(
+      source({...pages, [file_endpoint]: {type: "symlink", sha: "c".repeat(40)}}),
+      "acme/product",
+      "ci.yml",
+      commit,
+    ) },
+    "did not return a file",
+  )
+}
