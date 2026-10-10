@@ -1,0 +1,46 @@
+name: Request an automatic review
+description: Measure an eligible pull request head before dispatching the existing reviewer.
+inputs:
+  pull-request:
+    description: Pull request number in the calling repository.
+    required: true
+  release-app-client-id:
+    description: Organization release App client ID.
+    required: true
+  release-app-private-key:
+    description: Organization release App private key.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Set up Harn
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+      with:
+        version: 0.10.133
+    - name: Resolve the current eligible head
+      id: request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TARGET_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pull-request }}
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/review-dispatch/run.sh" resolve
+    - name: Mint a token that can only request reviews
+      id: app
+      if: steps.request.outputs.eligible == 'true'
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+      with:
+        client-id: ${{ inputs.release-app-client-id }}
+        private-key: ${{ inputs.release-app-private-key }}
+        owner: ${{ github.repository_owner }}
+        repositories: burin-code
+        permission-actions: write
+    - name: Request a review of the measured head
+      if: steps.request.outputs.eligible == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app.outputs.token }}
+        TARGET_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pull-request }}
+        HEAD_SHA: ${{ steps.request.outputs.head_sha }}
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/review-dispatch/run.sh" dispatch

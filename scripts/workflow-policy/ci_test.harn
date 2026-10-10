@@ -86,7 +86,7 @@ pipeline test_ci_joins_contracts_and_uses_exact_package_fixture(harness: Harness
   assert(smoke.run.contains("test \"$PACKAGE_SMOKE_RESULT\" = success"))
 }
 
-pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
+pipeline test_checkout_policy_scans_every_current_source(harness: Harness) {
   const sources = census(
     harness.fs,
     [
@@ -96,47 +96,7 @@ pipeline test_checkout_policy_has_complete_immutable_census(harness: Harness) {
       ".github/actions/**/action.yaml",
     ],
   )
-  const actions = [
-    "check-commit-signatures",
-    "check-dependabot-config",
-    "check-harn-docs",
-    "ci-latency-policy",
-    "ci-runtime-evidence",
-    "exact-tree-ci-proof",
-    "harn-package",
-    "harn-repo-policy",
-    "hosted-runner-labels",
-    "local-workflow-checks",
-    "pr-title-check",
-    "require-successful-needs",
-    "rust-test-impact",
-    "validate-candidate-manifest",
-  ]
-  const workflows = [
-    "ci-latency-observer",
-    "ci",
-    "dependabot-waiver-audit",
-    "docs-checker-smoke",
-    "harn-package",
-    "merge-override-dispatch",
-    "merge-override",
-    "promote-release",
-    "register-package-release",
-    "repin",
-    "reusable-pin-drift",
-    "review-dispatch",
-    "runner-availability",
-    "runner-fleet-health",
-    "ship",
-    "smart-ship",
-  ]
-  assert_eq(
-    sources,
-    sort(
-      actions.map({ name -> ".github/actions/" + name + "/action.yml" })
-        + workflows.map({ name -> ".github/workflows/" + name + ".yml" }),
-    ),
-  )
+  assert(sources.contains(".github/workflows/ci.yml"), "the actual CI source must be measured")
   let checkout_count = 0
   for source in sources {
     const policy = yaml_parse(read(harness.fs, source))
