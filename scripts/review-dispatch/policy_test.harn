@@ -91,15 +91,18 @@ pipeline test_workflow_uses_trusted_base_and_mints_only_a_scoped_eligible_token(
     expression_start + "github.event.pull_request.base.sha || github.sha }}",
   )
   assert_eq(checkout["with"]["persist-credentials"], false)
-  const mint = steps.filter({ step -> step?.id == "app" }).to_list()[0]
+  const action = read_yaml(harness.fs, "../../.github/actions/review-dispatch/action.yml")
+  assert_eq(steps[1]["uses"], "./.github/actions/review-dispatch")
+  const action_steps = action.runs.steps
+  const mint = action_steps.filter({ step -> step?.id == "app" }).to_list()[0]
   assert_eq(mint["if"], "steps.request.outputs.eligible == 'true'")
   assert_eq(mint["with"].repositories, "burin-code")
   assert_eq(mint["with"]["permission-actions"], "write")
-  const submit = steps[len(steps) - 1]
+  const submit = action_steps[len(action_steps) - 1]
   assert_eq(submit["if"], mint["if"])
   assert_eq(submit.env.HEAD_SHA, expression_start + "steps.request.outputs.head_sha }}")
   assert(
-    steps.index_of(mint)
-      > steps.index_of(steps.filter({ step -> step?.id == "request" }).to_list()[0]),
+    action_steps.index_of(mint)
+      > action_steps.index_of(action_steps.filter({ step -> step?.id == "request" }).to_list()[0]),
   )
 }
