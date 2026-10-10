@@ -26,6 +26,13 @@ not forwarded, so a credential reaches a check only when its contract declares
 it. The runner supplies absolute `GITHUB_WORKSPACE` and `RUNNER_TEMP` values
 from its normalized root and private run directory.
 
+An authored check that launches another fixed repository check can call
+`repository_check_environment(harness.env)` once and add the returned map to
+that child's explicit environment. It projects only the existing outer host
+scratch address, refuses incomplete addresses, and returns an empty map when
+none is present. The consuming launcher validates the address; nested checks
+allocate or delete nothing. Do not apply this map to arbitrary tool commands.
+
 Consumer packages can expose the same CLI without copying its boundary:
 
 ```harn

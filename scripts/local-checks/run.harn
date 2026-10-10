@@ -35,6 +35,11 @@ fn execution_environment(context: OuterExecutionContext?) -> dict<string, string
   return context == nil ? {} : {BURIN_HOST_EXECUTION_CONTEXT: json_stringify(context)}
 }
 
+/** Project existing outer authority only for an authored repository-check child. */
+pub fn repository_check_environment(env: HarnessEnv) -> dict<string, string> {
+  return execution_environment(capture_outer_execution_context(fn(name) { env.get(name) }))
+}
+
 fn runtime_environment(env: HarnessEnv) -> dict<string, string> {
   let result: dict<string, string> = {}
   for name in [
