@@ -1,6 +1,6 @@
 import { help_requested, parse, parser, render_help } from "std/cli/argparse"
 import { parse_policy, plan_checks } from "./plan.harn"
-import { run_checks } from "./run.harn"
+import { capture_outer_execution_context, run_checks } from "./run.harn"
 
 fn specification() {
   return parser(
@@ -67,6 +67,7 @@ pub fn run_cli(harness: Harness, arguments: list<string>) -> int {
       platform: to_string(options.platform ?? platform_name(harness.system)),
       build_wrapper: options.build_wrapper ?? [],
       group: options.group == nil ? nil : to_string(options.group),
+      outer_execution_context: capture_outer_execution_context(fn(name) { harness.env.get(name) }),
     },
   )
   return result.ok ? 0 : 1

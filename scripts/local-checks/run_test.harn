@@ -1,5 +1,37 @@
 import { parse_policy, plan_checks } from "./plan.harn"
-import { report, run_checks } from "./run.harn"
+import { capture_outer_execution_context, report, run_checks } from "./run.harn"
+
+pipeline test_outer_context_capture_is_closed_and_not_an_ambient_environment_copy() {
+  const values = {
+    BURIN_OWNED_SCRATCH_ROOT: "/private/tmp/owned-control",
+    BURIN_OWNED_SCRATCH_DEVICE: "1",
+    BURIN_OWNED_SCRATCH_INODE: "2",
+    UNRELATED_PRIVATE_VALUE: "not-projected",
+  }
+  const captured = capture_outer_execution_context(fn(name) { values[name] })
+  assert_eq(captured?.scratch_root, "/private/tmp/owned-control")
+  assert_eq(captured?.scratch_device, "1")
+  assert_eq(captured?.scratch_inode, "2")
+  assert(!json_stringify(captured).contains("not-projected"))
+  assert_eq(capture_outer_execution_context(fn(name) { nil }), nil)
+  for malformed in [
+    {BURIN_OWNED_SCRATCH_ROOT: "/private/tmp/owned-control"},
+    {BURIN_OWNED_SCRATCH_ROOT: "", BURIN_OWNED_SCRATCH_DEVICE: "1", BURIN_OWNED_SCRATCH_INODE: "2"},
+    {
+      BURIN_OWNED_SCRATCH_ROOT: "/private/tmp/owned-control",
+      BURIN_OWNED_SCRATCH_DEVICE: "bad",
+      BURIN_OWNED_SCRATCH_INODE: "2",
+    },
+  ] {
+    assert(
+      is_err(
+        try {
+          capture_outer_execution_context(fn(name) { malformed[name] })
+        },
+      ),
+    )
+  }
+}
 
 pipeline test_a_failed_process_is_named_and_the_next_check_fires(harness: Harness) {
   const root = harness.fs.mkdtemp_in_workspace("check-control-")

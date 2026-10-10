@@ -1,6 +1,39 @@
 import { Check, CheckReport, CheckResult, Plan } from "./model.harn"
 
-pub type RunOptions = {root: string, platform: string, build_wrapper: list<string>, group: string?}
+/** Address of scratch owned by the outer host, not proof of actor liveness. */
+pub type OuterExecutionContext = {
+  scratch_root: string,
+  scratch_device: string,
+  scratch_inode: string,
+}
+
+pub type RunOptions = {
+  root: string,
+  platform: string,
+  build_wrapper: list<string>,
+  group: string?,
+  outer_execution_context?: OuterExecutionContext?,
+}
+
+/** Capture once at the trusted CLI boundary; ordinary tools do not inherit it. */
+pub fn capture_outer_execution_context(get: fn(string) -> string?) -> OuterExecutionContext? {
+  const root = get("BURIN_OWNED_SCRATCH_ROOT")
+  const device = get("BURIN_OWNED_SCRATCH_DEVICE")
+  const inode = get("BURIN_OWNED_SCRATCH_INODE")
+  if root == nil && device == nil && inode == nil {
+    return nil
+  }
+  if root == nil || device == nil || inode == nil || trim(root ?? "") == ""
+    || regex_match("^[0-9]+$", device ?? "") == nil
+    || regex_match("^[1-9][0-9]*$", inode ?? "") == nil {
+    throw "outer repository-check execution context is incomplete or malformed"
+  }
+  return {scratch_root: root ?? "", scratch_device: device ?? "", scratch_inode: inode ?? ""}
+}
+
+fn execution_environment(context: OuterExecutionContext?) -> dict<string, string> {
+  return context == nil ? {} : {BURIN_HOST_EXECUTION_CONTEXT: json_stringify(context)}
+}
 
 fn runtime_environment(env: HarnessEnv) -> dict<string, string> {
   let result: dict<string, string> = {}
@@ -140,6 +173,7 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
               cwd: path_join(options.root, check.directory),
               env: runtime_environment(harness.env)
                 + check.environment
+                + execution_environment(options.outer_execution_context)
                 + {
                   GITHUB_WORKSPACE: options.root,
                   RUNNER_TEMP: temporary,
