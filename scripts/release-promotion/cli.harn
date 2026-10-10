@@ -1,4 +1,5 @@
 import { gha_write_output } from "std/gha"
+import { parse_authorization, verify_authorization } from "./authorization.harn"
 import { live_github } from "./live.harn"
 import { parse_request, publish_candidate, verify_candidate, verify_run } from "./promotion.harn"
 
@@ -35,13 +36,27 @@ fn main(harness: Harness) {
     harness.fs.mkdtemp_in_workspace("promote-release-gh-"),
   )
   const mode = required_env(harness.env, "PROMOTE_MODE")
+  const authorization = parse_authorization(
+    harness.env.get("PROMOTE_AUTHORIZATION_RUN_ID") ?? "",
+    harness.env.get("PROMOTE_AUTHORIZATION_ATTEMPT") ?? "",
+  )
+  const authorize_completion = authorization == nil ? nil : fn(attempt: int) { verify_authorization(
+    github,
+    harness.fs,
+    request.repository,
+    request.sha,
+    request.run_id,
+    attempt,
+    authorization,
+    path_join(directory, mode),
+  ) }
   if mode == "verify" {
-    const candidate = verify_candidate(github, harness.fs, request, directory)
+    const candidate = verify_candidate(github, harness.fs, request, directory, authorize_completion)
     for file in candidate.files {
       harness.stdio.println("verified " + file.name + " sha256 " + file.sha256)
     }
     harness.stdio.println(
-      "Run " + to_string(request.run_id) + " passed at " + request.sha + " and its "
+      "Run " + to_string(request.run_id) + " is authorized at " + request.sha + " and its "
         + to_string(len(candidate.files))
         + " files match their manifest digests and attestations.",
     )
@@ -52,7 +67,7 @@ fn main(harness: Harness) {
       github,
       harness.fs,
       request,
-      verify_run(github, request),
+      verify_run(github, request, authorize_completion),
       directory,
     )
     write_output(harness, "tag", release.tag)

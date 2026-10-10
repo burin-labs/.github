@@ -14,10 +14,15 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
   const workflow = promote(harness.fs)
   assert_eq(keys(workflow.on), ["workflow_call"])
   const call = workflow.on.workflow_call
-  assert_eq(keys(call.inputs).sorted(), ["run-id", "sha", "tag"])
-  for name in keys(call.inputs) {
+  assert_eq(keys(call.inputs).sorted(), ["authorization-attempt", "authorization-run-id", "run-id", "sha", "tag"])
+  for name in ["run-id", "sha", "tag"] {
     assert_eq(call.inputs[name].required, true)
     assert_eq(call.inputs[name].type, "string")
+  }
+  for name in ["authorization-run-id", "authorization-attempt"] {
+    assert_eq(call.inputs[name].required, false)
+    assert_eq(call.inputs[name].type, "string")
+    assert_eq(call.inputs[name].default, "")
   }
   for name in keys(call.secrets) {
     assert_eq(call.secrets[name].required, true)
@@ -69,12 +74,16 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     "PROMOTE_REPOSITORY",
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
+    "PROMOTE_AUTHORIZATION_RUN_ID",
+    "PROMOTE_AUTHORIZATION_ATTEMPT",
     "PROMOTE_TAG",
     "PROMOTE_DIRECTORY",
   ] {
     assert_eq(verify.env[name], publish.env[name])
   }
   assert_eq(verify.env.PROMOTE_REPOSITORY, expression("github.repository"))
+  assert_eq(verify.env.PROMOTE_AUTHORIZATION_RUN_ID, expression("inputs.authorization-run-id"))
+  assert_eq(verify.env.PROMOTE_AUTHORIZATION_ATTEMPT, expression("inputs.authorization-attempt"))
   const grants = keys(token["with"]).filter({ key -> key.starts_with("permission-") })
   // Publish mode re-verifies the run with this token before it publishes.
   assert_eq(grants.sort(), ["permission-actions", "permission-contents", "permission-workflows"])
@@ -96,6 +105,8 @@ pipeline test_promotion_bootstrap_only_dispatches_harn(harness: Harness) {
     "PROMOTE_REPOSITORY",
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
+    "PROMOTE_AUTHORIZATION_RUN_ID",
+    "PROMOTE_AUTHORIZATION_ATTEMPT",
     "PROMOTE_TAG",
     "PROMOTE_DIRECTORY",
     "GITHUB_OUTPUT",

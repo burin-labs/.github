@@ -3,8 +3,9 @@
 # A release publishes exactly the files that main CI built and tested at one
 # commit; nothing is rebuilt after testing. The build run uploads each file as
 # a run artifact, attests it, and records its SHA-256 in a candidate manifest
-# (schemas/candidate-manifest.v1.json). This workflow proves that the run passed
-# at the requested commit and that the files are the ones the manifest names,
+# (schemas/candidate-manifest.v1.json). This workflow requires a successful run
+# or Harn's authenticated late-consumer authorization, and proves that the
+# files are the ones the manifest names at the requested commit,
 # then tags that commit and publishes those same files. It never builds and
 # never writes release content: the release body is the manifest's notes file,
 # and checksums or asset indexes are files the run built like any other.
@@ -35,6 +36,7 @@
 #
 # Publishing to package registries is the caller's next job, gated on this
 # one. It reads the files from the release this workflow outputs.
+# See docs/release-completion-authorization.md for the narrow recovery boundary.
 
 name: Promote release
 
@@ -52,6 +54,16 @@ on:
       tag:
         description: Release tag to create at sha, as vX.Y.Z. A vX.Y.Z-suffix tag publishes a prerelease that never becomes latest.
         required: true
+        type: string
+      authorization-run-id:
+        description: Optional canonical Harn promotion run that authenticated a late completed consumer.
+        required: false
+        default: ''
+        type: string
+      authorization-attempt:
+        description: Exact attempt of the completion authorization run.
+        required: false
+        default: ''
         type: string
     secrets:
       RELEASE_APP_CLIENT_ID:
@@ -117,6 +129,8 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_AUTHORIZATION_RUN_ID: ${{ inputs.authorization-run-id }}
+          PROMOTE_AUTHORIZATION_ATTEMPT: ${{ inputs.authorization-attempt }}
           PROMOTE_TAG: ${{ inputs.tag }}
           PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh
@@ -150,6 +164,8 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_AUTHORIZATION_RUN_ID: ${{ inputs.authorization-run-id }}
+          PROMOTE_AUTHORIZATION_ATTEMPT: ${{ inputs.authorization-attempt }}
           PROMOTE_TAG: ${{ inputs.tag }}
           PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh

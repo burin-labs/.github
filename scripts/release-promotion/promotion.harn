@@ -34,6 +34,9 @@ pub type PromotionRequest = {
 /** The run facts promotion relies on after it has checked them. */
 pub type VerifiedRun = {url: string, attempt: int}
 
+/** Internal authenticated completion reader, never a caller-provided verdict. */
+pub type CompletionAuthorization = fn(int) -> nil
+
 /** A candidate whose manifest and file digests have been checked on disk. */
 pub type Candidate = {
   manifest: CandidateManifest,
@@ -79,7 +82,11 @@ fn run_label(request: PromotionRequest) -> string {
  * own commit, concluded success, tested exactly the requested commit, and
  * that commit is on the default branch.
  */
-pub fn verify_run(github: GitHub, request: PromotionRequest) -> VerifiedRun {
+pub fn verify_run(
+  github: GitHub,
+  request: PromotionRequest,
+  authorize_completion: CompletionAuthorization? = nil,
+) -> VerifiedRun {
   const run = github.json(
     "/repos/" + request.repository + "/actions/runs/" + to_string(request.run_id),
   )
@@ -95,7 +102,9 @@ pub fn verify_run(github: GitHub, request: PromotionRequest) -> VerifiedRun {
     throw run_label(request) + " built a commit from " + to_string(head_owner) + ", not "
       + request.repository
   }
-  if run?.status != "completed" || run?.conclusion != "success" {
+  if run?.status != "completed"
+    || (run?.conclusion != "success"
+      && (run?.conclusion != "failure" || authorize_completion == nil)) {
     throw run_label(request) + " did not succeed: status " + to_string(run?.status)
       + ", conclusion "
       + to_string(run?.conclusion)
@@ -121,6 +130,9 @@ pub fn verify_run(github: GitHub, request: PromotionRequest) -> VerifiedRun {
   const attempt = run?.run_attempt
   if type_of(attempt) != "int" || attempt < 1 {
     throw run_label(request) + " reported no run attempt"
+  }
+  if run?.conclusion == "failure" {
+    authorize_completion(attempt)
   }
   return {url: to_string(run?.html_url), attempt: attempt}
 }
@@ -209,8 +221,9 @@ pub fn verify_candidate(
   fs: HarnessFs,
   request: PromotionRequest,
   directory: string,
+  authorize_completion: CompletionAuthorization? = nil,
 ) -> Candidate {
-  const run = verify_run(github, request)
+  const run = verify_run(github, request, authorize_completion)
   github.download(
     request.run_id,
     candidate_manifest_artifact(request.sha),
