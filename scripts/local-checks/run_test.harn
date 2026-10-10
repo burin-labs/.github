@@ -1,5 +1,21 @@
 import { parse_policy, plan_checks } from "./plan.harn"
-import { capture_outer_execution_context, report, run_checks } from "./run.harn"
+import {
+  capture_outer_execution_context,
+  report,
+  repository_check_environment,
+  run_checks,
+} from "./run.harn"
+
+pipeline test_repository_check_environment_projects_only_the_existing_address(harness: Harness) {
+  const captured = capture_outer_execution_context(fn(name) { harness.env.get(name) })
+  const projected = repository_check_environment(harness.env)
+  if captured == nil {
+    assert_eq(projected, {})
+  } else {
+    assert_eq(keys(projected), ["BURIN_HOST_EXECUTION_CONTEXT"])
+    assert_eq(json_parse(projected.BURIN_HOST_EXECUTION_CONTEXT), captured)
+  }
+}
 
 pipeline test_outer_context_capture_is_closed_and_not_an_ambient_environment_copy() {
   const values = {
