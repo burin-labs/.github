@@ -1,0 +1,248 @@
+/** Authenticated Harn publication authorization for an observer deadline only. */
+pub type AuthorizationRequest = {run_id: int, attempt: int}
+
+pub fn parse_authorization(run: string, attempt: string) -> AuthorizationRequest? {
+  if run == "" && attempt == "" {
+    return nil
+  }
+  if regex_match("^[1-9][0-9]*$", run) == nil
+    || regex_match("^[1-9][0-9]*$", attempt) == nil {
+    throw "authorization requires a positive run and attempt"
+  }
+  return {run_id: to_int(run), attempt: to_int(attempt)}
+}
+
+fn positive(value: unknown) -> bool {
+  return type_of(value) == "int" && value > 0
+}
+
+type AuthorizationGitHub = {json: fn(string) -> unknown, download: fn(int, string, string) -> nil}
+
+/** Transport shape, not a second registry of Harn's product obligations. */
+type AuthorizationReceipt = {
+  schema: string,
+  authorization_run: int,
+  authorization_attempt: int,
+  source_sha: string,
+  producer_run: int,
+  producer_attempt: int,
+  consumer_run: int,
+  consumer_attempt: int,
+  consumer_head: string,
+  producer_observed: int,
+  consumer_observed: int,
+  pending: int,
+  original_observation: string,
+  failed_producer_jobs: list<string>,
+  linked_receipt: dict,
+  gauntlet_receipt: dict,
+}
+
+/** The repository owns completion semantics; publication authenticates its writer. */
+pub fn verify_authorization(
+  github: AuthorizationGitHub,
+  fs: HarnessFs,
+  repository: string,
+  source: string,
+  producer: int,
+  producer_attempt: int,
+  authorization: AuthorizationRequest,
+  directory: string,
+) {
+  if repository != "burin-labs/harn" || authorization.run_id == producer {
+    throw "no owning completion authorization for this producer"
+  }
+  const prefix = "/repos/" + repository + "/actions/runs/" + to_string(authorization.run_id)
+  const run = authenticate_run(github, repository, prefix, authorization)
+  authenticate_owner(github, prefix, authorization)
+  const name = authenticate_artifact(github, prefix, run, authorization)
+  const target = path_join(directory, "completion-authorization")
+  if fs.exists(target) {
+    throw "completion authorization directory must be fresh"
+  }
+  github.download(authorization.run_id, name, target)
+  const text = fs.read_text(path_join(target, "authorization.json"))
+  if len(text) == 0 || len(text) > 65536 {
+    throw "completion authorization payload exceeds its bound"
+  }
+  authenticate_payload(json_parse(text), source, producer, producer_attempt, authorization)
+  const final_run = authenticate_run(github, repository, prefix, authorization)
+  if final_run.head_sha != run.head_sha {
+    throw "completion authorization changed during verification"
+  }
+  const final_producer = github.json(
+    "/repos/" + repository + "/actions/runs/" + to_string(producer),
+  )
+  if final_producer?.id != producer || final_producer?.run_attempt != producer_attempt
+    || final_producer?.head_sha != source
+    || final_producer?.status != "completed"
+    || final_producer?.conclusion != "failure" {
+    throw "completion producer changed during verification"
+  }
+}
+
+fn authenticate_run(
+  github: AuthorizationGitHub,
+  repository: string,
+  prefix: string,
+  authorization: AuthorizationRequest,
+) -> dict {
+  const run = github.json(prefix)
+  if run?.id != authorization.run_id || run?.run_attempt != authorization.attempt
+    || run?.repository?.full_name != repository
+    || run?.head_repository?.full_name != repository
+    || run?.path != ".github/workflows/promote-release.yml"
+    || run?.event != "workflow_dispatch"
+    || run?.head_branch != "main"
+    || type_of(run?.head_sha) != "string"
+    || regex_match("^[0-9a-f]{40}$", run.head_sha) == nil
+    || (run?.status != "in_progress" && run?.status != "completed")
+    || !positive(run?.repository?.id)
+    || !positive(run?.head_repository?.id) {
+    throw "completion authorization has no canonical promotion identity"
+  }
+  const relation = github.json("/repos/" + repository + "/compare/main..." + run.head_sha)
+  if relation?.status != "behind" && relation?.status != "identical" {
+    throw "completion authorization source is not on main"
+  }
+  if (run.status == "in_progress" && run?.conclusion != nil)
+    || (run.status == "completed"
+      && !["success", "failure", "cancelled", "timed_out", "action_required", "neutral", "skipped"]
+        .contains(run?.conclusion)) {
+    throw "completion authorization run has an inconsistent terminal state"
+  }
+  return run
+}
+
+fn authenticate_owner(
+  github: AuthorizationGitHub,
+  prefix: string,
+  authorization: AuthorizationRequest,
+) {
+  let jobs = []
+  let total = 0
+  for page in range(1, 11) {
+    const response = github.json(
+      prefix + "/jobs?filter=latest&per_page=100&page=" + to_string(page),
+    )
+    if type_of(response?.jobs) != "list" || !positive(response?.total_count)
+      || (total != 0 && total != response.total_count) {
+      throw "completion authorization job census is unmeasured"
+    }
+    total = response.total_count
+    jobs = jobs + response.jobs
+    if len(jobs) >= total {
+      break
+    }
+    if len(response.jobs) != 100 {
+      throw "completion authorization job census is partial"
+    }
+  }
+  if len(jobs) != total {
+    throw "completion authorization job census is incomplete"
+  }
+  let ids = []
+  let owners = []
+  for job in jobs {
+    if !positive(job?.id) || ids.contains(job.id) || job?.run_id != authorization.run_id
+      || job?.run_attempt != authorization.attempt {
+      throw "completion authorization job identity is inconsistent"
+    }
+    ids = ids + [job.id]
+    if job?.name == "Require measured consumer completion" {
+      owners = owners + [job]
+    }
+  }
+  if len(owners) != 1 {
+    throw "completion authorization owner is absent or duplicated"
+  }
+  const owner = owners[0]
+  if owner?.status != "completed" || owner?.conclusion != "success"
+    || type_of(owner?.steps) != "list"
+    || len(owner.steps) == 0 {
+    throw "completion authorization owner did not succeed"
+  }
+  authenticate_steps(owner.steps)
+}
+
+fn authenticate_steps(steps: list<dict>) {
+  for name in [
+    "Attach completed exact-source consumer",
+    "Preserve exact consumer authorization",
+    "Require owning rehearsal result",
+  ] {
+    let matches = []
+    for step in steps {
+      if step?.name == name {
+        matches = matches + [step]
+      }
+    }
+    if len(matches) != 1 || matches[0]?.status != "completed"
+      || matches[0]?.conclusion != "success" {
+      throw "completion authorization obligation did not succeed"
+    }
+  }
+}
+
+fn authenticate_artifact(
+  github: AuthorizationGitHub,
+  prefix: string,
+  run: dict,
+  authorization: AuthorizationRequest,
+) -> string {
+  const name = "release-consumer-authorization-" + to_string(authorization.run_id) + "-"
+    + to_string(authorization.attempt)
+  const response = github.json(prefix + "/artifacts?per_page=100&page=1")
+  if type_of(response?.artifacts) != "list" || response?.total_count != len(response.artifacts) {
+    throw "completion authorization artifact census is incomplete"
+  }
+  let matches = []
+  for artifact in response.artifacts {
+    if artifact?.name == name {
+      matches = matches + [artifact]
+    }
+  }
+  if len(matches) != 1 {
+    throw "completion authorization artifact is absent or duplicated"
+  }
+  const artifact = matches[0]
+  if !positive(artifact?.id) || artifact?.expired != false || !positive(artifact?.size_in_bytes)
+    || artifact.size_in_bytes > 65536
+    || artifact?.workflow_run?.id != authorization.run_id
+    || artifact?.workflow_run?.head_sha != run.head_sha
+    || artifact?.workflow_run?.repository_id != run?.repository?.id
+    || artifact?.workflow_run?.head_repository_id != run?.head_repository?.id {
+    throw "completion authorization artifact identity is invalid"
+  }
+  return name
+}
+
+fn authenticate_payload(
+  raw: unknown,
+  source: string,
+  producer: int,
+  producer_attempt: int,
+  authorization: AuthorizationRequest,
+) {
+  const checked = schema_parse(raw, schema_of(AuthorizationReceipt))
+  if !is_ok(checked) {
+    throw "completion authorization payload has no typed receipt"
+  }
+  const proof: AuthorizationReceipt = unwrap(checked)
+  if proof.schema != "burin-labs.late-consumer-authorization.v1"
+    || proof.authorization_run != authorization.run_id
+    || proof.authorization_attempt != authorization.attempt
+    || proof.source_sha != source
+    || proof.producer_run != producer
+    || proof.producer_attempt != producer_attempt
+    || proof.pending != 0
+    || !positive(proof.producer_observed)
+    || !positive(proof.consumer_observed)
+    || !positive(proof.consumer_run)
+    || !positive(proof.consumer_attempt)
+    || regex_match("^[0-9a-f]{40}$", proof.consumer_head) == nil {
+    throw "completion authorization payload does not bind this producer"
+  }
+  // The authenticated owning job has already checked the product receipts and
+  // allowed failure census. Shared publication deliberately does not repeat it.
+}

@@ -1,0 +1,230 @@
+import { assert_error_contains } from "std/testing"
+import { parse_authorization, verify_authorization } from "./authorization.harn"
+
+const SOURCE = "89512fd930c0af99f13f9295d8b236407ad07244"
+
+const HEAD = "92bbaeb1bed4daf93a8911708246fb8c3cd2c780"
+
+const PREFIX = "/repos/burin-labs/harn/actions/runs/200"
+
+const NAME = "release-consumer-authorization-200-1"
+
+fn proof() -> dict {
+  return {
+    schema: "burin-labs.late-consumer-authorization.v1",
+    authorization_run: 200,
+    authorization_attempt: 1,
+    source_sha: SOURCE,
+    producer_run: 100,
+    producer_attempt: 1,
+    pending: 0,
+    producer_observed: 18,
+    consumer_observed: 8,
+    consumer_run: 300,
+    consumer_attempt: 1,
+    consumer_head: HEAD,
+    original_observation: "deadline_unmeasured",
+    failed_producer_jobs: [
+      "Consumer release rehearsal / Consumer canary",
+      "Release candidate verdict",
+    ],
+    linked_receipt: {
+      revision: SOURCE,
+      suite: "harn-linked",
+      testsRun: 1879,
+      observation: {outcome: "passed", producerExitCode: 0, logExitCode: 0},
+    },
+    gauntlet_receipt: {revision: SOURCE, suite: "first-run-gauntlet", testsRun: 5},
+  }
+}
+
+fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
+  const steps = [
+    "Attach completed exact-source consumer",
+    "Preserve exact consumer authorization",
+    "Require owning rehearsal result",
+  ]
+    .map(fn(name) { return {name: name, status: "completed", conclusion: "success"} })
+  const run = {
+    id: 200,
+    run_attempt: 1,
+    repository: {full_name: "burin-labs/harn", id: 10},
+    head_repository: {full_name: "burin-labs/harn", id: 10},
+    head_sha: HEAD,
+    head_branch: "main",
+    path: ".github/workflows/promote-release.yml",
+    event: "workflow_dispatch",
+    status: "in_progress",
+  }
+    + (options?.run ?? {})
+  const job = {
+    id: 50,
+    run_id: 200,
+    run_attempt: 1,
+    name: "Require measured consumer completion",
+    status: "completed",
+    conclusion: "success",
+    steps: steps,
+  }
+    + (options?.job ?? {})
+  const artifact = {
+    id: 60,
+    name: NAME,
+    expired: false,
+    size_in_bytes: 2000,
+    workflow_run: {id: 200, head_sha: HEAD, repository_id: 10, head_repository_id: 10},
+  }
+    + (options?.artifact ?? {})
+  const responses = {
+    [PREFIX]: run,
+    ["/repos/burin-labs/harn/compare/main..." + HEAD]: {status: options?.relation ?? "behind"},
+    [PREFIX + "/jobs?filter=latest&per_page=100&page=1"]: {
+      total_count: options?.job_total ?? 1,
+      jobs: options?.jobs ?? [job],
+    },
+    [PREFIX + "/artifacts?per_page=100&page=1"]: {
+      total_count: options?.artifact_total ?? 1,
+      artifacts: options?.artifacts ?? [artifact],
+    },
+    "/repos/burin-labs/harn/actions/runs/100": {
+      id: 100,
+      run_attempt: 1,
+      head_sha: SOURCE,
+      status: "completed",
+      conclusion: "failure",
+    }
+      + (options?.producer ?? {}),
+  }
+  let downloads = 0
+  let run_reads = 0
+  return {
+    github: {
+      json: fn(endpoint) {
+        if responses[endpoint] == nil {
+          throw "unexpected API endpoint"
+        }
+        if endpoint == PREFIX {
+          run_reads = run_reads + 1
+          if options?.changed_attempt == true && run_reads > 1 {
+            return run + {run_attempt: 2}
+          }
+        }
+        return responses[endpoint]
+      },
+      download: fn(run_id, name, directory) {
+        assert_eq(run_id, 200)
+        assert_eq(name, NAME)
+        downloads = downloads + 1
+        fs.write_text(
+          path_join(directory, "authorization.json"),
+          options?.text ?? json_stringify(proof() + (options?.proof ?? {})),
+        )
+      },
+    },
+    downloads: fn() { return downloads },
+  }
+}
+
+pipeline test_canonical_completed_owner_authorizes_original_producer(harness: Harness) {
+  const world = fixture(harness.fs)
+  verify_authorization(
+    world.github,
+    harness.fs,
+    "burin-labs/harn",
+    SOURCE,
+    100,
+    1,
+    {run_id: 200, attempt: 1},
+    harness.fs.mkdtemp_in_workspace("authorization-positive-"),
+  )
+  assert_eq(world.downloads(), 1)
+}
+
+pipeline test_optional_authorization_pair(harness: Harness) {
+  assert_eq(parse_authorization("", ""), nil)
+  for input in [{run: "200", attempt: ""}, {run: "", attempt: "1"}, {run: "0", attempt: "1"}] {
+    assert_error_contains(
+      fn() { parse_authorization(input.run, input.attempt) },
+      "positive run and attempt",
+    )
+  }
+}
+
+pipeline test_unmeasured_or_mismatched_authorization_refuses_publication(harness: Harness) {
+  for item in [
+    {options: {run: {event: "push"}}, error: "canonical promotion identity"},
+    {options: {run: {head_branch: "feature"}}, error: "canonical promotion identity"},
+    {options: {run: {run_attempt: 2}}, error: "canonical promotion identity"},
+    {options: {run: {status: "completed", conclusion: nil}}, error: "inconsistent terminal state"},
+    {options: {run: {conclusion: "success"}}, error: "inconsistent terminal state"},
+    {options: {relation: "ahead"}, error: "not on main"},
+    {options: {job_total: 2}, error: "partial"},
+    {options: {jobs: [], job_total: 0}, error: "unmeasured"},
+    {options: {job: {conclusion: "failure"}}, error: "did not succeed"},
+    {options: {job: {steps: []}}, error: "did not succeed"},
+    {options: {job: {run_attempt: 2}}, error: "identity is inconsistent"},
+    {options: {artifact_total: 2}, error: "artifact census is incomplete"},
+    {options: {artifacts: [], artifact_total: 0}, error: "absent or duplicated"},
+    {options: {artifact: {expired: true}}, error: "artifact identity"},
+    {options: {artifact: {size_in_bytes: 65537}}, error: "artifact identity"},
+    {options: {proof: {source_sha: HEAD}}, error: "does not bind"},
+    {options: {proof: {producer_attempt: 2}}, error: "does not bind"},
+    {options: {proof: {pending: 1}}, error: "does not bind"},
+    {options: {proof: {consumer_observed: 0}}, error: "does not bind"},
+    {options: {text: "[]"}, error: "no typed receipt"},
+    {options: {text: "null"}, error: "no typed receipt"},
+    {options: {text: "true"}, error: "no typed receipt"},
+    {options: {proof: {linked_receipt: nil}}, error: "no typed receipt"},
+    {options: {changed_attempt: true}, error: "canonical promotion identity"},
+    {options: {producer: {run_attempt: 2}}, error: "producer changed"},
+    {options: {producer: {status: "in_progress"}}, error: "producer changed"},
+    {
+      options: {
+        artifact: {
+          workflow_run: {id: 200, head_sha: SOURCE, repository_id: 10, head_repository_id: 10},
+        },
+      },
+      error: "artifact identity",
+    },
+  ] {
+    const world = fixture(harness.fs, item.options)
+    assert_error_contains(
+      fn() { verify_authorization(
+        world.github,
+        harness.fs,
+        "burin-labs/harn",
+        SOURCE,
+        100,
+        1,
+        {run_id: 200, attempt: 1},
+        harness.fs.mkdtemp_in_workspace("authorization-negative-"),
+      ) },
+      item.error,
+    )
+  }
+}
+
+pipeline test_duplicate_attempt_named_artifact_refuses(harness: Harness) {
+  const item = {
+    id: 60,
+    name: NAME,
+    expired: false,
+    size_in_bytes: 2000,
+    workflow_run: {id: 200, head_sha: HEAD, repository_id: 10, head_repository_id: 10},
+  }
+  const world = fixture(harness.fs, {artifacts: [item, item + {id: 61}], artifact_total: 2})
+  assert_error_contains(
+    fn() { verify_authorization(
+      world.github,
+      harness.fs,
+      "burin-labs/harn",
+      SOURCE,
+      100,
+      1,
+      {run_id: 200, attempt: 1},
+      harness.fs.mkdtemp_in_workspace("authorization-duplicate-"),
+    ) },
+    "absent or duplicated",
+  )
+  assert_eq(world.downloads(), 0)
+}
