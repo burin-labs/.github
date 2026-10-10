@@ -190,6 +190,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          # The bot the token acts as. GitHub reports the shepherd's own queue
+          # removals as `manual`, like a person's; the actor tells them apart.
+          BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REPO: ${{ github.repository }}
           LABEL: ${{ inputs.ship-label }}

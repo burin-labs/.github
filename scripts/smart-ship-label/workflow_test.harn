@@ -28,6 +28,16 @@ pipeline test_repair_bootstrap_provisions_the_declared_package_manager(harness: 
   assert(steps.index_of(package_manager) < steps.index_of(shepherd))
 }
 
+/** Unset, the shepherd reads its own queue removals as a person's (burin-code#10624). */
+pipeline test_shepherd_knows_the_bot_its_token_acts_as(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const steps = workflow.jobs.ship.steps
+  const shepherd = named(steps, "Shepherd")
+  assert_eq(named(steps, "Mint the release app token").id, "app")
+  assert_eq(shepherd.env.GH_TOKEN, expression("steps.app.outputs.token"))
+  assert_eq(shepherd.env.BURIN_SHIP_BOT_LOGIN, expression("steps.app.outputs.app-slug"))
+}
+
 pipeline test_shared_workflow_reconciles_its_canonical_label_before_discovery(harness: Harness) {
   const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
   const steps = workflow.jobs.ship.steps
