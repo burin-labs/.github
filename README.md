@@ -52,61 +52,51 @@ the pull request; this keeps shallow checkouts fast without weakening coverage.
 - run: cargo nextest run ${{ steps.rust-impact.outputs.package-args }}
 ```
 
-## Exact-tree CI proof reuse
+## CI job proof reuse
 
-`burin-labs/.github/.github/actions/exact-tree-ci-proof` is the organization-owned
-adapter for reusing completed jobs in a queue run. You provide a plan with the
-actual package choices, command inputs, and required successful steps. The
-action saves that plan before your selected jobs start. A later queue run can
-reuse those jobs only when its Git tree, workflow file, and plan match.
+`burin-labs/.github/.github/actions/ci-job-proof` reuses a passing job when its
+own inputs are unchanged. You give it one sha256 digest per reusable job,
+computed from everything that can change that job's verdict: its definition,
+the jobs it needs, and the files it reads. Every pull request, merge group,
+and main push run registers those digests before any reusable job starts.
 
-An unrelated failed or canceled job does not discard successful selected jobs.
-The reader requires a complete, unique job census from one attempt. Each named
-job and required step must have run and succeeded. The downloaded plan must
-match its archive digest and the producer's Git objects. Old runs without a
-saved plan cannot qualify. See the [typed proof owner](scripts/exact-tree-proof/contract.harn).
+A merge group then reuses a job that passed with the same digest in the pull
+request it merges, or in the latest main push. A main push reuses a job that
+passed with the same digest in the merge group at its commit, or in an earlier
+main push. A run that reused a job records the run where that job actually
+executed, and the next run proves the job there. It never accepts a pointer
+alone.
 
-A `main` push also requires the whole queue workflow to have succeeded at the
-exact commit. Review and authorization gates still run. A cache change keeps
-push writers running. Set `merge-group-writes-cache: "true"` when queue jobs
-save a cache. Restore-only queue jobs can reuse proof across a cache change.
-Unknown or partial reads run the selected jobs.
+A job counts as passed only when every leg GitHub reports for it succeeded in
+one complete attempt, after that run registered its digests. An unrelated
+failed or cancelled job does not discard the others. The producer must be this
+repository's workflow, completed, with a registration archive whose digest
+matches. Unknown, partial, or unreadable producers prove nothing, so the job
+runs. Lookup reads at most eight runs, with a 40-read budget and a 45-second
+deadline. See the [typed proof owner](scripts/ci-job-proof/contract.harn).
 
 ```yaml
-- name: Register Rust execution scope
-  id: rust-proof
-  uses: burin-labs/.github/.github/actions/exact-tree-ci-proof@<full-commit-sha>
+- name: Resolve CI job proof reuse
+  id: job-proof
+  uses: burin-labs/.github/.github/actions/ci-job-proof@<full-commit-sha>
   with:
     workflow-file: ci.yml
-    required-jobs: >-
-      ["Rust TUI fast fmt, clippy & test","Rust TUI harn-linked clippy, test & build"]
-    execution-scope: ${{ steps.selection.outputs.rust_execution_scope }}
-    registrar-job: Changes
-    registrar-step: Register Rust execution scope
-    cache-refresh-required: ${{ steps.filter.outputs.rust_cache_contract }}
-    merge-group-writes-cache: "true"
+    job-identities: ${{ steps.identities.outputs.job_identities }}
+    registrar-job: Detect changes
+    registrar-step: Resolve CI job proof reuse
+    merge-group-head-ref: ${{ github.event.merge_group.head_ref }}
     event-name: ${{ github.event_name }}
-    commit-sha: ${{ github.sha }}
+    commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
     github-token: ${{ github.token }}
 ```
 
-The `execution-scope` value uses schema `burin.exact_tree_execution_scope.v1`.
-Its `inputs` is a nonempty list of unique `{name, value}` string pairs. Its
-`jobs` names exactly the required job set. Each job has its own
-`inputs` and unique nonempty `requiredSteps`. A job with no variable command
-inputs can use an empty input list. Build this value from your actual
-selection outputs. Never include secrets. Register it after selection and
-before all selected jobs. `registrar-job` and `registrar-step` must match the
-job and step names reported by GitHub, including the action's uploads.
-
-The action returns `proven`, `reuse`, a typed `receipt` path, and `census` JSON.
-An unmeasured census is `null`. Qualified proof reports observed and declared
-job counts, selected pending and failing counts, and unrelated failing names.
-It preserves the producer's commit identity rather than relabeling old output.
-The separate `discovery` output reports the lookup reason and read count.
-Lookup checks at most eight recent candidates with a 24-read budget and a
-30-second deadline between reads. Each network read has a five-second timeout.
-Budget exhaustion runs the selected jobs.
+`job-identities` uses schema `burin.ci_job_identity.v1`:
+`{schema, jobs: [{id, names, digest}]}`. `names` lists the job names GitHub
+reports for the job's legs, exact or as an anchored `^...$` pattern for a
+dynamic matrix. `registrar-job` and `registrar-step` must match the job and
+step names GitHub reports. The action returns `reused`, a JSON list of job
+ids; a typed `receipt` path naming where each reused job ran; and `discovery`,
+the lookup reason and read count.
 
 ## Reusable workflows
 

@@ -11,7 +11,7 @@ fn options(token: string, limit: int) -> dict {
       Accept: "application/vnd.github+json",
       Authorization: "Bearer " + token,
       "X-GitHub-Api-Version": "2026-03-10",
-      "User-Agent": "burin-exact-tree-proof",
+      "User-Agent": "burin-ci-job-proof",
     },
     timeout_ms: 5000,
     retry: {max: 0},
@@ -59,7 +59,7 @@ fn download_registration(
     || artifact.size_in_bytes > MAX_REGISTRATION_BYTES {
     throw "registration artifact cannot be downloaded safely"
   }
-  const directory = fs.mkdtemp_in_workspace("exact-tree-registration-")
+  const directory = fs.mkdtemp_in_workspace("ci-job-registration-")
   const path = directory + "/registration.zip"
   defer {
     fs.delete(directory)

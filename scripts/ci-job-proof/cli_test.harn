@@ -1,0 +1,46 @@
+pipeline test_real_bootstrap_without_identities_reuses_nothing(harness: Harness) {
+  const temporary = harness.fs.mkdtemp_in_workspace("ci-job-proof-launcher-")
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const output = path_join(temporary, "github-output")
+  harness.fs.write_text(output, "")
+  const result = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: [".github/actions/ci-job-proof/run.sh"],
+      cwd: root,
+      env: {
+        PATH: to_string(harness.env.get("PATH") ?? ""),
+        GH_TOKEN: "fixture-token",
+        GITHUB_ACTION_PATH: path_join(root, ".github/actions/ci-job-proof"),
+        GITHUB_WORKSPACE: root,
+        GITHUB_OUTPUT: output,
+        CI_JOB_PROOF_EVENT: "merge_group",
+        CI_JOB_PROOF_COMMIT: "a".repeat(40),
+        CI_JOB_PROOF_REPOSITORY: "acme/product",
+        CI_JOB_PROOF_WORKFLOW: "ci.yml",
+        CI_JOB_PROOF_IDENTITIES: "",
+        CI_JOB_PROOF_MERGE_GROUP_HEAD_REF: "",
+        CI_JOB_PROOF_REGISTRAR_JOB: "Changes",
+        CI_JOB_PROOF_REGISTRAR_STEP: "Register",
+        CI_JOB_PROOF_RUN_ID: "20",
+        CI_JOB_PROOF_ATTEMPT: "1",
+      },
+      timeout_ms: 30000,
+    },
+  )
+  assert(result.success, result.stdout + result.stderr)
+  assert(result.stdout.contains("Job identities are unmeasured"))
+  const lines = trim(harness.fs.read_text(output)).split("\n")
+  assert_eq(len(lines), 6)
+  const reused = lines[0].split("<<")
+  assert_eq(reused[0], "reused")
+  assert_eq(lines[1], "[]")
+  assert_eq(lines[2], reused[1])
+  const discovery = lines[3].split("<<")
+  assert_eq(discovery[0], "discovery")
+  assert_eq(lines[5], discovery[1])
+  assert_eq(
+    json_parse(lines[4]),
+    {reason: "identities_unmeasured", probed: nil, reads: nil, budget: 40},
+  )
+}
