@@ -1,0 +1,182 @@
+import { assert_error_contains } from "std/testing"
+import {
+  JobIdentity,
+  Registration,
+  Run,
+  admit_jobs,
+  identities,
+  registration,
+} from "./contract.harn"
+
+const DIGEST_A = "a".repeat(64)
+
+const DIGEST_B = "b".repeat(64)
+
+fn wanted() -> list<JobIdentity> {
+  return [
+    {id: "lint", names: ["Lint"], digest: DIGEST_A},
+    {id: "stale", names: ["Stale"], digest: DIGEST_A},
+    {id: "pointer", names: ["Pointer"], digest: DIGEST_A},
+    {id: "broken", names: ["Broken (1 of 2)", "Broken (2 of 2)"], digest: DIGEST_A},
+    {id: "shards", names: ["^Shard \\(.+ of .+\\)$"], digest: DIGEST_A},
+    {id: "early", names: ["Early"], digest: DIGEST_A},
+  ]
+}
+
+fn current() -> Registration {
+  return {
+    schema: "burin.ci_job_proof_registration.v2",
+    repository: "acme/product",
+    workflow: "ci.yml",
+    event: "push",
+    commit: "c".repeat(40),
+    runId: 30,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register",
+    jobs: [],
+  }
+}
+
+fn producer() -> Run {
+  return {
+    id: 20,
+    run_attempt: 1,
+    head_sha: "d".repeat(40),
+    event: "merge_group",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "failure",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+}
+
+fn recorded() -> Registration {
+  const claims = wanted().map(
+    { job ->
+      {
+        id: job.id,
+        names: job.names,
+        digest: job.id == "stale" ? DIGEST_B : job.digest,
+        provenance: job.id == "pointer" ? {runId: 7, attempt: 2} : nil,
+      }
+    },
+  )
+    .to_list()
+  return {...current(), event: "merge_group", commit: "d".repeat(40), runId: 20, jobs: claims}
+}
+
+fn row(id: int, name: string, conclusion: string, started: string) -> dict {
+  return {
+    id: id,
+    run_id: 20,
+    run_attempt: 1,
+    head_sha: "d".repeat(40),
+    name: name,
+    status: "completed",
+    conclusion: conclusion,
+    started_at: started,
+    completed_at: "2026-10-09T10:10:00Z",
+    steps: [{name: "Register", status: "completed", conclusion: "success"}],
+  }
+}
+
+fn census() -> list {
+  const after = "2026-10-09T10:05:00Z"
+  return [
+    {...row(1, "Changes", "success", "2026-10-09T10:00:00Z"), completed_at: "2026-10-09T10:01:00Z"},
+    row(2, "Lint", "success", after),
+    row(3, "Stale", "success", after),
+    row(4, "Broken (1 of 2)", "success", after),
+    row(5, "Broken (2 of 2)", "failure", after),
+    row(6, "Shard (1 of 2)", "success", after),
+    row(7, "Shard (2 of 2)", "success", after),
+    row(8, "Early", "success", "2026-10-09T10:00:30Z"),
+    row(9, "Unrelated", "cancelled", after),
+  ]
+}
+
+fn artifact() -> dict {
+  return {
+    id: 99,
+    name: "ci-job-inputs-20-1",
+    size_in_bytes: 10,
+    expired: false,
+    digest: "sha256:" + "e".repeat(64),
+    created_at: "2026-10-09T10:02:00Z",
+    workflow_run: {id: 20, head_sha: "d".repeat(40)},
+  }
+}
+
+pipeline test_each_job_is_admitted_only_where_every_leg_passed_after_registration() {
+  const outcome = admit_jobs(
+    current(),
+    producer(),
+    {artifact: artifact(), registration: recorded()},
+    census(),
+    9,
+    wanted(),
+  )
+  // A changed digest, a failed leg and a leg that started before the
+  // registration existed prove nothing; an unrelated cancelled job does not
+  // discard the others.
+  assert_eq(outcome.admitted.map({ admission -> admission.id }), ["lint", "shards"])
+  assert_eq(outcome.admitted[1].jobIds, [6, 7])
+  assert_eq(outcome.admitted[0].provenance, {runId: 20, attempt: 1})
+  // A reused job is a pointer to the run that executed it, never proof here.
+  assert_eq(outcome.deferred, [{id: "pointer", provenance: {runId: 7, attempt: 2}}])
+}
+
+pipeline test_a_foreign_or_relabelled_producer_proves_nothing() {
+  for changed in [
+    {...producer(), head_repository: {full_name: "fork/product"}},
+    {...producer(), head_sha: "f".repeat(40)},
+    {...producer(), status: "in_progress"},
+    {...producer(), path: ".github/workflows/other.yml"},
+  ] {
+    assert_error_contains(
+      fn() { admit_jobs(
+        current(),
+        changed,
+        {artifact: artifact(), registration: recorded()},
+        census(),
+        9,
+        wanted(),
+      ) },
+      "mismatch",
+    )
+  }
+}
+
+pipeline test_identities_are_closed_unique_and_digest_shaped() {
+  const valid = {
+    schema: "burin.ci_job_identity.v1",
+    jobs: [{id: "lint", names: ["Lint"], digest: DIGEST_A}],
+  }
+  assert_eq(identities(valid), valid.jobs)
+  for invalid in [
+    {...valid, schema: "burin.ci_job_identity.v0"},
+    {...valid, jobs: valid.jobs + valid.jobs},
+    {...valid, jobs: [{...valid.jobs[0], digest: "short"}]},
+    {...valid, jobs: [{...valid.jobs[0], names: []}]},
+    {...valid, jobs: [{...valid.jobs[0], extra: true}]},
+  ] {
+    assert(
+      is_err(
+        try {
+          identities(invalid)
+        },
+      ),
+    )
+  }
+}
+
+pipeline test_registration_points_reused_jobs_at_their_executing_run() {
+  const published = registration(
+    current(),
+    wanted().slice(0, 2),
+    [{id: "lint", digest: DIGEST_A, provenance: {runId: 20, attempt: 1}, jobIds: [2]}],
+  )
+  assert_eq(published.jobs.map({ job -> job.provenance }), [{runId: 20, attempt: 1}, nil])
+}

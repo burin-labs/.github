@@ -37,12 +37,12 @@ jobs:
           harn test scripts/harn-required-review
           harn test scripts/review-dispatch
           bash .github/actions/local-workflow-checks/run_test.sh
-      - name: Set up the exact-tree proof runtime
+      - name: Set up the CI job proof runtime
         uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
         with:
           version: "0.10.159"
-      - name: Test exact-tree CI proof reuse
-        run: harn test scripts/exact-tree-proof
+      - name: Test CI job proof reuse
+        run: harn test scripts/ci-job-proof
       # Dogfooding: the same action product repositories call, on the Harn
       # release the shared action above already installed.
       - name: Check hosted runner labels
@@ -167,7 +167,7 @@ jobs:
           bash -n .github/actions/ci-runtime-evidence/run.sh
           bash -n .github/actions/ci-latency-policy/run.sh
           bash -n .github/actions/pr-title-check/check.sh
-          bash -n .github/actions/exact-tree-ci-proof/run.sh
+          bash -n .github/actions/ci-job-proof/run.sh
           bash -n scripts/ci-routing.sh
           bash -n scripts/runner-fleet-health.sh
           bash -n scripts/reusable-pin-drift.sh

@@ -167,10 +167,10 @@ pipeline test_ci_preserves_lint_title_and_owner_tests(harness: Harness) {
   )
   const local_steps = workflow(harness, "ci").jobs["local-check-contract"].steps
   assert_eq(
-    step(local_steps, "Test exact-tree CI proof reuse").run,
-    "harn test scripts/exact-tree-proof",
+    step(local_steps, "Test CI job proof reuse").run,
+    "harn test scripts/ci-job-proof",
   )
-  assert_eq(step(local_steps, "Set up the exact-tree proof runtime")["with"].version, "0.10.159")
+  assert_eq(step(local_steps, "Set up the CI job proof runtime")["with"].version, "0.10.159")
   const title = step(steps, "Check PR title and description")
   assert_eq(title.uses, "./.github/actions/pr-title-check")
   assert(title["if"].contains("github.event_name == 'pull_request'"))

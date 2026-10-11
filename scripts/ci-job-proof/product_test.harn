@@ -1,0 +1,107 @@
+import { assert_error_contains } from "std/testing"
+import { Registration, Run } from "./contract.harn"
+import { registration_from_archive } from "./live.harn"
+import { ProofSource, read_run } from "./reader.harn"
+
+pipeline test_reader_reaches_actual_archive_and_job_proof(harness: Harness) {
+  const digest = "a".repeat(64)
+  const wanted = [{id: "rust", names: ["Rust"], digest: digest}]
+  const current: Registration = {
+    schema: "burin.ci_job_proof_registration.v2",
+    repository: "acme/product",
+    workflow: "ci.yml",
+    event: "merge_group",
+    commit: "d".repeat(40),
+    runId: 20,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register",
+    jobs: [],
+  }
+  const recorded = {
+    ...current,
+    event: "pull_request",
+    commit: "a".repeat(40),
+    runId: 10,
+    attempt: 2,
+    jobs: [{id: "rust", names: ["Rust"], digest: digest, provenance: nil}],
+  }
+  const producer: Run = {
+    id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    event: "pull_request",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "failure",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+  const directory = harness.fs.mkdtemp_in_workspace("ci-job-reader-product-")
+  const path = directory + "/registration.zip"
+  const archive = zip_create([{path: "registration.json", content: json_stringify(recorded)}])
+  harness.fs.write_bytes(path, archive)
+  const artifact = {
+    id: 101,
+    name: "ci-job-inputs-10-2",
+    size_in_bytes: len(archive),
+    expired: false,
+    digest: "sha256:" + sha256(archive),
+    created_at: "2026-10-09T10:00:00Z",
+    workflow_run: {id: 10, head_sha: "a".repeat(40)},
+  }
+  const base = {
+    run_id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    status: "completed",
+    conclusion: "success",
+    started_at: "2026-10-09T10:00:02Z",
+    completed_at: "2026-10-09T10:00:03Z",
+  }
+  const rows = [
+    {
+      ...base,
+      id: 1,
+      name: "Changes",
+      completed_at: "2026-10-09T10:00:01Z",
+      steps: [{name: "Register", status: "completed", conclusion: "success"}],
+    },
+    {...base, id: 2, name: "Rust", steps: []},
+    {...base, id: 3, name: "Calibration", conclusion: "failure", steps: []},
+  ]
+  const pages = {
+    "/repos/acme/product/actions/runs/10/artifacts?per_page=100&page=1": {
+      total_count: 1,
+      artifacts: [artifact],
+    },
+    "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=1": {
+      total_count: 3,
+      jobs: rows,
+    },
+  }
+  const transport: ProofSource = {
+    json: fn(endpoint) {
+      if pages[endpoint] == nil {
+        throw "unexpected fixture endpoint"
+      }
+      return pages[endpoint]
+    },
+    registration: fn(repo, item) {
+      assert_eq(repo, "acme/product")
+      assert_eq(item.id, 101)
+      return registration_from_archive(harness.fs, path, item.digest)
+    },
+  }
+  // A pull request's passing job proves the merge group's identical job; its
+  // unrelated failure does not.
+  const outcome = read_run(transport, current, producer, wanted)
+  assert_eq(outcome.admitted.map({ admission -> admission.jobIds }), [[2]])
+  const changed = [{...wanted[0], digest: "b".repeat(64)}]
+  assert_eq(read_run(transport, current, producer, changed).admitted, [])
+  const tampered = zip_create(
+    [{path: "registration.json", content: json_stringify({...recorded, commit: "f".repeat(40)})}],
+  )
+  harness.fs.write_bytes(path, tampered)
+  assert_error_contains(fn() { read_run(transport, current, producer, wanted) }, "digest mismatch")
+}

@@ -1,0 +1,329 @@
+pub const IDENTITY_SCHEMA = "burin.ci_job_identity.v1"
+
+pub const REGISTRATION_SCHEMA = "burin.ci_job_proof_registration.v2"
+
+pub const RECEIPT_SCHEMA = "burin.ci_job_proof.v2"
+
+/** A caller's digest of one job's own inputs, and the names GitHub reports for its legs. */
+pub type JobIdentity = {id: string, names: list<string>, digest: string}
+
+pub type Identities = {schema: string, jobs: list<JobIdentity>}
+
+/** The run whose job actually executed. A reused job points here, never at another pointer. */
+pub type Provenance = {runId: int, attempt: int}
+
+pub type RegisteredJob = {id: string, names: list<string>, digest: string, provenance: Provenance?}
+
+pub type Registration = {
+  schema: string,
+  repository: string,
+  workflow: string,
+  event: string,
+  commit: string,
+  runId: int,
+  attempt: int,
+  registrarJob: string,
+  registrarStep: string,
+  jobs: list<RegisteredJob>,
+}
+
+pub type Run = {
+  id: int,
+  run_attempt: int,
+  head_sha: string,
+  event: string,
+  path: string,
+  status: string,
+  conclusion: string?,
+  repository: {full_name: string},
+  head_repository: {full_name: string},
+}
+
+pub type Step = {name: string, status: string, conclusion: string?}
+
+pub type Job = {
+  id: int,
+  run_id: int,
+  run_attempt: int,
+  head_sha: string,
+  name: string,
+  status: string,
+  conclusion: string?,
+  started_at: string?,
+  completed_at: string?,
+  steps: list<Step>,
+}
+
+pub type Artifact = {
+  id: int,
+  name: string,
+  size_in_bytes: int,
+  expired: bool,
+  digest: string,
+  created_at: string,
+  workflow_run: {id: int, head_sha: string},
+}
+
+pub type RegisteredArtifact = {artifact: Artifact, registration: Registration}
+
+/** One job proven by one executing run: the API job ids of every leg that passed. */
+pub type Admission = {id: string, digest: string, provenance: Provenance, jobIds: list<int>}
+
+/** A job a producer reused itself, to be proven at the run it names. */
+pub type Deferral = {id: string, provenance: Provenance}
+
+pub type RunAdmission = {admitted: list<Admission>, deferred: list<Deferral>}
+
+pub type ProofReceipt = {schema: string, current: Registration, admitted: list<Admission>}
+
+/** Events that may reuse a proof. A pull request only registers its own. */
+pub const CONSUMER_EVENTS = ["merge_group", "push"]
+
+pub const PRODUCER_EVENTS = ["pull_request", "merge_group", "push"]
+
+/** Derive closed wire schemas from the types rather than copying their field lists. */
+pub fn closed(schema: dict) -> dict {
+  if schema.type == "dict" && schema?.properties != nil {
+    let properties = {}
+    for name in schema.properties.keys() {
+      properties = properties + {[name]: closed(schema.properties[name])}
+    }
+    return {...schema, properties: properties, additionalProperties: false}
+  }
+  if schema.type == "list" {
+    return {...schema, items: closed(schema.items)}
+  }
+  return schema
+}
+
+pub fn registration_artifact_name(run_id: int, attempt: int) -> string {
+  return "ci-job-inputs-" + to_string(run_id) + "-" + to_string(attempt)
+}
+
+pub fn sha(value: string) -> string {
+  if !regex_match("^[0-9a-f]{40}$", value) {
+    throw "invalid Git identity"
+  }
+  return value
+}
+
+fn text(value: string, description: string) -> string {
+  if trim(value) == "" || value != trim(value) || len(value) > 512
+    || regex_match("[\\r\\n]", value) {
+    throw description + " must be a nonempty single line"
+  }
+  return value
+}
+
+/** The caller's closed identity list: unique ids, nonempty names, sha256 digests. */
+pub fn identities(raw: unknown) -> list<JobIdentity> {
+  if len(json_stringify(raw)) > 524288 {
+    throw "job identities exceed their wire bound"
+  }
+  schema_expect(raw, closed(schema_of(Identities)))
+  const value = schema_expect(raw, schema_of(Identities))
+  if value.schema != IDENTITY_SCHEMA {
+    throw "unsupported job identity schema"
+  }
+  if len(value.jobs) == 0 || len(value.jobs) > 256
+    || len(value.jobs.map({ job -> job.id }).unique()) != len(value.jobs) {
+    throw "job identities must be nonempty and unique"
+  }
+  for job in value.jobs {
+    text(job.id, "job id")
+    if len(job.names) == 0 || len(job.names) > 64 || len(job.names.unique()) != len(job.names) {
+      throw "job names must be nonempty and unique"
+    }
+    for name in job.names {
+      text(name, "job name")
+    }
+    if !regex_match("^[0-9a-f]{64}$", job.digest) {
+      throw "job digest must be sha256 hex"
+    }
+  }
+  return value.jobs.sorted_by({ job -> job.id }).map(
+    { job -> {id: job.id, names: job.names, digest: job.digest} },
+  )
+    .to_list()
+}
+
+/** A name starting with `^` is an anchored pattern for a dynamic matrix; any other is exact. */
+pub fn leg_of(names: list<string>, job_name: string) -> bool {
+  return names.any(
+    { name -> name.starts_with("^") ? regex_match(name, job_name) != nil : name == job_name },
+  )
+}
+
+pub fn qualified_artifact(artifact: Artifact, producer: Run) {
+  if artifact.id <= 0
+    || artifact.name != registration_artifact_name(producer.id, producer.run_attempt)
+    || artifact.expired
+    || artifact.size_in_bytes <= 0
+    || artifact.size_in_bytes > 1048576
+    || !regex_match("^sha256:[0-9a-f]{64}$", artifact.digest)
+    || artifact.workflow_run.id != producer.id
+    || artifact.workflow_run.head_sha != producer.head_sha {
+    throw "unqualified registration artifact"
+  }
+}
+
+/** The producer is this repository's workflow, completed, and its registration describes it. */
+pub fn trusted_producer(current: Registration, producer: Run, recorded: Registration) {
+  if recorded.schema != REGISTRATION_SCHEMA || recorded.repository != current.repository
+    || recorded.workflow != current.workflow
+    || recorded.commit != producer.head_sha
+    || recorded.runId != producer.id
+    || recorded.attempt != producer.run_attempt
+    || recorded.event != producer.event
+    || !PRODUCER_EVENTS.contains(producer.event)
+    || producer.id == current.runId
+    || producer.repository.full_name != current.repository
+    || producer.head_repository.full_name != current.repository
+    || producer.path != ".github/workflows/" + current.workflow
+    || producer.status != "completed"
+    || recorded.registrarJob != current.registrarJob
+    || recorded.registrarStep != current.registrarStep {
+    throw "producer source, workflow, repository or attempt mismatch"
+  }
+  sha(recorded.commit)
+}
+
+fn coherent_jobs(jobs: list<Job>, declared: int, producer: Run) {
+  if declared <= 0 || len(jobs) != declared
+    || len(jobs.map({ job -> job.id }).unique()) != declared {
+    throw "incomplete or duplicate attempt job census"
+  }
+  for job in jobs {
+    if job.id <= 0 || job.run_id != producer.id || job.run_attempt != producer.run_attempt
+      || job.head_sha != producer.head_sha {
+      throw "mixed attempt or source job census"
+    }
+    if job.status != "completed" {
+      throw "completed producer contains active jobs"
+    }
+  }
+}
+
+fn successful_registrar(recorded: Registration, jobs: list<Job>) -> Job {
+  const registrars = jobs.filter({ job -> job.name == recorded.registrarJob }).to_list()
+  if len(registrars) != 1 || registrars[0].conclusion != "success"
+    || registrars[0].completed_at == nil {
+    throw "registration job did not complete successfully"
+  }
+  const steps =
+    registrars[0].steps.filter({ step -> step.name == recorded.registrarStep }).to_list()
+  if len(steps) != 1 || steps[0].status != "completed" || steps[0].conclusion != "success" {
+    throw "registration step did not fire successfully"
+  }
+  return registrars[0]
+}
+
+/** Every leg of the job passed, after its contract was registered; nil when it did not. */
+fn executed(
+  wanted: JobIdentity,
+  others: list<JobIdentity>,
+  jobs: list<Job>,
+  registered_at: int | float,
+  registrar_completed: int | float,
+) -> list<int>? {
+  const legs = jobs.filter({ job -> leg_of(wanted.names, job.name) }).to_list()
+  if len(legs) == 0 {
+    return nil
+  }
+  for name in wanted.names.filter({ name -> !name.starts_with("^") }) {
+    if legs.filter({ job -> job.name == name }).count() != 1 {
+      return nil
+    }
+  }
+  for job in legs {
+    if job.conclusion != "success" || job.started_at == nil || job.completed_at == nil
+      || others.any({ other -> leg_of(other.names, job.name) }) {
+      return nil
+    }
+    const started = date_parse(job.started_at)
+    if started < registered_at || started < registrar_completed
+      || date_parse(job.completed_at) < started {
+      return nil
+    }
+  }
+  return legs.map({ job -> job.id }).sorted()
+}
+
+/**
+ * Admit each wanted job whose digest this producer recorded and whose legs all
+ * passed here. A job the producer itself reused is deferred to the run it
+ * names; nothing is admitted on a pointer alone.
+ */
+pub fn admit_jobs(
+  current: Registration,
+  producer: Run,
+  registered: RegisteredArtifact,
+  jobs: list<Job>,
+  declared: int,
+  wanted: list<JobIdentity>,
+) -> RunAdmission {
+  const recorded = registered.registration
+  trusted_producer(current, producer, recorded)
+  qualified_artifact(registered.artifact, producer)
+  coherent_jobs(jobs, declared, producer)
+  const registrar = successful_registrar(recorded, jobs)
+  const registered_at = date_parse(registered.artifact.created_at)
+  const registrar_completed = date_parse(registrar.completed_at)
+  let admitted: list<Admission> = []
+  let deferred: list<Deferral> = []
+  for identity in wanted {
+    const claims = recorded.jobs.filter({ job -> job.id == identity.id }).to_list()
+    if len(claims) != 1 || claims[0].digest != identity.digest
+      || claims[0].names != identity.names {
+      continue
+    }
+    const provenance = claims[0].provenance
+    if provenance != nil {
+      if provenance.runId != producer.id {
+        deferred = deferred + [{id: identity.id, provenance: provenance}]
+      }
+      continue
+    }
+    const others = wanted.filter({ other -> other.id != identity.id }).to_list()
+    const legs = executed(identity, others, jobs, registered_at, registrar_completed)
+    if legs != nil {
+      admitted = admitted
+        + [
+          {
+            id: identity.id,
+            digest: identity.digest,
+            provenance: {runId: producer.id, attempt: producer.run_attempt},
+            jobIds: legs,
+          },
+        ]
+    }
+  }
+  return {admitted: admitted, deferred: deferred}
+}
+
+/** The registration a run publishes: its identities, and where each reused job ran. */
+pub fn registration(
+  current: Registration,
+  wanted: list<JobIdentity>,
+  admitted: list<Admission>,
+) -> Registration {
+  let jobs: list<RegisteredJob> = []
+  for identity in wanted {
+    const proof = admitted.filter({ admission -> admission.id == identity.id }).to_list()
+    const provenance: Provenance? = len(proof) == 1 ? proof[0].provenance : nil
+    jobs = jobs
+      + [{id: identity.id, names: identity.names, digest: identity.digest, provenance: provenance}]
+  }
+  return {
+    schema: current.schema,
+    repository: current.repository,
+    workflow: current.workflow,
+    event: current.event,
+    commit: current.commit,
+    runId: current.runId,
+    attempt: current.attempt,
+    registrarJob: current.registrarJob,
+    registrarStep: current.registrarStep,
+    jobs: jobs,
+  }
+}

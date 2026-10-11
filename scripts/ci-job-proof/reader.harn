@@ -1,8 +1,9 @@
 import {
+  Admission,
   Artifact,
-  Identity,
   Job,
-  ProofReceipt,
+  JobIdentity,
+  Provenance,
   Registration,
   Run,
   admit_jobs,
@@ -17,15 +18,17 @@ pub type ProofSource = {json: fn(string) -> unknown, registration: fn(string, Ar
 
 pub type JobCensus = {declared: int, jobs: list<Job>}
 
-type CommitObject = {sha: string, tree: {sha: string}}
-
-type FileObject = {type: string, sha: string}
-
 type JobsPage = {total_count: int, jobs: list<Job>}
 
 type ArtifactsPage = {total_count: int, artifacts: list<Artifact>}
 
 type RunsPage = {total_count: int, workflow_runs: list<Run>}
+
+type Pull = {number: int, head: {sha: string, repo: {full_name: string}?}}
+
+pub const READ_BUDGET = 40
+
+pub const RUN_BUDGET = 8
 
 pub fn repository(value: string) -> string {
   if !regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", value) {
@@ -41,25 +44,14 @@ pub fn workflow(value: string) -> string {
   return value
 }
 
-/** Read identities from GitHub's commit and file objects, never from the receipt's claim alone. */
-pub fn identity(source: ProofSource, repo: string, file: string, commit: string) -> Identity {
-  const prefix = "/repos/" + repository(repo)
-  const target = sha(commit)
-  const object = schema_expect(
-    source.json(prefix + "/git/commits/" + target),
-    schema_of(CommitObject),
-  )
-  if object.sha != target {
-    throw "Git commit lookup returned a different source"
+/** The pull request a merge group was built for, from its readonly queue ref. */
+pub fn merge_group_pull(head_ref: string) -> int? {
+  const found = regex_captures("/pr-([0-9]+)-[0-9a-f]{40}$", head_ref)
+  if len(found) != 1 {
+    return nil
   }
-  const contents = schema_expect(
-    source.json(prefix + "/contents/.github/workflows/" + workflow(file) + "?ref=" + target),
-    schema_of(FileObject),
-  )
-  if contents.type != "file" {
-    throw "workflow lookup did not return a file"
-  }
-  return {commit: target, tree: sha(object.tree.sha), workflowBlob: sha(contents.sha)}
+  const number = to_int(found[0].groups[0])
+  return number > 0 ? number : nil
 }
 
 /** Every job comes from one explicit attempt; partial pages and repeated identities refuse. */
@@ -127,20 +119,18 @@ fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifac
   throw "artifact census exceeded its bound"
 }
 
-/** Qualify an explicit producer before admitting its selected proof obligations. */
-pub fn read_proof(source: ProofSource, current: Registration, producer: Run) -> ProofReceipt {
+/** Qualify one producer run, then admit the wanted jobs it proves or points at. */
+pub fn read_run(
+  source: ProofSource,
+  current: Registration,
+  producer: Run,
+  wanted: list<JobIdentity>,
+) {
   const artifact = registration_artifact(source, current.repository, producer)
   qualified_artifact(artifact, producer)
-  const actual = identity(source, current.repository, current.workflow, producer.head_sha)
-  if actual.tree != current.identity.tree || actual.workflowBlob != current.identity.workflowBlob {
-    throw "producer Git tree or workflow differs"
-  }
   const raw = source.registration(current.repository, artifact)
   schema_expect(raw, closed(schema_of(Registration)))
   const recorded = schema_expect(raw, schema_of(Registration))
-  if recorded.identity != actual {
-    throw "registration does not match the producer's actual Git objects"
-  }
   const census = job_census(source, current.repository, producer)
   return admit_jobs(
     current,
@@ -148,20 +138,27 @@ pub fn read_proof(source: ProofSource, current: Registration, producer: Run) -> 
     {artifact: artifact, registration: recorded},
     census.jobs,
     census.declared,
+    wanted,
   )
 }
 
-/** Search a bounded completed queue history; unknown receipts are ineligible, never green. */
-pub type Discovery = {proof: ProofReceipt?, probed: int, reads: int, budget: int, reason: string}
+/** Bounded discovery. Unknown, unreadable or unqualified producers prove nothing. */
+pub type Discovery = {
+  admitted: list<Admission>,
+  probed: int,
+  reads: int,
+  budget: int,
+  reason: string,
+}
 
 type BudgetSource = {source: ProofSource, reads: fn() -> int, exhausted: fn() -> bool}
 
 fn bounded_source(source: ProofSource, now: fn() -> int) -> BudgetSource {
   let reads = 0
   let memo = {}
-  const expires_at = now() + 30000
+  const expires_at = now() + 45000
   const take = fn() {
-    if reads >= 24 || now() >= expires_at {
+    if reads >= READ_BUDGET || now() >= expires_at {
       throw "proof discovery budget exhausted"
     }
     reads = reads + 1
@@ -183,60 +180,119 @@ fn bounded_source(source: ProofSource, now: fn() -> int) -> BudgetSource {
       },
     },
     reads: fn() { return reads },
-    exhausted: fn() { return reads >= 24 || now() >= expires_at },
+    exhausted: fn() { return reads >= READ_BUDGET || now() >= expires_at },
   }
 }
 
-pub fn discover(source: ProofSource, current: Registration, now: fn() -> int) -> Discovery {
-  const bounded = bounded_source(source, now)
-  let probed = 0
-  if !["push", "merge_group"].contains(current.event) {
-    return {proof: nil, probed: 0, reads: 0, budget: 24, reason: "unsupported_event"}
-  }
+fn runs(source: ProofSource, current: Registration, query: string) -> list<Run> {
   const endpoint = "/repos/" + repository(current.repository) + "/actions/workflows/"
     + workflow(current.workflow)
-    + "/runs?event=merge_group&status=completed&per_page=100&page=1"
-  const history = try {
-    schema_expect(bounded.source.json(endpoint), schema_of(RunsPage))
+    + "/runs?status=completed&per_page=5&"
+    + query
+  const page = schema_expect(source.json(endpoint), schema_of(RunsPage))
+  if page.total_count < 0 || len(page.workflow_runs) > 5
+    || len(page.workflow_runs) > page.total_count {
+    throw "incomplete run history"
   }
-  if is_err(history) {
-    return {proof: nil, probed: 0, reads: bounded.reads(), budget: 24, reason: "history_unmeasured"}
+  return page.workflow_runs
+}
+
+/**
+ * Producers worth reading, nearest first: for a main push, the merge group
+ * that tested this exact commit, then earlier main pushes; for a merge group,
+ * the pull request it merges, then the latest main push.
+ */
+fn candidates(source: ProofSource, current: Registration, pull: int?) -> list<Run> {
+  const pushes = runs(source, current, "event=push&branch=main").filter(
+    { run -> run.id < current.runId },
+  )
+    .to_list()
+  if current.event == "push" {
+    return runs(source, current, "event=merge_group&head_sha=" + sha(current.commit)) + pushes
   }
-  const result = unwrap(history)
-  if result.total_count < 0 || len(result.workflow_runs) > 100
-    || len(result.workflow_runs) > result.total_count
-    || len(result.workflow_runs.map({ run -> run.id }).unique()) != len(result.workflow_runs)
-    || (result.total_count > 0 && len(result.workflow_runs) == 0) {
-    return {proof: nil, probed: 0, reads: bounded.reads(), budget: 24, reason: "history_incomplete"}
+  if pull == nil {
+    return pushes.slice(0, 1)
   }
-  for producer in result.workflow_runs {
-    if producer.id == current.runId || producer.event != "merge_group"
-      || producer.status != "completed" {
-      continue
-    }
-    if probed >= 8 || bounded.exhausted() {
-      break
-    }
-    probed = probed + 1
-    const proof = try {
-      read_proof(bounded.source, current, producer)
-    }
-    if is_ok(proof) {
-      return {
-        proof: unwrap(proof),
-        probed: probed,
-        reads: bounded.reads(),
-        budget: 24,
-        reason: "qualified",
-      }
-    }
+  const prefix = "/repos/" + repository(current.repository)
+  const pr = schema_expect(source.json(prefix + "/pulls/" + to_string(pull)), schema_of(Pull))
+  if pr.number != pull || pr.head.repo?.full_name != current.repository {
+    return pushes.slice(0, 1)
   }
-  const exhausted = probed >= 8 || bounded.exhausted()
-  return {
-    proof: nil,
+  return runs(source, current, "event=pull_request&head_sha=" + sha(pr.head.sha)).slice(0, 2)
+    + pushes.slice(0, 1)
+}
+
+pub fn discover(
+  source: ProofSource,
+  current: Registration,
+  wanted: list<JobIdentity>,
+  pull: int?,
+  now: fn() -> int,
+) -> Discovery {
+  const bounded = bounded_source(source, now)
+  const result = fn(admitted, probed, reason) { return {
+    admitted: admitted.sorted_by({ admission -> admission.id }),
     probed: probed,
     reads: bounded.reads(),
-    budget: 24,
-    reason: exhausted ? "discovery_budget_exhausted" : "no_qualified_registration",
+    budget: READ_BUDGET,
+    reason: reason,
+  } }
+  if !["push", "merge_group"].contains(current.event) {
+    return result([], 0, "unsupported_event")
   }
+  const listed = try {
+    candidates(bounded.source, current, pull)
+  }
+  if is_err(listed) {
+    return result([], 0, "history_unmeasured")
+  }
+  let queue: list<Provenance> = unwrap(listed).map(
+    { run -> {runId: run.id, attempt: run.run_attempt} },
+  )
+    .to_list()
+  let known = {}
+  for run in unwrap(listed) {
+    known = known + {[to_string(run.id)]: run}
+  }
+  let admitted: list<Admission> = []
+  let seen: list<int> = []
+  let probed = 0
+  while len(queue) > 0 && len(admitted) < len(wanted) {
+    const next = queue[0]
+    queue = queue.slice(1)
+    if seen.contains(next.runId) || next.runId == current.runId {
+      continue
+    }
+    seen = seen + [next.runId]
+    if probed >= RUN_BUDGET || bounded.exhausted() {
+      return result(admitted, probed, "discovery_budget_exhausted")
+    }
+    probed = probed + 1
+    const run = try {
+      known[to_string(next.runId)]
+        ?? schema_expect(
+          bounded.source.json(
+            "/repos/" + repository(current.repository) + "/actions/runs/" + to_string(next.runId)
+              + "/attempts/"
+              + to_string(next.attempt),
+          ),
+          schema_of(Run),
+        )
+    }
+    if is_err(run) {
+      continue
+    }
+    const open = wanted.filter(
+      { identity -> !admitted.any({ admission -> admission.id == identity.id }) },
+    )
+      .to_list()
+    const outcome = try {
+      read_run(bounded.source, current, unwrap(run), open)
+    }
+    if is_ok(outcome) {
+      admitted = admitted + unwrap(outcome).admitted
+      queue = queue + unwrap(outcome).deferred.map({ deferral -> deferral.provenance }).to_list()
+    }
+  }
+  return result(admitted, probed, len(admitted) > 0 ? "qualified" : "no_qualified_registration")
 }
