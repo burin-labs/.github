@@ -202,6 +202,46 @@ pipeline test_a_run_repeated_by_page_drift_is_counted_once() {
   assert_eq(report.measuredRuns, 2)
 }
 
+pipeline test_jobless_run_backfills_from_the_remaining_first_page_before_older_pages() {
+  const first_page =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=1"
+  const second_page =
+    "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=2"
+  const source = fixture_source(
+    {
+      responses: {
+        [first_page]: {
+          workflow_runs: [
+            workflow_run(10, "cancelled"),
+            workflow_run(11, "feature"),
+            workflow_run(12, "recent"),
+          ],
+        },
+        [second_page]: {workflow_runs: [workflow_run(13, "older")]},
+        "/repos/acme/widgets/actions/runs/10/attempts/1/jobs?per_page=100&page=1": {
+          total_count: 0,
+          jobs: [],
+        },
+        "/repos/acme/widgets/actions/runs/11/attempts/1/jobs?per_page=100&page=1": {
+          total_count: 1,
+          jobs: [job(111, "test", ["ubuntu-latest"], "GitHub Actions 1")],
+        },
+        "/repos/acme/widgets/actions/runs/12/attempts/1/jobs?per_page=100&page=1": {
+          total_count: 1,
+          jobs: [job(121, "test", ["ubuntu-latest"], "GitHub Actions 2")],
+        },
+        "/repos/acme/widgets/actions/runs/13/attempts/1/jobs?per_page=100&page=1": {
+          total_count: 1,
+          jobs: [job(131, "test", ["ubuntu-latest"], "GitHub Actions 3")],
+        },
+      },
+    },
+  )
+  const report = collect(source, "acme/widgets", "ci.yml", [query("pull_request", 2)], "now")
+  assert_eq(report.runs.map(fn(run) { run.id }).sorted(), [11, 12])
+  assert_eq(report.measuredRuns, 2)
+}
+
 pipeline test_jobless_cancelled_run_is_replaced_by_the_next_completed_run() {
   const first_page =
     "/repos/acme/widgets/actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100&page=1"

@@ -206,9 +206,13 @@ fn measured_runs_for_query(
   // instead of double-counting them; the count check still demands enough
   // distinct runs.
   let seen = initial.map(fn(entry) { entry.run?.id })
+  let candidates = first_page[query.count:]
   let page = 2
   while len(measured) < query.count {
-    const candidates = runs_for_query(source, repository, workflow, query, page)
+    if len(candidates) == 0 {
+      candidates = runs_for_query(source, repository, workflow, query, page)
+      page = page + 1
+    }
     if len(candidates) == 0 {
       throw query_label(query) + " measured " + to_string(len(measured)) + " of "
         + to_string(query.count)
@@ -227,7 +231,7 @@ fn measured_runs_for_query(
         break
       }
     }
-    page = page + 1
+    candidates = []
   }
   return measured
 }
