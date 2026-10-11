@@ -91,3 +91,89 @@ pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness)
   assert_eq(json_parse(listed[0].groups[0]), ["burin-labs/burin-code", "burin-labs/harn-cloud"])
   assert(runs_on.contains("inputs.owned-runner != '' && contains("), runs_on)
 }
+
+/** Runs the Shepherd step against a fake shepherd; returns its calls in order. */
+fn run_shepherd_step(harness: Harness, defer_supported: bool, defer_pr: string) -> list<string> {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const shepherd = named(workflow.jobs.ship.steps, "Shepherd").run
+  const workspace = harness.fs.mkdtemp_in_workspace("smart-ship-sweep")
+  const calls = path_join(workspace, "calls")
+  const bin = path_join(workspace, "bin")
+  harness.fs.mkdir(path_join(workspace, "scripts"), true)
+  harness.fs.mkdir(bin, true)
+  harness.fs.mkdir(path_join(workspace, "home"), true)
+  harness.fs.write_text(calls, "")
+  harness.fs.write_text(
+    path_join(workspace, "scripts/smart-ship.harn"),
+    if defer_supported {
+      "// --defer-repair\n"
+    } else {
+      "// an older shepherd\n"
+    },
+  )
+  // The fake shepherd defers the one PR whose next action is a repair.
+  const harnw = path_join(workspace, "scripts/harnw")
+  harness.fs.write_text(
+    harnw,
+    "#!/usr/bin/env bash\necho \"$*\" >> \"$CALLS\"\npr=\"\"; defer=0\n"
+      + "while [ $# -gt 0 ]; do case \"$1\" in --pr) pr=\"$2\"; shift ;; --defer-repair) defer=1 ;; esac; shift; done\n"
+      + "if [ \"$defer\" = 1 ] && [ \"$pr\" = \"$DEFER_PR\" ]; then exit 3; fi\nexit 0\n",
+  )
+  // No policy is published: the step falls back to an empty one.
+  harness.fs.write_text(path_join(bin, "gh"), "#!/usr/bin/env bash\nexit 1\n")
+  for file in [harnw, path_join(bin, "gh")] {
+    assert(harness.process.run({program: "/bin/chmod", args: ["755", file]}).success)
+  }
+  const result = harness.process.run(
+    {
+      // The runner's bash, not macOS's 3.2, which rejects an empty array under `set -u`.
+      program: "/usr/bin/env",
+      args: ["bash", "-e", "-o", "pipefail", "-c", shepherd],
+      cwd: workspace,
+      env: {
+        PATH: bin + ":" + to_string(harness.env.get("PATH") ?? ""),
+        HOME: path_join(workspace, "home"),
+        CALLS: calls,
+        DEFER_PR: defer_pr,
+        REPO: "o/r",
+        LABEL: "ship",
+        NUMBERS: "1 2 3",
+        REPAIR: "true",
+        BURIN_REF: "main",
+        RUNNER_TEMP: workspace,
+      },
+      timeout_ms: 30000,
+    },
+  )
+  assert(result.success, "Shepherd step failed: " + result.stdout + result.stderr)
+  return harness.fs.read_text(calls).split("\n").filter({ line -> line != "" }).map(
+    { line -> regex_captures("--pr o/r#([0-9]+)", line)[0].groups[0]
+      + if line.contains("--defer-repair") {
+        " look"
+      } else {
+        " run"
+      } },
+  )
+    .to_list()
+}
+
+/**
+ * Sweep run burin-code 38100680022 repaired #10719 for 38 minutes, hit the
+ * job timeout, and never looked at the PRs after it. Every PR gets its look
+ * before any repair runs.
+ */
+pipeline test_a_sweep_looks_at_every_pr_before_it_repairs_any(harness: Harness) {
+  assert_eq(run_shepherd_step(harness, true, "o/r#2"), ["1 look", "2 look", "3 look", "2 run"])
+  assert_eq(run_shepherd_step(harness, true, ""), ["1 look", "2 look", "3 look"])
+  // A shepherd without the flag is run once per PR, as before.
+  assert_eq(run_shepherd_step(harness, false, "o/r#2"), ["1 run", "2 run", "3 run"])
+}
+
+/** A CI-completion wake must not share the sweep's group: it would replace a pending sweep. */
+pipeline test_a_ci_completion_wake_never_replaces_a_pending_sweep(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const group = workflow.jobs.ship.concurrency.group
+  assert(group.contains("github.event.workflow_run.pull_requests[0].number"), group)
+  assert(group.contains("format('run-{0}', github.event.workflow_run.head_branch)"), group)
+  assert(group.ends_with("|| 'sweep' }}"), group)
+}
