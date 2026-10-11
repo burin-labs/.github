@@ -728,6 +728,23 @@ jobs:
             echo "::notice::runner-availability linux_probe=$([ "$probe_count" -gt 0 ] && echo true || echo false) (${probe_count} idle of ${probe_online} online Linux ${LINUX_PROBE_TAG} runner(s))"
           fi
 
+          # In-flight Ubicloud work, from the same listing: Ubicloud registers
+          # one ephemeral runner per job in the Default group, labelled
+          # `ubicloud-standard-<vCPU>`. Busy ones are jobs running now. A caller
+          # that spills pull-request work onto Ubicloud caps it with this, so
+          # pull requests cannot fill the shared vCPU limit the merge queue
+          # also needs (burin-code#10746). Only the measured path records it;
+          # an unmeasured capacity has no `ubicloud` lane, so a caller that
+          # requires `measured` refuses the spill instead of reading zero.
+          ubicloud="$(echo "$runner_list" | jq -c '
+            [ .runners[]
+              | select(.status == "online" and .busy == true)
+              | [.labels[].name | capture("^ubicloud-standard-(?<n>[0-9]+)$")? | .n | tonumber]
+              | select(length > 0) | max ]
+            | {measured: true, busy_runners: length, busy_vcpu: (add // 0)}')"
+          capacity="$(jq -c -n --argjson acc "$capacity" --argjson ubicloud "$ubicloud" '$acc + {ubicloud: $ubicloud}')"
+          echo "::notice::runner-availability ubicloud=$(echo "$ubicloud" | jq -r '"\(.busy_vcpu) vCPU in flight on \(.busy_runners) busy runner(s)"')"
+
           # The measured path is the only one that reaches here, so it is the
           # only one that may claim `measured`. Written beside `capacity` so a
           # future lane added above cannot return without a probe state.
