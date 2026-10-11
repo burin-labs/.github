@@ -181,7 +181,7 @@ function main() {
   const workspaceRoot = normalize(relative(repoRoot, metadata.workspace_root));
   const workspacePrefix = workspaceRoot ? `${workspaceRoot}/` : "";
   const globalPaths = [
-    ".github/workflows",
+    ...(process.env.RUST_IMPACT_WORKFLOW_PATHS ?? ".github/workflows").split("\n").map((path) => path.trim()).filter(Boolean),
     `${workspacePrefix}Cargo.toml`,
     `${workspacePrefix}Cargo.lock`,
     `${workspacePrefix}.cargo`,

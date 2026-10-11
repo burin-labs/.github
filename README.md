@@ -27,13 +27,20 @@ contract, local command, and pinned action syntax.
 adapter for branch-only Rust test impact analysis. It reads Cargo's real
 workspace graph, expands directly changed packages through the transitive
 reverse-dependency closure, and emits `full`, `partial`, or `empty` plus Cargo
-package arguments. Merge queues, main pushes, schedules, workflow changes,
+package arguments. Merge queues, main pushes, schedules, declared workflow changes,
 workspace manifests, lockfiles, and unresolved diffs retain the complete
 workspace.
 
 Repositories provide only the Cargo workspace path and genuinely global inputs;
 they do not maintain crate dependency tables. Keep the action pinned to an exact
 commit and pass exact pull-request base/head SHAs.
+
+`workflow-paths` defaults to `.github/workflows` for conservative coverage.
+Replace it with the newline-separated prefixes of workflows that affect Rust
+tests, or pass an explicit empty string when no workflows affect them. Unrelated
+workflow edits can then produce an empty plan. `global-paths` adds other global
+inputs; workspace manifests, lockfiles, `.cargo`, and nextest configuration
+always retain complete coverage.
 
 The planner compares those two exact trees directly. A branch behind its base
 may over-select packages changed on main, but cannot omit a package changed by
@@ -47,6 +54,8 @@ the pull request; this keeps shallow checkouts fast without weakening coverage.
     base: ${{ github.event.pull_request.base.sha || github.sha }}
     head: ${{ github.event.pull_request.head.sha || github.sha }}
     workspace: crates/my-workspace
+    workflow-paths: |
+      .github/workflows/rust.yml
     extra-package-paths: |
       my-api=docs/openapi
 - run: cargo nextest run ${{ steps.rust-impact.outputs.package-args }}
