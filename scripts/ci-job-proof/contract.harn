@@ -279,7 +279,7 @@ pub fn admit_jobs(
     }
     const provenance = claims[0].provenance
     if provenance != nil {
-      if provenance.runId != producer.id {
+      if provenance.runId != producer.id || provenance.attempt != producer.run_attempt {
         deferred = deferred + [{id: identity.id, provenance: provenance}]
       }
       continue

@@ -252,24 +252,26 @@ pub fn discover(
     .to_list()
   let known = {}
   for run in unwrap(listed) {
-    known = known + {[to_string(run.id)]: run}
+    known = known + {[to_string(run.id) + ":" + to_string(run.run_attempt)]: run}
   }
   let admitted: list<Admission> = []
-  let seen: list<int> = []
+  // A run and its rerun attempt are different producers; key both by the pair.
+  let seen: list<string> = []
   let probed = 0
   while len(queue) > 0 && len(admitted) < len(wanted) {
     const next = queue[0]
     queue = queue.slice(1)
-    if seen.contains(next.runId) || next.runId == current.runId {
+    const key = to_string(next.runId) + ":" + to_string(next.attempt)
+    if seen.contains(key) || next.runId == current.runId {
       continue
     }
-    seen = seen + [next.runId]
+    seen = seen + [key]
     if probed >= RUN_BUDGET || bounded.exhausted() {
       return result(admitted, probed, "discovery_budget_exhausted")
     }
     probed = probed + 1
     const run = try {
-      known[to_string(next.runId)]
+      known[key]
         ?? schema_expect(
           bounded.source.json(
             "/repos/" + repository(current.repository) + "/actions/runs/" + to_string(next.runId)

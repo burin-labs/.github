@@ -46,7 +46,7 @@ fn producer(run: Run, claims: dict, ran: list<string>) -> dict {
   const job = fn(id: int, name: string, started: string, completed: string) { return {
     id: id,
     run_id: run.id,
-    run_attempt: 1,
+    run_attempt: run.run_attempt,
     head_sha: run.head_sha,
     name: name,
     status: "completed",
@@ -55,9 +55,10 @@ fn producer(run: Run, claims: dict, ran: list<string>) -> dict {
     completed_at: completed,
     steps: [{name: "Register", status: "completed", conclusion: "success"}],
   } }
-  const registrar = job(run.id * 100, "Changes", "2026-10-09T10:00:00Z", "2026-10-09T10:01:00Z")
+  const base = run.id * 1000 + run.run_attempt * 100
+  const registrar = job(base, "Changes", "2026-10-09T10:00:00Z", "2026-10-09T10:01:00Z")
   const legs = ran.map(
-    { name -> job(run.id * 100 + len(name), name, "2026-10-09T10:05:00Z", "2026-10-09T10:09:00Z") },
+    { name -> job(base + len(name), name, "2026-10-09T10:05:00Z", "2026-10-09T10:09:00Z") },
   )
     .to_list()
   return {
@@ -67,6 +68,7 @@ fn producer(run: Run, claims: dict, ran: list<string>) -> dict {
       event: run.event,
       commit: run.head_sha,
       runId: run.id,
+      attempt: run.run_attempt,
       jobs: wanted().map(
         { identity ->
           {
@@ -84,7 +86,10 @@ fn producer(run: Run, claims: dict, ran: list<string>) -> dict {
 }
 
 fn source(producers: list, calls: fn(string) -> nil) -> ProofSource {
-  const by_id = fn(id: int) { return producers.filter({ item -> item.run.id == id }).to_list()[0] }
+  const at = fn(id: int, attempt: int) { return producers.filter(
+    { item -> item.run.id == id && item.run.run_attempt == attempt },
+  )
+    .to_list()[0] }
   return {
     json: fn(endpoint) {
       calls(endpoint)
@@ -96,28 +101,36 @@ fn source(producers: list, calls: fn(string) -> nil) -> ProofSource {
       }
       const found = regex_captures("/actions/runs/([0-9]+)/", endpoint)
       const id = to_int(found[0].groups[0])
+      const attempt_found = regex_captures("/attempts/([0-9]+)", endpoint)
+      const attempt = len(attempt_found) == 1 ? to_int(attempt_found[0].groups[0]) : 1
       if endpoint.contains("/artifacts?") {
+        // Every attempt of a run uploads its own registration.
+        const attempts = producers.filter({ item -> item.run.id == id }).to_list()
         return {
-          total_count: 1,
-          artifacts: [
-            {
-              id: id,
-              name: "ci-job-inputs-" + to_string(id) + "-1",
-              size_in_bytes: 100,
-              expired: false,
-              digest: "sha256:" + "e".repeat(64),
-              created_at: "2026-10-09T10:02:00Z",
-              workflow_run: {id: id, head_sha: by_id(id).run.head_sha},
+          total_count: len(attempts),
+          artifacts: attempts.map(
+            { item ->
+              {
+                id: id * 10 + item.run.run_attempt,
+                name: "ci-job-inputs-" + to_string(id) + "-" + to_string(item.run.run_attempt),
+                size_in_bytes: 100,
+                expired: false,
+                digest: "sha256:" + "e".repeat(64),
+                created_at: "2026-10-09T10:02:00Z",
+                workflow_run: {id: id, head_sha: item.run.head_sha},
+              }
             },
-          ],
+          )
+            .to_list(),
         }
       }
       if endpoint.contains("/jobs?") {
-        return {total_count: len(by_id(id).jobs), jobs: by_id(id).jobs}
+        return {total_count: len(at(id, attempt).jobs), jobs: at(id, attempt).jobs}
       }
-      return by_id(id).run
+      return at(id, attempt).run
     },
-    registration: fn(_repo, artifact) { return by_id(artifact.id).registration },
+    registration:
+      fn(_repo, artifact) { return at(artifact.id / 10, artifact.id % 10).registration },
   }
 }
 
@@ -201,4 +214,33 @@ pipeline test_discovery_stops_at_its_deadline() {
   )
   assert_eq(result.reason, "discovery_budget_exhausted")
   assert_eq(result.admitted, [])
+}
+
+pipeline test_two_attempts_of_one_run_are_two_producers() {
+  const rerun = {...run(7, "push"), run_attempt: 2}
+  const producers = [
+    // The merge group reused lint from run 7's first attempt and suite from its rerun.
+    producer(
+      run(20, "merge_group"),
+      {
+        lint: {digest: DIGEST, provenance: {runId: 7, attempt: 1}},
+        suite: {digest: DIGEST, provenance: {runId: 7, attempt: 2}},
+      },
+      [],
+    ),
+    producer(run(25, "push"), {}, []),
+    producer(run(7, "push"), {lint: {digest: DIGEST}}, ["Lint"]),
+    producer(rerun, {suite: {digest: DIGEST}}, ["Suite"]),
+  ]
+  const result = discover(
+    source(producers, fn(_endpoint) { return nil }),
+    current(),
+    wanted(),
+    nil,
+    fn() { return 0 },
+  )
+  assert_eq(
+    result.admitted.map({ admission -> [admission.id, admission.provenance] }),
+    [["lint", {runId: 7, attempt: 1}], ["suite", {runId: 7, attempt: 2}]],
+  )
 }
