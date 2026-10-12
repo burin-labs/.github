@@ -1,0 +1,88 @@
+import { command_run } from "std/command"
+import { read_yaml } from "std/fs"
+import { with_temp_dir } from "std/testing"
+
+/** Run the actual bootstrap collector; never let a partial sweep look empty. */
+pipeline test_target_collection_requires_every_census_before_publishing(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const collector = workflow.jobs.ship.steps.find({ step -> step?.id == "prs" }).run
+  assert(type_of(collector) == "string" && collector != "")
+  for row in [
+    {mode: "open-failed", calls: 1, success: false, output: ""},
+    {mode: "merged-failed", calls: 2, success: false, output: ""},
+    {mode: "success", calls: 2, success: true, output: "numbers=7 9"},
+    {mode: "empty", calls: 2, success: true, output: "numbers="},
+    {mode: "direct", calls: 0, success: true, output: "numbers=11"},
+  ] {
+    with_temp_dir(
+      harness.fs,
+      { temp ->
+        const root = temp.starts_with("/") ? temp : path_join(harness.fs.cwd(), temp)
+        const calls = root + "/calls"
+        const output = root + "/output"
+        const event = root + "/event.json"
+        const source = root + "/collector.sh"
+        harness.fs.write_text(calls, "")
+        harness.fs.write_text(output, "")
+        harness.fs.write_text(
+          event,
+          json_stringify(row.mode == "direct" ? {pull_request: {number: 11}} : {}),
+        )
+        harness.fs.write_text(source, collector)
+        harness.fs.write_text(root + "/date", "#!/bin/sh\nprintf '%s\\n' '2026-10-10'\n")
+        harness.fs.write_text(
+          root + "/gh",
+          """
+#!/bin/sh
+printf '%s\n' "$*" >> "$FIXTURE_CALLS"
+case "$*" in
+  *"--state open"*)
+    if [ "$FIXTURE_MODE" = open-failed ]; then exit 22; fi
+    if [ "$FIXTURE_MODE" != empty ]; then printf '%s\n' 7; fi
+    ;;
+  *"--state merged"*)
+    if [ "$FIXTURE_MODE" = merged-failed ]; then exit 23; fi
+    if [ "$FIXTURE_MODE" != empty ]; then printf '%s\n' 9; fi
+    ;;
+  *) exit 93 ;;
+esac
+""",
+        )
+        assert(
+          command_run(harness.tools, {argv: ["/bin/chmod", "+x", root + "/gh", root + "/date"]})
+            .success,
+        )
+        const result = command_run(
+          harness.tools,
+          {
+            argv: [
+              "/usr/bin/env",
+              "-i",
+              "PATH=" + root + ":/opt/homebrew/bin:/usr/bin:/bin",
+              "GITHUB_EVENT_PATH=" + event,
+              "GITHUB_OUTPUT=" + output,
+              "REPO=example/repo",
+              "LABEL=ship",
+              "FIXTURE_MODE=" + row.mode,
+              "FIXTURE_CALLS=" + calls,
+              "/bin/bash",
+              source,
+            ],
+          },
+        )
+        assert_eq(result.success, row.success, row.mode + ": " + to_string(result))
+        const emitted = trim(harness.fs.read_text(output))
+        assert_eq(emitted, row.output, row.mode)
+        const observed = trim(harness.fs.read_text(calls))
+        const count = observed == "" ? 0 : len(split(observed, "\n"))
+        assert_eq(count, row.calls, row.mode)
+        if row.calls > 0 {
+          assert(observed.contains("--state open"), "known census path must be reached")
+        }
+        if row.calls == 2 {
+          assert(observed.contains("--state merged"), "both censuses must be reached")
+        }
+      },
+    )
+  }
+}
