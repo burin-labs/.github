@@ -161,11 +161,12 @@ jobs:
           # a merged change until its deploy is confirmed healthy.
           if [ -z "$numbers" ]; then
             since="$(date -u -d '2 days ago' +%Y-%m-%d)"
-            numbers="$( {
-              gh pr list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number'
-              gh pr list -R "$REPO" --label "$LABEL" --state merged --search "merged:>=$since" \
-                --json number --jq '.[].number'
-            } | sort -u)"
+            # Each assignment must succeed in this shell. Combining requests
+            # inside one substitution can hide a failed first census.
+            open_numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number')"
+            merged_numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state merged --search "merged:>=$since" \
+              --json number --jq '.[].number')"
+            numbers="$(printf '%s\n' "$open_numbers" "$merged_numbers" | sort -u)"
           fi
           echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
           echo "Looking at: ${numbers:-none}"
