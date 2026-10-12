@@ -1,5 +1,6 @@
 import { parse, parser } from "std/cli/argparse"
 import { CommandResult, command_run } from "std/command"
+import { complete_command_result } from "../captured-command.harn"
 import {
   OBSERVER_REPOSITORIES,
   observation_succeeded,
@@ -12,13 +13,8 @@ import {
   observe_repository,
 } from "./observer-runner.harn"
 
-type ObserverCapture = {stdout_truncated: bool, timed_out: bool}
-
 pub fn observer_command_result(result: CommandResult) -> ObserverCommand {
-  const capture = schema_expect(result, schema_of(ObserverCapture))
-  require !capture.stdout_truncated, "observer JSON output exceeded the bounded capture"
-  require !capture.timed_out, "observer command timed out before a complete report"
-  return {stdout: result.stdout, stderr: result.stderr, success: result.success}
+  return complete_command_result(result)
 }
 
 pub fn observer_command_options(token: string?, args: list<string>) -> dict {

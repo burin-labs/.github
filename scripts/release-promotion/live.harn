@@ -1,5 +1,50 @@
 import { command_output_tail, command_run } from "std/command"
+import { complete_command_result } from "../captured-command.harn"
+import { ReadRecovery } from "./authorization.harn"
 import { GitHub } from "./promotion.harn"
+
+pub type ConsumerRecoveryConfig = {
+  token: string,
+  repository: string,
+  workflow: string,
+  reader: string,
+}
+
+/**
+ * Invoke the immutable shared reader. Its closed output contains public
+ * context/counts only; arbitrary subprocess diagnostics never reach logs.
+ */
+pub fn live_consumer_recovery(tools: HarnessTools, config: ConsumerRecoveryConfig) -> ReadRecovery {
+  return fn(context: string, source: string) {
+    const result = command_run(
+      tools,
+      ["node", config.reader, "--recover"],
+      {
+        capture: {max_inline_bytes: 16384},
+        timeout_ms: 1200000,
+        env: {
+          GH_TOKEN: config.token,
+          CANARY_REPOSITORY: config.repository,
+          CANARY_WORKFLOW: config.workflow,
+          OBSERVER_CONTEXT: context,
+          SOURCE_REVISION: source,
+          REQUIRE_CURRENT_DEFAULT: "true",
+        },
+      },
+    )
+    const captured = complete_command_result(result)
+    if !captured.success {
+      throw "original consumer recovery is unproven"
+    }
+    const parsed = try {
+      json_parse(captured.stdout)
+    }
+    if !is_ok(parsed) || unwrap(parsed) == nil {
+      throw "original consumer recovery returned no measured decision"
+    }
+    return unwrap(parsed)
+  }
+}
 
 const API_ROOT = "https://api.github.com"
 
