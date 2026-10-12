@@ -55,13 +55,8 @@ on:
         description: Release tag to create at sha, as vX.Y.Z. A vX.Y.Z-suffix tag publishes a prerelease that never becomes latest.
         required: true
         type: string
-      authorization-run-id:
-        description: Optional canonical Harn promotion run that authenticated a late completed consumer.
-        required: false
-        default: ''
-        type: string
-      authorization-attempt:
-        description: Exact attempt of the completion authorization run.
+      original-consumer-context:
+        description: Optional issued context of the original candidate observer that reached its deadline.
         required: false
         default: ''
         type: string
@@ -72,6 +67,9 @@ on:
       RELEASE_APP_PRIVATE_KEY:
         description: GitHub App private key.
         required: true
+      CONSUMER_CANARY_REPOSITORY:
+        description: Registered consumer repository name, required only for original deadline recovery.
+        required: false
     outputs:
       tag:
         description: The tag the release was published under.
@@ -121,6 +119,35 @@ jobs:
         with:
           version: 0.10.133
 
+      - name: Check out the immutable consumer reader
+        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/harn
+          ref: d1b11367b22acd8b9b03ff3db66d43c89a7d0be9
+          path: .harn/promote-release/consumer-reader
+          persist-credentials: false
+
+      - name: Set up the consumer reader runtime
+        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Mint original consumer read authority
+        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        id: consumer-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            harn
+            ${{ secrets.CONSUMER_CANARY_REPOSITORY }}
+          permission-actions: read
+          permission-contents: read
+
       - name: Verify the run and its files
         shell: bash
         env:
@@ -129,8 +156,11 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
-          PROMOTE_AUTHORIZATION_RUN_ID: ${{ inputs.authorization-run-id }}
-          PROMOTE_AUTHORIZATION_ATTEMPT: ${{ inputs.authorization-attempt }}
+          PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
+          PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
+          PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
+          PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}
+          PROMOTE_CONSUMER_READER: ${{ github.workspace }}/.harn/promote-release/consumer-reader/scripts/ci/consumer-observer-read-decision.mjs
           PROMOTE_TAG: ${{ inputs.tag }}
           PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh
@@ -164,8 +194,11 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
-          PROMOTE_AUTHORIZATION_RUN_ID: ${{ inputs.authorization-run-id }}
-          PROMOTE_AUTHORIZATION_ATTEMPT: ${{ inputs.authorization-attempt }}
+          PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
+          PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
+          PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
+          PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}
+          PROMOTE_CONSUMER_READER: ${{ github.workspace }}/.harn/promote-release/consumer-reader/scripts/ci/consumer-observer-read-decision.mjs
           PROMOTE_TAG: ${{ inputs.tag }}
           PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh
