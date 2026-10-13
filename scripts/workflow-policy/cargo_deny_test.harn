@@ -53,3 +53,11 @@ pipeline test_the_binary_is_checksum_verified_before_use(harness: Harness) {
   assert(install.run.contains("sha256sum -c -"), "the archive is verified")
   assert(install.run.contains("set -euo pipefail"), "a failed verification stops the step")
 }
+
+pipeline test_both_checks_run_in_the_caller_directory(harness: Harness) {
+  const all = steps(harness.fs)
+  for name in ["Licenses, bans, and sources", "Security advisories"] {
+    assert_eq(step(all, name)["working-directory"], expression("inputs.working-directory"), name)
+  }
+  assert_eq(workflow(harness.fs).on.workflow_call.inputs["working-directory"].default, ".")
+}

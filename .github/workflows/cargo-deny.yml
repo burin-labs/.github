@@ -55,9 +55,6 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,7 +62,6 @@ jobs:
       # A pinned, checksum-verified prebuilt binary: no Rust toolchain, no
       # compile. Bump VERSION and SHA256 together.
       - name: Install cargo-deny
-        working-directory: .
         env:
           CARGO_DENY_VERSION: "0.19.9"
           CARGO_DENY_SHA256: "f1f8eedc2a3ac297c540873f93785d4104b102c0079506b2a6b3221b7ec956af"
@@ -88,6 +84,8 @@ jobs:
           "${HOME}/.local/bin/cargo-deny" --version
       - name: Licenses, bans, and sources
         if: ${{ inputs.policy }}
+        working-directory: ${{ inputs.working-directory }}
         run: cargo-deny --all-features check bans licenses sources
       - name: Security advisories
+        working-directory: ${{ inputs.working-directory }}
         run: cargo-deny --all-features check advisories --deny advisory-not-detected
