@@ -43,6 +43,24 @@ permissions:
 
 jobs:
   ship:
+    # A CI completion (workflow_run) wakes the shepherd only for a finished,
+    # same-repository run of a pull request, of a merge-queue branch, or of the
+    # default branch. Callers list the CI workflows to watch and need no copy
+    # of this rule; every other event was admitted by the caller.
+    if: >-
+      github.event_name != 'workflow_run'
+      || (github.event.workflow_run.status == 'completed'
+      && contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
+      && github.event.workflow_run.repository.full_name == github.repository
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.head_sha != ''
+      && ((github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.pull_requests[0].number > 0)
+      || (github.event.workflow_run.event == 'merge_group'
+      && startsWith(github.event.workflow_run.head_branch,
+      format('gh-readonly-queue/{0}/', github.event.repository.default_branch)))
+      || (github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == github.event.repository.default_branch)))
     # A run woken by an event about one PR queues behind earlier runs for that
     # PR, and a CI completion (workflow_run) counts as one for the PR it ran
     # for, or for its merge-queue branch. Every other run (schedule, dispatch)
@@ -120,27 +138,6 @@ jobs:
         with:
           token: ${{ steps.app.outputs.token }}
 
-      - name: Download the PR agent
-        if: inputs.repair
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          # The newest burin binary CI built from main or the merge queue.
-          id="$(gh api "repos/burin-labs/burin-code/actions/artifacts?name=burin-linux&per_page=50" \
-            --jq '[.artifacts[] | select(.expired | not)
-                   | select(.workflow_run.head_branch == "main"
-                            or (.workflow_run.head_branch | startswith("gh-readonly-queue/main/")))][0].id')"
-          if [ -z "$id" ] || [ "$id" = "null" ]; then
-            echo "::warning::no burin-linux artifact from main; repairs will hand back"
-            exit 0
-          fi
-          mkdir -p "$RUNNER_TEMP/burin-bin"
-          gh api "repos/burin-labs/burin-code/actions/artifacts/$id/zip" > "$RUNNER_TEMP/burin.zip"
-          unzip -q -o "$RUNNER_TEMP/burin.zip" -d "$RUNNER_TEMP/burin-bin"
-          chmod +x "$RUNNER_TEMP/burin-bin/burin"
-          echo "BURIN_HEADLESS_BIN=$RUNNER_TEMP/burin-bin/burin" >> "$GITHUB_ENV"
-
       - name: Find the pull requests to look at
         id: prs
         env:
@@ -171,27 +168,8 @@ jobs:
           echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
           echo "Looking at: ${numbers:-none}"
 
-      # Before a repair pushes, the shepherd reads fleet worktree leases with
-      # burin-code's TypeScript reader (scripts/fleet-lease-holder.ts), which
-      # needs burin-code's Node. The runner image's default Node cannot strip
-      # types, so the lease would always read as unchecked.
-      - name: Set up Node
-        if: steps.prs.outputs.numbers != ''
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: .node-version
-
-      - name: Set up the repair package manager
-        if: inputs.repair && steps.prs.outputs.numbers != ''
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          # Read the checked-out packageManager pin; repair worktrees own
-          # dependency installation through their repository setup policy.
-          run_install: false
-          # Owned runners share a home directory, but each job owns its temp directory.
-          dest: ${{ runner.temp }}/smart-ship-pnpm
-
       - name: Shepherd
+        id: shepherd
         if: steps.prs.outputs.numbers != ''
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -204,43 +182,23 @@ jobs:
           LABEL: ${{ inputs.ship-label }}
           NUMBERS: ${{ steps.prs.outputs.numbers }}
           REPAIR: ${{ inputs.repair }}
-          BURIN_REF: ${{ inputs.burin-ref }}
         run: |
           set -uo pipefail
-          git config --global user.name "harn-release-bot[bot]"
-          git config --global user.email "harn-release-bot[bot]@users.noreply.github.com"
           # The calling repository's checked-in policy, read from its default
           # branch so a pull request cannot rewrite the rules it is judged by.
           policy="$RUNNER_TEMP/ship.toml"
           gh api "repos/$REPO/contents/.github/smart-ship.toml" --jq '.content' 2>/dev/null \
             | base64 -d > "$policy" 2>/dev/null || : > "$policy"
-          # Until the shepherd script is on the chosen burin-code ref, the label
-          # still lands the change: hand each open labeled PR to the merge queue.
-          if [ ! -f scripts/smart-ship.harn ]; then
-            echo "::notice::Smart Ship is not on burin-code@${BURIN_REF} yet; queueing labeled PRs for merge instead"
-            status=0
-            for n in $NUMBERS; do
-              state="$(gh pr view "$n" -R "$REPO" --json state --jq .state)"
-              if [ "$state" != "OPEN" ]; then
-                continue
-              fi
-              gh pr merge "$n" -R "$REPO" --squash --auto || status=1
-            done
-            exit $status
-          fi
+          echo "policy=$policy" >> "$GITHUB_OUTPUT"
           extra=()
           if [ "$REPAIR" != "true" ]; then
             extra+=(--no-repair)
           fi
-          # A repair can run for most of the job's timeout, and a sweep that
-          # repaired inline never reached the PRs after it. Every PR gets its
-          # look first: with --defer-repair the shepherd changes nothing and
-          # exits 3 when its next action is a repair, and those PRs run again
-          # once every look is done. An older shepherd has no such flag.
-          defer=()
-          if grep -q -- '--defer-repair' scripts/smart-ship.harn; then
-            defer=(--defer-repair)
-          fi
+          # Every PR gets its look first. With --defer-repair the shepherd
+          # changes nothing and exits 3 when its next action is a repair; those
+          # PRs are repaired after every look, by the steps below. A sweep that
+          # repaired inline never reached the PRs after it, and the repair
+          # tooling costs about 40 seconds that a look never needs.
           status=0
           deferred=()
           for n in $NUMBERS; do
@@ -248,19 +206,78 @@ jobs:
             rc=0
             ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
               --pr "$REPO#$n" --state github --ship-label "$LABEL" \
-              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" "${extra[@]}" "${defer[@]}" || rc=$?
+              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" "${extra[@]}" --defer-repair || rc=$?
             echo "::endgroup::"
-            if [ "$rc" -eq 3 ] && [ "${#defer[@]}" -gt 0 ]; then
+            if [ "$rc" -eq 3 ]; then
               deferred+=("$n")
             elif [ "$rc" -ne 0 ]; then
               status=1
             fi
           done
-          for n in "${deferred[@]}"; do
+          echo "deferred=${deferred[*]}" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      # Repair tooling, set up only when a look deferred a repair.
+      - name: Download the PR agent
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The newest burin binary CI built from main or the merge queue.
+          id="$(gh api "repos/burin-labs/burin-code/actions/artifacts?name=burin-linux&per_page=50" \
+            --jq '[.artifacts[] | select(.expired | not)
+                   | select(.workflow_run.head_branch == "main"
+                            or (.workflow_run.head_branch | startswith("gh-readonly-queue/main/")))][0].id')"
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::warning::no burin-linux artifact from main; repairs will hand back"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/burin-bin"
+          gh api "repos/burin-labs/burin-code/actions/artifacts/$id/zip" > "$RUNNER_TEMP/burin.zip"
+          unzip -q -o "$RUNNER_TEMP/burin.zip" -d "$RUNNER_TEMP/burin-bin"
+          chmod +x "$RUNNER_TEMP/burin-bin/burin"
+          echo "BURIN_HEADLESS_BIN=$RUNNER_TEMP/burin-bin/burin" >> "$GITHUB_ENV"
+
+      # A repair worktree runs its repository's own setup, which needs
+      # burin-code's pinned Node and pnpm.
+      - name: Set up Node
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Set up the repair package manager
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          # Read the checked-out packageManager pin; repair worktrees own
+          # dependency installation through their repository setup policy.
+          run_install: false
+          # Owned runners share a home directory, but each job owns its temp directory.
+          dest: ${{ runner.temp }}/smart-ship-pnpm
+
+      - name: Repair deferred pull requests
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ inputs.ship-label }}
+          DEFERRED: ${{ steps.shepherd.outputs.deferred }}
+          POLICY: ${{ steps.shepherd.outputs.policy }}
+        run: |
+          set -uo pipefail
+          git config --global user.name "harn-release-bot[bot]"
+          git config --global user.email "harn-release-bot[bot]@users.noreply.github.com"
+          status=0
+          for n in $DEFERRED; do
             echo "::group::$REPO#$n (repair)"
             ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
               --pr "$REPO#$n" --state github --ship-label "$LABEL" \
-              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" "${extra[@]}" || status=1
+              --policy "$POLICY" --ship-root "$RUNNER_TEMP/ship" || status=1
             echo "::endgroup::"
           done
           exit $status
