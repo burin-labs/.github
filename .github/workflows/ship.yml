@@ -9,6 +9,11 @@ on:
     types: [labeled, unlabeled, synchronize, ready_for_review, dequeued, closed]
   pull_request_review:
     types: [submitted]
+  # The shared runner decides which CI completions it acts on, so a green PR
+  # joins the merge queue when CI finishes instead of at the next sweep.
+  workflow_run: # zizmor: ignore[dangerous-triggers] the shared runner admits only completed same-repository runs, reads metadata through the API, and never checks out the parent-run ref
+    workflows: [CI]
+    types: [completed]
   schedule:
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
@@ -23,6 +28,7 @@ jobs:
     if: >-
       github.event_name == 'schedule'
       || github.event_name == 'workflow_dispatch'
+      || github.event_name == 'workflow_run'
       || contains(github.event.pull_request.labels.*.name, 'ship')
       || (github.event.action == 'unlabeled' && github.event.label.name == 'ship')
     uses: burin-labs/.github/.github/workflows/smart-ship.yml@main
