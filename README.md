@@ -115,6 +115,11 @@ the lookup reason and read count.
 - `.github/workflows/harn-package.yml` checks out a Harn package, installs its
   exact `.harn-version`, runs the Harn-owned package contract, and uploads the
   structured receipts.
+- `.github/workflows/cargo-deny.yml` runs cargo-deny against a Rust
+  workspace's `deny.toml`: security advisories always, plus bans, licenses, and
+  sources unless the caller passes `policy: false` because it keeps those in a
+  required job. The advisories verdict follows the daily RustSec database, so
+  never make it a required check.
 - `.github/workflows/register-package-release.yml` tells the package index that
   a release shipped, so the index reconciles within minutes instead of at the
   next daily run.

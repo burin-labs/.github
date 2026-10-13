@@ -1,0 +1,55 @@
+fn read(fs: HarnessFs, path: string) -> string {
+  return fs.read_text(path_join(path_normalize(path_join(fs.cwd(), "../..")), path))
+}
+
+fn expression(body: string) -> string {
+  return "$" + "{{ " + body + " }}"
+}
+
+fn workflow(fs: HarnessFs) -> dict {
+  return yaml_parse(read(fs, ".github/workflows/cargo-deny.yml"))
+}
+
+fn steps(fs: HarnessFs) -> list {
+  return workflow(fs).jobs["cargo-deny"].steps
+}
+
+fn step(steps: list, name: string) -> dict {
+  const found = steps.filter({ candidate -> candidate.name == name }).to_list()
+  assert_eq(len(found), 1, "exactly one step named " + name)
+  return found[0]
+}
+
+pipeline test_no_step_can_report_success_while_failing(harness: Harness) {
+  const job = workflow(harness.fs).jobs["cargo-deny"]
+  assert(!job.has("continue-on-error"), "the job must not mask a failing check")
+  for candidate in job.steps {
+    assert(
+      !candidate.has("continue-on-error"),
+      (candidate.name ?? "unnamed") + " must not mask a failure",
+    )
+  }
+}
+
+pipeline test_advisories_always_run_and_reject_stale_ignores(harness: Harness) {
+  const advisories = step(steps(harness.fs), "Security advisories")
+  assert(!advisories.has("if"), "advisories must run for every caller")
+  assert_eq(
+    advisories.run,
+    "cargo-deny --all-features check advisories --deny advisory-not-detected",
+  )
+}
+
+pipeline test_policy_checks_follow_the_caller_switch(harness: Harness) {
+  const policy = step(steps(harness.fs), "Licenses, bans, and sources")
+  assert_eq(policy["if"], expression("inputs.policy"))
+  assert_eq(policy.run, "cargo-deny --all-features check bans licenses sources")
+  assert_eq(workflow(harness.fs).on.workflow_call.inputs.policy.default, true)
+}
+
+pipeline test_the_binary_is_checksum_verified_before_use(harness: Harness) {
+  const install = step(steps(harness.fs), "Install cargo-deny")
+  assert(regex_match("^[0-9a-f]{64}$", install.env.CARGO_DENY_SHA256) != nil, "a full sha256 pin")
+  assert(install.run.contains("sha256sum -c -"), "the archive is verified")
+  assert(install.run.contains("set -euo pipefail"), "a failed verification stops the step")
+}
