@@ -227,6 +227,8 @@ pipeline test_the_shared_job_owns_ci_completion_admission(harness: Harness) {
   const admission = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship["if"]
   assert(admission.starts_with("github.event_name != 'workflow_run'"), admission)
   for clause in [
+    "github.event.action == 'completed'",
+    "github.event.workflow_run.id > 0",
     "github.event.workflow_run.status == 'completed'",
     "contains(fromJSON('[\"success\",\"failure\",\"timed_out\"]'), github.event.workflow_run.conclusion)",
     "github.event.workflow_run.repository.full_name == github.repository",
