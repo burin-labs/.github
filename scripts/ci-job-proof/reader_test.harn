@@ -45,9 +45,9 @@ fn source(pages: dict) -> ProofSource {
   }
 }
 
-const FIRST = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=1"
+const FIRST = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=1"
 
-const SECOND = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=2"
+const SECOND = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=2"
 
 pipeline test_complete_explicit_attempt_pages_are_measured() {
   const census = job_census(

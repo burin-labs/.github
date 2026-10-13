@@ -84,6 +84,14 @@ matches. Unknown, partial, or unreadable producers prove nothing, so the job
 runs. Lookup reads at most eight runs, with a 40-read budget and a 45-second
 deadline. See the [typed proof owner](scripts/ci-job-proof/contract.harn).
 
+The [historical reader](scripts/ci-job-proof/history_cli.harn) projects original
+job IDs, run attempts and measured phases for a main run's reused jobs. It
+follows the same qualified registrations, leaves failed or changed evidence
+pending, and never replaces an executed failure. It reads the same consumer
+context variables as the action and accepts the historical run ID and attempt
+as its two arguments. Its JSON output names restored jobs and pending logical
+job IDs.
+
 ```yaml
 - name: Resolve CI job proof reuse
   id: job-proof

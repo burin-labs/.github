@@ -75,7 +75,7 @@ pipeline test_reader_reaches_actual_archive_and_job_proof(harness: Harness) {
       total_count: 1,
       artifacts: [artifact],
     },
-    "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=1": {
+    "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=1": {
       total_count: 3,
       jobs: rows,
     },

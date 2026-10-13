@@ -1,6 +1,7 @@
 import {
   Admission,
   Artifact,
+  IDENTITY_SCHEMA,
   Job,
   JobIdentity,
   Provenance,
@@ -8,6 +9,8 @@ import {
   Run,
   admit_jobs,
   closed,
+  identities,
+  leg_of,
   qualified_artifact,
   registration_artifact_name,
   sha,
@@ -62,13 +65,13 @@ pub fn job_census(source: ProofSource, repo: string, run: Run) -> JobCensus {
     const endpoint = "/repos/" + repository(repo) + "/actions/runs/" + to_string(run.id)
       + "/attempts/"
       + to_string(run.run_attempt)
-      + "/jobs?per_page=100&page="
+      + "/jobs?per_page=30&page="
       + to_string(page)
     const result = schema_expect(source.json(endpoint), schema_of(JobsPage))
     if result.total_count <= 0 || (declared != -1 && declared != result.total_count)
       || result.total_count > 10000
       || len(result.jobs) == 0
-      || len(result.jobs) > 100 {
+      || len(result.jobs) > 30 {
       throw "incomplete or changing attempt job census"
     }
     declared = result.total_count
@@ -120,11 +123,11 @@ fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifac
 }
 
 /** Qualify one producer run, then admit the wanted jobs it proves or points at. */
-pub fn read_run(
+fn read_run_data(
   source: ProofSource,
   current: Registration,
   producer: Run,
-  wanted: list<JobIdentity>,
+  wanted: list<JobIdentity>?,
 ) {
   const artifact = registration_artifact(source, current.repository, producer)
   qualified_artifact(artifact, producer)
@@ -132,14 +135,117 @@ pub fn read_run(
   schema_expect(raw, closed(schema_of(Registration)))
   const recorded = schema_expect(raw, schema_of(Registration))
   const census = job_census(source, current.repository, producer)
-  return admit_jobs(
+  const requested = wanted
+    ?? identities(
+      {
+        schema: IDENTITY_SCHEMA,
+        jobs: recorded.jobs.map({ identity -> pick(identity, ["id", "names", "digest"]) }),
+      },
+    )
+  const admission = admit_jobs(
     current,
     producer,
     {artifact: artifact, registration: recorded},
     census.jobs,
     census.declared,
-    wanted,
+    requested,
   )
+  return {admission: admission, census: census, requested: requested}
+}
+
+pub fn read_run(
+  source: ProofSource,
+  current: Registration,
+  producer: Run,
+  wanted: list<JobIdentity>,
+) {
+  return read_run_data(source, current, producer, wanted).admission
+}
+
+pub type HistoricalJob = {id: string, digest: string, provenance: Provenance, job: Job}
+
+pub type HistoricalReuse = {jobs: list<HistoricalJob>, pending: list<string>}
+
+/** Resolve a main run's skipped jobs through the same input-bound admission owner. */
+pub fn historical_reuse(
+  source: ProofSource,
+  current: Registration,
+  producer: Run,
+  now: fn() -> int,
+) -> HistoricalReuse {
+  const bounded = bounded_source(source, now)
+  const root = read_run_data(bounded.source, current, producer, nil)
+  const wanted = root.requested.filter(
+    { identity ->
+      const matches = root.census.jobs.filter({ job -> leg_of(identity.names, job.name) }).to_list()
+      return root.admission.deferred.any({ pointer -> pointer.id == identity.id })
+        && len(matches) > 0
+        && matches.all({ job -> job.conclusion == "skipped" })
+    },
+  )
+    .to_list()
+  let queue = root.admission.deferred.filter(
+    { pointer -> wanted.any({ identity -> identity.id == pointer.id }) },
+  )
+    .to_list()
+  let seen: list<string> = []
+  let restored: list<HistoricalJob> = []
+  while len(queue) > 0 {
+    const pointer = queue[0]
+    queue = queue.slice(1)
+    const key = to_string(pointer.provenance.runId) + ":" + to_string(pointer.provenance.attempt)
+    if seen.contains(key) {
+      continue
+    }
+    if len(seen) >= RUN_BUDGET || bounded.exhausted() {
+      throw "historical proof discovery budget exhausted"
+    }
+    seen = seen + [key]
+    const original = schema_expect(
+      bounded.source.json(
+        "/repos/" + repository(current.repository) + "/actions/runs/"
+          + to_string(pointer.provenance.runId)
+          + "/attempts/"
+          + to_string(pointer.provenance.attempt),
+      ),
+      schema_of(Run),
+    )
+    const eligible = [pointer]
+      + queue.filter({ next -> next.provenance == pointer.provenance }).to_list()
+    const open = wanted.filter(
+      { identity ->
+        eligible.any({ next -> next.id == identity.id })
+          && !restored.any({ value -> value.id == identity.id })
+      },
+    )
+      .to_list()
+    const qualified = read_run_data(bounded.source, current, original, open)
+    for admission in qualified.admission.admitted {
+      if qualified.census.jobs.any(
+        { job -> admission.jobIds.contains(job.id) && len(job.steps) == 0 },
+      ) {
+        continue
+      }
+      for job in qualified.census.jobs.filter({ job -> admission.jobIds.contains(job.id) }) {
+        restored = restored
+          + [
+            {
+              id: admission.id,
+              digest: admission.digest,
+              provenance: admission.provenance,
+              job: job,
+            },
+          ]
+      }
+    }
+    queue = queue + qualified.admission.deferred
+  }
+  return {
+    jobs: restored,
+    pending: wanted.filter({ identity -> !restored.any({ value -> value.id == identity.id }) })
+      .map({ identity -> identity.id })
+      .to_list(),
+  }
 }
 
 /** Bounded discovery. Unknown, unreadable or unqualified producers prove nothing. */
