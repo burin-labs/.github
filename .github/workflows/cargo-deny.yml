@@ -1,0 +1,91 @@
+name: cargo-deny (reusable)
+
+# Supply-chain gate for a Rust workspace. Policy lives in the caller's
+# deny.toml; this workflow owns the pinned cargo-deny binary and how its
+# verdicts are reported.
+#
+#   jobs:
+#     cargo-deny:
+#       uses: burin-labs/.github/.github/workflows/cargo-deny.yml@<sha>
+#       with:
+#         working-directory: crates/my-workspace  # default "."
+#         policy: false                          # default true
+#
+# Two checks, both blocking within the job:
+#   * `check bans licenses sources` (skipped with `policy: false`) reads only
+#     Cargo.lock, the manifests, and deny.toml, so its verdict changes only
+#     when the caller's own files change.
+#   * `check advisories --deny advisory-not-detected` reads the RustSec
+#     database, which changes daily, so a new advisory can turn the job red on
+#     an unrelated change. Do not make a job that runs it a required check;
+#     its red run is the report. `--deny advisory-not-detected` also fails on
+#     an ignore entry whose crate has left the tree.
+#
+# A caller that must keep the deterministic checks in a required job passes
+# `policy: false` here and runs `check bans licenses sources` in that job.
+#
+# Never add `continue-on-error`. It does not make a job non-blocking; it only
+# makes a failing job report success. Copies of this gate that carried it
+# showed green main runs over an unpatched h2 vulnerability (RUSTSEC-2026-0258)
+# and an unmaintained-crate advisory (RUSTSEC-2024-0449).
+#
+# Callers trigger on their dependency files and on a daily schedule: without
+# the schedule, an advisory published against an unchanged Cargo.lock is
+# never looked for.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory holding the workspace Cargo.lock and deny.toml"
+        type: string
+        default: "."
+        required: false
+      policy:
+        description: "Also run the deterministic bans, licenses, and sources checks"
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A pinned, checksum-verified prebuilt binary: no Rust toolchain, no
+      # compile. Bump VERSION and SHA256 together.
+      - name: Install cargo-deny
+        env:
+          CARGO_DENY_VERSION: "0.19.9"
+          CARGO_DENY_SHA256: "f1f8eedc2a3ac297c540873f93785d4104b102c0079506b2a6b3221b7ec956af"
+        run: |
+          set -euo pipefail
+          slug="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          archive="${RUNNER_TEMP}/${slug}.tar.gz"
+          # --retry-all-errors because a truncated transfer exits 18, outside
+          # curl's default retry set, and would surface as a checksum mismatch.
+          # --max-time bounds a stalled connection that never errors.
+          curl -fsSL --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 120 \
+            -o "${archive}" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${slug}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}" "${slug}/cargo-deny"
+          mkdir -p "${HOME}/.local/bin"
+          install -m 0755 "${RUNNER_TEMP}/${slug}/cargo-deny" "${HOME}/.local/bin/cargo-deny"
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+          "${HOME}/.local/bin/cargo-deny" --version
+      - name: Licenses, bans, and sources
+        if: ${{ inputs.policy }}
+        working-directory: ${{ inputs.working-directory }}
+        run: cargo-deny --all-features check bans licenses sources
+      - name: Security advisories
+        working-directory: ${{ inputs.working-directory }}
+        run: cargo-deny --all-features check advisories --deny advisory-not-detected
