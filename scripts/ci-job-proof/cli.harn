@@ -37,7 +37,7 @@ fn output(harness: Harness, name: string, value: unknown) {
 }
 
 /** The authenticated current run, with no jobs registered yet. */
-fn current_run(env: HarnessEnv, source: ProofSource) -> Registration {
+pub fn current_run(env: HarnessEnv, source: ProofSource) -> Registration {
   const repo = repository(required(env, "CI_JOB_PROOF_REPOSITORY"))
   const file = workflow(required(env, "CI_JOB_PROOF_WORKFLOW"))
   const run_id = to_int(required(env, "CI_JOB_PROOF_RUN_ID"))

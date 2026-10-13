@@ -1,0 +1,170 @@
+import { Registration, Run } from "./contract.harn"
+import { registration_from_archive } from "./live.harn"
+import { ProofSource, historical_reuse } from "./reader.harn"
+
+fn fixture(
+  fs: HarnessFs,
+  main_result: string,
+  original_result: string,
+  original_digest: string,
+  observed: bool = true,
+) {
+  const current: Registration = {
+    schema: "burin.ci_job_proof_registration.v2",
+    repository: "acme/product",
+    workflow: "ci.yml",
+    event: "merge_group",
+    commit: "c".repeat(40),
+    runId: 30,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register",
+    jobs: [],
+  }
+  const directory = fs.mkdtemp_in_workspace("historical-ci-proof-")
+  const original: Run = {
+    id: 10,
+    run_attempt: 1,
+    head_sha: "a".repeat(40),
+    event: "pull_request",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "success",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+  const main: Run = {...original, id: 20, head_sha: "b".repeat(40), event: "push"}
+  let pages = {}
+  let paths = {}
+  for run in [original, main] {
+    const recorded = {
+      ...current,
+      event: run.event,
+      commit: run.head_sha,
+      runId: run.id,
+      jobs: [
+        {
+          id: "calibration",
+          names: ["Calibration"],
+          digest: run.id == 20 ? "a".repeat(64) : original_digest,
+          provenance: run.id == 20 ? {runId: 10, attempt: 1} : nil,
+        },
+      ],
+    }
+    const archive = zip_create([{path: "registration.json", content: json_stringify(recorded)}])
+    const path = directory + "/" + to_string(run.id) + ".zip"
+    fs.write_bytes(path, archive)
+    const artifact = {
+      id: run.id + 1,
+      name: "ci-job-inputs-" + to_string(run.id) + "-1",
+      size_in_bytes: len(archive),
+      expired: false,
+      digest: "sha256:" + sha256(archive),
+      created_at: "2026-10-09T10:00:00Z",
+      workflow_run: pick(run, ["id", "head_sha"]),
+    }
+    const base = {
+      run_id: run.id,
+      run_attempt: 1,
+      head_sha: run.head_sha,
+      status: "completed",
+      conclusion: "success",
+      started_at: "2026-10-09T10:00:02Z",
+      completed_at: "2026-10-09T10:00:03Z",
+    }
+    const rows = [
+      {
+        ...base,
+        id: run.id + 1,
+        name: "Changes",
+        completed_at: "2026-10-09T10:00:01Z",
+        steps: [{name: "Register", status: "completed", conclusion: "success"}],
+      },
+      {
+        ...base,
+        id: run.id + 2,
+        name: "Calibration",
+        conclusion: run.id == 20 ? main_result : original_result,
+        steps: run.id == 20 || !observed ? [] : [
+          {name: "Replay", status: "completed", conclusion: original_result},
+        ],
+      },
+    ]
+    const prefix = "/repos/acme/product/actions/runs/" + to_string(run.id)
+    pages = pages
+      + {
+        [prefix + "/artifacts?per_page=100&page=1"]: {total_count: 1, artifacts: [artifact]},
+        [prefix + "/attempts/1/jobs?per_page=30&page=1"]: {total_count: 2, jobs: rows},
+        [prefix + "/attempts/1"]: run,
+      }
+    paths = paths + {[to_string(artifact.id)]: path}
+  }
+  const source: ProofSource = {
+    json: fn(endpoint) {
+      if pages[endpoint] == nil {
+        throw "unexpected fixture endpoint " + endpoint
+      }
+      return pages[endpoint]
+    },
+    registration: fn(_repo, artifact) { return registration_from_archive(
+      fs,
+      paths[to_string(artifact.id)],
+      artifact.digest,
+    ) },
+  }
+  return {source: source, current: current, main: main, directory: directory}
+}
+
+pipeline test_historical_skip_keeps_original_identity_and_phase(harness: Harness) {
+  const case = fixture(harness.fs, "skipped", "success", "a".repeat(64))
+  const restored = historical_reuse(case.source, case.current, case.main, { -> 0 })
+  assert_eq(restored.pending, [])
+  assert_eq(len(restored.jobs), 1)
+  assert_eq(restored.jobs[0].id, "calibration")
+  assert_eq(restored.jobs[0].provenance, {runId: 10, attempt: 1})
+  assert_eq(restored.jobs[0].job.id, 12)
+  assert_eq(restored.jobs[0].job.head_sha, "a".repeat(40))
+  assert_eq(
+    restored.jobs[0].job.steps,
+    [{name: "Replay", status: "completed", conclusion: "success"}],
+  )
+  harness.fs.delete(case.directory)
+}
+
+pipeline test_executed_failure_is_never_replaced_by_old_reuse(harness: Harness) {
+  const case = fixture(harness.fs, "failure", "success", "a".repeat(64))
+  assert_eq(historical_reuse(case.source, case.current, case.main, { -> 0 }).jobs, [])
+  harness.fs.delete(case.directory)
+}
+
+pipeline test_failed_or_changed_original_remains_pending(harness: Harness) {
+  for reading in [
+    {result: "failure", digest: "a".repeat(64), observed: true},
+    {result: "success", digest: "b".repeat(64), observed: true},
+    {result: "success", digest: "a".repeat(64), observed: false},
+  ] {
+    const case = fixture(harness.fs, "skipped", reading.result, reading.digest, reading.observed)
+    const restored = historical_reuse(case.source, case.current, case.main, { -> 0 })
+    assert_eq(restored.jobs, [])
+    assert_eq(restored.pending, ["calibration"])
+    harness.fs.delete(case.directory)
+  }
+}
+
+pipeline test_unreported_transport_cannot_supply_historical_reuse(harness: Harness) {
+  const case = fixture(harness.fs, "skipped", "success", "a".repeat(64))
+  const denied: ProofSource = {
+    ...case.source,
+    json: fn(_endpoint) {
+      throw "read refused"
+    },
+  }
+  assert(
+    is_err(
+      try {
+        historical_reuse(denied, case.current, case.main, { -> 0 })
+      },
+    ),
+  )
+  harness.fs.delete(case.directory)
+}
