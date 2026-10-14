@@ -1,5 +1,5 @@
 import { live_github } from "../merge-override/github.harn"
-import { dispatch, resolve } from "./policy.harn"
+import { dispatch, resolve, resolve_target } from "./policy.harn"
 
 fn required(env: HarnessEnv, name: string) -> string {
   const value = trim(env.get(name) ?? "")
@@ -10,6 +10,23 @@ fn required(env: HarnessEnv, name: string) -> string {
 }
 
 fn main(harness: Harness) {
+  if argv == ["target"] {
+    const target = resolve_target(
+      required(harness.env, "CALLER_REPOSITORY"),
+      harness.env.get("REQUESTED_REPOSITORY") ?? "",
+    )
+    harness.fs.append(
+      required(harness.env, "GITHUB_OUTPUT"),
+      "repository=" + target.repository + "\nowner=" + target.owner
+        + "\nname="
+        + target.name
+        + "\ncross_repository="
+        + to_string(target.cross_repository)
+        + "\n",
+    )
+    harness.stdio.println(json_stringify(target))
+    return
+  }
   const repository = required(harness.env, "TARGET_REPOSITORY")
   const number_text = required(harness.env, "PR_NUMBER")
   if !regex_match("^[1-9][0-9]{0,8}$", number_text) {
@@ -43,6 +60,6 @@ fn main(harness: Harness) {
     dispatch(github, request)
     harness.stdio.println(json_stringify({requested: request}))
   } else {
-    throw "expected resolve or dispatch"
+    throw "expected target, resolve, or dispatch"
   }
 }

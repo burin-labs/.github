@@ -9,11 +9,15 @@ on:
         description: Pull request number whose current head should be reviewed.
         type: string
         required: true
+      repository:
+        description: Optional same-organization target repository for first-review bootstrap.
+        type: string
+        required: false
 
 permissions: {}
 
 concurrency:
-  group: review-dispatch-${{ github.event.pull_request.number || inputs.pull-request }}
+  group: review-dispatch-${{ inputs.repository || github.repository }}-${{ github.event.pull_request.number || inputs.pull-request }}
   cancel-in-progress: false
 
 jobs:
@@ -35,5 +39,6 @@ jobs:
         uses: ./.github/actions/review-dispatch
         with:
           pull-request: ${{ github.event.pull_request.number || inputs.pull-request }}
+          repository: ${{ github.event_name == 'workflow_dispatch' && inputs.repository || '' }}
           release-app-client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           release-app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
