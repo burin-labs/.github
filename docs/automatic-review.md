@@ -22,3 +22,17 @@ If a daily-limit refusal appears on the pull request, retry after the next UTC
 day begins. If the head moved, its push requests another review automatically.
 Inspect the review's commit SHA before relying on its verdict. Manual replay
 uses the same admission checks and spending limits as an automatic request.
+
+## Bootstrap the first review caller
+
+When another enrolled repository has no dispatcher on its default branch yet,
+use **Automatic review dispatch** in `burin-labs/.github`. Enter its full
+`owner/name` in the optional **repository** field and its pull request number.
+Leave that field empty for a pull request in the calling repository.
+
+The target must belong to the same organization. The dispatcher validates its
+name before minting a token, reads only that repository's pull requests, and
+sends the measured head through the existing App-authenticated reviewer route.
+Missing installation permission fails the run. The reviewer still owns target
+enrollment, explicit review holds, duplicate admission, and spending limits;
+this bootstrap does not bypass them or supply an approval itself.
