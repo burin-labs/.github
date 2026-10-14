@@ -215,8 +215,12 @@ pipeline test_override_merge_uses_repository_scoped_workflow_authority(harness: 
   const merge = step(steps, "Squash-merge pull request")
   assert_eq(merge.env.GH_TOKEN, expression("steps.app-token.outputs.token"))
   assert_eq(merge.run, "bash scripts/merge-override/run.sh merge")
-  let without_workflow_grant = token["with"] + {}
-  without_workflow_grant.remove("permission-workflows")
+  let without_workflow_grant = {}
+  for key in token["with"].keys() {
+    if key != "permission-workflows" {
+      without_workflow_grant[key] = token["with"][key]
+    }
+  }
   for damaged in [
     without_workflow_grant,
     token["with"] + {"permission-workflows": "read"},
