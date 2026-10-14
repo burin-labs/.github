@@ -140,7 +140,10 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   )
   const grants = keys(token["with"]).filter({ key -> key.starts_with("permission-") })
   // Publish mode re-verifies the run with this token before it publishes.
-  assert_eq(grants.sort(), ["permission-actions", "permission-contents", "permission-workflows"])
+  assert_eq(
+    grants.sorted().to_list(),
+    ["permission-actions", "permission-contents", "permission-workflows"],
+  )
   assert_eq(token["with"]["permission-actions"], "read")
   assert_eq(token["with"]["permission-contents"], "write")
   assert_eq(token["with"]["permission-workflows"], "write")

@@ -214,7 +214,7 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
     }
     results = results + [result]
     harness.stdio.println(
-      result.state.to_upper() + " " + name + (result.reason == "" ? "" : ": " + result.reason),
+      result.state.upper() + " " + name + (result.reason == "" ? "" : ": " + result.reason),
     )
   }
   const summary = report(results, plan.missing)
