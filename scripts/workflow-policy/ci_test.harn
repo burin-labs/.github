@@ -1,4 +1,5 @@
 import { regex_all_first_captures } from "std/text"
+import { check, decode } from "../ci-latency/policy.harn"
 
 pipeline test_override_dispatcher_can_supply_every_required_permission(harness: Harness) {
   const caller = workflow(harness, "merge-override-dispatch").permissions
@@ -51,6 +52,12 @@ fn census(harness: HarnessFs, patterns: list) -> list {
 }
 
 pipeline test_ci_joins_contracts_and_uses_exact_package_fixture(harness: Harness) {
+  check(
+    decode(json_parse(read(harness.fs, ".github/ci-latency.json"))),
+    workflow(harness, "ci"),
+    nil,
+    "burin-labs/.github",
+  )
   const jobs = workflow(harness, "ci").jobs
   assert(
     read(harness.fs, ".github/dependabot.yml").starts_with(
