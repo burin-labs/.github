@@ -1,13 +1,14 @@
 import { assert_error_contains } from "std/testing"
 import { Registration, Run } from "./contract.harn"
 import { registration_from_archive } from "./live.harn"
-import { ProofSource, read_run } from "./reader.harn"
+import { ProofSource, inspect_run, read_run } from "./reader.harn"
 
 pipeline test_reader_reaches_actual_archive_and_job_proof(harness: Harness) {
   const digest = "a".repeat(64)
   const wanted = [{id: "rust", names: ["Rust"], digest: digest}]
   const current: Registration = {
-    schema: "burin.ci_job_proof_registration.v2",
+    schema: "burin.ci_job_proof_registration.v3",
+    tested_source: {commit: "e".repeat(40), tree: "f".repeat(40)},
     repository: "acme/product",
     workflow: "ci.yml",
     event: "merge_group",
@@ -97,6 +98,13 @@ pipeline test_reader_reaches_actual_archive_and_job_proof(harness: Harness) {
   // unrelated failure does not.
   const outcome = read_run(transport, current, producer, wanted)
   assert_eq(outcome.admitted.map({ admission -> admission.jobIds }), [[2]])
+  const inspected = inspect_run(transport, current, producer)
+  assert_eq(inspected.census.declared, 3)
+  assert_eq(inspected.census.jobs, rows)
+  assert_eq(inspected.registered.artifact.digest, artifact.digest)
+  assert_eq(inspected.registered.registration.tested_source, recorded.tested_source)
+  assert(inspected.registered.registration.tested_source.commit != producer.head_sha)
+  assert_eq(inspected.admission, outcome)
   const changed = [{...wanted[0], digest: "b".repeat(64)}]
   assert_eq(read_run(transport, current, producer, changed).admitted, [])
   const tampered = zip_create(

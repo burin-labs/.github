@@ -10,7 +10,8 @@ fn fixture(
   observed: bool = true,
 ) {
   const current: Registration = {
-    schema: "burin.ci_job_proof_registration.v2",
+    schema: "burin.ci_job_proof_registration.v3",
+    tested_source: {commit: "e".repeat(40), tree: "f".repeat(40)},
     repository: "acme/product",
     workflow: "ci.yml",
     event: "merge_group",
