@@ -52,7 +52,7 @@ on:
         required: true
         type: string
       tag:
-        description: Release tag to create at sha, as vX.Y.Z. A vX.Y.Z-suffix tag publishes a prerelease that never becomes latest.
+        description: Release tag as vX.Y.Z or package/vX.Y.Z. A version suffix marks a prerelease; namespaced tags never change repository latest.
         required: true
         type: string
       original-consumer-context:

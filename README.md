@@ -133,6 +133,9 @@ the lookup reason and read count.
 - `.github/workflows/register-package-release.yml` tells the package index that
   a release shipped, so the index reconciles within minutes instead of at the
   next daily run.
+- `.github/workflows/promote-release.yml` publishes the tested files from one
+  successful run. [Package release promotion](docs/promote-package-release.md)
+  keeps a package's version tags separate from the application's latest release.
 
 ## Registering package releases
 
