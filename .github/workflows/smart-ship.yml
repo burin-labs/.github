@@ -121,7 +121,7 @@ jobs:
           repository: burin-labs/.github
           # Repository-qualified source, checked by the typed control policy.
           # github.workflow_sha identifies the caller, not this org repository.
-          ref: 8ab5eb88533595579e9e79d556d719593a26a728
+          ref: a4da07f69b45a057dc46465bea10948f7bf3e0a3
           path: .smart-ship-runner
           persist-credentials: false
 

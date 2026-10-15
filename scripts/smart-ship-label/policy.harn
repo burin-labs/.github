@@ -8,7 +8,7 @@ pub type ControlPolicySource = {repository: string, ref: string}
 // A reusable workflow's github.workflow_sha belongs to its caller repository.
 pub const CONTROL_POLICY_SOURCE: ControlPolicySource = {
   repository: "burin-labs/.github",
-  ref: "8ab5eb88533595579e9e79d556d719593a26a728",
+  ref: "a4da07f69b45a057dc46465bea10948f7bf3e0a3",
 }
 
 /** Normalize the workflow projection at the repository/revision boundary. */
