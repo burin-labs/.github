@@ -73,17 +73,19 @@ pipeline test_ci_joins_contracts_and_uses_exact_package_fixture(harness: Harness
   )
   const status = jobs["ci-status"]
   assert_eq(status["if"], expression("always()"))
-  assert_eq(status.needs, ["local-check-contract", "package-smoke"])
+  assert_eq(status.needs, ["local-check-contract", "package-smoke", "smart-ship-control-runtime"])
   const smoke = step(status.steps, "Require reusable package smoke")
   assert_eq(
     smoke.env,
     {
       LOCAL_CHECK_CONTRACT_RESULT: expression("needs.local-check-contract.result"),
       PACKAGE_SMOKE_RESULT: expression("needs.package-smoke.result"),
+      SMART_SHIP_CONTROL_RESULT: expression("needs.smart-ship-control-runtime.result"),
     },
   )
   assert(smoke.run.contains("test \"$LOCAL_CHECK_CONTRACT_RESULT\" = success"))
   assert(smoke.run.contains("test \"$PACKAGE_SMOKE_RESULT\" = success"))
+  assert(smoke.run.contains("test \"$SMART_SHIP_CONTROL_RESULT\" = success"))
 }
 
 pipeline test_checkout_policy_scans_every_current_source(harness: Harness) {
