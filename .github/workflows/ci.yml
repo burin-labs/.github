@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,6 +50,31 @@ jobs:
         uses: ./.github/actions/hosted-runner-labels
         with:
           skip-harn-setup: "true"
+      - name: Measure registration smoke inputs
+        id: proof-smoke-inputs
+        run: >-
+          harn run --grant output=env:GITHUB_OUTPUT,expose=GITHUB_OUTPUT
+          --write-root "$RUNNER_TEMP" --read-only-root "$GITHUB_WORKSPACE"
+          scripts/ci-job-proof/smoke.harn -- identity "$GITHUB_WORKSPACE"
+      - name: Register actual CI checkout
+        id: proof-source
+        uses: ./.github/actions/ci-job-proof
+        with:
+          workflow-file: ci.yml
+          job-identities: ${{ steps.proof-smoke-inputs.outputs.identities }}
+          registrar-job: Local workflow check contract
+          registrar-step: Register actual CI checkout
+          event-name: ${{ github.event_name }}
+          commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          github-token: ${{ github.token }}
+      - name: Read back actual CI checkout registration
+        env:
+          REGISTRATION: ${{ steps.proof-source.outputs.registration }}
+          RUN_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          harn run --read-only-root "$GITHUB_WORKSPACE"
+          scripts/ci-job-proof/smoke.harn -- verify "$GITHUB_WORKSPACE"
+          "$REGISTRATION" "$RUN_HEAD" "$GITHUB_SHA"
 
   package-smoke:
     name: Reusable Harn package smoke (${{ matrix.strict && 'strict' || 'default' }})

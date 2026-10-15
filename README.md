@@ -83,6 +83,8 @@ repository's workflow, completed, with a registration archive whose digest
 matches. Unknown, partial, or unreadable producers prove nothing, so the job
 runs. Lookup reads at most eight runs, with a 40-read budget and a 45-second
 deadline. See the [typed proof owner](scripts/ci-job-proof/contract.harn).
+The [record reference](docs/ci-job-proof-records.md) defines the actual tested
+checkout, the API run head, and the original-run inspection interface.
 
 The [historical reader](scripts/ci-job-proof/history_cli.harn) projects original
 job IDs, run attempts and measured phases for a main run's reused jobs. It

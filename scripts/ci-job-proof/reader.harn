@@ -5,8 +5,11 @@ import {
   Job,
   JobIdentity,
   Provenance,
+  RegisteredArtifact,
   Registration,
   Run,
+  RunAdmission,
+  RunContext,
   admit_jobs,
   closed,
   identities,
@@ -20,6 +23,15 @@ import {
 pub type ProofSource = {json: fn(string) -> unknown, registration: fn(string, Artifact) -> unknown}
 
 pub type JobCensus = {declared: int, jobs: list<Job>}
+
+/** Qualified source, archive identity, and full attempt census remain inspectable. */
+pub type OriginalRunInspection = {
+  producer: Run,
+  registered: RegisteredArtifact,
+  census: JobCensus,
+  requested: list<JobIdentity>,
+  admission: RunAdmission,
+}
 
 type JobsPage = {total_count: int, jobs: list<Job>}
 
@@ -123,12 +135,12 @@ fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifac
 }
 
 /** Qualify one producer run, then admit the wanted jobs it proves or points at. */
-fn read_run_data(
+pub fn inspect_run(
   source: ProofSource,
-  current: Registration,
+  current: RunContext,
   producer: Run,
-  wanted: list<JobIdentity>?,
-) {
+  wanted: list<JobIdentity>? = nil,
+) -> OriginalRunInspection {
   const artifact = registration_artifact(source, current.repository, producer)
   qualified_artifact(artifact, producer)
   const raw = source.registration(current.repository, artifact)
@@ -150,31 +162,38 @@ fn read_run_data(
     census.declared,
     requested,
   )
-  return {admission: admission, census: census, requested: requested}
+  return {
+    producer: producer,
+    registered: {artifact: artifact, registration: recorded},
+    admission: admission,
+    census: census,
+    requested: requested,
+  }
 }
 
 pub fn read_run(
   source: ProofSource,
-  current: Registration,
+  current: RunContext,
   producer: Run,
   wanted: list<JobIdentity>,
 ) {
-  return read_run_data(source, current, producer, wanted).admission
+  return inspect_run(source, current, producer, wanted).admission
 }
 
 pub type HistoricalJob = {id: string, digest: string, provenance: Provenance, job: Job}
 
+/** Restored original jobs and explicitly unresolved logical job identities. */
 pub type HistoricalReuse = {jobs: list<HistoricalJob>, pending: list<string>}
 
 /** Resolve a main run's skipped jobs through the same input-bound admission owner. */
 pub fn historical_reuse(
   source: ProofSource,
-  current: Registration,
+  current: RunContext,
   producer: Run,
   now: fn() -> int,
 ) -> HistoricalReuse {
   const bounded = bounded_source(source, now)
-  const root = read_run_data(bounded.source, current, producer, nil)
+  const root = inspect_run(bounded.source, current, producer)
   const wanted = root.requested.filter(
     { identity ->
       const matches = root.census.jobs.filter({ job -> leg_of(identity.names, job.name) }).to_list()
@@ -219,7 +238,7 @@ pub fn historical_reuse(
       },
     )
       .to_list()
-    const qualified = read_run_data(bounded.source, current, original, open)
+    const qualified = inspect_run(bounded.source, current, original, open)
     for admission in qualified.admission.admitted {
       if qualified.census.jobs.any(
         { job -> admission.jobIds.contains(job.id) && len(job.steps) == 0 },
@@ -290,7 +309,7 @@ fn bounded_source(source: ProofSource, now: fn() -> int) -> BudgetSource {
   }
 }
 
-fn runs(source: ProofSource, current: Registration, query: string) -> list<Run> {
+fn runs(source: ProofSource, current: RunContext, query: string) -> list<Run> {
   const endpoint = "/repos/" + repository(current.repository) + "/actions/workflows/"
     + workflow(current.workflow)
     + "/runs?status=completed&per_page=5&"
@@ -308,7 +327,7 @@ fn runs(source: ProofSource, current: Registration, query: string) -> list<Run> 
  * that tested this exact commit, then earlier main pushes; for a merge group,
  * the pull request it merges, then the latest main push.
  */
-fn candidates(source: ProofSource, current: Registration, pull: int?) -> list<Run> {
+fn candidates(source: ProofSource, current: RunContext, pull: int?) -> list<Run> {
   const pushes = runs(source, current, "event=push&branch=main").filter(
     { run -> run.id < current.runId },
   )
@@ -330,7 +349,7 @@ fn candidates(source: ProofSource, current: Registration, pull: int?) -> list<Ru
 
 pub fn discover(
   source: ProofSource,
-  current: Registration,
+  current: RunContext,
   wanted: list<JobIdentity>,
   pull: int?,
   now: fn() -> int,

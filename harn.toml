@@ -13,5 +13,6 @@ local_checks_cli = "scripts/local-checks/cli.harn"
 ci_runtime_evidence = "scripts/ci-runtime-evidence/collector.harn"
 candidate_manifest = "scripts/release-promotion/manifest.harn"
 ci_latency = "scripts/ci-latency/lib.harn"
+ci_job_proof = "scripts/ci-job-proof/lib.harn"
 
 [dependencies]

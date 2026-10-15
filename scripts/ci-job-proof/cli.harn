@@ -4,23 +4,14 @@ import {
   JobIdentity,
   PRODUCER_EVENTS,
   RECEIPT_SCHEMA,
-  REGISTRATION_SCHEMA,
   Registration,
-  Run,
   identities,
   registration,
   registration_artifact_name,
-  sha,
 } from "./contract.harn"
-import { live_source } from "./live.harn"
-import {
-  ProofSource,
-  READ_BUDGET,
-  discover,
-  merge_group_pull,
-  repository,
-  workflow,
-} from "./reader.harn"
+import { current_run, live_source } from "./live.harn"
+import { READ_BUDGET, discover, merge_group_pull } from "./reader.harn"
+import { tested_source } from "./source.harn"
 
 fn required(env: HarnessEnv, name: string) -> string {
   const value = env.get(name) ?? ""
@@ -33,44 +24,6 @@ fn required(env: HarnessEnv, name: string) -> string {
 fn output(harness: Harness, name: string, value: unknown) {
   if !gha_write_output(harness, name, value) {
     throw "could not write job proof output"
-  }
-}
-
-/** The authenticated current run, with no jobs registered yet. */
-pub fn current_run(env: HarnessEnv, source: ProofSource) -> Registration {
-  const repo = repository(required(env, "CI_JOB_PROOF_REPOSITORY"))
-  const file = workflow(required(env, "CI_JOB_PROOF_WORKFLOW"))
-  const run_id = to_int(required(env, "CI_JOB_PROOF_RUN_ID"))
-  const attempt = to_int(required(env, "CI_JOB_PROOF_ATTEMPT"))
-  if run_id <= 0 || attempt <= 0 {
-    throw "invalid current run or attempt"
-  }
-  const run = schema_expect(
-    source.json(
-      "/repos/" + repo + "/actions/runs/" + to_string(run_id) + "/attempts/" + to_string(attempt),
-    ),
-    schema_of(Run),
-  )
-  const commit = sha(required(env, "CI_JOB_PROOF_COMMIT"))
-  const event = required(env, "CI_JOB_PROOF_EVENT")
-  if run.id != run_id || run.run_attempt != attempt || run.head_sha != commit
-    || run.event != event
-    || run.repository.full_name != repo
-    || run.head_repository.full_name != repo
-    || run.path != ".github/workflows/" + file {
-    throw "current workflow context differs from the authenticated run"
-  }
-  return {
-    schema: REGISTRATION_SCHEMA,
-    repository: repo,
-    workflow: file,
-    event: event,
-    commit: commit,
-    runId: run_id,
-    attempt: attempt,
-    registrarJob: required(env, "CI_JOB_PROOF_REGISTRAR_JOB"),
-    registrarStep: required(env, "CI_JOB_PROOF_REGISTRAR_STEP"),
-    jobs: [],
   }
 }
 
@@ -95,6 +48,8 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
     )
     return
   }
+  const workspace = required(harness.env, "GITHUB_WORKSPACE")
+  const actual_source = tested_source(harness.process, workspace)
   const discovery = try {
     discover(
       source,
@@ -114,7 +69,9 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
   output(harness, "discovery", json_stringify(pick(found, ["probed", "reads", "budget", "reason"])))
   // Registration records where each reused job actually ran, so a later run
   // proves it there instead of trusting this run's pointer.
-  const published = registration(current, wanted, found.admitted)
+  require tested_source(harness.process, workspace) == actual_source,
+    "tested checkout changed during proof discovery"
+  const published = registration(current, wanted, found.admitted, actual_source)
   register(harness, published)
   if len(found.admitted) == 0 {
     harness.stdio.println("No qualified job proof; selected jobs will run.")

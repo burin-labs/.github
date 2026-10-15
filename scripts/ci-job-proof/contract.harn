@@ -1,6 +1,6 @@
 pub const IDENTITY_SCHEMA = "burin.ci_job_identity.v1"
 
-pub const REGISTRATION_SCHEMA = "burin.ci_job_proof_registration.v2"
+pub const REGISTRATION_SCHEMA = "burin.ci_job_proof_registration.v3"
 
 pub const RECEIPT_SCHEMA = "burin.ci_job_proof.v2"
 
@@ -14,8 +14,8 @@ pub type Provenance = {runId: int, attempt: int}
 
 pub type RegisteredJob = {id: string, names: list<string>, digest: string, provenance: Provenance?}
 
-pub type Registration = {
-  schema: string,
+/** The authenticated workflow-run head is distinct from its actual tested checkout. */
+pub type RunContext = {
   repository: string,
   workflow: string,
   event: string,
@@ -24,9 +24,16 @@ pub type Registration = {
   attempt: int,
   registrarJob: string,
   registrarStep: string,
-  jobs: list<RegisteredJob>,
 }
 
+/** The clean Git commit and tree measured before registration. */
+pub type TestedSource = {commit: string, tree: string}
+
+/** An attempt's registered identities retain its actual checkout and API run context. */
+pub type Registration = RunContext \
+  & {schema: string, tested_source: TestedSource, jobs: list<RegisteredJob>}
+
+/** GitHub's workflow-run metadata for one explicit attempt. */
 pub type Run = {
   id: int,
   run_attempt: int,
@@ -83,6 +90,24 @@ pub const PRODUCER_EVENTS = ["pull_request", "merge_group", "push"]
 
 /** Derive closed wire schemas from the types rather than copying their field lists. */
 pub fn closed(schema: dict) -> dict {
+  if schema.all_of != nil {
+    let properties = {}
+    let required: list<string> = []
+    for member in schema.all_of {
+      require member.type == "dict" && member?.properties != nil,
+        "closed wire intersections require record schemas"
+      for name in member.properties.keys() {
+        require properties[name] == nil || properties[name] == member.properties[name],
+          "conflicting wire intersection field"
+      }
+      properties = properties + member.properties
+      required = required + (member?.required ?? [])
+    }
+    return closed({type: "dict", properties: properties, required: required.unique()})
+  }
+  if schema.union != nil {
+    return schema + {union: schema.union.map({ member -> closed(member) })}
+  }
   if schema.type == "dict" && schema?.properties != nil {
     let properties = {}
     for name in schema.properties.keys() {
@@ -142,7 +167,7 @@ pub fn identities(raw: unknown) -> list<JobIdentity> {
     }
   }
   return value.jobs.sorted_by({ job -> job.id }).map(
-    { job -> {id: job.id, names: job.names, digest: job.digest} },
+    { job -> pick(job, ["id", "names", "digest"]) },
   )
     .to_list()
 }
@@ -168,7 +193,7 @@ pub fn qualified_artifact(artifact: Artifact, producer: Run) {
 }
 
 /** The producer is this repository's workflow, completed, and its registration describes it. */
-pub fn trusted_producer(current: Registration, producer: Run, recorded: Registration) {
+pub fn trusted_producer(current: RunContext, producer: Run, recorded: Registration) {
   if recorded.schema != REGISTRATION_SCHEMA || recorded.repository != current.repository
     || recorded.workflow != current.workflow
     || recorded.commit != producer.head_sha
@@ -186,6 +211,8 @@ pub fn trusted_producer(current: Registration, producer: Run, recorded: Registra
     throw "producer source, workflow, repository or attempt mismatch"
   }
   sha(recorded.commit)
+  sha(recorded.tested_source.commit)
+  sha(recorded.tested_source.tree)
 }
 
 fn coherent_jobs(jobs: list<Job>, declared: int, producer: Run) {
@@ -231,7 +258,7 @@ fn executed(
     return nil
   }
   for name in wanted.names.filter({ name -> !name.starts_with("^") }) {
-    if legs.filter({ job -> job.name == name }).count() != 1 {
+    if len(legs.filter({ job -> job.name == name })) != 1 {
       return nil
     }
   }
@@ -255,7 +282,7 @@ fn executed(
  * names; nothing is admitted on a pointer alone.
  */
 pub fn admit_jobs(
-  current: Registration,
+  current: RunContext,
   producer: Run,
   registered: RegisteredArtifact,
   jobs: list<Job>,
@@ -303,10 +330,13 @@ pub fn admit_jobs(
 
 /** The registration a run publishes: its identities, and where each reused job ran. */
 pub fn registration(
-  current: Registration,
+  current: RunContext,
   wanted: list<JobIdentity>,
   admitted: list<Admission>,
+  tested_source: TestedSource,
 ) -> Registration {
+  sha(tested_source.commit)
+  sha(tested_source.tree)
   let jobs: list<RegisteredJob> = []
   for identity in wanted {
     const proof = admitted.filter({ admission -> admission.id == identity.id }).to_list()
@@ -315,7 +345,7 @@ pub fn registration(
       + [{id: identity.id, names: identity.names, digest: identity.digest, provenance: provenance}]
   }
   return {
-    schema: current.schema,
+    schema: REGISTRATION_SCHEMA,
     repository: current.repository,
     workflow: current.workflow,
     event: current.event,
@@ -324,6 +354,7 @@ pub fn registration(
     attempt: current.attempt,
     registrarJob: current.registrarJob,
     registrarStep: current.registrarStep,
+    tested_source: tested_source,
     jobs: jobs,
   }
 }

@@ -4,7 +4,8 @@ import { registration_from_archive } from "./live.harn"
 
 fn document() -> dict {
   return {
-    schema: "burin.ci_job_proof_registration.v2",
+    schema: "burin.ci_job_proof_registration.v3",
+    tested_source: {commit: "e".repeat(40), tree: "f".repeat(40)},
     repository: "acme/product",
     workflow: "ci.yml",
     event: "merge_group",
@@ -39,6 +40,23 @@ pipeline test_actual_archive_digest_and_closed_document_are_required(harness: Ha
       },
     ),
   )
+  for altered_document in [
+    pick(document(), document().keys().filter({ name -> name != "tested_source" })),
+    document() + {tested_source: document().tested_source + {extra: true}},
+    document() + {jobs: [document().jobs[0] + {provenance: {runId: 9, attempt: 1, extra: true}}]},
+  ] {
+    const invalid = zip_create(
+      [{path: "registration.json", content: json_stringify(altered_document)}],
+    )
+    harness.fs.write_bytes(path, invalid)
+    assert(
+      is_err(
+        try {
+          registration_from_archive(harness.fs, path, "sha256:" + sha256(invalid))
+        },
+      ),
+    )
+  }
   const unrelated = zip_create([{path: "other.json", content: "{}"}])
   harness.fs.write_bytes(path, unrelated)
   assert_error_contains(

@@ -5,9 +5,12 @@ package_root="$(cd "${GITHUB_ACTION_PATH:?GITHUB_ACTION_PATH is required}/../../
 readonly package_root
 readonly workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 readonly step_output="${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
-staged_output="$(mktemp "${workspace}/.ci-job-proof-output.XXXXXX")"
+staged_directory="$(mktemp -d "${TMPDIR:-/tmp}/ci-job-proof-output.XXXXXX")"
+readonly staged_directory
+staged_output="${staged_directory}/github-output"
 readonly staged_output
-trap 'rm -f -- "$staged_output"' EXIT
+trap 'rm -f -- "$staged_output"; rmdir -- "$staged_directory"' EXIT
+: > "$staged_output"
 
 GITHUB_OUTPUT="$staged_output" harn run \
   --standalone \
@@ -24,8 +27,10 @@ GITHUB_OUTPUT="$staged_output" harn run \
   --grant run_id=env:CI_JOB_PROOF_RUN_ID,expose=CI_JOB_PROOF_RUN_ID \
   --grant attempt=env:CI_JOB_PROOF_ATTEMPT,expose=CI_JOB_PROOF_ATTEMPT \
   --grant github_output=env:GITHUB_OUTPUT,expose=GITHUB_OUTPUT \
+  --grant github_workspace=env:GITHUB_WORKSPACE,expose=GITHUB_WORKSPACE \
   --read-only-root "$package_root" \
   --write-root "$workspace" \
+  --write-root "$staged_directory" \
   "$package_root/scripts/ci-job-proof/cli.harn"
 
 cat -- "$staged_output" >> "$step_output"

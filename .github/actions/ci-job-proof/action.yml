@@ -43,6 +43,9 @@ inputs:
     required: true
 
 outputs:
+  registration:
+    description: Path to the complete source-bound registration uploaded for this attempt; empty when none.
+    value: ${{ steps.resolve.outputs.registration }}
   reused:
     description: JSON list of job ids whose passing result this run reuses. Empty list when none.
     value: ${{ steps.resolve.outputs.reused }}

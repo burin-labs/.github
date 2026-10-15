@@ -1,6 +1,5 @@
-import { current_run } from "./cli.harn"
 import { Run } from "./contract.harn"
-import { live_source } from "./live.harn"
+import { current_run, live_source } from "./live.harn"
 import { historical_reuse } from "./reader.harn"
 
 fn main(harness: Harness) {

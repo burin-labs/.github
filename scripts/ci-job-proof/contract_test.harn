@@ -6,6 +6,7 @@ import {
   admit_jobs,
   identities,
   registration,
+  trusted_producer,
 } from "./contract.harn"
 
 const DIGEST_A = "a".repeat(64)
@@ -25,7 +26,8 @@ fn wanted() -> list<JobIdentity> {
 
 fn current() -> Registration {
   return {
-    schema: "burin.ci_job_proof_registration.v2",
+    schema: "burin.ci_job_proof_registration.v3",
+    tested_source: {commit: "e".repeat(40), tree: "f".repeat(40)},
     repository: "acme/product",
     workflow: "ci.yml",
     event: "push",
@@ -177,6 +179,24 @@ pipeline test_registration_points_reused_jobs_at_their_executing_run() {
     current(),
     wanted().slice(0, 2),
     [{id: "lint", digest: DIGEST_A, provenance: {runId: 20, attempt: 1}, jobIds: [2]}],
+    current().tested_source,
   )
   assert_eq(published.jobs.map({ job -> job.provenance }), [{runId: 20, attempt: 1}, nil])
+  assert_eq(published.tested_source, current().tested_source)
+}
+
+pipeline test_actual_tested_merge_stays_distinct_and_unknown_source_refuses() {
+  const valid = recorded()
+  trusted_producer(current(), producer(), valid)
+  assert(valid.tested_source.commit != producer().head_sha)
+  for source in [
+    {commit: "", tree: valid.tested_source.tree},
+    {commit: valid.tested_source.commit, tree: ""},
+    {commit: "HEAD", tree: valid.tested_source.tree},
+  ] {
+    assert_error_contains(
+      fn() { trusted_producer(current(), producer(), valid + {tested_source: source}) },
+      "invalid Git identity",
+    )
+  }
 }

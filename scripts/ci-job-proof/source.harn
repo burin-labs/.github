@@ -1,0 +1,18 @@
+import { TestedSource, sha } from "./contract.harn"
+
+/** Measure the clean checkout that produced the input identities, not the API run head. */
+pub fn tested_source(process: HarnessProcess, workspace: string) -> TestedSource {
+  require workspace != "", "tested checkout workspace is required"
+  const status = process.run(
+    {program: "git", args: ["status", "--porcelain", "--untracked-files=all"], cwd: workspace},
+  )
+  require status.success && status.exit_code == 0 && status.stdout == "",
+    "tested checkout is dirty or unreadable"
+  const result = process.run(
+    {program: "git", args: ["rev-parse", "HEAD", "HEAD^{tree}"], cwd: workspace},
+  )
+  require result.success && result.exit_code == 0, "tested checkout identity is unreadable"
+  const lines = result.stdout.trim().split("\n")
+  require len(lines) == 2, "tested checkout identity is incomplete"
+  return {commit: sha(lines[0]!), tree: sha(lines[1]!)}
+}
