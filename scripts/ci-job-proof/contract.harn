@@ -275,16 +275,17 @@ fn coherent_jobs(jobs: list<Job>, declared: int, producer: Run) {
 
 fn successful_registrar(recorded: Registration, jobs: list<Job>) -> Job {
   const registrars = jobs.filter({ job -> job.name == recorded.registrarJob }).to_list()
-  if len(registrars) != 1 || registrars[0].conclusion != "success"
-    || registrars[0].completed_at == nil {
+  const registrar = registrars[0]
+  if len(registrars) != 1 || registrar == nil || registrar.conclusion != "success"
+    || registrar.completed_at == nil {
     throw "registration job did not complete successfully"
   }
-  const steps =
-    registrars[0].steps.filter({ step -> step.name == recorded.registrarStep }).to_list()
-  if len(steps) != 1 || steps[0].status != "completed" || steps[0].conclusion != "success" {
+  const steps = registrar.steps.filter({ step -> step.name == recorded.registrarStep }).to_list()
+  const step = steps[0]
+  if len(steps) != 1 || step == nil || step.status != "completed" || step.conclusion != "success" {
     throw "registration step did not fire successfully"
   }
-  return registrars[0]
+  return registrar
 }
 
 /** Every leg of the job passed, after its contract was registered; nil when it did not. */
@@ -342,11 +343,12 @@ pub fn qualified_jobs(
   let deferred: list<Deferral> = []
   for identity in wanted {
     const claims = recorded.jobs.filter({ job -> job.id == identity.id }).to_list()
-    if len(claims) != 1 || claims[0].digest != identity.digest
-      || claims[0].names != identity.names {
+    const claim = claims[0]
+    if len(claims) != 1 || claim == nil || claim.digest != identity.digest
+      || claim.names != identity.names {
       continue
     }
-    const provenance = claims[0].provenance
+    const provenance = claim.provenance
     if provenance != nil {
       if provenance.runId != producer.id || provenance.attempt != producer.run_attempt {
         deferred = deferred + [{id: identity.id, provenance: provenance}]
@@ -401,7 +403,8 @@ pub fn registration(
   let jobs: list<RegisteredJob> = []
   for identity in wanted {
     const proof = admitted.filter({ admission -> admission.id == identity.id }).to_list()
-    const provenance: Provenance? = len(proof) == 1 ? proof[0].provenance : nil
+    const single = proof[0]
+    const provenance: Provenance? = len(proof) == 1 && single != nil ? single.provenance : nil
     jobs = jobs
       + [{id: identity.id, names: identity.names, digest: identity.digest, provenance: provenance}]
   }
