@@ -21,13 +21,14 @@ pub type GitHub = {
 
 /**
  * What the caller asked to promote. A tag with a pre-release suffix, such as
- * v1.2.3-rc.1, is a prerelease and never becomes the latest release.
+ * v1.2.3-rc.1, is a prerelease. Package namespaces never change repository latest.
  */
 pub type PromotionRequest = {
   repository: string,
   sha: string,
   run_id: int,
   tag: string,
+  namespace: string?,
   prerelease: bool,
 }
 
@@ -59,17 +60,34 @@ pub fn parse_request(
   expect_format(repository, "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "repository must be owner/name")
   expect_format(sha, "^[0-9a-f]{40}$", "sha must be a full 40-character lowercase commit SHA")
   expect_format(run_id, "^[1-9][0-9]*$", "run-id must be a workflow run id")
+  const parts = tag.split("/")
+  require len(parts) == 1 || len(parts) == 2, "tag must have at most one package namespace"
+  const namespace = if len(parts) == 2 {
+    parts[0]!
+  } else {
+    nil
+  }
+  if namespace != nil {
+    expect_format(
+      namespace,
+      "^[A-Za-z0-9]+([._-][A-Za-z0-9]+)*$",
+      "tag namespace must contain alphanumeric groups separated by '.', '_' or '-'",
+    )
+    require !namespace.ends_with(".lock"), "tag namespace cannot end in .lock"
+  }
+  const version = parts[len(parts) - 1]!
   expect_format(
-    tag,
+    version,
     "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$",
-    "tag must look like vX.Y.Z or vX.Y.Z-suffix, got " + tag,
+    "tag must look like vX.Y.Z or vX.Y.Z-suffix, optionally after a package namespace: " + tag,
   )
   return {
     repository: repository,
     sha: sha,
     run_id: to_int(run_id),
     tag: tag,
-    prerelease: tag.contains("-"),
+    namespace: namespace,
+    prerelease: version.contains("-"),
   }
 }
 
@@ -261,7 +279,9 @@ pub fn verify_candidate(
 }
 
 fn tag_commit(github: GitHub, request: PromotionRequest) -> string? {
-  const ref = github.json("/repos/" + request.repository + "/git/ref/tags/" + request.tag)
+  const ref = github.json(
+    "/repos/" + request.repository + "/git/ref/tags/" + url_encode(request.tag),
+  )
   if ref == nil {
     return nil
   }
@@ -297,7 +317,9 @@ pub fn publish_candidate(
   directory: string,
 ) -> {tag: string, url: string} {
   const candidate = check_candidate(fs, request, run, directory)
-  const existing = github.json("/repos/" + request.repository + "/releases/tags/" + request.tag)
+  const existing = github.json(
+    "/repos/" + request.repository + "/releases/tags/" + url_encode(request.tag),
+  )
   if existing != nil {
     throw "release " + request.tag + " already exists: " + to_string(existing?.html_url)
   }
@@ -373,7 +395,7 @@ pub fn publish_candidate(
   if tagged == nil {
     github.create_tag(request.tag, request.sha, "Release " + request.tag)
   }
-  const published = github.publish_draft(draft.id, !request.prerelease)
+  const published = github.publish_draft(draft.id, request.namespace == nil && !request.prerelease)
   const landed = tag_commit(github, request)
   if landed != request.sha {
     throw "published " + request.tag + " but the tag points at " + to_string(landed) + ", not "
