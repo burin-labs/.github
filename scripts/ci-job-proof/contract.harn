@@ -26,6 +26,18 @@ pub type RunContext = {
   registrarStep: string,
 }
 
+/** Implemented producer events; dispatch observation requires explicit enrollment. */
+pub type ProducerEvent = "pull_request" | "merge_group" | "push" | "workflow_dispatch"
+
+/** Trusted producer selection is independent of the workflow running an observer. */
+pub type ProducerPolicy = {
+  repository: string,
+  workflow: string,
+  events: list<ProducerEvent>,
+  registrarJob: string,
+  registrarStep: string,
+}
+
 /** The clean Git commit and tree measured before registration. */
 pub type TestedSource = {commit: string, tree: string}
 
@@ -86,7 +98,7 @@ pub type ProofReceipt = {schema: string, current: Registration, admitted: list<A
 /** Events that may reuse a proof. A pull request only registers its own. */
 pub const CONSUMER_EVENTS = ["merge_group", "push"]
 
-pub const PRODUCER_EVENTS = ["pull_request", "merge_group", "push"]
+pub const PRODUCER_EVENTS: list<ProducerEvent> = ["pull_request", "merge_group", "push"]
 
 /** Derive closed wire schemas from the types rather than copying their field lists. */
 pub fn closed(schema: dict) -> dict {
@@ -192,27 +204,53 @@ pub fn qualified_artifact(artifact: Artifact, producer: Run) {
   }
 }
 
-/** The producer is this repository's workflow, completed, and its registration describes it. */
-pub fn trusted_producer(current: RunContext, producer: Run, recorded: Registration) {
-  if recorded.schema != REGISTRATION_SCHEMA || recorded.repository != current.repository
-    || recorded.workflow != current.workflow
+/** Existing reuse keeps its original event policy and never accepts its own run. */
+pub fn reuse_producer_policy(current: RunContext, producer: Run) -> ProducerPolicy {
+  if producer.id == current.runId {
+    throw "producer source, workflow, repository or attempt mismatch"
+  }
+  return {
+    repository: current.repository,
+    workflow: current.workflow,
+    events: PRODUCER_EVENTS,
+    registrarJob: current.registrarJob,
+    registrarStep: current.registrarStep,
+  }
+}
+
+/** One source/workflow/attempt owner serves original observation and historical reuse. */
+pub fn qualified_producer(policy: ProducerPolicy, producer: Run, recorded: Registration) {
+  schema_expect(policy, schema_of(ProducerPolicy))
+  if policy.repository.trim() == "" || policy.workflow.trim() == ""
+    || policy.registrarJob.trim() == ""
+    || policy.registrarStep.trim() == ""
+    || len(policy.events) == 0
+    || len(policy.events.unique()) != len(policy.events) {
+    throw "producer policy is incomplete or ambiguous"
+  }
+  if recorded.schema != REGISTRATION_SCHEMA || recorded.repository != policy.repository
+    || recorded.workflow != policy.workflow
     || recorded.commit != producer.head_sha
     || recorded.runId != producer.id
     || recorded.attempt != producer.run_attempt
     || recorded.event != producer.event
-    || !PRODUCER_EVENTS.contains(producer.event)
-    || producer.id == current.runId
-    || producer.repository.full_name != current.repository
-    || producer.head_repository.full_name != current.repository
-    || producer.path != ".github/workflows/" + current.workflow
+    || !policy.events.contains(producer.event)
+    || producer.repository.full_name != policy.repository
+    || producer.head_repository.full_name != policy.repository
+    || producer.path != ".github/workflows/" + policy.workflow
     || producer.status != "completed"
-    || recorded.registrarJob != current.registrarJob
-    || recorded.registrarStep != current.registrarStep {
+    || recorded.registrarJob != policy.registrarJob
+    || recorded.registrarStep != policy.registrarStep {
     throw "producer source, workflow, repository or attempt mismatch"
   }
   sha(recorded.commit)
   sha(recorded.tested_source.commit)
   sha(recorded.tested_source.tree)
+}
+
+/** Historical callers retain the distinct consumer run and default producer events. */
+pub fn trusted_producer(current: RunContext, producer: Run, recorded: Registration) {
+  qualified_producer(reuse_producer_policy(current, producer), producer, recorded)
 }
 
 fn coherent_jobs(jobs: list<Job>, declared: int, producer: Run) {
@@ -281,8 +319,8 @@ fn executed(
  * passed here. A job the producer itself reused is deferred to the run it
  * names; nothing is admitted on a pointer alone.
  */
-pub fn admit_jobs(
-  current: RunContext,
+pub fn qualified_jobs(
+  policy: ProducerPolicy,
   producer: Run,
   registered: RegisteredArtifact,
   jobs: list<Job>,
@@ -290,7 +328,7 @@ pub fn admit_jobs(
   wanted: list<JobIdentity>,
 ) -> RunAdmission {
   const recorded = registered.registration
-  trusted_producer(current, producer, recorded)
+  qualified_producer(policy, producer, recorded)
   qualified_artifact(registered.artifact, producer)
   coherent_jobs(jobs, declared, producer)
   const registrar = successful_registrar(recorded, jobs)
@@ -326,6 +364,25 @@ pub fn admit_jobs(
     }
   }
   return {admitted: admitted, deferred: deferred}
+}
+
+/** Historical reuse is the conservative policy projection of the same job qualifier. */
+pub fn admit_jobs(
+  current: RunContext,
+  producer: Run,
+  registered: RegisteredArtifact,
+  jobs: list<Job>,
+  declared: int,
+  wanted: list<JobIdentity>,
+) -> RunAdmission {
+  return qualified_jobs(
+    reuse_producer_policy(current, producer),
+    producer,
+    registered,
+    jobs,
+    declared,
+    wanted,
+  )
 }
 
 /** The registration a run publishes: its identities, and where each reused job ran. */

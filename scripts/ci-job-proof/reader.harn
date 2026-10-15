@@ -4,18 +4,20 @@ import {
   IDENTITY_SCHEMA,
   Job,
   JobIdentity,
+  ProducerPolicy,
   Provenance,
   RegisteredArtifact,
   Registration,
   Run,
   RunAdmission,
   RunContext,
-  admit_jobs,
   closed,
   identities,
   leg_of,
   qualified_artifact,
+  qualified_jobs,
   registration_artifact_name,
+  reuse_producer_policy,
   sha,
 } from "./contract.harn"
 
@@ -134,19 +136,19 @@ fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifac
   throw "artifact census exceeded its bound"
 }
 
-/** Qualify one producer run, then admit the wanted jobs it proves or points at. */
-pub fn inspect_run(
+/** Inspect a producer under trusted policy without inventing a consumer workflow or run. */
+pub fn inspect_original_run(
   source: ProofSource,
-  current: RunContext,
+  policy: ProducerPolicy,
   producer: Run,
   wanted: list<JobIdentity>? = nil,
 ) -> OriginalRunInspection {
-  const artifact = registration_artifact(source, current.repository, producer)
+  const artifact = registration_artifact(source, policy.repository, producer)
   qualified_artifact(artifact, producer)
-  const raw = source.registration(current.repository, artifact)
+  const raw = source.registration(policy.repository, artifact)
   schema_expect(raw, closed(schema_of(Registration)))
   const recorded = schema_expect(raw, schema_of(Registration))
-  const census = job_census(source, current.repository, producer)
+  const census = job_census(source, policy.repository, producer)
   const requested = wanted
     ?? identities(
       {
@@ -154,8 +156,8 @@ pub fn inspect_run(
         jobs: recorded.jobs.map({ identity -> pick(identity, ["id", "names", "digest"]) }),
       },
     )
-  const admission = admit_jobs(
-    current,
+  const admission = qualified_jobs(
+    policy,
     producer,
     {artifact: artifact, registration: recorded},
     census.jobs,
@@ -169,6 +171,16 @@ pub fn inspect_run(
     census: census,
     requested: requested,
   }
+}
+
+/** Existing reuse and history keep their same-workflow, distinct-consumer policy. */
+pub fn inspect_run(
+  source: ProofSource,
+  current: RunContext,
+  producer: Run,
+  wanted: list<JobIdentity>? = nil,
+) -> OriginalRunInspection {
+  return inspect_original_run(source, reuse_producer_policy(current, producer), producer, wanted)
 }
 
 pub fn read_run(

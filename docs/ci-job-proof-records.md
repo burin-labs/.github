@@ -28,7 +28,25 @@ action until they adopt a new pin. A missing proof runs the job.
 ## Original run inspection
 
 The package's `ci_job_proof` export exposes the reader, its input types, and
-the bounded live transport. The reader's `inspect_run` returns:
+the bounded live transport. Use `inspect_original_run(source, policy, producer,
+wanted?)` to observe a run from a controller or another workflow. It takes a
+trusted `ProducerPolicy`, with no invented consumer run:
+
+| Policy field | Meaning |
+| --- | --- |
+| `repository` | Exact repository that ran the job, as `owner/name` |
+| `workflow` | Exact producer workflow file, such as `ci.yml` |
+| `events` | Enrolled producer events, with no empty or duplicate entries |
+| `registrarJob` | Exact job name that published the input record |
+| `registrarStep` | Exact successful step that published it |
+
+The implemented events are `pull_request`, `merge_group`, `push` and
+`workflow_dispatch`. Dispatch observation requires explicit enrollment. The
+policy comes from your trusted installation, not from the inspected change.
+Supply the producer from an authenticated read of that exact run and attempt.
+The bounded `live_source` transport checks the downloaded archive bytes.
+
+The result retains:
 
 | Field | Meaning |
 | --- | --- |
@@ -39,10 +57,21 @@ the bounded live transport. The reader's `inspect_run` returns:
 | `admission` | Jobs that passed and pointers to original runs still to read |
 
 If you omit `wanted`, inspection reads all identities in the record. It uses
-the same source, archive, job count, and registrar checks as `read_run`.
+the same source, archive, job count, and registrar checks as reuse.
 The result retains failed jobs; a retained job is not a passing proof.
-Reuse and history both call this owner. Empty, partial, mixed, and duplicate
-job lists refuse. Archive bytes must match the API digest before parsing.
+Empty, partial, mixed, and duplicate job lists refuse. Archive bytes must match
+the API digest before parsing. The producer must have finished; its overall
+conclusion may be failure when an unrelated job failed.
+
+`inspect_run(source, current, producer, wanted?)` remains the reuse entrypoint.
+It projects the existing `RunContext` onto the same verifier. It still requires
+a distinct consumer run of the same workflow and accepts only `pull_request`,
+`merge_group` and `push` producers. History keeps that policy too. Enrolling a
+dispatch observer grants no new reuse authority to existing callers.
+
+Inspection returns facts and logical job proofs. It does not sign a Smart Ship
+receipt, admit a change, merge work or qualify a release. A consumer still has
+to bind those facts to its trusted job plan and release policy.
 
 ## Action output
 
@@ -57,6 +86,9 @@ The [source test](../scripts/ci-job-proof/source_test.harn) measures a real
 Git checkout and rejects tracked edits, untracked input, and a missing path.
 The [archive test](../scripts/ci-job-proof/product_test.harn) retains a tested
 merge distinct from the run head, the archive digest, and the full job list.
+It observes an explicitly enrolled dispatch and refuses a different workflow,
+attempt, active run, empty policy and missing event enrollment. The same test
+confirms that the existing path still refuses self-reuse and dispatch reuse.
 The [CI workflow](../.github/workflows/ci.yml) runs the actual action with a
 nonempty identity, uploads its record, then reads back both source fields.
 Its smoke identity proves registration transport; it grants no reused CI
