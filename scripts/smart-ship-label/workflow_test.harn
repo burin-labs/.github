@@ -82,6 +82,28 @@ pipeline test_wrong_repository_or_caller_revision_is_refused() {
   }
 }
 
+pipeline test_ci_runs_the_pinned_control_graph_on_the_shipping_runtime(harness: Harness) {
+  const ci = read_yaml(harness.fs, "../../.github/workflows/ci.yml")
+  const job = ci.jobs["smart-ship-control-runtime"]
+  const checkout = job.steps[0]
+  assert_eq(control_policy_source(checkout["with"]), CONTROL_POLICY_SOURCE)
+  assert_eq(checkout["with"].path, ".smart-ship-control")
+  assert_eq(checkout["with"]["persist-credentials"], false)
+  const setup = named(job.steps, "Install the shipping consumer runtime")
+  assert_eq(setup["with"].version, "0.10.166")
+  const proof = named(job.steps, "Exercise the immutable control script")
+  assert(
+    proof.run.contains("harn test .smart-ship-control/scripts/smart-ship-label/policy_test.harn"),
+  )
+  assert(ci.jobs["ci-status"].needs.contains("smart-ship-control-runtime"))
+  const gate = named(ci.jobs["ci-status"].steps, "Require reusable package smoke")
+  assert_eq(
+    gate.env.SMART_SHIP_CONTROL_RESULT,
+    expression("needs.smart-ship-control-runtime.result"),
+  )
+  assert(gate.run.contains("test \"$SMART_SHIP_CONTROL_RESULT\" = success"))
+}
+
 pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness) {
   const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
   const input = workflow.on.workflow_call.inputs["owned-runner"]
