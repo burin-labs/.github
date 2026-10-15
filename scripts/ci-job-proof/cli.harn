@@ -2,8 +2,8 @@ import { write_json } from "std/fs"
 import { gha_write_output } from "std/gha"
 import {
   JobIdentity,
-  PRODUCER_EVENTS,
   RECEIPT_SCHEMA,
+  REGISTRATION_EVENTS,
   Registration,
   identities,
   registration,
@@ -42,7 +42,7 @@ fn register(harness: Harness, published: Registration) {
 fn resolve(harness: Harness, wanted: list<JobIdentity>) {
   const source = live_source(harness.net, harness.fs, required(harness.env, "GH_TOKEN"))
   const current = current_run(harness.env, source)
-  if !PRODUCER_EVENTS.contains(current.event) {
+  if !REGISTRATION_EVENTS.contains(current.event) {
     harness.stdio.println(
       "This event neither registers nor reuses job proofs; every selected job runs.",
     )

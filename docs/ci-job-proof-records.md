@@ -45,6 +45,8 @@ The implemented events are `pull_request`, `merge_group`, `push` and
 policy comes from your trusted installation, not from the inspected change.
 Supply the producer from an authenticated read of that exact run and attempt.
 The bounded `live_source` transport checks the downloaded archive bytes.
+The shared action publishes an original input record for dispatch runs. Those
+runs do not search history, skip selected jobs or publish a reuse receipt.
 
 The result retains:
 

@@ -1,9 +1,39 @@
-import { JobIdentity, Registration, Run } from "./contract.harn"
+import {
+  JobIdentity,
+  REGISTRATION_EVENTS,
+  REUSE_PRODUCER_EVENTS,
+  Registration,
+  Run,
+  registration,
+} from "./contract.harn"
 import { ProofSource, discover } from "./reader.harn"
 
 const DIGEST = "a".repeat(64)
 
 const COMMIT = "c".repeat(40)
+
+pipeline test_dispatch_registers_original_jobs_without_searching_or_reusing_history() {
+  const context = current() + {event: "workflow_dispatch"}
+  const forbidden: ProofSource = {
+    json: fn(_endpoint) {
+      throw "dispatch must not read reuse history"
+    },
+    registration: fn(_repo, _artifact) {
+      throw "dispatch must not read reused registration"
+    },
+  }
+  const result = discover(forbidden, context, wanted(), nil, fn() { return 0 })
+  assert_eq(result.admitted, [])
+  assert_eq(result.reads, 0)
+  assert_eq(result.reason, "unsupported_event")
+  assert(REGISTRATION_EVENTS.contains(context.event))
+  assert(!REUSE_PRODUCER_EVENTS.contains(context.event))
+  const published = registration(context, wanted(), result.admitted, context.tested_source)
+  assert_eq(published.event, "workflow_dispatch")
+  assert_eq(published.tested_source, context.tested_source)
+  assert_eq(len(published.jobs), 2)
+  assert(published.jobs.all({ job -> job.provenance == nil }))
+}
 
 fn wanted() -> list<JobIdentity> {
   return [
@@ -218,7 +248,7 @@ pipeline test_discovery_stops_at_its_deadline() {
 }
 
 pipeline test_two_attempts_of_one_run_are_two_producers() {
-  const rerun = {...run(7, "push"), run_attempt: 2}
+  const rerun = run(7, "push") + {run_attempt: 2}
   const producers = [
     // The merge group reused lint from run 7's first attempt and suite from its rerun.
     producer(

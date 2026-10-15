@@ -98,7 +98,11 @@ pub type ProofReceipt = {schema: string, current: Registration, admitted: list<A
 /** Events that may reuse a proof. A pull request only registers its own. */
 pub const CONSUMER_EVENTS = ["merge_group", "push"]
 
-pub const PRODUCER_EVENTS: list<ProducerEvent> = ["pull_request", "merge_group", "push"]
+/** Existing history may reuse only these producer events. */
+pub const REUSE_PRODUCER_EVENTS: list<ProducerEvent> = ["pull_request", "merge_group", "push"]
+
+/** Dispatches publish original evidence too, but never discover or grant reused proofs. */
+pub const REGISTRATION_EVENTS: list<ProducerEvent> = REUSE_PRODUCER_EVENTS + ["workflow_dispatch"]
 
 /** Derive closed wire schemas from the types rather than copying their field lists. */
 pub fn closed(schema: dict) -> dict {
@@ -212,7 +216,7 @@ pub fn reuse_producer_policy(current: RunContext, producer: Run) -> ProducerPoli
   return {
     repository: current.repository,
     workflow: current.workflow,
-    events: PRODUCER_EVENTS,
+    events: REUSE_PRODUCER_EVENTS,
     registrarJob: current.registrarJob,
     registrarStep: current.registrarStep,
   }
