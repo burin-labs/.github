@@ -1,0 +1,49 @@
+/** The exact population selected before a Smart Ship run arbitrates ownership. */
+pub type TargetSelection = {
+  schema: int,
+  repository: string,
+  workflow: string,
+  run_id: int,
+  attempt: int,
+  prs: list<int>,
+}
+
+pub type SelectionInput = {
+  repository: string,
+  workflow_ref: string,
+  run_id: int,
+  attempt: int,
+  numbers: string?,
+}
+
+/** NUMBERS comes from the selector, never from its deferred repair subset. */
+pub fn selected_targets(input: SelectionInput) -> TargetSelection {
+  const {repository, run_id, attempt, numbers} = input
+  const prefix = repository + "/.github/workflows/"
+  const source = split(input.workflow_ref, "@")[0] ?? ""
+  const workflow = source.starts_with(prefix) ? source[len(prefix):] : ""
+  require regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repository) != nil
+    && regex_match("^[A-Za-z0-9_][A-Za-z0-9_.-]*\\.ya?ml$", workflow) != nil
+    && run_id > 0
+    && attempt > 0,
+    "Smart Ship selection identity is unmeasured"
+  require numbers != nil, "the original Smart Ship selection is absent"
+  require numbers == "" || regex_match("^[1-9][0-9]*( [1-9][0-9]*)*$", numbers) != nil,
+    "Smart Ship selection is malformed"
+  const prs =
+    numbers == "" ? [] : split(numbers, " ").map({ value -> to_int(value) ?? 0 }).to_list()
+  require len(prs) <= 1000, "Smart Ship selection exceeds its population bound"
+  let seen = []
+  for number in prs {
+    require number > 0 && !seen.contains(number), "Smart Ship selection repeats or invalidates a PR"
+    seen = seen + [number]
+  }
+  return {
+    schema: 1,
+    repository: repository,
+    workflow: workflow,
+    run_id: run_id,
+    attempt: attempt,
+    prs: prs,
+  }
+}
