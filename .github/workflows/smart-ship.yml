@@ -172,6 +172,32 @@ jobs:
           echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
           echo "Looking at: ${numbers:-none}"
 
+      - name: Check out the Smart Ship target publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 91ad5a4b9c7fe58823e1433808eda60c5cd48cdb
+          path: .smart-ship-targets
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
+
+      - name: Record the selected pull requests
+        env:
+          NUMBERS: ${{ steps.prs.outputs.numbers }}
+        run: >-
+          ./scripts/harnw run --no-sandbox
+          .smart-ship-targets/scripts/smart-ship-targets/cli.harn --
+          --output "$RUNNER_TEMP/ship-targets/targets.json"
+
+      - name: Publish the selected pull requests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ship-targets/targets.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
       - name: Shepherd
         id: shepherd
         if: steps.prs.outputs.numbers != ''
