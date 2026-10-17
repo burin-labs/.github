@@ -163,6 +163,7 @@ fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
     CALLS: calls,
     DEFER_PR: defer_pr,
     GITHUB_OUTPUT: output,
+    GITHUB_WORKSPACE: workspace,
     REPO: "o/r",
     LABEL: "ship",
     NUMBERS: "1 2 3",
