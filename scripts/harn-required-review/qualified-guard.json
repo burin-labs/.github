@@ -1,0 +1,11 @@
+{
+  "guards": [
+    {
+      "gh_budget_py_sha256": "efb0c91125ba5359e6af6a4c1b5ef8afc5572c55cfb04011ddd84015a73666c0",
+      "gh_sha256": "cd824da2b906818fcf0033aa5f865f0fcaab635e30338a9ae416db0e568fe315",
+      "revision": "47b6dd1b95bc88aab1a879abf1462a58973b188c"
+    }
+  ],
+  "schema": "burin-labs.gh-budget-qualified-guard.v1",
+  "source": "burin-labs/burin-code"
+}
