@@ -57,7 +57,7 @@ test("maps non-Cargo inputs to their owning package before expanding dependents"
   );
 });
 
-function runEntryPoint(t, { path, workflowPaths, globalPaths = "", eventName = "pull_request" }) {
+function runEntryPoint(t, { path, workflowPaths, globalPaths = "", eventName = "pull_request", pruneMergeGroup = "" }) {
   const root = mkdtempSync(join(tmpdir(), "rust-impact-entry-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   function write(path, content) {
@@ -97,6 +97,7 @@ function runEntryPoint(t, { path, workflowPaths, globalPaths = "", eventName = "
     RUST_IMPACT_WORKSPACE: ".",
     RUST_IMPACT_GLOBAL_PATHS: globalPaths,
     RUST_IMPACT_EXTRA_PACKAGE_PATHS: "",
+    RUST_IMPACT_PRUNE_MERGE_GROUP: pruneMergeGroup,
   };
   if (workflowPaths === undefined) delete env.RUST_IMPACT_WORKFLOW_PATHS;
   else env.RUST_IMPACT_WORKFLOW_PATHS = workflowPaths;
@@ -120,6 +121,9 @@ test("entry point honors workflow scope without weakening Cargo coverage", async
     { name: "additional caller global", path: "docs/ci-policy.json", workflowPaths: ".github/workflows/rust.yml", globalPaths: "docs/ci-policy.json", mode: "full" },
     { name: "actual reverse dependency graph", path: "crates/core/src/lib.rs", workflowPaths: ".github/workflows/rust.yml", mode: "partial" },
     { name: "merge groups remain full", path: ".github/workflows/docs.yml", workflowPaths: ".github/workflows/rust.yml", eventName: "merge_group", mode: "full" },
+    { name: "opted-in merge group selects its own entry", path: ".github/workflows/docs.yml", workflowPaths: ".github/workflows/rust.yml", eventName: "merge_group", pruneMergeGroup: "true", mode: "empty" },
+    { name: "opted-in merge group still reaches changed Rust", path: "crates/core/src/lib.rs", workflowPaths: ".github/workflows/rust.yml", eventName: "merge_group", pruneMergeGroup: "true", mode: "partial" },
+    { name: "push ignores the merge-group opt-in", path: "docs/readme.md", workflowPaths: ".github/workflows/rust.yml", eventName: "push", pruneMergeGroup: "true", mode: "full" },
   ];
   for (const scenario of cases) {
     await t.test(scenario.name, (t) => {
@@ -136,4 +140,6 @@ test("action projects the workflow input and its conservative default", () => {
   const action = readFileSync(new URL("./action.yml", import.meta.url), "utf8");
   assert.match(action, /workflow-paths:[\s\S]*?default: "\.github\/workflows"/);
   assert.ok(action.includes("RUST_IMPACT_WORKFLOW_PATHS: ${{ inputs.workflow-paths }}"));
+  assert.match(action, /prune-merge-group:[\s\S]*?default: "false"/);
+  assert.ok(action.includes("RUST_IMPACT_PRUNE_MERGE_GROUP: ${{ inputs.prune-merge-group }}"));
 });

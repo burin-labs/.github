@@ -3,8 +3,12 @@ description: Conservatively select changed Cargo packages and their transitive r
 
 inputs:
   event-name:
-    description: GitHub event name. Only pull_request is eligible for pruning.
+    description: GitHub event name. Only pull_request is eligible for pruning unless prune-merge-group is true.
     required: true
+  prune-merge-group:
+    description: Set "true" to prune merge_group entries. Only safe when base is the entry's own merge_group.base_sha and the queue's grouping strategy is ALLGREEN; under HEADGREEN an entry's checks also land every entry ahead of it.
+    required: false
+    default: "false"
   base:
     description: Exact base tree Git ref or commit.
     required: true
@@ -54,6 +58,7 @@ runs:
       shell: bash
       env:
         RUST_IMPACT_EVENT_NAME: ${{ inputs.event-name }}
+        RUST_IMPACT_PRUNE_MERGE_GROUP: ${{ inputs.prune-merge-group }}
         RUST_IMPACT_BASE: ${{ inputs.base }}
         RUST_IMPACT_HEAD: ${{ inputs.head }}
         RUST_IMPACT_WORKSPACE: ${{ inputs.workspace }}
