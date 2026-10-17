@@ -110,21 +110,24 @@ pipeline test_ci_runs_the_pinned_control_graph_on_the_shipping_runtime(harness: 
 
 pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness) {
   const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
-  const input = workflow.on.workflow_call.inputs["owned-runner"]
+  const input = workflow.on.workflow_call.inputs["owned-runner-tag"]
   assert_eq(input.type, "string")
   assert_eq(input["default"], "")
-  const runs_on = workflow.jobs.ship["runs-on"]
-  // Hosted is both the default and the fallback, and an owned runner needs a
+  // An owned runner needs a measured probe, and the probe runs only for a
   // caller on the private allowlist: a public repository's run must never
   // land on an owned host, whatever it passes.
-  assert(runs_on.ends_with("|| 'ubuntu-24.04' }}"), runs_on)
+  const probe = workflow.jobs.availability["if"]
+  assert(probe.starts_with("inputs.owned-runner-tag != '' && contains("), probe)
   const listed = regex_captures(
     "contains\\(fromJSON\\('(\\[[^']*\\])'\\), github\\.repository\\)",
-    runs_on,
+    probe,
   )
-  assert_eq(len(listed), 1, runs_on)
+  assert_eq(len(listed), 1, probe)
   assert_eq(json_parse(listed[0].groups[0]), ["burin-labs/burin-code", "burin-labs/harn-cloud"])
-  assert(runs_on.contains("inputs.owned-runner != '' && contains("), runs_on)
+  const runs_on = workflow.jobs.ship["runs-on"]
+  // Hosted is both the default and the fallback.
+  assert(runs_on.starts_with("$" + "{{ needs.availability.result == 'success' && "), runs_on)
+  assert(runs_on.ends_with("|| 'ubuntu-24.04' }}"), runs_on)
 }
 
 /**
@@ -251,11 +254,15 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
 }
 
 /**
- * Only a finished same-repository CI run of a PR, a merge-queue branch, or main wakes the shepherd.
+ * Both jobs admit by one rule. Only a finished same-repository CI verdict of a
+ * PR, or of a failed merge-queue branch, wakes the shepherd; a passing queue
+ * run's PRs wake on `closed`, and a default-branch run names no PR.
  */
-pipeline test_the_shared_job_owns_ci_completion_admission(harness: Harness) {
-  const admission = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship["if"]
-  assert(admission.starts_with("github.event_name != 'workflow_run'"), admission)
+pipeline test_the_shared_jobs_own_wake_admission(harness: Harness) {
+  const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
+  const probe = jobs.availability["if"]
+  const admission = probe.substring(probe.index_of("(github.event_name == 'schedule'"))
+  assert(jobs.ship["if"].contains(admission), jobs.ship["if"])
   for clause in [
     "github.event.action == 'completed'",
     "github.event.workflow_run.id > 0",
@@ -263,15 +270,18 @@ pipeline test_the_shared_job_owns_ci_completion_admission(harness: Harness) {
     "contains(fromJSON('[\"success\",\"failure\",\"timed_out\"]'), github.event.workflow_run.conclusion)",
     "github.event.workflow_run.repository.full_name == github.repository",
     "github.event.workflow_run.head_repository.full_name == github.repository",
-    // Without these, a push with no branch facts compares null to null and is admitted.
     "github.event.workflow_run.head_branch != ''",
     "github.event.repository.default_branch != ''",
     "github.event.workflow_run.pull_requests[0].number > 0",
+    "github.event.workflow_run.conclusion != 'success'",
     "format('gh-readonly-queue/{0}/', github.event.repository.default_branch)",
-    "github.event.workflow_run.head_branch == github.event.repository.default_branch",
+    "contains(github.event.pull_request.labels.*.name, inputs.ship-label)",
+    "!(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')",
+    "github.event.sender.type == 'Bot'",
   ] {
     assert(admission.contains(clause), clause)
   }
+  assert(!admission.contains("'push'"), admission)
 }
 
 /** A CI-completion wake must not share the sweep's group: it would replace a pending sweep. */
@@ -280,5 +290,6 @@ pipeline test_a_ci_completion_wake_never_replaces_a_pending_sweep(harness: Harne
   const group = workflow.jobs.ship.concurrency.group
   assert(group.contains("github.event.workflow_run.pull_requests[0].number"), group)
   assert(group.contains("format('run-{0}', github.event.workflow_run.head_branch)"), group)
+  assert(group.contains("github.event.inputs.pr"), group)
   assert(group.ends_with("|| 'sweep' }}"), group)
 }
