@@ -14,7 +14,7 @@ fn main(harness: Harness) {
     throw "usage: cli.harn -- <repository> <default-branch> <output-file>"
   }
   const github = live_github(
-    pick(harness, ["fs", "tools"]),
+    {fs: harness.fs, tools: harness.tools},
     required(harness.env, "GH_TOKEN"),
     harness.fs.mkdtemp_in_workspace("smart-ship-policy-gh-"),
   )
@@ -22,6 +22,15 @@ fn main(harness: Harness) {
   // No output policy is created or replaced until observation and decoding finish.
   harness.fs.write_text(argv[2], reading.content)
   harness.stdio.println(
-    json_stringify(pick(reading, ["repository", "branch", "state", "entries", "blob", "bytes"])),
+    json_stringify(
+      {
+        repository: reading.repository,
+        branch: reading.branch,
+        state: reading.state,
+        entries: reading.entries,
+        blob: reading.blob,
+        bytes: reading.bytes,
+      },
+    ),
   )
 }
