@@ -23,7 +23,7 @@ fn main(harness: Harness) {
       to_string(harness.env.get("REVIEW_CONTROL_BUNDLE_CANONICAL") ?? ""),
       to_string(harness.env.get("REVIEW_CONTROL_LEDGER_CANONICAL") ?? ""),
     )
-    require_qualified_guard()
+    require_qualified_guard(harness.fs, root)
   }
   if argv[1] == "preflight" {
     verify_control_source(harness.fs, root)
@@ -34,7 +34,7 @@ fn main(harness: Harness) {
     return
   }
   if profile.mode != "plan" {
-    verify_installed_guard(harness.fs, profile.bundle_root)
+    verify_installed_guard(harness.fs, root, profile.bundle_root)
   }
   const snapshot = snapshot_control_source(harness.fs, root)
   const dispatch = launch_profile(
