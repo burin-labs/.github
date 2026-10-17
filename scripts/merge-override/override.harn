@@ -267,7 +267,17 @@ pub fn publish_status(gh: GitHub, input: Input, record: dict) {
 /**
  * Squash-merge the exact labeled head; GitHub refuses if the head moved. Returns the merge commit.
  */
-pub fn merge_pull(gh: GitHub, input: Input, record: dict) -> string {
+/**
+ * GitHub answers a squash merge with 405 "Base branch was modified" when the
+ * base moved while it computed the merge. Every override that errored on
+ * 2026-10-17 hit it while a backlog drain landed. The request stays bound to
+ * the decided head through `sha`, so retrying cannot land a different commit.
+ */
+const BASE_MOVED = "Base branch was modified"
+
+const MERGE_ATTEMPTS = 5
+
+pub fn merge_pull(gh: GitHub, input: Input, record: dict, sleep_ms: fn(int) -> nil) -> string {
   const path = "repos/" + input.repository + "/pulls/" + to_string(input.pr)
   const pull = gh.read(path)
   try {
@@ -275,19 +285,27 @@ pub fn merge_pull(gh: GitHub, input: Input, record: dict) -> string {
   } catch (error) {
     // Not queued: nothing to dequeue.
   }
-  const merged = gh.send(
-    "PUT",
-    path + "/merge",
-    {
-      merge_method: "squash",
-      sha: input.head_sha,
-      commit_title: to_string(pull?.title) + " (#" + to_string(input.pr) + ")",
-      commit_message: "Merged with override label `" + record.label + "` by "
-        + join(record.actors.map({ login -> "@" + login }), ", ")
-        + ".\nReason: "
-        + record.reason,
-    },
-  )
+  const body = {
+    merge_method: "squash",
+    sha: input.head_sha,
+    commit_title: to_string(pull?.title) + " (#" + to_string(input.pr) + ")",
+    commit_message: "Merged with override label `" + record.label + "` by "
+      + join(record.actors.map({ login -> "@" + login }), ", ")
+      + ".\nReason: "
+      + record.reason,
+  }
+  let merged = nil
+  for attempt in range(MERGE_ATTEMPTS) {
+    try {
+      merged = gh.send("PUT", path + "/merge", body)
+      break
+    } catch (error) {
+      if !contains(to_string(error), BASE_MOVED) || attempt == MERGE_ATTEMPTS - 1 {
+        throw error
+      }
+      sleep_ms((attempt + 1) * 3000)
+    }
+  }
   const sha = merged?.sha
   if type_of(sha) != "string" || sha == "" {
     throw "the merge response carried no commit"

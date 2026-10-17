@@ -1,5 +1,5 @@
 import { assert_error_contains } from "std/testing"
-import { append_log, draft_record, finish_record, measure } from "./override.harn"
+import { append_log, draft_record, finish_record, measure, merge_pull } from "./override.harn"
 import {
   NO_REASON,
   log_issue_title,
@@ -367,4 +367,65 @@ pipeline test_the_outcome_and_org_log_entry_cover_every_attempt(harness: Harness
     existing.sent().map({ call -> call.path }),
     ["repos/burin-labs/override-log/issues/4/comments"],
   )
+}
+
+fn merging(failures: list<string>) -> dict {
+  let attempts = 0
+  let slept = []
+  const gh = {
+    read: fn(_path) { return {node_id: "PR_1", title: "Fix the queue"} },
+    pages: fn(_path) { return [] },
+    send: fn(_method, _path, body) {
+      assert_eq(body.sha, HEAD)
+      attempts = attempts + 1
+      if attempts <= len(failures) {
+        throw failures[attempts - 1]
+      }
+      return {sha: "abc123"}
+    },
+    graphql: fn(_query, _variables) { return nil },
+  }
+  return {
+    gh: gh,
+    attempts: fn() { return attempts },
+    slept: fn() { return slept },
+    sleep: fn(ms) { slept = slept + [ms] },
+  }
+}
+
+const OVERRIDE = {label: "bypass-merge-queue", actors: ["admin"], reason: "drain"}
+
+const BASE_MOVED_ERROR =
+  "PUT repos/burin-labs/example/pulls/42/merge failed: gh: Base branch was modified. Review and try the merge again. (HTTP 405)"
+
+pipeline test_a_merge_retries_while_the_base_branch_moves(harness: Harness) {
+  const world = merging([BASE_MOVED_ERROR, BASE_MOVED_ERROR])
+  assert_eq(merge_pull(world.gh, INPUT, OVERRIDE, world.sleep), "abc123")
+  assert_eq(world.attempts(), 3)
+  assert_eq(world.slept(), [3000, 6000])
+}
+
+pipeline test_a_merge_does_not_retry_other_refusals(harness: Harness) {
+  const world = merging(
+    [
+      "PUT repos/burin-labs/example/pulls/42/merge failed: gh: Head branch was modified. (HTTP 409)",
+    ],
+  )
+  assert_error_contains(
+    { -> merge_pull(world.gh, INPUT, OVERRIDE, world.sleep) },
+    "Head branch was modified",
+  )
+  assert_eq(world.attempts(), 1)
+  assert_eq(world.slept(), [])
+}
+
+pipeline test_a_merge_gives_up_when_the_base_never_settles(harness: Harness) {
+  const world = merging(
+    [BASE_MOVED_ERROR, BASE_MOVED_ERROR, BASE_MOVED_ERROR, BASE_MOVED_ERROR, BASE_MOVED_ERROR],
+  )
+  assert_error_contains(
+    { -> merge_pull(world.gh, INPUT, OVERRIDE, world.sleep) },
+    "Base branch was modified",
+  )
+  assert_eq(world.attempts(), 5)
 }
