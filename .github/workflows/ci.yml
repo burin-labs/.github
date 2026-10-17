@@ -16,6 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - name: Check out the immutable shipping control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
           repository: burin-labs/.github
           ref: a4da07f69b45a057dc46465bea10948f7bf3e0a3
           path: .smart-ship-control
@@ -28,6 +32,8 @@ jobs:
         run: >-
           harn test .smart-ship-control/scripts/smart-ship-label/policy_test.harn
           --json-out "${{ runner.temp }}/smart-ship-control-tests.json"
+      - name: Exercise the candidate policy reader on the shipping runtime
+        run: harn test scripts/smart-ship-policy
 
   local-check-contract:
     name: Local workflow check contract
@@ -54,6 +60,7 @@ jobs:
           harn test scripts/release-repin
           harn test scripts/merge-override
           harn test scripts/smart-ship-label
+          harn test scripts/smart-ship-policy
           harn test scripts/smart-ship-targets
           harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels

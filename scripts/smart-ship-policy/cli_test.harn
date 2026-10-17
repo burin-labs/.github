@@ -1,0 +1,123 @@
+import { with_temp_dir } from "std/testing"
+
+pipeline test_actual_cli_keeps_bytes_and_refuses_unmeasured_reads_before_writing(harness: Harness) {
+  with_temp_dir(
+    harness.fs,
+    fn(temp) {
+      const bin = path_join(temp, "bin")
+      harness.fs.mkdir(bin, true)
+      const calls = path_join(temp, "calls")
+      const directory = path_join(temp, "directory.json")
+      const blob = path_join(temp, "blob.json")
+      const output = path_join(temp, "policy.toml")
+      const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      const content = "# café\r\n[release]\ntargets = [\"app\"]\n"
+      const policy = {
+        name: "smart-ship.toml",
+        path: ".github/smart-ship.toml",
+        type: "file",
+        sha: sha,
+        git_url: "https://api.github.com/repos/example/consumer/git/blobs/" + sha,
+      }
+      harness.fs.write_text(
+        blob,
+        json_stringify(
+          {
+            sha: sha,
+            encoding: "base64",
+            size: bytes_len(bytes_from_string(content)),
+            content: base64_encode(content),
+          },
+        ),
+      )
+      const gh = path_join(bin, "gh")
+      harness.fs.write_text(
+        gh,
+        "#!/bin/sh\n"
+          + "printf '%s\\n' \"$2\" >> \"$CALLS\"\n"
+          + "case \"$READ_CASE\" in denied) echo 'HTTP 403 denied' >&2; exit 1;;"
+          + " hidden) echo 'HTTP 404' >&2; exit 1;; network) echo 'network timeout' >&2; exit 1;;"
+          + " json) echo 'invalid JSON'; exit 0;; esac\n"
+          + "case \"$2\" in repos/example/consumer/contents/.github?ref=main) cat \"$DIRECTORY\";;"
+          + " repos/example/consumer/git/blobs/"
+          + sha
+          + ") cat \"$BLOB\";; *) exit 9;; esac\n",
+      )
+      assert(harness.process.run({program: "/bin/chmod", args: ["755", gh]}).success)
+      let measured = 0
+      for scenario in [
+        "present",
+        "absent",
+        "denied",
+        "hidden",
+        "network",
+        "json",
+        "empty",
+        "base64",
+      ] {
+        harness.fs.write_text(calls, "")
+        harness.fs.write_text(output, "previous measured policy\n")
+        harness.fs.write_text(
+          directory,
+          json_stringify(
+            scenario == "empty" ? [] : scenario == "absent" ? [
+              policy + {name: "workflows", path: ".github/workflows", type: "dir"},
+            ] : [policy],
+          ),
+        )
+        if scenario == "base64" {
+          harness.fs.write_text(
+            blob,
+            json_stringify({sha: sha, encoding: "base64", size: 1, content: "%%%"}),
+          )
+        }
+        const result = harness.process.run(
+          {
+            program: harness.env.get("HARN_BIN") ?? "harn",
+            args: [
+              "run",
+              "--no-sandbox",
+              path_join(harness.fs.source_dir(), "cli.harn"),
+              "--",
+              "example/consumer",
+              "main",
+              output,
+            ],
+            cwd: temp,
+            env: {
+              PATH: bin + ":" + to_string(harness.env.get("PATH") ?? ""),
+              HOME: temp,
+              GH_TOKEN: "fixture-token",
+              HARN_SECRET_PROVIDERS: "env",
+              HARN_LLM_CALLS_DISABLED: "1",
+              CALLS: calls,
+              DIRECTORY: directory,
+              BLOB: blob,
+              READ_CASE: scenario,
+            },
+            timeout_ms: 30000,
+          },
+        )
+        const expected = scenario == "present" || scenario == "absent"
+        assert_eq(result.success, expected, scenario + ": " + result.stdout + result.stderr)
+        const paths = harness.fs.read_text(calls).split("\n").filter(fn(line) { return line != "" })
+          .to_list()
+        assert_eq(paths[0], "repos/example/consumer/contents/.github?ref=main", scenario)
+        if expected {
+          const reading = json_parse(result.stdout)
+          assert_eq(reading.state, scenario)
+          assert_eq(reading.entries, 1)
+          assert_eq(reading.repository, "example/consumer")
+          assert_eq(reading.branch, "main")
+          assert_eq(reading?.content, nil)
+          assert_eq(harness.fs.read_text(output), scenario == "present" ? content : "")
+        } else {
+          assert_eq(harness.fs.read_text(output), "previous measured policy\n", scenario)
+        }
+        assert_eq(len(paths), scenario == "present" || scenario == "base64" ? 2 : 1, scenario)
+        measured = measured + 1
+      }
+      assert_eq(measured, 8)
+    },
+  )
+}
