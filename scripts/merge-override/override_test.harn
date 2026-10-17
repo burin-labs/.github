@@ -369,11 +369,22 @@ pipeline test_the_outcome_and_org_log_entry_cover_every_attempt(harness: Harness
   )
 }
 
-fn merging(failures: list<string>) -> dict {
+/** A merge that fails with `failures` in turn; re-reads after the first see `later`. */
+fn merging(failures: list<string>, later: dict = {state: "open", merged: false}) -> dict {
   let attempts = 0
+  let reads = 0
   let slept = []
+  let windows = []
   const gh = {
-    read: fn(_path) { return {node_id: "PR_1", title: "Fix the queue"} },
+    read: fn(_path) {
+      reads = reads + 1
+      return reads == 1 ? {
+        node_id: "PR_1",
+        title: "Fix the queue",
+        state: "open",
+        merged: false,
+      } : later
+    },
     pages: fn(_path) { return [] },
     send: fn(_method, _path, body) {
       assert_eq(body.sha, HEAD)
@@ -389,7 +400,13 @@ fn merging(failures: list<string>) -> dict {
     gh: gh,
     attempts: fn() { return attempts },
     slept: fn() { return slept },
+    windows: fn() { return windows },
     sleep: fn(ms) { slept = slept + [ms] },
+    // The longest draw, so the budget arithmetic is exact.
+    draw: fn(low, high) {
+      windows = windows + [[low, high]]
+      return high
+    },
   }
 }
 
@@ -398,11 +415,16 @@ const OVERRIDE = {label: "bypass-merge-queue", actors: ["admin"], reason: "drain
 const BASE_MOVED_ERROR =
   "PUT repos/burin-labs/example/pulls/42/merge failed: gh: Base branch was modified. Review and try the merge again. (HTTP 405)"
 
-pipeline test_a_merge_retries_while_the_base_branch_moves(harness: Harness) {
+fn merge(world: dict) -> string {
+  return merge_pull(world.gh, INPUT, OVERRIDE, world.sleep, world.draw)
+}
+
+pipeline test_a_merge_retries_with_jittered_backoff_while_the_base_branch_moves(harness: Harness) {
   const world = merging([BASE_MOVED_ERROR, BASE_MOVED_ERROR])
-  assert_eq(merge_pull(world.gh, INPUT, OVERRIDE, world.sleep), "abc123")
+  assert_eq(merge(world), "abc123")
   assert_eq(world.attempts(), 3)
-  assert_eq(world.slept(), [3000, 6000])
+  assert_eq(world.windows(), [[0, 2000], [0, 4000]])
+  assert_eq(world.slept(), [3000, 5000])
 }
 
 pipeline test_a_merge_does_not_retry_other_refusals(harness: Harness) {
@@ -411,21 +433,36 @@ pipeline test_a_merge_does_not_retry_other_refusals(harness: Harness) {
       "PUT repos/burin-labs/example/pulls/42/merge failed: gh: Head branch was modified. (HTTP 409)",
     ],
   )
-  assert_error_contains(
-    { -> merge_pull(world.gh, INPUT, OVERRIDE, world.sleep) },
-    "Head branch was modified",
-  )
+  assert_error_contains({ -> merge(world) }, "Head branch was modified")
   assert_eq(world.attempts(), 1)
   assert_eq(world.slept(), [])
 }
 
-pipeline test_a_merge_gives_up_when_the_base_never_settles(harness: Harness) {
+pipeline test_a_merge_keeps_retrying_for_three_minutes_before_giving_up(harness: Harness) {
+  let failures = []
+  for _ in range(40) {
+    failures = failures + [BASE_MOVED_ERROR]
+  }
+  const world = merging(failures)
+  assert_error_contains({ -> merge(world) }, "Base branch was modified")
+  const total = world.slept().reduce(0, { sum, ms -> sum + ms })
+  assert(total >= 180000)
+  assert(total - world.slept()[len(world.slept()) - 1] < 180000)
+  assert_eq(world.windows()[len(world.windows()) - 1], [0, 30000])
+  assert_eq(world.attempts(), len(world.slept()) + 1)
+}
+
+pipeline test_a_retry_stops_when_the_pull_request_already_merged(harness: Harness) {
   const world = merging(
-    [BASE_MOVED_ERROR, BASE_MOVED_ERROR, BASE_MOVED_ERROR, BASE_MOVED_ERROR, BASE_MOVED_ERROR],
+    [BASE_MOVED_ERROR],
+    {state: "closed", merged: true, merge_commit_sha: "def456"},
   )
-  assert_error_contains(
-    { -> merge_pull(world.gh, INPUT, OVERRIDE, world.sleep) },
-    "Base branch was modified",
-  )
-  assert_eq(world.attempts(), 5)
+  assert_eq(merge(world), "def456")
+  assert_eq(world.attempts(), 1)
+}
+
+pipeline test_a_retry_stops_when_the_pull_request_closed(harness: Harness) {
+  const world = merging([BASE_MOVED_ERROR], {state: "closed", merged: false})
+  assert_error_contains({ -> merge(world) }, "closed before the override could merge it")
+  assert_eq(world.attempts(), 1)
 }
