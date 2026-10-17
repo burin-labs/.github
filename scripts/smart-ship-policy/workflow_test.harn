@@ -1,0 +1,94 @@
+import { read_yaml } from "std/fs"
+import { with_temp_dir } from "std/testing"
+import { READ_CASES, policy_fixture } from "./fixture.harn"
+
+pipeline test_actual_workflow_refuses_before_any_shepherd_when_policy_read_fails(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const shepherds = steps.filter(fn(step) { return step?.name == "Shepherd" }).to_list()
+  assert_eq(len(shepherds), 1)
+  const step = shepherds[0]
+  assert_eq(step.env.DEFAULT_BRANCH, "$" + "{{ github.event.repository.default_branch }}")
+  with_temp_dir(
+    harness.fs,
+    fn(temp) {
+      const fixture = policy_fixture(harness, temp)
+      const scripts = path_join(temp, "scripts")
+      harness.fs.mkdir(scripts, true)
+      const child_calls = path_join(temp, "shepherd-calls")
+      const acquired = path_join(temp, "acquired")
+      const output = path_join(temp, "github-output")
+      const harnw = path_join(scripts, "harnw")
+      harness.fs.write_text(
+        harnw,
+        "#!/bin/sh\n"
+          + "if [ \"$3\" = .smart-ship-runner/scripts/smart-ship-policy/cli.harn ]; then\n"
+          + "  printf '%s\\n' \"$5\" \"$6\" \"$7\" > \"$ACQUIRED\"\n"
+          + "  exec \"$HARN_BINARY\" run --no-sandbox \"$POLICY_CLI\" -- \"$5\" \"$6\" \"$7\"\nfi\n"
+          + "printf '%s\\n' \"$*\" >> \"$SHEPHERD_CALLS\"\n"
+          + "case \"$*\" in *'example/consumer#2'*) exit 3;; esac\nexit 0\n",
+      )
+      assert(harness.process.run({program: "/bin/chmod", args: ["755", harnw]}).success)
+      let measured = 0
+      for scenario in READ_CASES {
+        harness.fs.write_text(child_calls, "")
+        harness.fs.write_text(acquired, "")
+        harness.fs.write_text(output, "")
+        const result = harness.process.run(
+          {
+            program: "/usr/bin/env",
+            args: ["bash", "-e", "-o", "pipefail", "-c", step.run],
+            cwd: temp,
+            env: fixture.prepare(scenario)
+              + {
+                HARN_BINARY: harness.env.get("HARN_BIN") ?? "harn",
+                POLICY_CLI: path_join(harness.fs.source_dir(), "cli.harn"),
+                ACQUIRED: acquired,
+                SHEPHERD_CALLS: child_calls,
+                GITHUB_OUTPUT: output,
+                RUNNER_TEMP: temp,
+                REPO: "example/consumer",
+                DEFAULT_BRANCH: "main",
+                LABEL: "ship",
+                NUMBERS: "1 2 3",
+                REPAIR: "false",
+              },
+            timeout_ms: 30000,
+          },
+        )
+        const expected = scenario == "present" || scenario == "absent"
+        assert_eq(result.success, expected, scenario + ": " + result.stdout + result.stderr)
+        assert_eq(
+          harness.fs.read_text(acquired),
+          "example/consumer\nmain\n" + fixture.output + "\n",
+        )
+        const paths = fixture.paths()
+        assert_eq(paths[0], "repos/example/consumer/contents/.github?ref=main", scenario)
+        assert_eq(
+          len(paths),
+          ["present", "base64", "identity"].contains(scenario) ? 2 : 1,
+          scenario,
+        )
+        const children = harness.fs.read_text(child_calls).split("\n").filter(
+          fn(line) { return line != "" },
+        )
+          .to_list()
+        assert_eq(len(children), expected ? 3 : 0, scenario)
+        if expected {
+          assert_eq(
+            harness.fs.read_text(fixture.output),
+            scenario == "present" ? fixture.content : "",
+          )
+          assert(harness.fs.read_text(output).contains("policy=" + fixture.output + "\n"))
+          for number in [1, 2, 3] {
+            assert(children[number - 1].contains("--pr example/consumer#" + to_string(number)))
+          }
+        } else {
+          assert_eq(harness.fs.read_text(fixture.output), "previous measured policy\n", scenario)
+          assert_eq(harness.fs.read_text(output), "", scenario)
+        }
+        measured = measured + 1
+      }
+      assert_eq(measured, 10)
+    },
+  )
+}
