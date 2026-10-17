@@ -25,12 +25,12 @@ on:
         default: true
       owned-runner-tag:
         description: >-
-          Label of an owned Linux runner pool to run on when the availability
-          probe finds one of its runners online, idle or busy; empty keeps
-          the hosted runner and skips the
-          probe. Honored only for the private repositories listed at the
-          probe: a public caller always runs on the free hosted runner, so no
-          owned host runs on behalf of a public repository.
+          Label of an owned Linux runner pool. A sweep runs on it when the
+          availability probe finds one of its runners online, idle or busy; a
+          wake about one PR runs on it without a probe. Empty keeps the hosted
+          runner and skips the probe. Honored only for the private repositories
+          listed at the probe: a public caller always runs on the free hosted
+          runner, so no owned host runs on behalf of a public repository.
         type: string
         default: ""
       runner-groups:
@@ -57,52 +57,19 @@ permissions:
   contents: read
 
 jobs:
-  # Whether the owned pool has a runner online, read only for a run that will
-  # ship, by a private caller that named one. Each hosted look bills at least a
-  # whole minute and a repair bills many, so an owned runner is worth one short
-  # probe. Its `if` is the admission rule, repeated verbatim at the end of the
-  # ship job's `if` (burin-code scripts/tests/test-smart-ship-wake.ts):
-  #
-  # - A sweep (schedule) or a dispatch always runs. A dispatch naming `pr`
-  #   looks at that PR only.
-  # - A PR event wakes only for a PR carrying the label, or one that just lost
-  #   it. Two post-merge echoes change nothing and stay asleep: the queue
-  #   removal of a PR that is already closed (its `closed` event is the wake),
-  #   and a bot taking the label off a closed PR, which is the shepherd
-  #   finishing its own watch. A person unlabeling a merged PR still wakes it.
-  # - A CI completion (workflow_run) wakes only for a finished,
-  #   same-repository run with a verdict, of a pull request or of a failed
-  #   merge-queue branch. A passing queue run merges its PRs and their
-  #   `closed` events wake them. A default-branch push names no PR, so it would
-  #   only repeat the 15-minute sweep.
+  # Whether the owned pool has a runner online, read only by a sweep of a
+  # private caller that named one. A sweep recovers every missed wake, so it must
+  # start even when the pool is down: it probes and runs hosted when no runner is
+  # online. A wake about one PR skips the probe and goes to the owned pool, which
+  # saves the probe's hosted minute (a private repository bills every hosted job at
+  # least one); the sweep's stale-wake step bounds a pool that went down since the
+  # last sweep.
   availability:
     if: >-
       inputs.owned-runner-tag != ''
       && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository)
       && (github.event_name == 'schedule'
-      || github.event_name == 'workflow_dispatch'
-      || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
-      && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
-      || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
-      && !(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')
-      && !(github.event.action == 'unlabeled' && github.event.pull_request.state == 'closed'
-      && github.event.sender.type == 'Bot'))
-      || (github.event_name == 'workflow_run'
-      && github.event.action == 'completed'
-      && github.event.workflow_run.id > 0
-      && github.event.workflow_run.status == 'completed'
-      && contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
-      && github.event.workflow_run.repository.full_name == github.repository
-      && github.event.workflow_run.head_repository.full_name == github.repository
-      && github.event.workflow_run.head_sha != ''
-      && github.event.workflow_run.head_branch != ''
-      && github.event.repository.default_branch != ''
-      && ((github.event.workflow_run.event == 'pull_request'
-      && github.event.workflow_run.pull_requests[0].number > 0)
-      || (github.event.workflow_run.event == 'merge_group'
-      && github.event.workflow_run.conclusion != 'success'
-      && startsWith(github.event.workflow_run.head_branch,
-      format('gh-readonly-queue/{0}/', github.event.repository.default_branch))))))
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == ''))
     uses: burin-labs/.github/.github/workflows/runner-availability.yml@cd5b9a60ece73b7dcb5923963b86ca7b570cfdad
     with:
       runner_groups: ${{ inputs.runner-groups }}
@@ -115,16 +82,29 @@ jobs:
 
   ship:
     needs: [availability]
-    # A measured probe failure still runs on the hosted runner. A skipped probe
-    # runs only when the caller asked for none and the wake is admitted.
+    # The wake admission rule, written once (burin-code
+    # scripts/tests/test-smart-ship-wake.ts):
+    #
+    # - A sweep (schedule) or a dispatch always runs. A dispatch naming `pr`
+    #   looks at that PR only.
+    # - A PR event wakes only for a PR carrying the label, or one that just lost
+    #   it. Two post-merge echoes change nothing and stay asleep: the queue
+    #   removal of a PR that is already closed (its `closed` event is the wake),
+    #   and a bot taking the label off a closed PR, which is the shepherd
+    #   finishing its own watch. A person unlabeling a merged PR still wakes it.
+    # - A CI completion (workflow_run) wakes only for a finished,
+    #   same-repository run with a verdict, of a pull request or of a failed
+    #   merge-queue branch. A passing queue run merges its PRs and their
+    #   `closed` events wake them. A default-branch push names no PR, so it would
+    #   only repeat the 15-minute sweep.
+    #
+    # A caller without an owned pool runs on every wake; the shepherd does nothing
+    # for one that changes nothing.
     if: >-
       !cancelled()
-      && (needs.availability.result == 'success'
-      || needs.availability.result == 'failure'
-      || (needs.availability.result == 'skipped'
-      && !(inputs.owned-runner-tag != ''
+      && (!(inputs.owned-runner-tag != ''
       && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository))
-      && (github.event_name == 'schedule'
+      || (github.event_name == 'schedule'
       || github.event_name == 'workflow_dispatch'
       || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
       && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
@@ -147,7 +127,8 @@ jobs:
       || (github.event.workflow_run.event == 'merge_group'
       && github.event.workflow_run.conclusion != 'success'
       && startsWith(github.event.workflow_run.head_branch,
-      format('gh-readonly-queue/{0}/', github.event.repository.default_branch))))))))
+      format('gh-readonly-queue/{0}/', github.event.repository.default_branch)))))))
+
     # A run woken by an event about one PR queues behind earlier runs for that
     # PR, and a CI completion (workflow_run) or a dispatch naming a PR counts as
     # one for that PR, or for its merge-queue branch. Every other run (schedule,
@@ -169,13 +150,14 @@ jobs:
         || github.event.workflow_run.head_branch
         && format('run-{0}', github.event.workflow_run.head_branch) || 'sweep' }}
       cancel-in-progress: false
-    # An online owned pool takes the look even when every runner is busy. The
-    # light pool shares its machines with long CI builds, so it is often full,
-    # and falling back then billed a hosted look on top of the probe's minute
-    # (24 of 62 looks on 2026-10-17). A light-labelled job queued on that full
-    # pool started within three minutes. A pool with no runner online is never
-    # queued on, so an outage still falls back to the hosted runner.
-    runs-on: ${{ needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0 && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
+    # A private caller that named an owned pool runs on it. A sweep probed the
+    # pool and needs a runner online; a wake about one PR is not probed and goes
+    # straight there, unless a kill switch retires the pool. The light pool
+    # shares its machines with long CI builds, so it is often full, and falling
+    # back then billed a hosted look on top of the probe's minute (24 of 62
+    # looks on 2026-10-17); a light-labelled job queued on that full pool started
+    # within three minutes. Anything else runs hosted.
+    runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
     steps:
       - name: Mint the release app token
@@ -222,6 +204,33 @@ jobs:
             --repo "$REPO" \
             --label "${{ inputs.ship-label }}" \
             --registry .smart-ship-runner/.github/labels.yml
+
+      # A wake sent to the owned pool without a probe waits there if the pool
+      # went down or stalled since the last sweep, and a queued run that has not
+      # published its targets blocks every other run's look (`single_actor`).
+      # The sweep looks at every labeled PR, so it cancels what has queued past
+      # any normal wait and acts itself.
+      - name: Cancel stale queued Smart Ship runs
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '') }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          workflow="${WORKFLOW_REF#*/.github/workflows/}"
+          workflow="${workflow%%@*}"
+          cutoff="$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          stale="$(gh run list -R "$REPO" --workflow "$workflow" --status queued --limit 100 \
+            --json databaseId,createdAt --jq ".[] | select(.createdAt < \"$cutoff\" and .databaseId != $RUN_ID) | .databaseId")"
+          for id in $stale; do
+            if gh run cancel "$id" -R "$REPO"; then
+              echo "::notice::cancelled run $id, queued since before $cutoff"
+            else
+              echo "::warning::could not cancel stale queued run $id; it may block other looks"
+            fi
+          done
 
       - name: Let git use the app token
         uses: ./.github/actions/github-token-git-auth

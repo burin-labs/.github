@@ -113,9 +113,10 @@ pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness)
   const input = workflow.on.workflow_call.inputs["owned-runner-tag"]
   assert_eq(input.type, "string")
   assert_eq(input["default"], "")
-  // An owned runner needs a measured probe, and the probe runs only for a
-  // caller on the private allowlist: a public repository's run must never
-  // land on an owned host, whatever it passes.
+  // The probe and the owned runner are both limited to the private allowlist:
+  // a public repository's run must never land on an owned host, whatever it
+  // passes.
+  const allowlist = "contains(fromJSON('[\"burin-labs/burin-code\", \"burin-labs/harn-cloud\"]'), github.repository)"
   const probe = workflow.jobs.availability["if"]
   assert(probe.starts_with("inputs.owned-runner-tag != '' && contains("), probe)
   const listed = regex_captures(
@@ -124,9 +125,18 @@ pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness)
   )
   assert_eq(len(listed), 1, probe)
   assert_eq(json_parse(listed[0].groups[0]), ["burin-labs/burin-code", "burin-labs/harn-cloud"])
+  // Only a sweep probes: a wake about one PR goes to the owned pool unprobed.
+  assert(probe.contains("github.event_name == 'schedule'"), probe)
+  assert(probe.contains("github.event.inputs.pr == ''"), probe)
+  assert(!probe.contains("pull_request"), probe)
+  assert(!probe.contains("workflow_run"), probe)
   const runs_on = workflow.jobs.ship["runs-on"]
-  // Hosted is both the default and the fallback.
-  assert(runs_on.starts_with("$" + "{{ needs.availability.result == 'success' && "), runs_on)
+  // Hosted is both the default and the fallback; the allowlist and the kill
+  // switch gate the owned pool, and a probed sweep needs a runner online.
+  assert(runs_on.starts_with("$" + "{{ inputs.owned-runner-tag != '' && " + allowlist), runs_on)
+  assert(runs_on.contains("vars.CI_SELFHOSTED_DISABLED"), runs_on)
+  assert(runs_on.contains("needs.availability.result == 'skipped'"), runs_on)
+  assert(runs_on.contains("needs.availability.outputs.probe_state == 'measured'"), runs_on)
   assert(runs_on.ends_with("|| 'ubuntu-24.04' }}"), runs_on)
 }
 
@@ -260,9 +270,10 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
  */
 pipeline test_the_shared_jobs_own_wake_admission(harness: Harness) {
   const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
-  const probe = jobs.availability["if"]
-  const admission = probe.substring(probe.index_of("(github.event_name == 'schedule'"))
-  assert(jobs.ship["if"].contains(admission), jobs.ship["if"])
+  const shipped = jobs.ship["if"]
+  const admission = shipped.substring(shipped.index_of("(github.event_name == 'schedule'"))
+  // The rule is written once, in the ship job; the probe takes only sweeps.
+  assert(!jobs.availability["if"].contains("workflow_run"), jobs.availability["if"])
   for clause in [
     "github.event.action == 'completed'",
     "github.event.workflow_run.id > 0",
@@ -292,4 +303,16 @@ pipeline test_a_ci_completion_wake_never_replaces_a_pending_sweep(harness: Harne
   assert(group.contains("format('run-{0}', github.event.workflow_run.head_branch)"), group)
   assert(group.contains("github.event.inputs.pr"), group)
   assert(group.ends_with("|| 'sweep' }}"), group)
+}
+
+/** A wake sent to the pool unprobed must not be able to wedge the sweep that recovers it. */
+pipeline test_a_sweep_cancels_stale_queued_runs_but_never_its_own(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const reap = named(steps, "Cancel stale queued Smart Ship runs")
+  assert(reap["if"].contains("github.event_name == 'schedule'"), reap["if"])
+  assert(reap["if"].contains("github.event.inputs.pr == ''"), reap["if"])
+  assert(!reap["if"].contains("pull_request"), reap["if"])
+  assert(reap.run.contains("--status queued"), reap.run)
+  assert(reap.run.contains(".databaseId != $RUN_ID"), reap.run)
+  assert(reap.run.contains("::warning::"), reap.run)
 }
