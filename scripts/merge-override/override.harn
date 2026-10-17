@@ -276,11 +276,14 @@ const RETRY_FIRST_MS = 2000
 
 const RETRY_CAP_MS = 30000
 
-type PullState = {state: string, merged: bool, merge_commit_sha?: string?}
+type PullState = {state: string, merged: bool, merge_commit_sha?: string?, head: {sha: string}}
 
-/** The merge commit if the pull request already merged, "" while it is still open. */
-fn landed(value: unknown) -> string {
+/** The merge commit if the decided head already merged, "" while the pull request is still open. */
+fn landed(value: unknown, head_sha: string) -> string {
   const pull: PullState = schema_expect(value, schema_of(PullState))
+  if pull.merged && pull.head.sha != head_sha {
+    throw "the pull request merged at " + pull.head.sha + ", not the decided head " + head_sha
+  }
   if pull.merged {
     if pull.merge_commit_sha == nil {
       throw "the pull request merged without a merge commit"
@@ -335,7 +338,7 @@ pub fn merge_pull(
       sleep_ms(delay)
       waited = waited + delay
       window = min(RETRY_CAP_MS, window * 2)
-      sha = landed(gh.read(path))
+      sha = landed(gh.read(path), input.head_sha)
     }
   }
   return sha

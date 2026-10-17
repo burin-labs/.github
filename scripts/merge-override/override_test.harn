@@ -370,7 +370,10 @@ pipeline test_the_outcome_and_org_log_entry_cover_every_attempt(harness: Harness
 }
 
 /** A merge that fails with `failures` in turn; re-reads after the first see `later`. */
-fn merging(failures: list<string>, later: dict = {state: "open", merged: false}) -> dict {
+fn merging(
+  failures: list<string>,
+  later: dict = {state: "open", merged: false, head: {sha: HEAD}},
+) -> dict {
   let attempts = 0
   let reads = 0
   let slept = []
@@ -455,14 +458,19 @@ pipeline test_a_merge_keeps_retrying_for_three_minutes_before_giving_up(harness:
 pipeline test_a_retry_stops_when_the_pull_request_already_merged(harness: Harness) {
   const world = merging(
     [BASE_MOVED_ERROR],
-    {state: "closed", merged: true, merge_commit_sha: "def456"},
+    {state: "closed", merged: true, merge_commit_sha: "def456", head: {sha: HEAD}},
   )
   assert_eq(merge(world), "def456")
   assert_eq(world.attempts(), 1)
+  const elsewhere = merging(
+    [BASE_MOVED_ERROR],
+    {state: "closed", merged: true, merge_commit_sha: "def456", head: {sha: "2222"}},
+  )
+  assert_error_contains({ -> merge(elsewhere) }, "not the decided head")
 }
 
 pipeline test_a_retry_stops_when_the_pull_request_closed(harness: Harness) {
-  const world = merging([BASE_MOVED_ERROR], {state: "closed", merged: false})
+  const world = merging([BASE_MOVED_ERROR], {state: "closed", merged: false, head: {sha: HEAD}})
   assert_error_contains({ -> merge(world) }, "closed before the override could merge it")
   assert_eq(world.attempts(), 1)
 }
