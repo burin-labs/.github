@@ -116,6 +116,7 @@ fn merge_step(harness: Harness) {
     input(harness.env),
     draft(harness.env),
     fn(ms) { harness.clock.sleep_ms(ms) },
+    fn(low, high) { return harness.random.range(low, high) },
   )
   output(harness, "merge_commit", sha)
   harness.stdio.println("Merged as " + sha)
