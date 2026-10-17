@@ -111,7 +111,12 @@ fn publish_step(harness: Harness) {
 }
 
 fn merge_step(harness: Harness) {
-  const sha = merge_pull(github(harness, "GH_TOKEN"), input(harness.env), draft(harness.env))
+  const sha = merge_pull(
+    github(harness, "GH_TOKEN"),
+    input(harness.env),
+    draft(harness.env),
+    fn(ms) { harness.clock.sleep_ms(ms) },
+  )
   output(harness, "merge_commit", sha)
   harness.stdio.println("Merged as " + sha)
 }
