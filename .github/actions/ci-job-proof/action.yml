@@ -1,0 +1,97 @@
+name: Reuse CI job proofs by input digest
+description: >-
+  Registers a digest of each reusable job's own inputs for this run, and on a
+  merge group or main push reuses each job whose digest a qualified earlier run
+  recorded and whose legs all passed there. Unknown or unreadable proof runs
+  the job.
+
+inputs:
+  workflow-file:
+    description: Workflow filename under .github/workflows (for example ci.yml).
+    required: true
+  job-identities:
+    description: >-
+      Closed JSON `burin.ci_job_identity.v1`: each reusable job's id, the job
+      names GitHub reports for its legs (exact, or anchored `^...$` patterns),
+      and the sha256 digest of its inputs. Empty registers and reuses nothing.
+    required: false
+    default: ""
+  registrar-job:
+    description: Actual API job name that registers the identities before any reusable job starts.
+    required: true
+  registrar-step:
+    description: Actual API step name containing this action, including its artifact upload.
+    required: true
+  merge-group-head-ref:
+    description: github.event.merge_group.head_ref, which names the pull request a merge group merges.
+    required: false
+    default: ""
+  event-name:
+    description: GitHub event name.
+    required: true
+  commit-sha:
+    description: >-
+      The run's head commit as GitHub reports it: the pull request head on a
+      pull request, github.sha otherwise.
+    required: true
+  repository:
+    description: owner/name. Defaults to github.repository.
+    required: false
+    default: ${{ github.repository }}
+  github-token:
+    description: Token with actions:read and pull-requests:read.
+    required: true
+
+outputs:
+  registration:
+    description: Path to the complete source-bound registration uploaded for this attempt; empty when none.
+    value: ${{ steps.resolve.outputs.registration }}
+  reused:
+    description: JSON list of job ids whose passing result this run reuses. Empty list when none.
+    value: ${{ steps.resolve.outputs.reused }}
+  receipt:
+    description: Typed proof receipt path naming the run that executed each reused job; empty when none.
+    value: ${{ steps.resolve.outputs.receipt }}
+  discovery:
+    description: Bounded discovery reason and probe and read counts.
+    value: ${{ steps.resolve.outputs.discovery }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Harn
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+      with:
+        version: "0.10.159"
+    - name: Resolve CI job proof reuse
+      id: resolve
+      shell: bash
+      env:
+        CI_JOB_PROOF_EVENT: ${{ inputs.event-name }}
+        CI_JOB_PROOF_COMMIT: ${{ inputs.commit-sha }}
+        CI_JOB_PROOF_REPOSITORY: ${{ inputs.repository }}
+        CI_JOB_PROOF_WORKFLOW: ${{ inputs.workflow-file }}
+        CI_JOB_PROOF_IDENTITIES: ${{ inputs.job-identities }}
+        CI_JOB_PROOF_MERGE_GROUP_HEAD_REF: ${{ inputs.merge-group-head-ref }}
+        CI_JOB_PROOF_REGISTRAR_JOB: ${{ inputs.registrar-job }}
+        CI_JOB_PROOF_REGISTRAR_STEP: ${{ inputs.registrar-step }}
+        CI_JOB_PROOF_RUN_ID: ${{ github.run_id }}
+        CI_JOB_PROOF_ATTEMPT: ${{ github.run_attempt }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"
+    - name: Register job input identities
+      if: ${{ steps.resolve.outputs.registration != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: ${{ steps.resolve.outputs.registration-name }}
+        path: ${{ steps.resolve.outputs.registration }}
+        if-no-files-found: error
+        retention-days: 7
+    - name: Preserve job proof receipt
+      if: ${{ steps.resolve.outputs.receipt != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: ci-job-proof-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.resolve.outputs.receipt }}
+        if-no-files-found: error
+        retention-days: 7

@@ -1,6 +1,6 @@
 import { gha_write_output } from "std/gha"
 import { parse_authorization, verify_authorization } from "./authorization.harn"
-import { live_github } from "./live.harn"
+import { live_consumer_recovery, live_github } from "./live.harn"
 import { parse_request, publish_candidate, verify_candidate, verify_run } from "./promotion.harn"
 
 fn required_env(env: HarnessEnv, name: string) -> string {
@@ -37,18 +37,23 @@ fn main(harness: Harness) {
   )
   const mode = required_env(harness.env, "PROMOTE_MODE")
   const authorization = parse_authorization(
-    harness.env.get("PROMOTE_AUTHORIZATION_RUN_ID") ?? "",
-    harness.env.get("PROMOTE_AUTHORIZATION_ATTEMPT") ?? "",
+    harness.env.get("PROMOTE_ORIGINAL_CONSUMER_CONTEXT") ?? "",
   )
   const authorize_completion = authorization == nil ? nil : fn(attempt: int) { verify_authorization(
-    github,
-    harness.fs,
+    live_consumer_recovery(
+      harness.tools,
+      {
+        token: required_env(harness.env, "PROMOTE_CONSUMER_TOKEN"),
+        repository: required_env(harness.env, "PROMOTE_CONSUMER_REPOSITORY"),
+        workflow: required_env(harness.env, "PROMOTE_CONSUMER_WORKFLOW"),
+        reader: required_env(harness.env, "PROMOTE_CONSUMER_READER"),
+      },
+    ),
     request.repository,
     request.sha,
     request.run_id,
     attempt,
     authorization,
-    path_join(directory, mode),
   ) }
   if mode == "verify" {
     const candidate = verify_candidate(github, harness.fs, request, directory, authorize_completion)

@@ -1,0 +1,67 @@
+name: Request an automatic review
+description: Measure an eligible pull request head before dispatching the existing reviewer.
+inputs:
+  pull-request:
+    description: Pull request number in the calling repository.
+    required: true
+  repository:
+    description: Optional same-organization target repository for first-review bootstrap.
+    required: false
+    default: ""
+  release-app-client-id:
+    description: Organization release App client ID.
+    required: true
+  release-app-private-key:
+    description: Organization release App private key.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Set up Harn
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+      with:
+        version: 0.10.133
+    - name: Validate the requested repository before minting a token
+      id: target
+      shell: bash
+      env:
+        CALLER_REPOSITORY: ${{ github.repository }}
+        REQUESTED_REPOSITORY: ${{ inputs.repository }}
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/review-dispatch/run.sh" target
+    - name: Read another repository with only its pull-request permission
+      id: target-read
+      if: steps.target.outputs.cross_repository == 'true'
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+      with:
+        client-id: ${{ inputs.release-app-client-id }}
+        private-key: ${{ inputs.release-app-private-key }}
+        owner: ${{ steps.target.outputs.owner }}
+        repositories: ${{ steps.target.outputs.name }}
+        permission-pull-requests: read
+    - name: Resolve the current eligible head
+      id: request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.target-read.outputs.token || (steps.target.outputs.cross_repository != 'true' && github.token || '') }}
+        TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
+        PR_NUMBER: ${{ inputs.pull-request }}
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/review-dispatch/run.sh" resolve
+    - name: Mint a token that can only request reviews
+      id: app
+      if: steps.request.outputs.eligible == 'true'
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+      with:
+        client-id: ${{ inputs.release-app-client-id }}
+        private-key: ${{ inputs.release-app-private-key }}
+        owner: ${{ github.repository_owner }}
+        repositories: burin-code
+        permission-actions: write
+    - name: Request a review of the measured head
+      if: steps.request.outputs.eligible == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app.outputs.token }}
+        TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
+        PR_NUMBER: ${{ inputs.pull-request }}
+        HEAD_SHA: ${{ steps.request.outputs.head_sha }}
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/review-dispatch/run.sh" dispatch

@@ -1,0 +1,44 @@
+import { read_yaml } from "std/fs"
+
+fn named(steps: list, name: string) -> dict {
+  const matches = steps.filter({ step -> step?.name == name }).to_list()
+  assert_eq(len(matches), 1, name)
+  return matches[0] ?? {}
+}
+
+pipeline test_the_exact_selection_is_finalized_before_any_shepherd(harness: Harness) {
+  const ship = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const ci = read_yaml(harness.fs, "../../.github/workflows/ci.yml").jobs["ci-status"].steps
+  const checkout = named(ship, "Check out the Smart Ship target publisher")
+  assert_eq(checkout["with"].repository, "burin-labs/.github")
+  assert_eq(checkout["with"].ref, "91ad5a4b9c7fe58823e1433808eda60c5cd48cdb")
+  assert_eq(checkout["with"]["persist-credentials"], false)
+  assert_eq(named(ci, checkout.name)["with"], checkout["with"])
+  const record = named(ship, "Record the selected pull requests")
+  const publish = named(ship, "Publish the selected pull requests")
+  const shepherd = named(ship, "Shepherd")
+  assert_eq(record.env.NUMBERS, "$" + "{{ steps.prs.outputs.numbers }}")
+  assert(record.run.contains(".smart-ship-targets/scripts/smart-ship-targets/cli.harn"))
+  assert(record.run.contains("--output \"$RUNNER_TEMP/ship-targets/targets.json\""))
+  assert_eq(publish["if"], nil)
+  assert_eq(publish.uses, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+  assert_eq(
+    publish["with"],
+    {
+      name: "smart-ship-targets-$" + "{{ github.run_id }}-$" + "{{ github.run_attempt }}",
+      path: "$" + "{{ runner.temp }}/ship-targets/targets.json",
+      "if-no-files-found": "error",
+      "compression-level": 0,
+      "retention-days": 1,
+    },
+  )
+  assert_eq(named(ci, publish.name)["with"], publish["with"])
+  assert_eq(named(ci, publish.name).uses, publish.uses)
+  const discovery = named(ship, "Find the pull requests to look at")
+  assert(ship.index_of(discovery) < ship.index_of(record))
+  assert(ship.index_of(record) < ship.index_of(publish))
+  assert(ship.index_of(publish) < ship.index_of(shepherd))
+  const repair = named(ship, "Repair deferred pull requests")
+  assert_eq(repair.env.NUMBERS, nil)
+  assert_eq(repair.env.DEFERRED, "$" + "{{ steps.shepherd.outputs.deferred }}")
+}

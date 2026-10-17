@@ -6,6 +6,7 @@
   "topology_epoch": "2026-09-08T04:48:00Z",
   "full_run_jobs": [
     { "name": "Reusable Harn package smoke", "match": "prefix" },
+    { "name": "Pinned shipping control runtime", "match": "exact" },
     { "name": "CI status", "match": "exact" }
   ],
   "slo": {
@@ -20,7 +21,8 @@
     "critical_path_allowance_ms": 300000,
     "jobs": {
       "local-check-contract": { "budget_ms": 300000 },
-      "package-smoke": { "budget_ms": 300000 }
+      "package-smoke": { "budget_ms": 300000 },
+      "smart-ship-control-runtime": { "budget_ms": 120000 }
     }
   }
 }

@@ -1,0 +1,102 @@
+import { command_output_tail, command_run } from "std/command"
+import { with_temp_dir } from "std/testing"
+import { live_consumer_recovery } from "./live.harn"
+
+const TOKEN = "fixture-read-only-token"
+
+const SOURCE = "89512fd930c0af99f13f9295d8b236407ad07244"
+
+const CONTEXT = "fixture-original-context"
+
+fn fixture(fs: HarnessFs, directory: string, output: string) -> string {
+  const reader = path_join(directory, "reader.mjs")
+  fs.write_text(
+    reader,
+    "if (JSON.stringify(process.argv.slice(2)) !== '[\"--recover\"]' || process.argv.includes('fixture-read-only-token')) process.exit(73);\n"
+      + "if (process.env.GH_TOKEN !== 'fixture-read-only-token' || process.env.OBSERVER_CONTEXT !== 'fixture-original-context' || process.env.SOURCE_REVISION !== '89512fd930c0af99f13f9295d8b236407ad07244' || process.env.REQUIRE_CURRENT_DEFAULT !== 'true' || process.env.CANARY_REPOSITORY !== 'acme/consumer' || process.env.CANARY_WORKFLOW !== 'rehearsal.yml') process.exit(74);\n"
+      + output,
+  )
+  return reader
+}
+
+fn config(reader: string) -> dict {
+  return {token: TOKEN, repository: "acme/consumer", workflow: "rehearsal.yml", reader: reader}
+}
+
+pipeline test_live_recovery_reaches_the_actual_node_child_with_env_only_credentials(
+  harness: Harness,
+) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const measured = {
+        context: {parent_run_id: "100"},
+        owned: false,
+        reading: {product: {verdict: "pass"}},
+        deadline: {observed_at: 8200},
+      }
+      const reader = fixture(
+        harness.fs,
+        work,
+        "process.stdout.write(" + json_stringify(json_stringify(measured)) + ");\n",
+      )
+      const recovered = live_consumer_recovery(harness.tools, config(reader))(CONTEXT, SOURCE)
+      assert_eq(recovered, measured)
+      assert(!json_stringify(recovered).contains(TOKEN))
+    },
+  )
+}
+
+pipeline test_live_recovery_refuses_failed_empty_malformed_and_truncated_command_output(
+  harness: Harness,
+) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      for output in [
+        "process.stderr.write('private-reader-detail fixture-read-only-token'); process.exit(13);\n",
+        "",
+        "process.stdout.write('not-json');\n",
+        "process.stdout.write('malformed-prefix' + ' '.repeat(20000) + '{\"measured\":true}');\n",
+      ] {
+        const reader = fixture(harness.fs, work, output)
+        const outcome = try {
+          live_consumer_recovery(harness.tools, config(reader))(CONTEXT, SOURCE)
+        }
+        assert(is_err(outcome), "unmeasured command output became a decision")
+        const error = to_string(unwrap_err(outcome))
+        assert(!error.contains("private-reader-detail"))
+        assert(!error.contains(TOKEN))
+        if output.contains("malformed-prefix") {
+          const captured = command_run(
+            harness.tools,
+            ["node", reader, "--recover"],
+            {
+              capture: {max_inline_bytes: 16384},
+              env: {
+                GH_TOKEN: TOKEN,
+                OBSERVER_CONTEXT: CONTEXT,
+                SOURCE_REVISION: SOURCE,
+                REQUIRE_CURRENT_DEFAULT: "true",
+                CANARY_REPOSITORY: "acme/consumer",
+                CANARY_WORKFLOW: "rehearsal.yml",
+              },
+            },
+          )
+          assert(captured.success)
+          assert(captured.stdout_truncated, "the negative control must exceed the actual capture")
+          const tail = command_output_tail(
+            harness.tools,
+            captured,
+            {source: "stdout", length: 16384},
+          ).content
+          assert_eq(
+            json_parse(tail),
+            {measured: true},
+            "a parsable tail must not qualify the malformed full report",
+          )
+        }
+      }
+    },
+  )
+}

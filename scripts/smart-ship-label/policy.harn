@@ -8,7 +8,7 @@ pub type ControlPolicySource = {repository: string, ref: string}
 // A reusable workflow's github.workflow_sha belongs to its caller repository.
 pub const CONTROL_POLICY_SOURCE: ControlPolicySource = {
   repository: "burin-labs/.github",
-  ref: "8ab5eb88533595579e9e79d556d719593a26a728",
+  ref: "df9c75308b05be787532b0d2a827e0ae8a61c095",
 }
 
 /** Normalize the workflow projection at the repository/revision boundary. */
@@ -41,7 +41,7 @@ pub fn ship_label(registry: unknown) -> LabelSpec {
       + to_string(len(entries))
   }
   const entry = entries[0]
-  const color = text(entry?.color, "color").to_lower()
+  const color = text(entry?.color, "color").lower()
   if len(regex_captures("^[0-9a-f]{6}$", color) ?? []) != 1 {
     throw "Smart Ship label color must be six lowercase hexadecimal digits"
   }
@@ -74,7 +74,7 @@ fn matching(census: list<dict>, name: string) -> list<dict> {
 
 fn exact(label: dict, spec: LabelSpec) -> bool {
   return to_string(label?.name ?? "") == spec.name
-    && to_string(label?.color ?? "").to_lower() == spec.color
+    && to_string(label?.color ?? "").lower() == spec.color
     && to_string(label?.description ?? "") == spec.description
 }
 

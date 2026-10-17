@@ -1,0 +1,32 @@
+import { Run } from "./contract.harn"
+import { current_run, live_source } from "./live.harn"
+import { historical_reuse } from "./reader.harn"
+
+fn main(harness: Harness) {
+  const source = live_source(harness.net, harness.fs, harness.env.get("GH_TOKEN") ?? "")
+  const current = current_run(harness.env, source)
+  const id = to_int(argv[0] ?? "0")
+  const attempt = to_int(argv[1] ?? "0")
+  if id <= 0 || attempt <= 0 {
+    throw "historical run and attempt are required"
+  }
+  const producer = schema_expect(
+    source.json(
+      "/repos/" + current.repository + "/actions/runs/" + to_string(id)
+        + "/attempts/"
+        + to_string(attempt),
+    ),
+    schema_of(Run),
+  )
+  const restored = historical_reuse(source, current, producer, { -> harness.clock.now_ms() })
+  harness.stdio.println(
+    json_stringify(
+      {
+        schema: "burin.ci_historical_job_proof.v1",
+        main_run: {id: producer.id, attempt: producer.run_attempt, commit: producer.head_sha},
+        jobs: restored.jobs,
+        pending: restored.pending,
+      },
+    ),
+  )
+}

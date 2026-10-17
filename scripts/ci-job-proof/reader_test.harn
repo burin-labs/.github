@@ -1,6 +1,6 @@
 import { assert_error_contains } from "std/testing"
 import { Run } from "./contract.harn"
-import { ProofSource, identity, job_census } from "./reader.harn"
+import { ProofSource, job_census, merge_group_pull } from "./reader.harn"
 
 fn run() -> Run {
   return {
@@ -45,9 +45,9 @@ fn source(pages: dict) -> ProofSource {
   }
 }
 
-const FIRST = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=1"
+const FIRST = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=1"
 
-const SECOND = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=100&page=2"
+const SECOND = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=2"
 
 pipeline test_complete_explicit_attempt_pages_are_measured() {
   const census = job_census(
@@ -96,34 +96,8 @@ pipeline test_empty_partial_duplicate_and_changing_census_refuse() {
   )
 }
 
-pipeline test_git_objects_not_receipt_claims_define_source_identity() {
-  const commit = "a".repeat(40)
-  const commit_endpoint = "/repos/acme/product/git/commits/" + commit
-  const file_endpoint = "/repos/acme/product/contents/.github/workflows/ci.yml?ref=" + commit
-  const pages = {
-    [commit_endpoint]: {sha: commit, tree: {sha: "b".repeat(40)}},
-    [file_endpoint]: {type: "file", sha: "c".repeat(40)},
-  }
-  assert_eq(
-    identity(source(pages), "acme/product", "ci.yml", commit),
-    {commit: commit, tree: "b".repeat(40), workflowBlob: "c".repeat(40)},
-  )
-  assert_error_contains(
-    fn() { identity(
-      source({...pages, [commit_endpoint]: {sha: "d".repeat(40), tree: {sha: "b".repeat(40)}}}),
-      "acme/product",
-      "ci.yml",
-      commit,
-    ) },
-    "different source",
-  )
-  assert_error_contains(
-    fn() { identity(
-      source({...pages, [file_endpoint]: {type: "symlink", sha: "c".repeat(40)}}),
-      "acme/product",
-      "ci.yml",
-      commit,
-    ) },
-    "did not return a file",
-  )
+pipeline test_merge_group_names_its_pull_request_only_in_its_queue_ref() {
+  assert_eq(merge_group_pull("refs/heads/gh-readonly-queue/main/pr-10697-" + "a".repeat(40)), 10697)
+  assert_eq(merge_group_pull("refs/heads/gh-readonly-queue/main/pr-10697-short"), nil)
+  assert_eq(merge_group_pull(""), nil)
 }

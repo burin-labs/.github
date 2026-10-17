@@ -1,0 +1,24 @@
+import { selected_targets } from "./lib.harn"
+
+fn main(harness: Harness) {
+  const index = argv.index_of("--output")
+  require index >= 0 && index + 1 < len(argv), "--output is required"
+  const output = argv[index + 1]
+  const record = selected_targets(
+    {
+      repository: harness.env.get("GITHUB_REPOSITORY") ?? "",
+      workflow_ref: harness.env.get("GITHUB_WORKFLOW_REF") ?? "",
+      run_id: to_int(harness.env.get("GITHUB_RUN_ID")) ?? 0,
+      attempt: to_int(harness.env.get("GITHUB_RUN_ATTEMPT")) ?? 0,
+      numbers: harness.env.get("NUMBERS"),
+    },
+  )
+  harness.fs.mkdir(dirname(output) ?? ".", true)
+  harness.fs.write_text(output, json_stringify(record) + "\n")
+  harness.stdio.println(
+    "Selected " + to_string(len(record.prs)) + " pull requests for run "
+      + to_string(record.run_id)
+      + " attempt "
+      + to_string(record.attempt),
+  )
+}

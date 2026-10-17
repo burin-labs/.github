@@ -1,6 +1,6 @@
 import { read_yaml } from "std/fs"
 import { assert_error_contains } from "std/testing"
-import { dispatch, resolve } from "./policy.harn"
+import { dispatch, resolve, resolve_target } from "./policy.harn"
 
 const REPOSITORY = "burin-labs/.github"
 
@@ -13,6 +13,33 @@ const PULL = {
   user: {type: "User", login: "burin-labs-agent"},
   base: {repo: {full_name: REPOSITORY}},
   head: {sha: HEAD, repo: {full_name: REPOSITORY}},
+}
+
+pipeline test_manual_target_defaults_to_the_caller_and_refuses_foreign_or_malformed_repositories() {
+  assert_eq(
+    resolve_target(REPOSITORY, ""),
+    {repository: REPOSITORY, owner: "burin-labs", name: ".github", cross_repository: false},
+  )
+  assert_eq(
+    resolve_target(REPOSITORY, "burin-labs/smart-ship-sandbox"),
+    {
+      repository: "burin-labs/smart-ship-sandbox",
+      owner: "burin-labs",
+      name: "smart-ship-sandbox",
+      cross_repository: true,
+    },
+  )
+  for requested in [
+    "other-org/project",
+    "burin-labs/..",
+    "burin-labs/.",
+    "burin-labs/project/extra",
+    "https://github.com/burin-labs/project",
+    "burin-labs/project\nowner=foreign",
+  ] {
+    assert_error_contains({ -> resolve_target(REPOSITORY, requested) }, "review target")
+  }
+  assert_error_contains({ -> resolve_target("", REPOSITORY) }, "review target")
 }
 
 pipeline test_trusted_live_head_dispatches_only_exact_review_inputs() {
@@ -77,6 +104,7 @@ pipeline test_workflow_uses_trusted_base_and_mints_only_a_scoped_eligible_token(
     ["opened", "reopened", "ready_for_review", "synchronize"],
   )
   assert_eq(workflow.on.workflow_dispatch.inputs["pull-request"].required, true)
+  assert_eq(workflow.on.workflow_dispatch.inputs.repository.required, false)
   const job = workflow.jobs.dispatch
   assert_eq(job.permissions, {contents: "read", "pull-requests": "read"})
   assert_eq(
@@ -91,15 +119,41 @@ pipeline test_workflow_uses_trusted_base_and_mints_only_a_scoped_eligible_token(
     expression_start + "github.event.pull_request.base.sha || github.sha }}",
   )
   assert_eq(checkout["with"]["persist-credentials"], false)
-  const mint = steps.filter({ step -> step?.id == "app" }).to_list()[0]
+  const action = read_yaml(harness.fs, "../../.github/actions/review-dispatch/action.yml")
+  assert_eq(steps[1]["uses"], "./.github/actions/review-dispatch")
+  assert_eq(
+    steps[1]["with"].repository,
+    expression_start + "github.event_name == 'workflow_dispatch' && inputs.repository || '' }}",
+  )
+  const action_steps = action.runs.steps
+  const target = action_steps.filter({ step -> step?.id == "target" }).to_list()[0]
+  const read = action_steps.filter({ step -> step?.id == "target-read" }).to_list()[0]
+  assert_eq(target.env.CALLER_REPOSITORY, expression_start + "github.repository }}")
+  assert_eq(read["if"], "steps.target.outputs.cross_repository == 'true'")
+  assert_eq(read["with"]["permission-pull-requests"], "read")
+  assert_eq(read["with"]["permission-actions"], nil)
+  assert_eq(read["with"].repositories, expression_start + "steps.target.outputs.name }}")
+  assert_eq(read["with"].owner, expression_start + "steps.target.outputs.owner }}")
+  assert(action_steps.index_of(target) < action_steps.index_of(read))
+  const resolve_step = action_steps.filter({ step -> step?.id == "request" }).to_list()[0]
+  assert_eq(
+    resolve_step.env.GH_TOKEN,
+    expression_start + "steps.target-read.outputs.token || (steps.target.outputs.cross_repository != 'true' && github.token || '') }}",
+  )
+  assert_eq(
+    resolve_step.env.TARGET_REPOSITORY,
+    expression_start + "steps.target.outputs.repository }}",
+  )
+  const mint = action_steps.filter({ step -> step?.id == "app" }).to_list()[0]
   assert_eq(mint["if"], "steps.request.outputs.eligible == 'true'")
   assert_eq(mint["with"].repositories, "burin-code")
   assert_eq(mint["with"]["permission-actions"], "write")
-  const submit = steps[len(steps) - 1]
+  const submit = action_steps[len(action_steps) - 1]
   assert_eq(submit["if"], mint["if"])
   assert_eq(submit.env.HEAD_SHA, expression_start + "steps.request.outputs.head_sha }}")
+  assert_eq(submit.env.TARGET_REPOSITORY, expression_start + "steps.target.outputs.repository }}")
   assert(
-    steps.index_of(mint)
-      > steps.index_of(steps.filter({ step -> step?.id == "request" }).to_list()[0]),
+    action_steps.index_of(mint)
+      > action_steps.index_of(action_steps.filter({ step -> step?.id == "request" }).to_list()[0]),
   )
 }

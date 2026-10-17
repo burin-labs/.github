@@ -16,8 +16,12 @@ inputs:
     description: Cargo workspace directory, relative to the repository root.
     required: false
     default: .
+  workflow-paths:
+    description: Newline-separated workflow prefixes that force the complete workspace. Replace with Rust-relevant workflows or set empty to disable workflow-wide coverage.
+    required: false
+    default: ".github/workflows"
   global-paths:
-    description: Newline-separated repository-relative prefixes that force the complete workspace.
+    description: Additional newline-separated repository-relative prefixes that force the complete workspace. Cargo workspace inputs always remain global.
     required: false
     default: ""
   extra-package-paths:
@@ -53,6 +57,7 @@ runs:
         RUST_IMPACT_BASE: ${{ inputs.base }}
         RUST_IMPACT_HEAD: ${{ inputs.head }}
         RUST_IMPACT_WORKSPACE: ${{ inputs.workspace }}
+        RUST_IMPACT_WORKFLOW_PATHS: ${{ inputs.workflow-paths }}
         RUST_IMPACT_GLOBAL_PATHS: ${{ inputs.global-paths }}
         RUST_IMPACT_EXTRA_PACKAGE_PATHS: ${{ inputs.extra-package-paths }}
       run: node "$GITHUB_ACTION_PATH/plan.mjs"

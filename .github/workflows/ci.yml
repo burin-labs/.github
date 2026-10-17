@@ -8,11 +8,39 @@ on:
   workflow_dispatch:
 
 jobs:
+  smart-ship-control-runtime:
+    name: Pinned shipping control runtime
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the immutable shipping control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/.github
+          ref: df9c75308b05be787532b0d2a827e0ae8a61c095
+          path: .smart-ship-control
+          persist-credentials: false
+      - name: Install the shipping consumer runtime
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        with:
+          version: "0.10.166"
+      - name: Exercise the immutable control script
+        run: >-
+          harn test .smart-ship-control/scripts/smart-ship-label/policy_test.harn
+          --json-out "${{ runner.temp }}/smart-ship-control-tests.json"
+      - name: Exercise the candidate policy reader on the shipping runtime
+        run: harn test scripts/smart-ship-policy
+
   local-check-contract:
     name: Local workflow check contract
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,23 +60,50 @@ jobs:
           harn test scripts/release-repin
           harn test scripts/merge-override
           harn test scripts/smart-ship-label
+          harn test scripts/smart-ship-policy
+          harn test scripts/smart-ship-targets
           harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels
           harn test scripts/harn-required-review
           harn test scripts/review-dispatch
           bash .github/actions/local-workflow-checks/run_test.sh
-      - name: Set up the exact-tree proof runtime
+      - name: Set up the CI job proof runtime
         uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
         with:
           version: "0.10.159"
-      - name: Test exact-tree CI proof reuse
-        run: harn test scripts/exact-tree-proof
+      - name: Test CI job proof reuse
+        run: harn test scripts/ci-job-proof
       # Dogfooding: the same action product repositories call, on the Harn
       # release the shared action above already installed.
       - name: Check hosted runner labels
         uses: ./.github/actions/hosted-runner-labels
         with:
           skip-harn-setup: "true"
+      - name: Measure registration smoke inputs
+        id: proof-smoke-inputs
+        run: >-
+          harn run --grant output=env:GITHUB_OUTPUT,expose=GITHUB_OUTPUT
+          --write-root "$RUNNER_TEMP" --read-only-root "$GITHUB_WORKSPACE"
+          scripts/ci-job-proof/smoke.harn -- identity "$GITHUB_WORKSPACE"
+      - name: Register actual CI checkout
+        id: proof-source
+        uses: ./.github/actions/ci-job-proof
+        with:
+          workflow-file: ci.yml
+          job-identities: ${{ steps.proof-smoke-inputs.outputs.identities }}
+          registrar-job: Local workflow check contract
+          registrar-step: Register actual CI checkout
+          event-name: ${{ github.event_name }}
+          commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          github-token: ${{ github.token }}
+      - name: Read back actual CI checkout registration
+        env:
+          REGISTRATION: ${{ steps.proof-source.outputs.registration }}
+          RUN_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          harn run --read-only-root "$GITHUB_WORKSPACE"
+          scripts/ci-job-proof/smoke.harn -- verify "$GITHUB_WORKSPACE"
+          "$REGISTRATION" "$RUN_HEAD" "$GITHUB_SHA"
 
   package-smoke:
     name: Reusable Harn package smoke (${{ matrix.strict && 'strict' || 'default' }})
@@ -70,7 +125,7 @@ jobs:
 
   ci-status:
     name: CI status
-    needs: [local-check-contract, package-smoke]
+    needs: [local-check-contract, package-smoke, smart-ship-control-runtime]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     permissions:
@@ -93,6 +148,29 @@ jobs:
         with:
           baseline-sha: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
           github-token: ${{ github.token }}
+      - name: Check out the Smart Ship target publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 91ad5a4b9c7fe58823e1433808eda60c5cd48cdb
+          path: .smart-ship-targets
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
+      - name: Record the selected pull requests
+        env:
+          NUMBERS: "7 8"
+        run: >-
+          harn run --no-sandbox
+          .smart-ship-targets/scripts/smart-ship-targets/cli.harn --
+          --output "$RUNNER_TEMP/ship-targets/targets.json"
+      - name: Publish the selected pull requests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ship-targets/targets.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
       - name: Markdown lint
         uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
@@ -129,9 +207,11 @@ jobs:
         env:
           LOCAL_CHECK_CONTRACT_RESULT: ${{ needs.local-check-contract.result }}
           PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
+          SMART_SHIP_CONTROL_RESULT: ${{ needs.smart-ship-control-runtime.result }}
         run: |
           test "$LOCAL_CHECK_CONTRACT_RESULT" = success
           test "$PACKAGE_SMOKE_RESULT" = success
+          test "$SMART_SHIP_CONTROL_RESULT" = success
       - name: Test package workflow policy
         run: |
           ruby .github/actions/harn-repo-policy/check-workflow_test.rb
@@ -167,7 +247,7 @@ jobs:
           bash -n .github/actions/ci-runtime-evidence/run.sh
           bash -n .github/actions/ci-latency-policy/run.sh
           bash -n .github/actions/pr-title-check/check.sh
-          bash -n .github/actions/exact-tree-ci-proof/run.sh
+          bash -n .github/actions/ci-job-proof/run.sh
           bash -n scripts/ci-routing.sh
           bash -n scripts/runner-fleet-health.sh
           bash -n scripts/reusable-pin-drift.sh

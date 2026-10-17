@@ -1,0 +1,437 @@
+import {
+  Admission,
+  Artifact,
+  IDENTITY_SCHEMA,
+  Job,
+  JobIdentity,
+  ProducerPolicy,
+  Provenance,
+  RegisteredArtifact,
+  Registration,
+  Run,
+  RunAdmission,
+  RunContext,
+  closed,
+  identities,
+  leg_of,
+  qualified_artifact,
+  qualified_jobs,
+  registration_artifact_name,
+  reuse_producer_policy,
+  sha,
+} from "./contract.harn"
+
+/** Artifact transport verifies the downloaded archive digest before decoding its registration. */
+pub type ProofSource = {json: fn(string) -> unknown, registration: fn(string, Artifact) -> unknown}
+
+pub type JobCensus = {declared: int, jobs: list<Job>}
+
+/** Qualified source, archive identity, and full attempt census remain inspectable. */
+pub type OriginalRunInspection = {
+  producer: Run,
+  registered: RegisteredArtifact,
+  census: JobCensus,
+  requested: list<JobIdentity>,
+  admission: RunAdmission,
+}
+
+type JobsPage = {total_count: int, jobs: list<Job>}
+
+type ArtifactsPage = {total_count: int, artifacts: list<Artifact>}
+
+type RunsPage = {total_count: int, workflow_runs: list<Run>}
+
+type Pull = {number: int, head: {sha: string, repo: {full_name: string}?}}
+
+pub const READ_BUDGET = 40
+
+pub const RUN_BUDGET = 8
+
+pub fn repository(value: string) -> string {
+  if !regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", value) {
+    throw "invalid repository identity"
+  }
+  return value
+}
+
+pub fn workflow(value: string) -> string {
+  if !regex_match("^[A-Za-z0-9_-]+\\.ya?ml$", value) {
+    throw "invalid workflow filename"
+  }
+  return value
+}
+
+/** The pull request a merge group was built for, from its readonly queue ref. */
+pub fn merge_group_pull(head_ref: string) -> int? {
+  const found = regex_captures("/pr-([0-9]+)-[0-9a-f]{40}$", head_ref)
+  if len(found) != 1 {
+    return nil
+  }
+  const number = to_int(found[0].groups[0])
+  return number > 0 ? number : nil
+}
+
+/** Every job comes from one explicit attempt; partial pages and repeated identities refuse. */
+pub fn job_census(source: ProofSource, repo: string, run: Run) -> JobCensus {
+  let jobs: list<Job> = []
+  let declared = -1
+  for page in range(1, 102) {
+    const endpoint = "/repos/" + repository(repo) + "/actions/runs/" + to_string(run.id)
+      + "/attempts/"
+      + to_string(run.run_attempt)
+      + "/jobs?per_page=30&page="
+      + to_string(page)
+    const result = schema_expect(source.json(endpoint), schema_of(JobsPage))
+    if result.total_count <= 0 || (declared != -1 && declared != result.total_count)
+      || result.total_count > 10000
+      || len(result.jobs) == 0
+      || len(result.jobs) > 30 {
+      throw "incomplete or changing attempt job census"
+    }
+    declared = result.total_count
+    jobs = jobs + result.jobs
+    if len(jobs.map({ job -> job.id }).unique()) != len(jobs) || len(jobs) > declared {
+      throw "duplicate or excess attempt job census"
+    }
+    if len(jobs) == declared {
+      return {declared: declared, jobs: jobs}
+    }
+  }
+  throw "attempt job census exceeded its bound"
+}
+
+fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifact {
+  let artifacts: list<Artifact> = []
+  let declared = -1
+  for page in range(1, 102) {
+    const endpoint = "/repos/" + repository(repo) + "/actions/runs/" + to_string(run.id)
+      + "/artifacts?per_page=100&page="
+      + to_string(page)
+    const result = schema_expect(source.json(endpoint), schema_of(ArtifactsPage))
+    if result.total_count < 0 || (declared != -1 && declared != result.total_count)
+      || result.total_count > 10000
+      || len(result.artifacts) > 100 {
+      throw "changing or excessive artifact census"
+    }
+    declared = result.total_count
+    artifacts = artifacts + result.artifacts
+    if len(artifacts.map({ artifact -> artifact.id }).unique()) != len(artifacts)
+      || len(artifacts) > declared {
+      throw "duplicate or excess artifact census"
+    }
+    if len(artifacts) == declared {
+      const named = artifacts.filter(
+        { artifact -> artifact.name == registration_artifact_name(run.id, run.run_attempt) },
+      )
+        .to_list()
+      if len(named) != 1 {
+        throw "registration artifact missing or ambiguous"
+      }
+      return named[0]
+    }
+    if len(result.artifacts) == 0 {
+      throw "incomplete artifact census"
+    }
+  }
+  throw "artifact census exceeded its bound"
+}
+
+/** Inspect a producer under trusted policy without inventing a consumer workflow or run. */
+pub fn inspect_original_run(
+  source: ProofSource,
+  policy: ProducerPolicy,
+  producer: Run,
+  wanted: list<JobIdentity>? = nil,
+) -> OriginalRunInspection {
+  const artifact = registration_artifact(source, policy.repository, producer)
+  qualified_artifact(artifact, producer)
+  const raw = source.registration(policy.repository, artifact)
+  schema_expect(raw, closed(schema_of(Registration)))
+  const recorded = schema_expect(raw, schema_of(Registration))
+  const census = job_census(source, policy.repository, producer)
+  const requested = wanted
+    ?? identities(
+      {
+        schema: IDENTITY_SCHEMA,
+        jobs: recorded.jobs.map({ identity -> pick(identity, ["id", "names", "digest"]) }),
+      },
+    )
+  const admission = qualified_jobs(
+    policy,
+    producer,
+    {artifact: artifact, registration: recorded},
+    census.jobs,
+    census.declared,
+    requested,
+  )
+  return {
+    producer: producer,
+    registered: {artifact: artifact, registration: recorded},
+    admission: admission,
+    census: census,
+    requested: requested,
+  }
+}
+
+/** Existing reuse and history keep their same-workflow, distinct-consumer policy. */
+pub fn inspect_run(
+  source: ProofSource,
+  current: RunContext,
+  producer: Run,
+  wanted: list<JobIdentity>? = nil,
+) -> OriginalRunInspection {
+  return inspect_original_run(source, reuse_producer_policy(current, producer), producer, wanted)
+}
+
+pub fn read_run(
+  source: ProofSource,
+  current: RunContext,
+  producer: Run,
+  wanted: list<JobIdentity>,
+) {
+  return inspect_run(source, current, producer, wanted).admission
+}
+
+pub type HistoricalJob = {id: string, digest: string, provenance: Provenance, job: Job}
+
+/** Restored original jobs and explicitly unresolved logical job identities. */
+pub type HistoricalReuse = {jobs: list<HistoricalJob>, pending: list<string>}
+
+/** Resolve a main run's skipped jobs through the same input-bound admission owner. */
+pub fn historical_reuse(
+  source: ProofSource,
+  current: RunContext,
+  producer: Run,
+  now: fn() -> int,
+) -> HistoricalReuse {
+  const bounded = bounded_source(source, now)
+  const root = inspect_run(bounded.source, current, producer)
+  const wanted = root.requested.filter(
+    { identity ->
+      const matches = root.census.jobs.filter({ job -> leg_of(identity.names, job.name) }).to_list()
+      return root.admission.deferred.any({ pointer -> pointer.id == identity.id })
+        && len(matches) > 0
+        && matches.all({ job -> job.conclusion == "skipped" })
+    },
+  )
+    .to_list()
+  let queue = root.admission.deferred.filter(
+    { pointer -> wanted.any({ identity -> identity.id == pointer.id }) },
+  )
+    .to_list()
+  let seen: list<string> = []
+  let restored: list<HistoricalJob> = []
+  while len(queue) > 0 {
+    const pointer = queue[0]
+    queue = queue.slice(1)
+    const key = to_string(pointer.provenance.runId) + ":" + to_string(pointer.provenance.attempt)
+    if seen.contains(key) {
+      continue
+    }
+    if len(seen) >= RUN_BUDGET || bounded.exhausted() {
+      throw "historical proof discovery budget exhausted"
+    }
+    seen = seen + [key]
+    const original = schema_expect(
+      bounded.source.json(
+        "/repos/" + repository(current.repository) + "/actions/runs/"
+          + to_string(pointer.provenance.runId)
+          + "/attempts/"
+          + to_string(pointer.provenance.attempt),
+      ),
+      schema_of(Run),
+    )
+    const eligible = [pointer]
+      + queue.filter({ next -> next.provenance == pointer.provenance }).to_list()
+    const open = wanted.filter(
+      { identity ->
+        eligible.any({ next -> next.id == identity.id })
+          && !restored.any({ value -> value.id == identity.id })
+      },
+    )
+      .to_list()
+    const qualified = inspect_run(bounded.source, current, original, open)
+    for admission in qualified.admission.admitted {
+      if qualified.census.jobs.any(
+        { job -> admission.jobIds.contains(job.id) && len(job.steps) == 0 },
+      ) {
+        continue
+      }
+      for job in qualified.census.jobs.filter({ job -> admission.jobIds.contains(job.id) }) {
+        restored = restored
+          + [
+            {
+              id: admission.id,
+              digest: admission.digest,
+              provenance: admission.provenance,
+              job: job,
+            },
+          ]
+      }
+    }
+    queue = queue + qualified.admission.deferred
+  }
+  return {
+    jobs: restored,
+    pending: wanted.filter({ identity -> !restored.any({ value -> value.id == identity.id }) })
+      .map({ identity -> identity.id })
+      .to_list(),
+  }
+}
+
+/** Bounded discovery. Unknown, unreadable or unqualified producers prove nothing. */
+pub type Discovery = {
+  admitted: list<Admission>,
+  probed: int,
+  reads: int,
+  budget: int,
+  reason: string,
+}
+
+type BudgetSource = {source: ProofSource, reads: fn() -> int, exhausted: fn() -> bool}
+
+fn bounded_source(source: ProofSource, now: fn() -> int) -> BudgetSource {
+  let reads = 0
+  let memo = {}
+  const expires_at = now() + 45000
+  const take = fn() {
+    if reads >= READ_BUDGET || now() >= expires_at {
+      throw "proof discovery budget exhausted"
+    }
+    reads = reads + 1
+  }
+  return {
+    source: {
+      json: fn(endpoint) {
+        if memo[endpoint] != nil {
+          return memo[endpoint]
+        }
+        take()
+        const result = source.json(endpoint)
+        memo = memo + {[endpoint]: result}
+        return result
+      },
+      registration: fn(repo, artifact) {
+        take()
+        return source.registration(repo, artifact)
+      },
+    },
+    reads: fn() { return reads },
+    exhausted: fn() { return reads >= READ_BUDGET || now() >= expires_at },
+  }
+}
+
+fn runs(source: ProofSource, current: RunContext, query: string) -> list<Run> {
+  const endpoint = "/repos/" + repository(current.repository) + "/actions/workflows/"
+    + workflow(current.workflow)
+    + "/runs?status=completed&per_page=5&"
+    + query
+  const page = schema_expect(source.json(endpoint), schema_of(RunsPage))
+  if page.total_count < 0 || len(page.workflow_runs) > 5
+    || len(page.workflow_runs) > page.total_count {
+    throw "incomplete run history"
+  }
+  return page.workflow_runs
+}
+
+/**
+ * Producers worth reading, nearest first: for a main push, the merge group
+ * that tested this exact commit, then earlier main pushes; for a merge group,
+ * the pull request it merges, then the latest main push.
+ */
+fn candidates(source: ProofSource, current: RunContext, pull: int?) -> list<Run> {
+  const pushes = runs(source, current, "event=push&branch=main").filter(
+    { run -> run.id < current.runId },
+  )
+    .to_list()
+  if current.event == "push" {
+    return runs(source, current, "event=merge_group&head_sha=" + sha(current.commit)) + pushes
+  }
+  if pull == nil {
+    return pushes.slice(0, 1)
+  }
+  const prefix = "/repos/" + repository(current.repository)
+  const pr = schema_expect(source.json(prefix + "/pulls/" + to_string(pull)), schema_of(Pull))
+  if pr.number != pull || pr.head.repo?.full_name != current.repository {
+    return pushes.slice(0, 1)
+  }
+  return runs(source, current, "event=pull_request&head_sha=" + sha(pr.head.sha)).slice(0, 2)
+    + pushes.slice(0, 1)
+}
+
+pub fn discover(
+  source: ProofSource,
+  current: RunContext,
+  wanted: list<JobIdentity>,
+  pull: int?,
+  now: fn() -> int,
+) -> Discovery {
+  const bounded = bounded_source(source, now)
+  const result = fn(admitted, probed, reason) { return {
+    admitted: admitted.sorted_by({ admission -> admission.id }),
+    probed: probed,
+    reads: bounded.reads(),
+    budget: READ_BUDGET,
+    reason: reason,
+  } }
+  if !["push", "merge_group"].contains(current.event) {
+    return result([], 0, "unsupported_event")
+  }
+  const listed = try {
+    candidates(bounded.source, current, pull)
+  }
+  if is_err(listed) {
+    return result([], 0, "history_unmeasured")
+  }
+  let queue: list<Provenance> = unwrap(listed).map(
+    { run -> {runId: run.id, attempt: run.run_attempt} },
+  )
+    .to_list()
+  let known = {}
+  for run in unwrap(listed) {
+    known = known + {[to_string(run.id) + ":" + to_string(run.run_attempt)]: run}
+  }
+  let admitted: list<Admission> = []
+  // A run and its rerun attempt are different producers; key both by the pair.
+  let seen: list<string> = []
+  let probed = 0
+  while len(queue) > 0 && len(admitted) < len(wanted) {
+    const next = queue[0]
+    queue = queue.slice(1)
+    const key = to_string(next.runId) + ":" + to_string(next.attempt)
+    if seen.contains(key) || next.runId == current.runId {
+      continue
+    }
+    seen = seen + [key]
+    if probed >= RUN_BUDGET || bounded.exhausted() {
+      return result(admitted, probed, "discovery_budget_exhausted")
+    }
+    probed = probed + 1
+    const run = try {
+      known[key]
+        ?? schema_expect(
+          bounded.source.json(
+            "/repos/" + repository(current.repository) + "/actions/runs/" + to_string(next.runId)
+              + "/attempts/"
+              + to_string(next.attempt),
+          ),
+          schema_of(Run),
+        )
+    }
+    if is_err(run) {
+      continue
+    }
+    const open = wanted.filter(
+      { identity -> !admitted.any({ admission -> admission.id == identity.id }) },
+    )
+      .to_list()
+    const outcome = try {
+      read_run(bounded.source, current, unwrap(run), open)
+    }
+    if is_ok(outcome) {
+      admitted = admitted + unwrap(outcome).admitted
+      queue = queue + unwrap(outcome).deferred.map({ deferral -> deferral.provenance }).to_list()
+    }
+  }
+  return result(admitted, probed, len(admitted) > 0 ? "qualified" : "no_qualified_registration")
+}
