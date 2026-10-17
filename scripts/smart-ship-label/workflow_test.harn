@@ -145,12 +145,14 @@ fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
   const harnw = path_join(workspace, "scripts/harnw")
   harness.fs.write_text(
     harnw,
-    "#!/usr/bin/env bash\necho \"$*\" >> \"$CALLS\"\npr=\"\"; defer=0\n"
+    "#!/usr/bin/env bash\n"
+      + "if [ \"$3\" = .smart-ship-runner/scripts/smart-ship-policy/cli.harn ]; then : > \"$7\"; exit 0; fi\n"
+      + "echo \"$*\" >> \"$CALLS\"\npr=\"\"; defer=0\n"
       + "while [ $# -gt 0 ]; do case \"$1\" in --pr) pr=\"$2\"; shift ;; --defer-repair) defer=1 ;; esac; shift; done\n"
       + "if [ \"$defer\" = 1 ] && [ \"$pr\" = \"$DEFER_PR\" ]; then exit 3; fi\nexit 0\n",
   )
-  // No policy is published: the step falls back to an empty one.
-  harness.fs.write_text(path_join(bin, "gh"), "#!/usr/bin/env bash\nexit 1\n")
+  // This fixture isolates look/repair ordering; the policy tests execute the reader.
+  harness.fs.write_text(path_join(bin, "gh"), "#!/usr/bin/env bash\nexit 19\n")
   harness.fs.write_text(path_join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
   for file in [harnw, path_join(bin, "gh"), path_join(bin, "git")] {
     assert(harness.process.run({program: "/bin/chmod", args: ["755", file]}).success)
@@ -165,6 +167,7 @@ fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
     LABEL: "ship",
     NUMBERS: "1 2 3",
     REPAIR: "true",
+    DEFAULT_BRANCH: "main",
     RUNNER_TEMP: workspace,
   }
   const look = run_step(harness, named(steps, "Shepherd").run, workspace, env)

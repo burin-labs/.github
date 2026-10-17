@@ -121,7 +121,7 @@ jobs:
           repository: burin-labs/.github
           # Repository-qualified source, checked by the typed control policy.
           # github.workflow_sha identifies the caller, not this org repository.
-          ref: a4da07f69b45a057dc46465bea10948f7bf3e0a3
+          ref: df9c75308b05be787532b0d2a827e0ae8a61c095
           path: .smart-ship-runner
           persist-credentials: false
 
@@ -212,13 +212,14 @@ jobs:
           LABEL: ${{ inputs.ship-label }}
           NUMBERS: ${{ steps.prs.outputs.numbers }}
           REPAIR: ${{ inputs.repair }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -uo pipefail
           # The calling repository's checked-in policy, read from its default
           # branch so a pull request cannot rewrite the rules it is judged by.
           policy="$RUNNER_TEMP/ship.toml"
-          gh api "repos/$REPO/contents/.github/smart-ship.toml" --jq '.content' 2>/dev/null \
-            | base64 -d > "$policy" 2>/dev/null || : > "$policy"
+          ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn -- \
+            "$REPO" "$DEFAULT_BRANCH" "$policy" || exit $?
           echo "policy=$policy" >> "$GITHUB_OUTPUT"
           extra=()
           if [ "$REPAIR" != "true" ]; then

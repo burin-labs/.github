@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: burin-labs/.github
-          ref: a4da07f69b45a057dc46465bea10948f7bf3e0a3
+          ref: df9c75308b05be787532b0d2a827e0ae8a61c095
           path: .smart-ship-control
           persist-credentials: false
       - name: Install the shipping consumer runtime
