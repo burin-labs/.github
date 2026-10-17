@@ -1,10 +1,12 @@
 name: Smart Ship
 
 # Reusable: one look at each pull request labeled for shipping, then exit.
-# Callers wire the GitHub events that should wake the shepherd; see
-# burin-labs/burin-code docs/design/smart-ship.md. Memory and history live in a
-# comment on the PR. This lives in the org repo because burin-code is private
-# and a public repository cannot call a private repository's workflows.
+# Callers subscribe to the GitHub events and pass every one through; this
+# workflow alone decides which wake the shepherd, so a wake that cannot change
+# anything never starts a billed job. See burin-labs/burin-code
+# docs/design/smart-ship.md. Memory and history live in a comment on the PR.
+# This lives in the org repo because burin-code is private and a public
+# repository cannot call a private repository's workflows.
 
 on:
   workflow_call:
@@ -21,15 +23,27 @@ on:
         description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
         type: boolean
         default: true
-      owned-runner:
+      owned-runner-tag:
         description: >-
-          JSON label array of an owned runner for this run, chosen by the
-          caller from its own availability probe; empty keeps the hosted
-          runner. Honored only for the private repositories listed at the
-          job's runs-on: a public caller always runs on the free hosted
-          runner, so no owned host runs on behalf of a public repository.
+          Label of an owned Linux runner pool to run on when the availability
+          probe finds one idle; empty keeps the hosted runner and skips the
+          probe. Honored only for the private repositories listed at the
+          probe: a public caller always runs on the free hosted runner, so no
+          owned host runs on behalf of a public repository.
         type: string
         default: ""
+      runner-groups:
+        description: Runner groups the availability probe reads for the owned pool.
+        type: string
+        default: Default
+      minimum-online:
+        description: Online runners the probe requires in a shared pool.
+        type: number
+        default: 1
+      minimum-online-by-pool:
+        description: JSON object of per-pool online minimums for the probe.
+        type: string
+        default: "{}"
     secrets:
       RELEASE_APP_CLIENT_ID:
         required: true
@@ -42,14 +56,38 @@ permissions:
   contents: read
 
 jobs:
-  ship:
-    # A CI completion (workflow_run) wakes the shepherd only for a finished,
-    # same-repository run of a pull request, of a merge-queue branch, or of the
-    # default branch. Callers list the CI workflows to watch and need no copy
-    # of this rule; every other event was admitted by the caller.
+  # Whether the owned pool has an idle runner, read only for a run that will
+  # ship, by a private caller that named one. Each hosted look bills at least a
+  # whole minute and a repair bills many, so an owned runner is worth one short
+  # probe. Its `if` is the admission rule, repeated verbatim at the end of the
+  # ship job's `if` (burin-code scripts/tests/test-smart-ship-wake.ts):
+  #
+  # - A sweep (schedule) or a dispatch always runs. A dispatch naming `pr`
+  #   looks at that PR only.
+  # - A PR event wakes only for a PR carrying the label, or one that just lost
+  #   it. Two post-merge echoes change nothing and stay asleep: the queue
+  #   removal of a PR that is already closed (its `closed` event is the wake),
+  #   and a bot taking the label off a closed PR, which is the shepherd
+  #   finishing its own watch. A person unlabeling a merged PR still wakes it.
+  # - A CI completion (workflow_run) wakes only for a finished,
+  #   same-repository run with a verdict, of a pull request or of a failed
+  #   merge-queue branch. A passing queue run merges its PRs and their
+  #   `closed` events wake them. A default-branch push names no PR, so it would
+  #   only repeat the 15-minute sweep.
+  availability:
     if: >-
-      github.event_name != 'workflow_run'
-      || (github.event.action == 'completed'
+      inputs.owned-runner-tag != ''
+      && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository)
+      && (github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
+      && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
+      || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
+      && !(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')
+      && !(github.event.action == 'unlabeled' && github.event.pull_request.state == 'closed'
+      && github.event.sender.type == 'Bot'))
+      || (github.event_name == 'workflow_run'
+      && github.event.action == 'completed'
       && github.event.workflow_run.id > 0
       && github.event.workflow_run.status == 'completed'
       && contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
@@ -61,14 +99,58 @@ jobs:
       && ((github.event.workflow_run.event == 'pull_request'
       && github.event.workflow_run.pull_requests[0].number > 0)
       || (github.event.workflow_run.event == 'merge_group'
+      && github.event.workflow_run.conclusion != 'success'
       && startsWith(github.event.workflow_run.head_branch,
-      format('gh-readonly-queue/{0}/', github.event.repository.default_branch)))
-      || (github.event.workflow_run.event == 'push'
-      && github.event.workflow_run.head_branch == github.event.repository.default_branch)))
+      format('gh-readonly-queue/{0}/', github.event.repository.default_branch))))))
+    uses: burin-labs/.github/.github/workflows/runner-availability.yml@cd5b9a60ece73b7dcb5923963b86ca7b570cfdad
+    with:
+      runner_groups: ${{ inputs.runner-groups }}
+      minimum_online: ${{ inputs.minimum-online }}
+      minimum_online_by_pool: ${{ inputs.minimum-online-by-pool }}
+      linux_probe_runner_tag: ${{ inputs.owned-runner-tag }}
+    secrets:
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+  ship:
+    needs: [availability]
+    # A measured probe failure still runs on the hosted runner. A skipped probe
+    # runs only when the caller asked for none and the wake is admitted.
+    if: >-
+      !cancelled()
+      && (needs.availability.result == 'success'
+      || needs.availability.result == 'failure'
+      || (needs.availability.result == 'skipped'
+      && !(inputs.owned-runner-tag != ''
+      && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository))
+      && (github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
+      && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
+      || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
+      && !(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')
+      && !(github.event.action == 'unlabeled' && github.event.pull_request.state == 'closed'
+      && github.event.sender.type == 'Bot'))
+      || (github.event_name == 'workflow_run'
+      && github.event.action == 'completed'
+      && github.event.workflow_run.id > 0
+      && github.event.workflow_run.status == 'completed'
+      && contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
+      && github.event.workflow_run.repository.full_name == github.repository
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.head_sha != ''
+      && github.event.workflow_run.head_branch != ''
+      && github.event.repository.default_branch != ''
+      && ((github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.pull_requests[0].number > 0)
+      || (github.event.workflow_run.event == 'merge_group'
+      && github.event.workflow_run.conclusion != 'success'
+      && startsWith(github.event.workflow_run.head_branch,
+      format('gh-readonly-queue/{0}/', github.event.repository.default_branch))))))))
     # A run woken by an event about one PR queues behind earlier runs for that
-    # PR, and a CI completion (workflow_run) counts as one for the PR it ran
-    # for, or for its merge-queue branch. Every other run (schedule, dispatch)
-    # is a sweep and queues behind earlier sweeps. GitHub keeps one pending run per
+    # PR, and a CI completion (workflow_run) or a dispatch naming a PR counts as
+    # one for that PR, or for its merge-queue branch. Every other run (schedule,
+    # plain dispatch) is a sweep and queues behind earlier sweeps. GitHub keeps one pending run per
     # group and a newer one replaces it, so with one group per repository the
     # PR events replaced the sweeps meant to recover them. Now an event cancels
     # only an older pending run for its own PR, and a sweep only an older
@@ -80,15 +162,13 @@ jobs:
     concurrency:
       group: >-
         smart-ship-${{ github.repository }}-${{ (github.event.pull_request.number
-        || github.event.workflow_run.pull_requests[0].number)
+        || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr)
         && format('pr-{0}', github.event.pull_request.number
-        || github.event.workflow_run.pull_requests[0].number)
+        || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr)
         || github.event.workflow_run.head_branch
         && format('run-{0}', github.event.workflow_run.head_branch) || 'sweep' }}
       cancel-in-progress: false
-    # Private callers are billed per hosted minute, so they may hand in an
-    # owned runner; the hosted runner stays the default and the fallback.
-    runs-on: ${{ inputs.owned-runner != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && fromJSON(inputs.owned-runner) || 'ubuntu-24.04' }}
+    runs-on: ${{ needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && needs.availability.outputs.linux_probe == 'true' && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
     steps:
       - name: Mint the release app token
@@ -153,6 +233,7 @@ jobs:
           numbers="$(jq -r '
             (.pull_request.number // empty),
             (.workflow_run.pull_requests[]?.number // empty),
+            ((.inputs.pr // "") | tostring | select(test("^[1-9][0-9]*$"))),
             ((.workflow_run.head_branch // "") | (capture("^gh-readonly-queue/[^/]+/pr-(?<n>[0-9]+)-").n)?),
             ((.merge_group.head_ref // "") | (capture("/pr-(?<n>[0-9]+)-").n)?)
           ' "$event" | sort -u)"
