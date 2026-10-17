@@ -26,7 +26,8 @@ on:
       owned-runner-tag:
         description: >-
           Label of an owned Linux runner pool to run on when the availability
-          probe finds one idle; empty keeps the hosted runner and skips the
+          probe finds one of its runners online, idle or busy; empty keeps
+          the hosted runner and skips the
           probe. Honored only for the private repositories listed at the
           probe: a public caller always runs on the free hosted runner, so no
           owned host runs on behalf of a public repository.
@@ -56,7 +57,7 @@ permissions:
   contents: read
 
 jobs:
-  # Whether the owned pool has an idle runner, read only for a run that will
+  # Whether the owned pool has a runner online, read only for a run that will
   # ship, by a private caller that named one. Each hosted look bills at least a
   # whole minute and a repair bills many, so an owned runner is worth one short
   # probe. Its `if` is the admission rule, repeated verbatim at the end of the
@@ -168,7 +169,13 @@ jobs:
         || github.event.workflow_run.head_branch
         && format('run-{0}', github.event.workflow_run.head_branch) || 'sweep' }}
       cancel-in-progress: false
-    runs-on: ${{ needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && needs.availability.outputs.linux_probe == 'true' && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
+    # An online owned pool takes the look even when every runner is busy. The
+    # light pool shares its machines with long CI builds, so it is often full,
+    # and falling back then billed a hosted look on top of the probe's minute
+    # (24 of 62 looks on 2026-10-17). A light-labelled job queued on that full
+    # pool started within three minutes. A pool with no runner online is never
+    # queued on, so an outage still falls back to the hosted runner.
+    runs-on: ${{ needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0 && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
     steps:
       - name: Mint the release app token
