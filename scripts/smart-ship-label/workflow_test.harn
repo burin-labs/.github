@@ -85,7 +85,7 @@ pipeline test_wrong_repository_or_caller_revision_is_refused() {
 pipeline test_ci_runs_the_pinned_control_graph_on_the_shipping_runtime(harness: Harness) {
   const ci = read_yaml(harness.fs, "../../.github/workflows/ci.yml")
   const job = ci.jobs["smart-ship-control-runtime"]
-  const checkout = job.steps[0]
+  const checkout = named(job.steps, "Check out the immutable shipping control")
   assert_eq(control_policy_source(checkout["with"]), CONTROL_POLICY_SOURCE)
   assert_eq(checkout["with"].path, ".smart-ship-control")
   assert_eq(checkout["with"]["persist-credentials"], false)
@@ -94,6 +94,10 @@ pipeline test_ci_runs_the_pinned_control_graph_on_the_shipping_runtime(harness: 
   const proof = named(job.steps, "Exercise the immutable control script")
   assert(
     proof.run.contains("harn test .smart-ship-control/scripts/smart-ship-label/policy_test.harn"),
+  )
+  assert_eq(
+    named(job.steps, "Exercise the candidate policy reader on the shipping runtime").run,
+    "harn test scripts/smart-ship-policy",
   )
   assert(ci.jobs["ci-status"].needs.contains("smart-ship-control-runtime"))
   const gate = named(ci.jobs["ci-status"].steps, "Require reusable package smoke")

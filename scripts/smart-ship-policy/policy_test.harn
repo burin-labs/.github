@@ -1,0 +1,175 @@
+import { read_policy } from "./policy.harn"
+
+const SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+const ROOT = "repos/example/consumer"
+
+fn entry(name: string, kind: string) -> dict {
+  return {
+    name: name,
+    path: ".github/" + name,
+    type: kind,
+    sha: SHA,
+    git_url: "https://api.github.com/" + ROOT + "/git/blobs/" + SHA,
+  }
+}
+
+fn blob(content: string) -> dict {
+  return {
+    sha: SHA,
+    size: bytes_len(bytes_from_string(content)),
+    encoding: "base64",
+    content: base64_encode(content),
+  }
+}
+
+fn world(directory: unknown, response: unknown) -> dict {
+  let calls = []
+  return {
+    calls: fn() { return calls },
+    github: {
+      read: fn(path) {
+        calls = calls + [path]
+        if path == ROOT + "/contents/.github?ref=release%2Fstable" {
+          return directory
+        }
+        if path == ROOT + "/git/blobs/" + SHA {
+          return response
+        }
+        throw "unexpected GitHub path: " + path
+      },
+      pages: fn(_path) {
+        throw "policy reads are not paginated"
+      },
+      send: fn(_method, _path, _body) {
+        throw "policy reads never write"
+      },
+      graphql: fn(_query, _variables) {
+        throw "policy reads never use GraphQL"
+      },
+    },
+  }
+}
+
+fn refusal(directory: unknown, response: unknown) -> string {
+  return try {
+    read_policy(world(directory, response).github, "example/consumer", "release/stable")
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+}
+
+pipeline test_present_policy_preserves_exact_utf8_bytes_and_immutable_identity() {
+  const content = "# café\r\n[release]\ntargets = [\"app\"]\n"
+  const response = blob(content)
+  const wrapped = response
+    + {content: response.content[0:12] + "\n" + response.content[12:len(response.content)] + "\n"}
+  const fixture = world([entry("workflows", "dir"), entry("smart-ship.toml", "file")], wrapped)
+  const result = read_policy(fixture.github, "example/consumer", "release/stable")
+  assert_eq(result.content, content)
+  assert_eq(result.bytes, bytes_len(bytes_from_string(content)))
+  assert_eq(result.state, "present")
+  assert_eq(result.entries, 2)
+  assert_eq(result.blob, SHA)
+  assert_eq(
+    fixture.calls(),
+    [ROOT + "/contents/.github?ref=release%2Fstable", ROOT + "/git/blobs/" + SHA],
+  )
+}
+
+pipeline test_absence_requires_a_positive_scoped_directory_read() {
+  const fixture = world([entry("workflows", "dir")], nil)
+  const result = read_policy(fixture.github, "example/consumer", "release/stable")
+  assert_eq(result.state, "absent")
+  assert_eq(result.entries, 1)
+  assert_eq(result.content, "")
+  assert_eq(result.blob, nil)
+  assert_eq(len(fixture.calls()), 1)
+  assert(refusal([], nil).contains("empty"))
+  assert(refusal(nil, nil) != "")
+  assert(refusal({message: "Not Found"}, nil) != "")
+  assert(
+    refusal(
+      range(0, 1000).map(fn(index) { return entry(to_string(index), "file") }).to_list(),
+      nil,
+    )
+      .contains("truncated"),
+  )
+}
+
+pipeline test_directory_scope_duplicates_shapes_and_file_kind_fail_closed() {
+  const policy = entry("smart-ship.toml", "file")
+  for directory in [
+    [policy, policy],
+    [policy + {path: "outside/smart-ship.toml"}],
+    [policy + {name: "../smart-ship.toml"}],
+    [policy + {sha: "short"}],
+    [policy + {type: "symlink"}],
+    [policy + {git_url: "https://api.github.com/repos/other/repo/git/blobs/" + SHA}],
+    [policy + {sha: 12}],
+    [policy + {type: "unknown"}],
+  ] {
+    assert(refusal(directory, blob("x")) != "", json_stringify(directory))
+  }
+}
+
+pipeline test_blob_identity_payload_size_base64_and_utf8_fail_closed() {
+  const valid = blob("[release]\n")
+  for response in [
+    nil,
+    {},
+    valid + {sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    valid + {encoding: "utf8"},
+    valid + {size: -1},
+    valid + {size: 99},
+    valid + {content: "not base64"},
+    valid + {content: "/w==", size: 1},
+  ] {
+    assert(refusal([entry("smart-ship.toml", "file")], response) != "", json_stringify(response))
+  }
+}
+
+pipeline test_transport_denial_and_unavailability_are_never_absence() {
+  for message in ["HTTP 403 denied", "HTTP 404 hidden directory", "network timeout", "invalid JSON"] {
+    let calls = 0
+    const github = world(nil, nil).github
+      + {
+        read: fn(_path) {
+          calls = calls + 1
+          throw message
+        },
+      }
+    const error = try {
+      read_policy(github, "example/consumer", "main")
+      ""
+    } catch (error) {
+      to_string(error)
+    }
+    assert(error.contains(message), error)
+    assert_eq(calls, 1)
+  }
+}
+
+pipeline test_invalid_source_never_reads_and_empty_present_policy_stays_measured() {
+  const fixture = world([entry("smart-ship.toml", "file")], blob(""))
+  for source in [
+    {repository: "example", branch: "main"},
+    {repository: "example/consumer", branch: ""},
+    {repository: "example/consumer", branch: " main"},
+    {repository: "../consumer", branch: "main"},
+  ] {
+    const error = try {
+      read_policy(fixture.github, source.repository, source.branch)
+      ""
+    } catch (error) {
+      to_string(error)
+    }
+    assert(error.contains("policy source"), error)
+  }
+  assert_eq(len(fixture.calls()), 0)
+  const result = read_policy(fixture.github, "example/consumer", "release/stable")
+  assert_eq(result.state, "present")
+  assert_eq(result.bytes, 0)
+  assert_eq(result.blob, SHA)
+}

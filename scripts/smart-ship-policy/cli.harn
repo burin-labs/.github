@@ -1,0 +1,27 @@
+import { live_github } from "../merge-override/github.harn"
+import { read_policy } from "./policy.harn"
+
+fn required(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name) ?? ""
+  if trim(value) == "" {
+    throw name + " is required"
+  }
+  return value
+}
+
+fn main(harness: Harness) {
+  if len(argv) != 3 {
+    throw "usage: cli.harn -- <repository> <default-branch> <output-file>"
+  }
+  const github = live_github(
+    pick(harness, ["fs", "tools"]),
+    required(harness.env, "GH_TOKEN"),
+    harness.fs.mkdtemp_in_workspace("smart-ship-policy-gh-"),
+  )
+  const reading = read_policy(github, argv[0], argv[1])
+  // No output policy is created or replaced until observation and decoding finish.
+  harness.fs.write_text(argv[2], reading.content)
+  harness.stdio.println(
+    json_stringify(pick(reading, ["repository", "branch", "state", "entries", "blob", "bytes"])),
+  )
+}
