@@ -59,10 +59,88 @@ pipeline test_action_installs_the_runtime_and_invokes_the_only_owner(harness: Ha
     ),
   )
   const command = action.runs.steps.find({ step -> step.run != nil }).run
-  assert(to_string(command).contains("scripts/dependabot-config/cli.harn"))
+  assert(to_string(command).contains("run.sh"))
+  const bootstrap = harness.fs.read_text(
+    path_join(root, ".github/actions/check-dependabot-config/run.sh"),
+  )
+  assert(bootstrap.contains("scripts/dependabot-config/cli.harn"))
+  assert(action.runs.steps[0].with["install-dir"].contains("dependabot-config-"))
   assert(
     !harness.fs.exists(
       path_join(root, ".github/actions/check-dependabot-config/check_dependabot_config.rb"),
     ),
   )
+}
+
+pipeline test_private_bootstrap_restores_ambient_runtime_after_success_and_refusal(
+  harness: Harness,
+) {
+  const package = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const root = harness.fs.mkdtemp_in_workspace("dependabot-bootstrap-")
+  const ambient = path_join(root, "ambient")
+  const private = path_join(root, "dependabot-config-fixture")
+  harness.fs.mkdir(ambient, true)
+  harness.fs.mkdir(private, true)
+  harness.fs.mkdir(path_join(root, ".github"), true)
+  const marker = "#!/bin/sh\nprintf '%s\\n' ambient-runtime-preserved\n"
+  harness.fs.write_text(path_join(ambient, "harn"), marker)
+  assert(harness.process.run({program: "chmod", args: ["+x", path_join(ambient, "harn")]}).success)
+  harness.fs.write_text(
+    path_join(root, "package.json"),
+    "{\"dependencies\":{\"ceiling\":\">=1 <2\"}}",
+  )
+  const config =
+    "version: 2\nupdates:\n  - package-ecosystem: npm\n    directory: /\n    groups:\n      all:\n        patterns: ['*']\n"
+  const runtime = path_join(private, "harn")
+  const installed = harness.process.run({program: "/usr/bin/which", args: ["harn"]})
+  const binary = harness.env.get("HARN_BIN") ?? trim(installed.stdout)
+  assert(binary != "", "the bootstrap control needs a measured installed runtime")
+  const path = "${private}:${ambient}:${harness.env.get("PATH") ?? ""}"
+  for ignored in [true, false] {
+    assert(harness.process.run({program: "ln", args: ["-s", binary, runtime]}).success)
+    harness.fs.write_text(
+      path_join(root, ".github/dependabot.yml"),
+      config + (ignored ? "    ignore:\n      - dependency-name: ceiling\n" : ""),
+    )
+    const result = harness.process.run(
+      {
+        program: "/bin/bash",
+        args: [path_join(package, ".github/actions/check-dependabot-config/run.sh")],
+        cwd: root,
+        env: {
+          PATH: path,
+          RUNNER_TEMP: root,
+          GITHUB_ACTION_PATH: path_join(package, ".github/actions/check-dependabot-config"),
+          DEPENDABOT_CHECK_ROOT: root,
+          DEPENDABOT_CHECK_HARN_BINARY: runtime,
+          DEPENDABOT_CHECK_OWNS_RUNTIME: "1",
+        },
+        timeout_ms: 30000,
+      },
+    )
+    assert_eq(result.exit_code, ignored ? 0 : 1, result.stderr)
+    assert(
+      !harness.fs.exists(runtime),
+      "private runtime must not shadow the caller after completion",
+    )
+    assert_eq(harness.fs.read_text(path_join(ambient, "harn")), marker)
+    const restored = harness.process.run(
+      {program: "/usr/bin/which", args: ["harn"], env: {PATH: path}, cwd: root},
+    )
+    assert_eq(trim(restored.stdout), path_join(ambient, "harn"))
+  }
+  const refused = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: [path_join(package, ".github/actions/check-dependabot-config/run.sh")],
+      cwd: root,
+      env: {
+        RUNNER_TEMP: root,
+        DEPENDABOT_CHECK_HARN_BINARY: path_join(ambient, "harn"),
+        DEPENDABOT_CHECK_OWNS_RUNTIME: "1",
+      },
+    },
+  )
+  assert_eq(refused.exit_code, 2)
+  assert_eq(harness.fs.read_text(path_join(ambient, "harn")), marker)
 }

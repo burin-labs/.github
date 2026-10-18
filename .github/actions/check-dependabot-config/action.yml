@@ -35,16 +35,18 @@ runs:
   using: composite
   steps:
     - name: Install checker runtime
+      id: runtime
       if: ${{ inputs.skip-harn-setup != 'true' }}
       uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
       with:
         version: ${{ inputs.harn-version }}
+        install-dir: ${{ runner.temp }}/dependabot-config-${{ github.run_id }}-${{ github.run_attempt }}
     - name: Check Dependabot config
       shell: bash
       env:
         DEPENDABOT_CHECK_ROOT: ${{ inputs.repo-root }}
         DEPENDABOT_CHECK_REQUIRE_LOCKFILES: ${{ inputs.require-lockfiles == 'true' && '1' || '0' }}
         DEPENDABOT_CHECK_REQUIRE_OVERRIDES: ${{ inputs.require-overrides == 'true' && '1' || '0' }}
-      run: >-
-        harn run --read-only-root "$DEPENDABOT_CHECK_ROOT"
-        "$GITHUB_ACTION_PATH/../../../scripts/dependabot-config/cli.harn"
+        DEPENDABOT_CHECK_HARN_BINARY: ${{ steps.runtime.outputs.path }}
+        DEPENDABOT_CHECK_OWNS_RUNTIME: ${{ inputs.skip-harn-setup != 'true' && '1' || '0' }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"
