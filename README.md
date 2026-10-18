@@ -816,8 +816,8 @@ is blocked with nothing to look at.
   ecosystem entry, Cargo workspace members and path deps must stay inside the
   configured `directory`, and exact `pnpm-workspace.yaml` overrides need a
   `# pin:` annotation. Direct dependencies with explicit upper bounds in Cargo,
-  npm, Python, and Swift manifests need a matching ignore in the same ecosystem and
-  directory entry. Ordinary Cargo/npm caret requirements remain updatable and
+  npm, Python, and Swift manifests need a matching ignore in the same ecosystem
+  and directory entry. Ordinary Cargo/npm caret requirements remain updatable and
   do not count as explicit ceilings. An unrestricted matching ignore suffices;
   a version-filtered ignore must cover the forbidden versions, and an ignore
   limited to update types must cover all three update classes. Diagnostics name
