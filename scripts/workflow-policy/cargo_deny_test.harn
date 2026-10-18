@@ -34,10 +34,46 @@ pipeline test_no_step_can_report_success_while_failing(harness: Harness) {
 pipeline test_advisories_always_run_and_reject_stale_ignores(harness: Harness) {
   const advisories = step(steps(harness.fs), "Security advisories")
   assert(!advisories.has("if"), "advisories must run for every caller")
-  assert_eq(
-    advisories.run,
-    "cargo-deny --all-features check advisories --deny advisory-not-detected",
+  assert(
+    advisories.run.contains(
+      "cargo-deny --all-features check advisories --deny advisory-not-detected $"
+        + "{ADVISORY_LINTS}",
+    ),
+    "advisories reject stale ignores on every event",
   )
+  assert(
+    advisories.run.contains("exit \"$" + "{status}\""),
+    "the cargo-deny verdict is the step's verdict",
+  )
+}
+
+pipeline test_only_pull_requests_downgrade_unmaintained_and_unsound(harness: Harness) {
+  const advisories = step(steps(harness.fs), "Security advisories")
+  assert_eq(
+    advisories.env.ADVISORY_LINTS,
+    expression("github.event_name == 'pull_request' && '--warn unmaintained --warn unsound' || ''"),
+  )
+}
+
+pipeline test_the_tracking_issue_follows_the_default_branch_verdict(harness: Harness) {
+  const flow = workflow(harness.fs)
+  assert_eq(flow.jobs["cargo-deny"].outputs.advisories, expression("steps.advisories.outcome"))
+  const tracking = flow.jobs["tracking-issue"]
+  assert_eq(tracking.permissions, {issues: "write"})
+  const condition = tracking["if"]
+  assert(
+    condition.contains("github.event_name != 'pull_request'"),
+    "pull requests never touch the issue",
+  )
+  // A run that never reached the advisories step must not close the issue.
+  assert(
+    condition.contains("needs.cargo-deny.outputs.advisories == 'success'"),
+    "close only on a pass",
+  )
+  assert(condition.contains("needs.cargo-deny.outputs.findings != ''"), "open only with findings")
+  assert(!condition.contains("skipped"), "a skipped check is not a verdict")
+  const run = tracking.steps[0].run
+  assert(run.contains("default_branch"), "the step checks the branch itself")
 }
 
 pipeline test_policy_checks_follow_the_caller_switch(harness: Harness) {
