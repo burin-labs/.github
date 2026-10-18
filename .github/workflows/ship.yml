@@ -26,8 +26,9 @@ jobs:
     # The shared runner decides which events wake the shepherd.
     uses: burin-labs/.github/.github/workflows/smart-ship.yml@main
     with:
-      # Land-only until repair has been proven in this repository.
-      repair: false
+      # .github/smart-ship.toml limits repair to merge conflicts.
+      repair: true
     secrets:
       RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
       RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

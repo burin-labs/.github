@@ -56,12 +56,16 @@ effort:
     color: "d93f0b"
     description: Multi-day or multi-PR
 
-# Smart Ship reconciles this one control label before every sweep. Other
+# Smart Ship reconciles the `ship` control label before every sweep and skips
+# repair on a pull request labeled `no-auto-repair`. Other
 # taxonomy entries remain additive reference data applied by each repository.
 delivery:
   - name: ship
     color: "0e8a16"
     description: Ship this pull request with the Smart Ship shepherd
+  - name: no-auto-repair
+    color: "d4c5f9"
+    description: Smart Ship lands this pull request but leaves every fix to a person
 
 reused-unprefixed:
   # Already exist as GitHub defaults or prior art in harn/burin-code. Reuse
