@@ -1,0 +1,1 @@
+pub type BoundedDependency = {name: string, bound: string, manifest: string}

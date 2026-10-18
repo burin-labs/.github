@@ -1,0 +1,192 @@
+import { assert_error_contains } from "std/testing"
+import { ignore_covers, manifest_dependencies } from "./bounds"
+import { BoundedDependency } from "./types"
+
+fn item(rows: list<BoundedDependency>, index: int) -> BoundedDependency {
+  const row = rows[index]
+  if row == nil {
+    throw "expected a discovered dependency at index ${index}"
+  }
+  return row
+}
+
+pipeline test_cargo_structural_direct_bounds_keep_aliases_and_workspace_targets() {
+  const rows = manifest_dependencies(
+    "cargo",
+    "Cargo.toml",
+    """
+[dependencies]
+alias = { package = "real-dep", version = ">=1.0, <2" }
+normal = "^1.0"
+[workspace.dependencies]
+shared = ">=0.25, <0.27"
+[target.'cfg(unix)'.build-dependencies]
+build = { version = "<=3.2" }
+[package.metadata]
+dependencies = { false_positive = "<99" }
+""",
+  )
+  assert_eq(len(rows), 4)
+  assert_eq(item(rows, 0), {name: "real-dep", bound: ">=1.0, <2", manifest: "Cargo.toml"})
+  assert_eq(item(rows, 1).bound, "")
+  assert_eq(item(rows, 2).name, "shared")
+  assert_eq(item(rows, 3).name, "build")
+  assert(!ignore_covers({"dependency-name": "alias"}, item(rows, 0)))
+  assert(ignore_covers({"dependency-name": "real-*", versions: [">=2"]}, item(rows, 0)))
+  assert(!ignore_covers({"dependency-name": "real-*", versions: [">=3"]}, item(rows, 0)))
+  assert(!ignore_covers({"dependency-name": "real-*", versions: [">2"]}, item(rows, 0)))
+  assert(ignore_covers({"dependency-name": "build", versions: [">3.2"]}, item(rows, 3)))
+}
+
+pipeline test_npm_nonempty_unbounded_and_filtered_ignore_do_not_pass_vacuously() {
+  const rows = manifest_dependencies(
+    "npm",
+    "package.json",
+    "{\"dependencies\":{\"bounded\":\">=1 <2\",\"normal\":\"^1.2\",\"alternative\":\"<2 || >=3\"},\"devDependencies\":{\"@org/dev\":\">=4, <=5.1\"}}",
+  )
+  assert_eq(len(rows), 4)
+  const bounded = item(rows.filter({ row -> row.name == "bounded" }).to_list(), 0)
+  assert_eq(bounded.bound, ">=1 <2")
+  assert_eq(item(rows.filter({ row -> row.name == "normal" }).to_list(), 0).bound, "")
+  assert_eq(item(rows.filter({ row -> row.name == "alternative" }).to_list(), 0).bound, "")
+  assert(!ignore_covers({"dependency-name": "bounded", versions: ["<2"]}, bounded))
+  assert(
+    !ignore_covers(
+      {"dependency-name": "bounded", "update-types": ["version-update:semver-patch"]},
+      bounded,
+    ),
+  )
+  assert(ignore_covers({"dependency-name": "bounded"}, bounded))
+  assert(ignore_covers({"dependency-name": "*", versions: [">=2"]}, bounded))
+}
+
+pipeline test_python_named_requirements_optional_and_groups_have_real_ceilings() {
+  const rows = manifest_dependencies(
+    "uv",
+    "pyproject.toml",
+    """
+[project]
+dependencies = ["Some_Package[extra]>=1.0,<2 ; python_version >= '3.10'", "plain>=1"]
+[project.optional-dependencies]
+test = ["pytest~=8.1"]
+[dependency-groups]
+lint = ["ruff>=0.9,<0.10"]
+dev = [{include-group = "lint"}]
+""",
+  )
+  assert_eq(len(rows), 4)
+  assert_eq(item(rows, 0).name, "some-package")
+  assert_eq(item(rows, 1).bound, "")
+  assert(ignore_covers({"dependency-name": "pytest", versions: [">=9"]}, item(rows, 2)))
+  assert(!ignore_covers({"dependency-name": "pytest", versions: [">=10"]}, item(rows, 2)))
+  assert_eq(item(rows, 3).name, "ruff")
+  const requirements = manifest_dependencies(
+    "pip",
+    "requirements.txt",
+    "# a comment\nhttpx>=0.27,<0.28\nlocal @ https://example.invalid/project.whl\n",
+  )
+  assert_eq(len(requirements), 2)
+  assert_eq(item(requirements, 0).bound, ">=0.27,<0.28")
+  assert_eq(item(requirements, 1).bound, "")
+}
+
+pipeline test_unknown_upper_bound_tokens_refuse_instead_of_accepting_a_numeric_prefix() {
+  assert_error_contains(
+    fn() { manifest_dependencies("pip", "requirements.txt", "pkg<2.0rc1") },
+    "unsupported dependency bound version",
+  )
+  assert_error_contains(
+    fn() { manifest_dependencies("pip", "requirements.txt", "pkg>=1,<2,<unsupported") },
+    "unsupported dependency bound version",
+  )
+}
+
+pipeline test_python_dynamic_dependency_lists_refuse_and_build_requirements_are_measured() {
+  for field in ["dependencies", "optional-dependencies"] {
+    assert_error_contains(
+      fn() { manifest_dependencies("pip", "pyproject.toml", "[project]\ndynamic=['${field}']\n") },
+      "Python dependency declarations are dynamic: pyproject.toml",
+    )
+  }
+  const rows = manifest_dependencies(
+    "pip",
+    "pyproject.toml",
+    "[project]\ndynamic=['version']\ndependencies=['plain>=1']\n[build-system]\nrequires=['setuptools>=70,<80']\n",
+  )
+  assert_eq(len(rows), 2)
+  assert_eq(item(rows, 0).bound, "")
+  assert_eq(item(rows, 1), {name: "setuptools", bound: ">=70,<80", manifest: "pyproject.toml"})
+  assert(ignore_covers({"dependency-name": "setuptools", versions: [">=80"]}, item(rows, 1)))
+}
+
+pipeline test_unresolved_npm_alias_identity_refuses() {
+  assert_error_contains(
+    fn() { manifest_dependencies(
+      "npm",
+      "package.json",
+      "{\"dependencies\":{\"alias\":\"npm:real@>=1 <2\"}}",
+    ) },
+    "npm alias dependency identity requires a supported adapter",
+  )
+}
+
+pipeline test_swift_parser_discovers_real_ranges_and_ignores_comment_decoys(harness: Harness) {
+  const source = """
+// swift-tools-version: 6.0
+import PackageDescription
+// .package(url: "https://example.invalid/decoy", "1.0.0"..<"99.0.0")
+let package = Package(name: "example", dependencies: [
+  .package(url: "https://github.com/Apple/Swift-Collections.git", "1.0.0"..<"2.0.0"),
+  .package(url: "https://example.invalid/normal", from: "1.0.0"),
+  .package(path: "../local")
+])
+"""
+  const rows = manifest_dependencies("swift", "Package.swift", source, harness.ast)
+  assert_eq(len(rows), 2)
+  assert_eq(
+    item(rows, 0),
+    {
+      name: "github.com/apple/swift-collections",
+      bound: ">=1.0.0,<2.0.0",
+      manifest: "Package.swift",
+    },
+  )
+  assert_eq(item(rows, 1).bound, "")
+  assert(ignore_covers({"dependency-name": "github.com/apple/*", versions: [">=2"]}, item(rows, 0)))
+  assert(
+    !ignore_covers({"dependency-name": "github.com/apple/*", versions: [">=3"]}, item(rows, 0)),
+  )
+  assert_error_contains(
+    fn() { manifest_dependencies(
+      "swift",
+      "Package.swift",
+      "let package = Package(name: \"example\", dependencies: externalDependencies)",
+      harness.ast,
+    ) },
+    "array is dynamic",
+  )
+}
+
+pipeline test_swift_unknown_array_elements_concatenations_and_inferred_initializers_refuse(
+  harness: Harness,
+) {
+  for source in [
+    "let package = Package(name: \"x\", dependencies: [makeDependency()])",
+    "let package = Package(name: \"x\", dependencies: [.package(url: \"https://example.invalid/a\", from: \"1.0.0\")] + externalDependencies)",
+    "let package: Package = .init(name: \"x\", dependencies: externalDependencies)",
+  ] {
+    assert_error_contains(
+      fn() { manifest_dependencies("swift", "Package.swift", source, harness.ast) },
+      "Swift dependency array",
+    )
+  }
+  assert_eq(
+    manifest_dependencies(
+      "swift",
+      "Package.swift",
+      "let package = Package(name: \"x\", dependencies: [])",
+      harness.ast,
+    ),
+    [],
+  )
+}

@@ -1,10 +1,18 @@
 name: Check Dependabot config
 description: >
   Fail when Dependabot cannot act — missing catch-alls, uncovered lockfiles,
-  cargo scope escapes, or frozen exact pnpm overrides. Static Ruby/Psych; no
-  network and no Harn binary, so always-on hygiene jobs can call it.
+  Cargo scope escapes, frozen exact pnpm overrides, or manifest upper bounds
+  without a matching ignore. Parses manifests structurally with Harn.
 
 inputs:
+  harn-version:
+    description: Published runtime used by the configuration checker
+    required: false
+    default: "0.10.170"
+  skip-harn-setup:
+    description: Reuse an already installed compatible Harn runtime
+    required: false
+    default: "false"
   repo-root:
     description: Repository root that contains .github/dependabot.yml
     required: false
@@ -26,10 +34,17 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Install checker runtime
+      if: ${{ inputs.skip-harn-setup != 'true' }}
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+      with:
+        version: ${{ inputs.harn-version }}
     - name: Check Dependabot config
       shell: bash
       env:
         DEPENDABOT_CHECK_ROOT: ${{ inputs.repo-root }}
         DEPENDABOT_CHECK_REQUIRE_LOCKFILES: ${{ inputs.require-lockfiles == 'true' && '1' || '0' }}
         DEPENDABOT_CHECK_REQUIRE_OVERRIDES: ${{ inputs.require-overrides == 'true' && '1' || '0' }}
-      run: ruby "$GITHUB_ACTION_PATH/check_dependabot_config.rb"
+      run: >-
+        harn run --read-only-root "$DEPENDABOT_CHECK_ROOT"
+        "$GITHUB_ACTION_PATH/../../../scripts/dependabot-config/cli.harn"

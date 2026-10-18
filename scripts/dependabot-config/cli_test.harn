@@ -1,0 +1,68 @@
+type Receipt = {
+  entries: int,
+  dependency_manifests: int,
+  direct_dependencies: int,
+  bounded_dependencies: int,
+  problems: list<string>,
+}
+
+pipeline test_real_cli_refuses_removed_ignore_and_recovers(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("dependabot-cli-")
+  harness.fs.mkdir(path_join(root, ".github"), true)
+  harness.fs.write_text(
+    path_join(root, "package.json"),
+    "{\"dependencies\":{\"ceiling\":\">=1 <2\",\"floor\":\">=1\"}}",
+  )
+  const config =
+    "version: 2\nupdates:\n  - package-ecosystem: npm\n    directory: /\n    groups:\n      all:\n        patterns: ['*']\n"
+  const script = path_join(harness.fs.cwd(), "cli.harn")
+  for restored in [false, true] {
+    harness.fs.write_text(
+      path_join(root, ".github/dependabot.yml"),
+      config + (restored ? "    ignore:\n      - dependency-name: ceiling\n" : ""),
+    )
+    const result = harness.process.run(
+      {
+        program: harness.env.get("HARN_BIN") ?? "harn",
+        args: ["run", "--read-only-root", root, script],
+        cwd: root,
+        env: {DEPENDABOT_CHECK_ROOT: root},
+        timeout_ms: 30000,
+      },
+    )
+    const receipt: Receipt = schema_expect(json_parse(result.stdout), schema_of(Receipt))
+    assert_eq(result.exit_code, restored ? 0 : 1, result.stderr)
+    assert_eq(receipt.entries, 1)
+    assert_eq(receipt.dependency_manifests, 1)
+    assert_eq(receipt.direct_dependencies, 2)
+    assert_eq(receipt.bounded_dependencies, 1)
+    assert_eq(len(receipt.problems), restored ? 0 : 1)
+    if !restored {
+      assert(
+        result.stderr.contains("package.json: direct dependency ceiling has upper bound >=1 <2"),
+      )
+    }
+  }
+}
+
+pipeline test_action_installs_the_runtime_and_invokes_the_only_owner(harness: Harness) {
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const action = yaml_parse(
+    harness.fs.read_text(path_join(root, ".github/actions/check-dependabot-config/action.yml")),
+  )
+  assert_eq(action.inputs["harn-version"].default, "0.10.170")
+  assert(
+    action.runs.steps.any(
+      { step ->
+        to_string(step.uses ?? "").starts_with("burin-labs/harn/.github/actions/setup-harn@")
+      },
+    ),
+  )
+  const command = action.runs.steps.find({ step -> step.run != nil }).run
+  assert(to_string(command).contains("scripts/dependabot-config/cli.harn"))
+  assert(
+    !harness.fs.exists(
+      path_join(root, ".github/actions/check-dependabot-config/check_dependabot_config.rb"),
+    ),
+  )
+}

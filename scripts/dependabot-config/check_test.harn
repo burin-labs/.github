@@ -1,0 +1,265 @@
+import { Report, check } from "./check"
+
+const CATCH_ALL = "    groups:\n      all:\n        patterns: [\"*\"]\n"
+
+const NPM = "  - package-ecosystem: npm\n    directory: /\n${CATCH_ALL}"
+
+const ACTIONS = "  - package-ecosystem: github-actions\n    directory: /\n${CATCH_ALL}"
+
+fn fixture(fs: HarnessFs, updates: string, files: dict) -> string {
+  const root = fs.mkdtemp_in_workspace("dependabot-")
+  fs.mkdir(path_join(root, ".github"), true)
+  fs.write_text(path_join(root, ".github/dependabot.yml"), "version: 2\nupdates:\n${updates}")
+  for file in keys(files) {
+    fs.mkdir(dirname(path_join(root, file)), true)
+    fs.write_text(path_join(root, file), to_string(files[file]))
+  }
+  return root
+}
+
+fn inspect(harness: Harness, updates: string, files: dict) -> Report {
+  return check(
+    pick(harness, ["fs", "ast"]),
+    fixture(harness.fs, updates, files),
+    {require_lockfiles: false, require_overrides: false},
+  )
+}
+
+fn cargo(directory: string) -> string {
+  return "  - package-ecosystem: cargo\n    directory: ${directory}\n${CATCH_ALL}"
+}
+
+fn fails(report: Report, message: string) {
+  assert(report.problems.any({ problem -> problem.contains(message) }), json_stringify(report))
+}
+
+pipeline test_contained_cargo_workspace(harness: Harness) {
+  const report = inspect(
+    harness,
+    cargo("/crates/tui"),
+    {
+      "crates/tui/Cargo.toml": "[workspace]\nmembers = ['util', 'flags']\n",
+      "crates/tui/util/Cargo.toml": "[package]\nname = 'util'\n",
+      "crates/tui/flags/Cargo.toml": "[package]\nname = 'flags'\n",
+    },
+  )
+  assert_eq(report.problems, [])
+  assert_eq(report.cargo_manifests, 3)
+}
+
+pipeline test_workspace_members_cannot_escape(harness: Harness) {
+  for key in ["members", "default-members"] {
+    fails(
+      inspect(
+        harness,
+        cargo("/crates/tui"),
+        {"crates/tui/Cargo.toml": "[workspace]\n${key} = ['../shared']\n"},
+      ),
+      "${key} entry ../shared resolves outside",
+    )
+  }
+}
+
+pipeline test_path_dependency_cannot_escape(harness: Harness) {
+  fails(
+    inspect(
+      harness,
+      cargo("/crates/tui"),
+      {
+        "crates/tui/Cargo.toml":
+          "[package]\nname='tui'\n[dependencies]\nshared = {path = '../shared'}\n",
+      },
+    ),
+    "path dependency ../shared resolves outside",
+  )
+}
+
+pipeline test_cargo_comments_and_metadata_are_not_dependencies(harness: Harness) {
+  const report = inspect(
+    harness,
+    cargo("/crate"),
+    {
+      "crate/Cargo.toml":
+        "[package]\nname='crate'\n# path = '../not-a-dependency'\n[package.metadata]\npath='../also-not-a-dependency'\n",
+    },
+  )
+  assert_eq(report.problems, [])
+  assert_eq(report.cargo_manifests, 1)
+}
+
+pipeline test_missing_cargo_manifest_fails(harness: Harness) {
+  fails(inspect(harness, cargo("/missing"), {}), "has no Cargo.toml")
+}
+
+pipeline test_uncovered_lockfile_fails(harness: Harness) {
+  fails(
+    inspect(harness, ACTIONS, {"site/pnpm-lock.yaml": "lockfileVersion: '9.0'\n"}),
+    "site/pnpm-lock.yaml: committed npm lockfile",
+  )
+}
+
+pipeline test_actions_only_without_lockfiles(harness: Harness) {
+  assert_eq(inspect(harness, ACTIONS, {}).problems, [])
+}
+
+pipeline test_fixture_lockfiles_are_not_repository_dependencies(harness: Harness) {
+  assert_eq(
+    inspect(harness, ACTIONS, {"fixtures/example/pnpm-lock.yaml": "lockfileVersion: 9\n"}).problems,
+    [],
+  )
+}
+
+pipeline test_catch_all_is_a_patterns_list(harness: Harness) {
+  const prefix = "  - package-ecosystem: npm\n    directory: /\n"
+  for group in [
+    "",
+    "    groups:\n      named:\n        patterns: [left-pad]\n        exclude-patterns: ['*']\n",
+    "    groups:\n      named:\n        dependency-type: '*'\n",
+    "    groups:\n      named:\n        patterns: '*'\n",
+  ] {
+    fails(inspect(harness, "${prefix}${group}", {}), "no catch-all group")
+  }
+  for patterns in ["['*']", "\n          - '*'", "['**']"] {
+    assert_eq(
+      inspect(harness, "${prefix}    groups:\n      all:\n        patterns: ${patterns}\n", {})
+        .problems,
+      [],
+    )
+  }
+}
+
+pipeline test_directories_plural_scope_lockfiles(harness: Harness) {
+  const updates = "  - package-ecosystem: npm\n    directories: [/a, /b]\n${CATCH_ALL}"
+  assert_eq(
+    inspect(
+      harness,
+      updates,
+      {"a/pnpm-lock.yaml": "lockfileVersion: 9\n", "b/pnpm-lock.yaml": "lockfileVersion: 9\n"},
+    ).problems,
+    [],
+  )
+}
+
+pipeline test_exact_override_requires_annotation(harness: Harness) {
+  fails(
+    inspect(harness, NPM, {"pnpm-workspace.yaml": "overrides:\n  left-pad: '1.3.0'\n"}),
+    "exact version",
+  )
+  for body in [
+    "overrides:\n  left-pad: '^1.3.0'\n",
+    "overrides:\n  left-pad: '1.3.0' # pin: deliberate ceiling\n",
+    "overrides:\n  # pin: deliberate ceiling\n  left-pad: '1.3.0'\n",
+  ] {
+    assert_eq(inspect(harness, NPM, {"pnpm-workspace.yaml": body}).problems, [])
+  }
+}
+
+pipeline test_required_censuses_cannot_pass_empty(harness: Harness) {
+  const root = fixture(harness.fs, ACTIONS, {})
+  const report = check(
+    pick(harness, ["fs", "ast"]),
+    root,
+    {require_lockfiles: true, require_overrides: true},
+  )
+  fails(report, "ZERO committed lockfiles")
+  fails(report, "ZERO pnpm overrides")
+}
+
+pipeline test_invalid_config_refuses(harness: Harness) {
+  for updates in [
+    "[]\n",
+    "  - package-ecosystem: npm\n",
+    "  - package-ecosystem: npm\n    directory: /\n    directories: [/a]\n",
+    "  - package-ecosystem: npm\n    directory: /../outside\n",
+  ] {
+    const refused = try {
+      inspect(harness, updates, {})
+      false
+    } catch (_error) {
+      true
+    }
+    assert(refused, updates)
+  }
+  const root = harness.fs.mkdtemp_in_workspace("dependabot-missing-")
+  const missing = try {
+    check(pick(harness, ["fs", "ast"]), root, {require_lockfiles: false, require_overrides: false})
+    false
+  } catch (_error) {
+    true
+  }
+  assert(missing)
+}
+
+pipeline test_removed_ignore_fails_and_restoration_recovers(harness: Harness) {
+  const files = {"package.json": "{\"dependencies\":{\"bounded\":\">=1.0.0 <2.0.0\"}}"}
+  const missing = inspect(harness, NPM, files)
+  assert_eq(missing.dependency_manifests, 1)
+  assert_eq(missing.direct_dependencies, 1)
+  assert_eq(missing.bounded_dependencies, 1)
+  fails(missing, "package.json: direct dependency bounded has upper bound")
+  const restored = inspect(harness, "${NPM}    ignore:\n      - dependency-name: bounded\n", files)
+  assert_eq(restored.problems, [])
+  assert_eq(restored.bounded_dependencies, 1)
+}
+
+pipeline test_unbounded_dependency_is_measured_and_unaffected(harness: Harness) {
+  const files = {"package.json": "{\"dependencies\":{\"unbounded\":\">=1.0.0\"}}"}
+  for updates in [NPM, "${NPM}    ignore:\n      - dependency-name: unbounded\n"] {
+    const report = inspect(harness, updates, files)
+    assert_eq(report.problems, [])
+    assert_eq(report.dependency_manifests, 1)
+    assert_eq(report.direct_dependencies, 1)
+    assert_eq(report.bounded_dependencies, 0)
+  }
+}
+
+pipeline test_ignores_do_not_cross_directory_or_ecosystem(harness: Harness) {
+  const updates =
+    "  - package-ecosystem: npm\n    directory: /a\n${CATCH_ALL}    ignore:\n      - dependency-name: capped\n  - package-ecosystem: npm\n    directory: /b\n${CATCH_ALL}"
+  const report = inspect(
+    harness,
+    updates,
+    {
+      "a/package.json": "{\"dependencies\":{\"capped\":\">=1 <2\"}}",
+      "b/package.json": "{\"dependencies\":{\"capped\":\">=1 <2\"}}",
+      "outside/package.json": "{\"dependencies\":{\"other\":\">=1 <2\"}}",
+      "b/Cargo.toml": "[dependencies]\nother = '<2'\n",
+    },
+  )
+  assert_eq(report.dependency_manifests, 2)
+  assert_eq(report.direct_dependencies, 2)
+  assert_eq(len(report.problems), 1)
+  fails(report, "b/package.json: direct dependency capped")
+}
+
+pipeline test_actual_org_config(harness: Harness) {
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const report = check(
+    pick(harness, ["fs", "ast"]),
+    root,
+    {require_lockfiles: false, require_overrides: false},
+  )
+  assert_eq(report.problems, [])
+  assert(report.entries > 0)
+}
+
+pipeline test_unimplemented_manifest_adapter_is_not_a_measured_zero(harness: Harness) {
+  const report = inspect(
+    harness,
+    "  - package-ecosystem: composer\n    directory: /\n${CATCH_ALL}",
+    {"composer.json": "{\"require\":{\"vendor/capped\":\"<2\"}}"},
+  )
+  fails(report, "composer.json: upper-bound inspection is unsupported")
+  fails(
+    inspect(
+      harness,
+      "  - package-ecosystem: pip\n    directory: /\n${CATCH_ALL}",
+      {"setup.py": "setup(install_requires=['capped<2'])\n"},
+    ),
+    "setup.py: upper-bound inspection is unsupported",
+  )
+  fails(
+    inspect(harness, "  - package-ecosystem: unknown\n    directory: /\n${CATCH_ALL}", {}),
+    "dependency coverage is unknown",
+  )
+}
