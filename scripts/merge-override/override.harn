@@ -205,6 +205,24 @@ pub fn finish_record(draft: dict, steps: dict, effects: dict, now: string) -> di
     }
 }
 
+/**
+ * Ask GitHub to stop one run. A 409 means the run is no longer cancellable,
+ * usually because it finished or is already stopping; the caller's wait loop
+ * re-reads it until it reports completed.
+ */
+fn request_stop(gh: GitHub, repo: string, id: int, action: string) {
+  try {
+    gh.send("POST", repo + "/actions/runs/" + to_string(id) + "/" + action, {})
+  } catch (error) {
+    if to_string(error).contains("(HTTP 409)") {
+      return
+    }
+    if gh.read(repo + "/actions/runs/" + to_string(id))?.status != "completed" {
+      throw "could not " + action + " workflow run " + to_string(id) + ": " + to_string(error)
+    }
+  }
+}
+
 /** Stop the active workflow runs on the head, other than this override's own. */
 pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int) -> nil) -> int {
   const repo = "repos/" + input.repository
@@ -223,13 +241,7 @@ pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int)
   }
   const selection = select_competing_runs(run_id, workflow_id, status_pages)
   for id in selection.competing_run_ids {
-    try {
-      gh.send("POST", repo + "/actions/runs/" + to_string(id) + "/cancel", {})
-    } catch (error) {
-      if gh.read(repo + "/actions/runs/" + to_string(id))?.status != "completed" {
-        throw "could not cancel workflow run " + to_string(id) + ": " + to_string(error)
-      }
-    }
+    request_stop(gh, repo, id, "cancel")
   }
   // One budget for every run. A large run often outlives an ordinary cancel's
   // first two minutes, so each run still going then gets one force-cancel.
@@ -244,13 +256,7 @@ pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int)
       }
       if waited >= FORCE_CANCEL_AFTER_MS && !forced.contains(id) {
         forced = forced + [id]
-        try {
-          gh.send("POST", repo + "/actions/runs/" + to_string(id) + "/force-cancel", {})
-        } catch (error) {
-          if gh.read(repo + "/actions/runs/" + to_string(id))?.status != "completed" {
-            throw "could not force-cancel workflow run " + to_string(id) + ": " + to_string(error)
-          }
-        }
+        request_stop(gh, repo, id, "force-cancel")
       }
       sleep_ms(5000)
       waited = waited + 5000

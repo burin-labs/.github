@@ -535,3 +535,40 @@ pipeline test_a_run_that_never_stops_is_refused_after_the_budget(harness: Harnes
   )
   assert_eq(len(world.sent().filter({ path -> path.ends_with("/force-cancel") }).to_list()), 1)
 }
+
+/**
+ * A run that stops on its own between listing and cancelling answers the
+ * cancel with a 409. That is the goal state once a re-read reports it completed.
+ */
+fn refused_cancel_world(error: string) -> dict {
+  let reads = 0
+  const gh = {
+    read: fn(path) {
+      if path == REPO + "/actions/runs/9" {
+        return {workflow_id: 100}
+      }
+      reads = reads + 1
+      return {status: reads > 1 ? "completed" : "in_progress"}
+    },
+    pages: fn(path) { return path.contains("status=queued") ? [
+      {total_count: 1, workflow_runs: [{id: 5, workflow_id: 200}]},
+    ] : [{total_count: 0, workflow_runs: []}] },
+    send: fn(_method, path, _body) {
+      throw "POST " + path + " failed: gh: " + error
+    },
+  }
+  return {gh: gh, reads: fn() { return reads }}
+}
+
+pipeline test_a_run_no_longer_in_progress_counts_as_cancelled_once_reread(harness: Harness) {
+  const world = refused_cancel_world(
+    "Cannot cancel a workflow run that is not in progress. (HTTP 409)",
+  )
+  assert_eq(cancel_competing(world.gh, INPUT, 9, { _ms -> nil }), 1)
+  assert_eq(world.reads(), 2)
+  const denied = refused_cancel_world("Resource not accessible by integration (HTTP 403)")
+  assert_error_contains(
+    { -> cancel_competing(denied.gh, INPUT, 9, { _ms -> nil }) },
+    "could not cancel workflow run 5",
+  )
+}
