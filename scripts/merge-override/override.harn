@@ -18,7 +18,9 @@ import {
 
 pub const LOG_LABEL = "override-log"
 
-const CANCEL_WAIT_MS = 120000
+const CANCEL_WAIT_MS = 600000
+
+const FORCE_CANCEL_AFTER_MS = 120000
 
 const REVIEW_QUERY =
   "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision}}}"
@@ -229,13 +231,26 @@ pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int)
       }
     }
   }
+  // One budget for every run. A large run often outlives an ordinary cancel's
+  // first two minutes, so each run still going then gets one force-cancel.
+  let waited = 0
+  let forced = []
   for id in selection.competing_run_ids {
-    let waited = 0
     while gh.read(repo + "/actions/runs/" + to_string(id))?.status != "completed" {
       if waited >= CANCEL_WAIT_MS {
         throw "workflow run " + to_string(id) + " did not stop within "
           + to_string(CANCEL_WAIT_MS / 1000)
-          + " seconds"
+          + " seconds, including a force-cancel"
+      }
+      if waited >= FORCE_CANCEL_AFTER_MS && !forced.contains(id) {
+        forced = forced + [id]
+        try {
+          gh.send("POST", repo + "/actions/runs/" + to_string(id) + "/force-cancel", {})
+        } catch (error) {
+          if gh.read(repo + "/actions/runs/" + to_string(id))?.status != "completed" {
+            throw "could not force-cancel workflow run " + to_string(id) + ": " + to_string(error)
+          }
+        }
       }
       sleep_ms(5000)
       waited = waited + 5000

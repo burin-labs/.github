@@ -1,5 +1,12 @@
 import { assert_error_contains } from "std/testing"
-import { append_log, draft_record, finish_record, measure, merge_pull } from "./override.harn"
+import {
+  append_log,
+  cancel_competing,
+  draft_record,
+  finish_record,
+  measure,
+  merge_pull,
+} from "./override.harn"
 import {
   NO_REASON,
   log_issue_title,
@@ -473,4 +480,58 @@ pipeline test_a_retry_stops_when_the_pull_request_closed(harness: Harness) {
   const world = merging([BASE_MOVED_ERROR], {state: "closed", merged: false, head: {sha: HEAD}})
   assert_error_contains({ -> merge(world) }, "closed before the override could merge it")
   assert_eq(world.attempts(), 1)
+}
+
+/**
+ * A run that keeps going after an ordinary cancel is force-cancelled, not refused at two minutes.
+ */
+fn cancel_world(stops_after_force_reads: int?) -> dict {
+  let sent = []
+  let reads_after_force = 0
+  const forced = { -> sent.any({ row -> row.path.ends_with("/5/force-cancel") }) }
+  const empty = [{total_count: 0, workflow_runs: []}]
+  const gh = {
+    read: fn(path) {
+      if path == REPO + "/actions/runs/9" {
+        return {workflow_id: 100}
+      }
+      assert_eq(path, REPO + "/actions/runs/5")
+      if forced() {
+        reads_after_force = reads_after_force + 1
+      }
+      const stopped = stops_after_force_reads != nil && forced()
+        && reads_after_force > stops_after_force_reads
+      return {status: stopped ? "completed" : "in_progress"}
+    },
+    pages: fn(path) { return path.contains("status=in_progress") ? [
+      {total_count: 1, workflow_runs: [{id: 5, workflow_id: 200}]},
+    ] : empty },
+    send: fn(method, path, _body) {
+      sent = sent + [{method: method, path: path}]
+      return nil
+    },
+  }
+  let slept = 0
+  return {
+    gh: gh,
+    sent: fn() { return sent.map({ row -> row.path }).to_list() },
+    sleep: fn(ms) { slept = slept + ms },
+    slept: fn() { return slept },
+  }
+}
+
+pipeline test_a_slow_run_is_force_cancelled_and_waited_for(harness: Harness) {
+  const world = cancel_world(3)
+  cancel_competing(world.gh, INPUT, 9, world.sleep)
+  assert_eq(world.sent(), [REPO + "/actions/runs/5/cancel", REPO + "/actions/runs/5/force-cancel"])
+  assert(world.slept() > 120000, "the old two-minute limit would have refused this run")
+}
+
+pipeline test_a_run_that_never_stops_is_refused_after_the_budget(harness: Harness) {
+  const world = cancel_world(nil)
+  assert_error_contains(
+    { -> cancel_competing(world.gh, INPUT, 9, world.sleep) },
+    "did not stop within 600 seconds, including a force-cancel",
+  )
+  assert_eq(len(world.sent().filter({ path -> path.ends_with("/force-cancel") }).to_list()), 1)
 }
