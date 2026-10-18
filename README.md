@@ -815,8 +815,21 @@ is blocked with nothing to look at.
   (block or inline `patterns`), every committed lockfile needs a matching
   ecosystem entry, Cargo workspace members and path deps must stay inside the
   configured `directory`, and exact `pnpm-workspace.yaml` overrides need a
-  `# pin:` annotation. It uses Ruby/Psych only — no network, no Harn binary —
-  so always-on hygiene jobs can call it. The reusable `harn-package.yml`
+  `# pin:` annotation. Direct dependencies with explicit upper bounds in Cargo,
+  npm, Python, and Swift manifests need a matching ignore in the same ecosystem
+  and directory entry. Ordinary Cargo/npm caret requirements remain updatable and
+  do not count as explicit ceilings. An unrestricted matching ignore suffices;
+  a version-filtered ignore must cover the forbidden versions, and an ignore
+  limited to update types must cover all three update classes. Diagnostics name
+  the dependency, bound, and manifest, and the receipt reports manifests, direct
+  dependencies, and ceilings examined. The action installs its published Harn
+  runtime by default; `skip-harn-setup: "true"` reuses a compatible installation.
+  Its private runtime is removed after the check, preserving the caller's
+  existing Harn executable on both success and refusal.
+  Manifest parsing is local and makes no provider calls. Unsupported manifest
+  adapters fail with unknown coverage rather than reporting a measured zero.
+  Directory scopes must be literal absolute repository paths; unsupported glob
+  scopes refuse inspection. The reusable `harn-package.yml`
   workflow runs it for every Burin Labs package CI caller. Product monorepos
   that do not use that workflow should call the action from an always-on job.
   Fleet prose for schedule/grouping lives in `harn-bump-fleet`; Harn-local

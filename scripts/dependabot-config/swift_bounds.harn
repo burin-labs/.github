@@ -1,0 +1,179 @@
+import { BoundedDependency } from "./types"
+
+type Capture = {text: string, range: {start_byte: int, end_byte: int}}
+
+type SwiftMatch = {
+  captures: {call: Capture, callee: Capture, argument: Capture, value: Capture, label?: Capture},
+}
+
+type SwiftSearch = {result: string, had_errors: bool, truncated: bool, matches: list<SwiftMatch>}
+
+type ArraySearch = {
+  result: string,
+  had_errors: bool,
+  truncated: bool,
+  matches: list<{captures: {literal?: Capture, array?: Capture, element?: Capture}}>,
+}
+
+type Text = string
+
+const QUERY =
+  "(call_expression . (_) @callee (call_suffix (value_arguments (value_argument name: (value_argument_label)? @label value: (_) @value) @argument))) @call"
+
+fn literal(source: string, manifest: string) -> string {
+  const value = try {
+    json_parse(source)
+  } catch (_) {
+    nil
+  }
+  require type_of(value) == "string", "Swift dependency requires a literal declaration: ${manifest}"
+  return schema_expect(value, schema_of(Text))
+}
+
+fn dependency_name(source: string, manifest: string) -> string {
+  let location = literal(source, manifest).lower()
+  const ssh = regex_captures(r"^[^@]+@([^:]+):(.+)$", location)
+  if ssh.count == 1 {
+    location = "ssh://${ssh[0].groups[0]}/${ssh[0].groups[1]}"
+  }
+  const parsed = url_parse(location)
+  require parsed.host != nil && parsed.query == nil && parsed.fragment == nil
+    && parsed.password == nil,
+    "Swift dependency URL must have an inspectable credential-free identity: ${manifest}"
+  let name = "${parsed.host}${parsed.path}"
+  name = regex_replace(r"^www\.", "", name)
+  name = regex_replace(r"/$", "", name)
+  return regex_replace(r"\.git$", "", name)
+}
+
+fn range_bound(value: string, manifest: string) -> string {
+  const range = regex_captures(
+    r"^\s*(\x22[^\x22]+\x22)\s*(\.\.<|\.\.\.)\s*(\x22[^\x22]+\x22)\s*$",
+    value,
+  )
+  if range.count == 1 {
+    const lower = literal(range[0].groups[0], manifest)
+    const upper = literal(range[0].groups[2], manifest)
+    const operator = range[0].groups[1] == "..<" ? "<" : "<="
+    return ">=${lower},${operator}${upper}"
+  }
+  // These SwiftPM constructors are ordinary updatable requirements, not explicit range ceilings.
+  if regex_match(
+    r"^\s*\.(?:upToNextMajor|upToNextMinor)\s*\(from:\s*\x22[^\x22]+\x22\s*\)\s*$",
+    value,
+  )
+    != nil {
+    return ""
+  }
+  if regex_match(r"^\s*\.exact\s*\(\s*\x22[^\x22]+\x22\s*\)\s*$", value) != nil {
+    return ""
+  }
+  throw "Swift dependency requirement cannot be structurally resolved: ${manifest}"
+}
+
+fn same_range(left: Capture, right: Capture) -> bool {
+  return left.range.start_byte == right.range.start_byte
+    && left.range.end_byte == right.range.end_byte
+}
+
+fn validate_arrays(ast: HarnessAst, source: string, manifest: string, calls: SwiftSearch) {
+  const arrays: ArraySearch = schema_expect(
+    ast.search(
+      {
+        source: source,
+        language: "swift",
+        query: "(array_literal) @literal\n(array_literal (_) @element) @array",
+      },
+    ),
+    schema_of(ArraySearch),
+  )
+  require arrays.result == "ok" && !arrays.had_errors && !arrays.truncated,
+    "Swift dependency array census is incomplete: ${manifest}"
+  let initialized = false
+  for item in calls.matches {
+    const capture = item.captures
+    if !["Package", "Package.init", ".init"].contains(capture.callee.text) {
+      continue
+    }
+    initialized = true
+    if capture.label?.text != "dependencies" {
+      continue
+    }
+    require arrays.matches.any(
+      { row -> row.captures.literal != nil && same_range(row.captures.literal, capture.value) },
+    ),
+      "Swift dependency array is dynamic: ${manifest}"
+    for row in arrays.matches {
+      const parent = row.captures.array
+      const element = row.captures.element
+      if parent == nil || element == nil || !same_range(parent, capture.value) {
+        continue
+      }
+      if element.text.starts_with("//") || element.text.starts_with("/*") {
+        continue
+      }
+      require calls.matches.any(
+        { declaration ->
+          same_range(declaration.captures.call, element)
+            && [".package", "Package.Dependency.package"].contains(declaration.captures.callee.text)
+        },
+      ),
+        "Swift dependency array contains an unresolved element: ${manifest}"
+    }
+  }
+  require initialized, "Swift package construction is unresolved: ${manifest}"
+}
+
+pub fn swift_dependencies(
+  ast: HarnessAst,
+  manifest: string,
+  source: string,
+) -> list<BoundedDependency> {
+  const searched: SwiftSearch = schema_expect(
+    ast.search({source: source, language: "swift", query: QUERY}),
+    schema_of(SwiftSearch),
+  )
+  require searched.result == "ok" && !searched.had_errors && !searched.truncated,
+    "Swift dependency syntax is unsupported, damaged, or incomplete: ${manifest}"
+  require len(searched.matches) > 0,
+    "Swift dependency census observed no manifest calls: ${manifest}"
+  validate_arrays(ast, source, manifest, searched)
+  let result: list<BoundedDependency> = []
+  let seen: set<int> = set()
+  for item in searched.matches {
+    const capture = item.captures
+    if ![".package", "Package.Dependency.package"].contains(capture.callee.text)
+      || seen.contains(capture.call.range.start_byte) {
+      continue
+    }
+    seen = seen.union(set([capture.call.range.start_byte]))
+    let name: string? = nil
+    let bound = ""
+    let local = false
+    for argument in searched.matches {
+      if argument.captures.call.range.start_byte != capture.call.range.start_byte {
+        continue
+      }
+      const label = argument.captures.label?.text ?? ""
+      const value = argument.captures.value.text
+      if label == "url" {
+        name = dependency_name(value, manifest)
+      } else if label == "path" {
+        literal(value, manifest)
+        local = true
+      } else if label == "" {
+        bound = range_bound(value, manifest)
+      } else if ["from", "exact", "branch", "revision", "name"].contains(label) {
+        literal(value, manifest)
+      } else {
+        throw "Swift dependency has an unsupported argument ${label}: ${manifest}"
+      }
+    }
+    if local {
+      continue
+    }
+    require name != nil, "Swift dependency has no resolvable URL: ${manifest}"
+    result = result + [{name: name, bound: bound, manifest: manifest}]
+  }
+  return result
+}

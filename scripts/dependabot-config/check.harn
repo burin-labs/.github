@@ -1,0 +1,426 @@
+import { relative_path } from "std/fs"
+import { ignore_covers, manifest_dependencies } from "./bounds"
+
+const CONFIG = ".github/dependabot.yml"
+
+const LOCKFILES = {
+  "pnpm-lock.yaml": "npm",
+  "package-lock.json": "npm",
+  "yarn.lock": "npm",
+  "Cargo.lock": "cargo",
+  "Package.resolved": "swift",
+  "uv.lock": "uv",
+  "go.sum": "gomod",
+}
+
+const SKIP = [
+  ".build",
+  ".git",
+  ".next",
+  ".turbo",
+  ".venv",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "target",
+  "vendor",
+]
+
+const MANIFESTS = {
+  cargo: ["Cargo.toml"],
+  npm: ["package.json"],
+  uv: ["pyproject.toml", "requirements*.txt", "requirements*.in"],
+  pip: ["pyproject.toml", "requirements*.txt", "requirements*.in"],
+  swift: ["Package.swift"],
+}
+
+const UNSUPPORTED_MANIFESTS = {
+  pip: ["setup.py", "setup.cfg", "Pipfile"],
+  uv: ["setup.py", "setup.cfg"],
+  bundler: ["Gemfile", "*.gemspec"],
+  composer: ["composer.json"],
+  nuget: ["*.csproj", "*.fsproj", "*.vbproj", "packages.config", "Directory.Packages.props"],
+  maven: ["pom.xml"],
+  gradle: ["build.gradle", "build.gradle.kts", "libs.versions.toml"],
+  terraform: ["*.tf"],
+  pub: ["pubspec.yaml"],
+  mix: ["mix.exs"],
+  hex: ["mix.exs"],
+}
+
+type Config = {updates: list<dict>}
+
+type Strings = list<string>
+
+type Objects = list<dict>
+
+type Object = dict
+
+type Text = string
+
+pub type Entry = {
+  ecosystem: string,
+  directory: string,
+  has_catch_all: bool,
+  index: int,
+  ignore: list<dict>,
+}
+
+pub type Options = {require_lockfiles: bool, require_overrides: bool}
+
+pub type ScanCapabilities = {fs: HarnessFs, ast: HarnessAst}
+
+pub type Report = {
+  problems: list<string>,
+  entries: int,
+  cargo_manifests: int,
+  lockfiles: int,
+  overrides: int,
+  dependency_manifests: int,
+  direct_dependencies: int,
+  bounded_dependencies: int,
+}
+
+fn object(value: unknown) -> dict {
+  const parsed: Object = schema_expect(value, schema_of(Object))
+  return parsed
+}
+
+fn ensure(condition: bool, message: string) {
+  if !condition {
+    throw message
+  }
+}
+
+fn regex_is_match(pattern: string, text: string) -> bool {
+  return regex_match(pattern, text) != nil
+}
+
+fn excluded(path: string) -> bool {
+  return path.split("/").any(
+    { part -> SKIP.contains(part) || (part.starts_with(".") && part != ".github") },
+  )
+}
+
+fn fixture(path: string) -> bool {
+  return path.split("/").any(
+    { part ->
+      ["fixtures", "testdata", "__fixtures__"].contains(part) || part.ends_with("-fixtures")
+    },
+  )
+}
+
+fn files_named(fs: HarnessFs, root: string, names: list<string>) -> list<string> {
+  let files: list<string> = []
+  for name in names {
+    for path in fs.glob("**/${name}", root) {
+      const relative = relative_path(root, path_join(root, path))
+      if !excluded(relative) && !files.contains(relative) {
+        files = files + [relative]
+      }
+    }
+  }
+  return files.sorted()
+}
+
+fn scope(directory: string) -> string {
+  return regex_replace(r"^/+|/+$", "", directory)
+}
+
+fn inside(root: string, candidate: string) -> bool {
+  const base = path_normalize(root)
+  const path = path_normalize(candidate)
+  return path == base || path.starts_with("${base}/")
+}
+
+pub fn parse_entries(text: string) -> list<Entry> {
+  const config: Config = schema_expect(yaml_parse(text), schema_of(Config))
+  ensure(
+    len(config.updates) > 0,
+    "found ZERO update entries in ${CONFIG}; check cannot pass vacuously",
+  )
+  let entries: list<Entry> = []
+  let index = 0
+  for update in config.updates {
+    const ecosystem: Text = schema_expect(update["package-ecosystem"], schema_of(Text))
+    ensure(ecosystem != "", "${CONFIG}: updates[${index}] missing package-ecosystem")
+    ensure(
+      !(update.directory != nil && update.directories != nil),
+      "${CONFIG}: updates[${index}] sets both 'directory' and 'directories'",
+    )
+    ensure(
+      update.directory != nil || update.directories != nil,
+      "${CONFIG}: updates[${index}] sets neither 'directory' nor 'directories'",
+    )
+    const directories: list<string> = schema_expect(
+      update.directories ?? [update.directory ?? ""],
+      schema_of(Strings),
+    )
+    ensure(len(directories) > 0, "${CONFIG}: updates[${index}] has empty directories")
+    const groups = update.groups ?? {}
+    let catch_all = false
+    for key in keys(groups) {
+      const group = object(groups[key])
+      if schema_is(group.patterns, schema_of(Strings)) {
+        const patterns: list<string> = schema_expect(group.patterns, schema_of(Strings))
+        catch_all = catch_all
+          || patterns.any({ pattern -> regex_is_match(r"^\*+$", trim(pattern)) })
+      }
+    }
+    for directory in directories {
+      ensure(
+        directory.starts_with("/") && !directory.split("/").contains("..")
+          && !regex_is_match(r"[\*?\[\]{}]", directory),
+        "${CONFIG}: updates[${index}] has unsafe directory ${directory}",
+      )
+      entries = entries
+        + [
+          {
+            ecosystem: ecosystem,
+            directory: directory,
+            has_catch_all: catch_all,
+            index: index,
+            ignore: schema_expect(update.ignore ?? [], schema_of(Objects)),
+          },
+        ]
+    }
+    index = index + 1
+  }
+  return entries
+}
+
+fn dependency_paths(table: dict) -> list<string> {
+  let paths: list<string> = []
+  for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+    const dependencies = object(table[section] ?? {})
+    for name in keys(dependencies) {
+      if schema_is(dependencies[name], schema_of(Object)) {
+        const declaration = object(dependencies[name])
+        if declaration.path != nil {
+          const path: Text = schema_expect(declaration.path, schema_of(Text))
+          paths = paths + [path]
+        }
+      }
+    }
+  }
+  return paths
+}
+
+fn cargo_paths(text: string) -> list<string> {
+  const document = object(toml_parse(text))
+  let paths = dependency_paths(document) + dependency_paths(object(document.workspace ?? {}))
+  const targets = object(document.target ?? {})
+  for target in keys(targets) {
+    paths = paths + dependency_paths(object(targets[target]))
+  }
+  return paths
+}
+
+fn exact_version(value: string) -> bool {
+  return regex_is_match(r"^v?\d+(\.\d+)*(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$", trim(value))
+}
+
+fn annotated_override(text: string, key: string) -> bool {
+  const lines = text.split("\n")
+  let previous = ""
+  let in_block = false
+  for line in lines {
+    if regex_is_match(r"^overrides:\s*$", line) {
+      in_block = true
+    } else if in_block && regex_is_match(r"^[^\s#]", line) {
+      in_block = false
+    }
+    if in_block && regex_is_match(r"^\s+", line) {
+      const parsed = try {
+        yaml_parse(line)
+      } catch (_error) {
+        nil
+      }
+      if schema_is(parsed, schema_of(Object)) && keys(object(parsed)).contains(key) {
+        return regex_is_match(r"#\s*pin:", line) || regex_is_match(r"#\s*pin:", previous)
+      }
+    }
+    previous = line
+  }
+  return false
+}
+
+type CargoScope = {problems: list<string>, manifests: int}
+
+type OverrideScan = {problems: list<string>, count: int}
+
+fn override_scan(fs: HarnessFs, root: string) -> OverrideScan {
+  let problems: list<string> = []
+  let count = 0
+  for file in files_named(fs, root, ["pnpm-workspace.yaml"]) {
+    const text = fs.read_text(path_join(root, file))
+    const parsed = object(yaml_parse(text))
+    const values = object(parsed.overrides ?? {})
+    for key in keys(values) {
+      count = count + 1
+      if type_of(values[key]) == "string" && exact_version(to_string(values[key]))
+        && !annotated_override(text, key) {
+        problems = problems
+          + [
+            "${file}: override ${key}: ${values[key]} is an exact version without a # pin: annotation",
+          ]
+      }
+    }
+  }
+  return {problems: problems, count: count}
+}
+
+fn cargo_scope(fs: HarnessFs, root: string, entry: Entry) -> CargoScope {
+  let problems: list<string> = []
+  let manifests = 0
+  const directory = path_join(root, scope(entry.directory))
+  const manifest = path_join(directory, "Cargo.toml")
+  if !fs.exists(manifest) {
+    problems = problems
+      + ["${CONFIG}: updates[${entry.index}]: directory ${entry.directory} has no Cargo.toml"]
+  } else {
+    const parsed = object(toml_parse(fs.read_text(manifest)))
+    const workspace = object(parsed.workspace ?? {})
+    for key in ["members", "default-members"] {
+      const members: list<string> = schema_expect(workspace[key] ?? [], schema_of(Strings))
+      for member in members {
+        if !inside(directory, path_join(directory, member)) {
+          problems = problems
+            + [
+              "${relative_path(root, manifest)}: ${key} entry ${member} resolves outside ${entry.directory}",
+            ]
+        }
+      }
+    }
+    for file in files_named(fs, directory, ["Cargo.toml"]) {
+      manifests = manifests + 1
+      const path = path_join(directory, file)
+      for dependency in cargo_paths(fs.read_text(path)) {
+        if !inside(directory, path_join(dirname(path), dependency)) {
+          problems = problems
+            + [
+              "${relative_path(root, path)}: path dependency ${dependency} resolves outside ${entry.directory}",
+            ]
+        }
+      }
+    }
+  }
+  return {problems: problems, manifests: manifests}
+}
+
+pub fn check(capabilities: ScanCapabilities, root: string, options: Options) -> Report {
+  const fs = capabilities.fs
+  const config = path_join(root, CONFIG)
+  ensure(fs.exists(config), "${CONFIG} not found; this check cannot run vacuously")
+  const entries = parse_entries(fs.read_text(config))
+  let problems: list<string> = []
+  let cargo_manifests = 0
+  let lockfiles = 0
+  const overrides = override_scan(fs, root)
+  problems = problems + overrides.problems
+  let dependency_manifests = 0
+  let direct_dependencies = 0
+  let bounded_dependencies = 0
+  for entry in entries {
+    if !entry.has_catch_all {
+      problems = problems
+        + [
+          "${CONFIG}: updates[${entry.index}]: ${entry.ecosystem} entry for ${entry.directory} has no catch-all group",
+        ]
+    }
+    const directory = path_join(root, scope(entry.directory))
+    if MANIFESTS[entry.ecosystem] == nil && UNSUPPORTED_MANIFESTS[entry.ecosystem] == nil
+      && !["github-actions", "gomod", "docker", "gitsubmodule", "devcontainers"].contains(
+        entry.ecosystem,
+      ) {
+      problems = problems
+        + [
+          "${CONFIG}: updates[${entry.index}]: unsupported ecosystem ${entry.ecosystem}; dependency coverage is unknown",
+        ]
+    }
+    if entry.ecosystem == "cargo" {
+      const cargo = cargo_scope(fs, root, entry)
+      cargo_manifests = cargo_manifests + cargo.manifests
+      problems = problems + cargo.problems
+    }
+    const names: Strings = schema_expect(MANIFESTS[entry.ecosystem] ?? [], schema_of(Strings))
+    const unsupported: Strings = schema_expect(
+      UNSUPPORTED_MANIFESTS[entry.ecosystem] ?? [],
+      schema_of(Strings),
+    )
+    for file in files_named(fs, directory, unsupported) {
+      if !fixture(file) {
+        problems = problems
+          + [
+            "${relative_path(root, path_join(directory, file))}: upper-bound inspection is unsupported for configured ecosystem ${entry.ecosystem}; cannot establish dependency coverage",
+          ]
+      }
+    }
+    for file in files_named(fs, directory, names) {
+      if fixture(file) {
+        continue
+      }
+      const path = path_join(directory, file)
+      dependency_manifests = dependency_manifests + 1
+      const dependencies = manifest_dependencies(
+        entry.ecosystem,
+        relative_path(root, path),
+        fs.read_text(path),
+        capabilities.ast,
+      )
+      direct_dependencies = direct_dependencies + len(dependencies)
+      for dependency in dependencies {
+        if dependency.bound == "" {
+          continue
+        }
+        bounded_dependencies = bounded_dependencies + 1
+        if !entry.ignore.any({ ignored -> ignore_covers(ignored, dependency) }) {
+          problems = problems
+            + [
+              "${dependency.manifest}: direct dependency ${dependency.name} has upper bound ${dependency.bound} without a matching ignore in ${CONFIG} updates[${entry.index}] (${entry.directory})",
+            ]
+        }
+      }
+    }
+  }
+  for file in files_named(fs, root, keys(LOCKFILES)) {
+    if fixture(file) {
+      continue
+    }
+    lockfiles = lockfiles + 1
+    const ecosystem = to_string(LOCKFILES[basename(file)])
+    const directory = if dirname(file) == "." {
+      ""
+    } else {
+      dirname(file)
+    }
+    if !entries.any(
+      { entry -> entry.ecosystem == ecosystem && scope(entry.directory) == directory },
+    ) {
+      problems = problems
+        + ["${file}: committed ${ecosystem} lockfile in a directory no ${CONFIG} entry names"]
+    }
+  }
+  if entries.any({ entry -> entry.ecosystem == "cargo" }) && cargo_manifests == 0 {
+    problems = problems + ["scanned ZERO Cargo manifests"]
+  }
+  if options.require_lockfiles && lockfiles == 0 {
+    problems = problems + ["found ZERO committed lockfiles to attribute"]
+  }
+  if options.require_overrides && overrides.count == 0 {
+    problems = problems + ["read ZERO pnpm overrides"]
+  }
+  return {
+    problems: problems,
+    entries: len(entries),
+    cargo_manifests: cargo_manifests,
+    lockfiles: lockfiles,
+    overrides: overrides.count,
+    dependency_manifests: dependency_manifests,
+    direct_dependencies: direct_dependencies,
+    bounded_dependencies: bounded_dependencies,
+  }
+}
