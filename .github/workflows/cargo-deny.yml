@@ -6,6 +6,9 @@ name: cargo-deny (reusable)
 #
 #   jobs:
 #     cargo-deny:
+#       permissions:
+#         contents: read
+#         issues: write    # the default-branch tracking issue
 #       uses: burin-labs/.github/.github/workflows/cargo-deny.yml@<sha>
 #       with:
 #         working-directory: crates/my-workspace  # default "."
@@ -16,10 +19,17 @@ name: cargo-deny (reusable)
 #     Cargo.lock, the manifests, and deny.toml, so its verdict changes only
 #     when the caller's own files change.
 #   * `check advisories --deny advisory-not-detected` reads the RustSec
-#     database, which changes daily, so a new advisory can turn the job red on
-#     an unrelated change. Do not make a job that runs it a required check;
-#     its red run is the report. `--deny advisory-not-detected` also fails on
-#     an ignore entry whose crate has left the tree.
+#     database, which changes daily. Do not make a job that runs it a required
+#     check. `--deny advisory-not-detected` also fails on an ignore entry whose
+#     crate has left the tree.
+#
+# Advisories split by event. On a pull request, only vulnerabilities, yanked
+# crates, and stale ignores fail; `unmaintained` and `unsound` are warnings,
+# because one published overnight against an unchanged crate turned every
+# dependency PR red (RUSTSEC-2026-0370..0372, zbus). Every other event enforces
+# them, and a run on the default branch opens, updates, or closes one tracking
+# issue per workspace, so the finding has an owner instead of a red run nobody
+# opens.
 #
 # A caller that must keep the deterministic checks in a required job passes
 # `policy: false` here and runs `check bans licenses sources` in that job.
@@ -87,5 +97,84 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: cargo-deny --all-features check bans licenses sources
       - name: Security advisories
+        id: advisories
         working-directory: ${{ inputs.working-directory }}
-        run: cargo-deny --all-features check advisories --deny advisory-not-detected
+        env:
+          ADVISORY_LINTS: ${{ github.event_name == 'pull_request' && '--warn unmaintained --warn unsound' || '' }}
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC2086 # ADVISORY_LINTS is a flag list
+          cargo-deny --all-features check advisories --deny advisory-not-detected ${ADVISORY_LINTS}
+          status=$?
+          if [ "${status}" -ne 0 ]; then
+            # Re-read the fetched database as JSON so the tracking issue lists
+            # each finding. An empty list means cargo-deny itself failed.
+            # shellcheck disable=SC2086
+            findings="$(cargo-deny --format json --all-features check --disable-fetch \
+              advisories --deny advisory-not-detected ${ADVISORY_LINTS} 2>&1 \
+              | jq -r 'select(.type == "diagnostic" and .fields.severity == "error")
+                  | .fields as $f | ($f.graphs[0].Krate // {}) as $k
+                  | "- \($f.advisory.id // $f.code) `\($k.name // "")` \($k.version // ""): \($f.message) (\($f.code))"' \
+              | sort -u || true)"
+            delimiter="findings-$(openssl rand -hex 8)"
+            printf 'findings<<%s\n%s\n%s\n' "${delimiter}" "${findings}" "${delimiter}" >> "${GITHUB_OUTPUT}"
+          fi
+          exit "${status}"
+    outputs:
+      advisories: ${{ steps.advisories.outcome }}
+      findings: ${{ steps.advisories.outputs.findings }}
+
+  tracking-issue:
+    name: Advisory tracking issue
+    needs: cargo-deny
+    # Only the default branch owns the issue; the step checks the branch,
+    # because a `schedule` payload carries no `repository` object. A run that
+    # never reached the advisories step (install or policy failure) says
+    # nothing about advisories, so it leaves the issue alone.
+    if: >-
+      ${{ always()
+      && github.event_name != 'pull_request'
+      && (needs.cargo-deny.outputs.advisories == 'success'
+          || (needs.cargo-deny.outputs.advisories == 'failure' && needs.cargo-deny.outputs.findings != '')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update, or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OUTCOME: ${{ needs.cargo-deny.outputs.advisories }}
+          FINDINGS: ${{ needs.cargo-deny.outputs.findings }}
+          WORKSPACE: ${{ inputs.working-directory }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/${GH_REPO}" --jq .default_branch)"
+          if [ "${GITHUB_REF_NAME}" != "${default_branch}" ]; then
+            echo "Ref ${GITHUB_REF_NAME} is not ${default_branch}; the tracking issue follows the default branch only."
+            exit 0
+          fi
+          # The marker finds the issue without a label or a search index.
+          marker="<!-- cargo-deny-advisories:${WORKSPACE} -->"
+          issue="$(gh issue list --state open --limit 500 --json number,body \
+            | jq -r --arg m "${marker}" 'map(select(.body | contains($m))) | .[0].number // empty')"
+          if [ "${OUTCOME}" = "success" ]; then
+            if [ -n "${issue}" ]; then
+              gh issue close "${issue}" --comment "Advisories pass on the default branch as of ${RUN_URL}."
+            fi
+            exit 0
+          fi
+          # shellcheck disable=SC2016 # the backticks are Markdown
+          body="$(printf '%s\n\ncargo-deny reports these RustSec advisories against the default branch in `%s`:\n\n%s\n\nUpgrade the crate, or add an ignore with the advisory ID and a reason to `deny.toml`. Never ignore a vulnerability that has a fix. This issue closes itself when the scheduled run passes.\n' \
+            "${marker}" "${WORKSPACE}" "${FINDINGS}")"
+          if [ -z "${issue}" ]; then
+            title="RustSec advisories on the default branch"
+            [ "${WORKSPACE}" = "." ] || title="${title} (${WORKSPACE})"
+            issue="$(gh issue create --title "${title}" --body "${body}" | sed 's#.*/##')"
+            gh issue comment "${issue}" --body "Found by ${RUN_URL}."
+          elif [ "$(gh issue view "${issue}" --json body --jq .body)" != "${body}" ]; then
+            gh issue edit "${issue}" --body "${body}"
+            gh issue comment "${issue}" --body "The advisory set changed in ${RUN_URL}."
+          fi

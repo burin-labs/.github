@@ -129,7 +129,10 @@ the lookup reason and read count.
   workspace's `deny.toml`: security advisories always, plus bans, licenses, and
   sources unless the caller passes `policy: false` because it keeps those in a
   required job. The advisories verdict follows the daily RustSec database, so
-  never make it a required check.
+  never make it a required check. On pull requests only vulnerabilities, yanked
+  crates, and stale ignores fail; unmaintained and unsound advisories warn. On
+  the default branch every advisory fails, and the run opens, updates, or
+  closes one tracking issue, so the caller's job grants `issues: write`.
 - `.github/workflows/register-package-release.yml` tells the package index that
   a release shipped, so the index reconciles within minutes instead of at the
   next daily run.
