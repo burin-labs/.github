@@ -6,7 +6,7 @@ const API = "https://api.github.test"
 
 const COMMIT = "b" * 40
 
-fn git(harness: {process: HarnessProcess}, root: string, args: list<string>) -> string {
+fn git(harness: Harness, root: string, args: list<string>) -> string {
   const result = harness.process.run(
     {program: "git", args: args, cwd: root, env: {}, stdin: "", timeout_ms: 10000},
   )
@@ -35,7 +35,7 @@ fn fixture(harness: Harness) -> {root: string, base: string} {
   return {root: root, base: base}
 }
 
-fn answer(harness: {testing: HarnessTesting}, base: string, signed: bool) {
+fn answer(harness: Harness, base: string, signed: bool) {
   harness.testing.http_mock_clear()
   harness.testing.http_mock(
     "GET",
