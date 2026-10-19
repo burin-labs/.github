@@ -125,7 +125,7 @@ const CONTROL_SOURCES = {
   "scripts/harn-required-review/measure.harn":
     "20865341d64321daf27a73c4c04f51560e456b37fd11d6e173ab266f71e14931",
   "scripts/harn-required-review/policy.harn":
-    "a34a7c5f935cd6ba5235b9a751fa71af10d0d1fc9ffda22b9bd3c9a429f04af7",
+    "3361a7910eb8aa4a4a62a569337786749c901471a41747483532f65a6ccc3c72",
   "scripts/merge-override/github.harn":
     "02749d57ca9e80fef98555d1a37d8910d53547e476e052b98b8e63a041f6d5dc",
 }

@@ -25,7 +25,10 @@ fn effective() -> list {
     {type: "deletion"},
     {type: "non_fast_forward"},
     {type: "merge_queue"},
-    {type: "required_status_checks"},
+    {
+      type: "required_status_checks",
+      parameters: {required_status_checks: [{context: "CI status"}, {context: "drift"}]},
+    },
     {type: "pull_request", parameters: {required_approving_review_count: 1}},
   ]
 }
@@ -49,16 +52,57 @@ pipeline test_installed_rule_and_preserved_queue_are_measured(harness: Harness) 
   )
 }
 
-pipeline test_admin_and_other_app_bypass_are_refused(harness: Harness) {
+pipeline test_plan_keeps_review_required_for_every_actor(harness: Harness) {
+  const plan = desired_ruleset()
+  assert_eq(plan.name, "Main review approval required")
+  assert_eq(plan.bypass_actors, [])
+  assert_eq(plan.conditions.ref_name.include, ["refs/heads/main"])
+}
+
+pipeline test_admin_and_all_app_bypasses_are_refused(harness: Harness) {
   for bypass in [
-    [],
     [{actor_type: "OrganizationAdmin", actor_id: nil, bypass_mode: "pull_request"}],
     [{actor_type: "Integration", actor_id: 1236702, bypass_mode: "always"}],
+    [{actor_type: "Integration", actor_id: 3472013, bypass_mode: "always"}],
   ] {
     refused(
       fn() { verify_installed(
         [existing(), installed() + {bypass_actors: bypass}],
         effective(),
+        {id: 3472013, slug: "harn-release-bot"},
+      ) },
+    )
+  }
+}
+
+pipeline test_legacy_rule_cannot_live_beside_the_current_owner(harness: Harness) {
+  const legacy = installed() + {id: 4, name: "review required (harn)"}
+  refused(
+    fn() { verify_installed(
+      [existing(), legacy, installed()],
+      effective(),
+      {id: 3472013, slug: "harn-release-bot"},
+    ) },
+  )
+}
+
+pipeline test_named_required_checks_cannot_be_replaced_by_an_empty_category(harness: Harness) {
+  const withoutChecks = effective().filter({ rule -> rule.type != "required_status_checks" })
+    .to_list()
+  for checkRule in [
+    {type: "required_status_checks"},
+    {type: "required_status_checks", parameters: {required_status_checks: []}},
+    {
+      type: "required_status_checks",
+      parameters: {required_status_checks: [{context: "CI status"}]},
+    },
+    {type: "required_status_checks", parameters: {required_status_checks: [{context: "drift"}]}},
+    {type: "required_status_checks", parameters: {required_status_checks: [{context: nil}]}},
+  ] {
+    refused(
+      fn() { verify_installed(
+        [existing(), installed()],
+        withoutChecks + [checkRule],
         {id: 3472013, slug: "harn-release-bot"},
       ) },
     )
