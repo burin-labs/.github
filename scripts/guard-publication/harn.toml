@@ -1,0 +1,8 @@
+[package]
+name = "guard-publication"
+version = "0.1.0"
+description = "Publish the selected guard qualification through the released GitHub adapter."
+harn = ">=0.10.170,<0.11"
+
+[dependencies]
+harn-github-connector = { git = "https://github.com/burin-labs/harn-github-connector", tag = "v0.17.0", registry = "https://packages.harnlang.com/harn-package-index.toml", registry_name = "@burin/github-connector", registry_version = "0.17.0", registry_commit = "a41d014b40d85dd718fdb1845d216600b42ea8e3", registry_provenance = "https://github.com/burin-labs/harn-github-connector/releases/tag/v0.17.0" }

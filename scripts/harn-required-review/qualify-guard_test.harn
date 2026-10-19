@@ -170,25 +170,41 @@ pipeline test_publish_commits_the_record_on_a_branch_cut_from_main_and_ships_it(
   // First run: no branch, no pull request.
   const fresh = fake_github([main_ref, [pulls, []]], "d" * 40)
   assert_eq(
-    publish(fresh.github, "{}\n", "e" * 40),
+    publish(fresh.github, "e" * 40, fn() { return "d" * 40 }),
     {state: "published", commit: "d" * 40, pull_request: 41},
   )
   const writes = fresh.writes()
-  assert(writes[0].starts_with("POST " + repo + "/git/refs "))
-  assert(writes[0].contains("\"sha\":\"" + "c" * 40))
-  assert(writes[1].contains("\"expectedHeadOid\":\"" + "c" * 40))
-  assert(writes[1].contains(base64_encode("{}\n")))
-  assert(writes[2].starts_with("POST " + repo + "/pulls "))
-  assert_eq(writes[3], "POST " + repo + "/issues/41/labels {\"labels\":[\"ship\"]}")
-  // A rerun resets the existing branch to main and reuses the open pull request.
+  assert_eq(len(writes), 2)
+  assert(writes[0].starts_with("POST " + repo + "/pulls "))
+  assert_eq(writes[1], "POST " + repo + "/issues/41/labels {\"labels\":[\"ship\"]}")
+  // Existing proposals keep sole ownership, including armed or queued proposals.
   const branch = [repo + "/git/ref/heads/" + QUALIFY_BRANCH, {object: {sha: "f" * 40}}]
   const rerun = fake_github([main_ref, branch, [pulls, [{number: 7}]]], "d" * 40)
-  assert_eq(publish(rerun.github, "{}\n", "e" * 40).pull_request, 7)
-  const rewrites = rerun.writes()
-  assert(rewrites[0].starts_with("PATCH " + repo + "/git/refs/heads/" + QUALIFY_BRANCH))
-  assert(!rewrites.any({ call -> call.starts_with("POST " + repo + "/pulls ") }))
+  let attempted = false
+  refused(
+    fn() { publish(
+      rerun.github,
+      "e" * 40,
+      fn() {
+        attempted = true
+        return "d" * 40
+      },
+    ) },
+    "existing qualification pull request owns this branch",
+  )
+  assert_eq(attempted, false)
+  assert_eq(len(rerun.writes()), 0)
   // A refused signed commit stops before any pull request or label.
   const moved = fake_github([main_ref, [pulls, []]], "")
-  refused(fn() { publish(moved.github, "{}\n", "e" * 40) }, "signed commit was not created")
+  refused(
+    fn() { publish(
+      moved.github,
+      "e" * 40,
+      fn() {
+        throw "adapter refused"
+      },
+    ) },
+    "adapter refused",
+  )
   assert(!moved.writes().any({ call -> call.contains("/pulls ") || call.contains("/labels") }))
 }

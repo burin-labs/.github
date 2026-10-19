@@ -52,13 +52,25 @@ jobs:
           persist-credentials: false
 
       - name: Install Harn
-        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        uses: burin-labs/harn/.github/actions/setup-harn@c9a72eda6b8e015481089c5a5b8ea4511e4ce5d3
         with:
-          version: "0.10.166"
+          version-file: scripts/guard-publication/.harn-version
+
+      - name: Install the locked publication adapter
+        working-directory: scripts/guard-publication
+        run: harn install --locked
 
       - name: Propose the qualified record
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: >-
-          harn run --no-sandbox scripts/harn-required-review/qualify-guard.harn --
-          .harn/burin-code "$(git -C .harn/burin-code rev-parse HEAD)" --publish
+        run: |
+          set -euo pipefail
+          revision="$(git -C .harn/burin-code rev-parse HEAD)"
+          harn run --no-sandbox scripts/harn-required-review/qualify-guard.harn -- .harn/burin-code "$revision"
+          if git diff --quiet -- scripts/harn-required-review/qualified-guard.json; then
+            exit 0
+          fi
+          git add -- scripts/harn-required-review/qualified-guard.json
+          base="$(git rev-parse HEAD)"
+          cd scripts/guard-publication
+          harn run --no-sandbox publish.harn -- "$GITHUB_WORKSPACE" "$base" "$revision"
