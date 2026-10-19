@@ -1,0 +1,143 @@
+import { QUALIFIED_GUARD_PATH } from "../harn-required-review/launch-profile.harn"
+import { QUALIFY_BRANCH } from "../harn-required-review/qualify-guard.harn"
+import { commit_record } from "./publish"
+
+const API = "https://api.github.test"
+
+const COMMIT = "b" * 40
+
+fn git(harness: Harness, root: string, args: list<string>) -> string {
+  const result = harness.process.run(
+    {program: "git", args: args, cwd: root, env: {}, stdin: "", timeout_ms: 10000},
+  )
+  if !result.success {
+    throw "fixture git failed: ${result.stderr}"
+  }
+  return trim(to_string(result.stdout))
+}
+
+fn fixture(harness: Harness) -> {root: string, base: string} {
+  const root = harness.fs.mkdtemp_in_workspace("guard-publication-")
+  git(harness, root, ["init", "-q", "-b", "main"])
+  git(harness, root, ["config", "user.name", "Guard fixture"])
+  git(harness, root, ["config", "user.email", "guard@example.test"])
+  git(harness, root, ["config", "commit.gpgsign", "false"])
+  git(harness, root, ["config", "gc.auto", "0"])
+  harness.fs.mkdir(path_join(root, "scripts/harn-required-review"), true)
+  harness.fs.write_text(path_join(root, QUALIFIED_GUARD_PATH), "old\n")
+  harness.fs.write_text(path_join(root, "other"), "old\n")
+  git(harness, root, ["add", "-A"])
+  git(harness, root, ["commit", "-qm", "base"])
+  const base = git(harness, root, ["rev-parse", "HEAD"])
+  harness.fs.write_text(path_join(root, QUALIFIED_GUARD_PATH), "selected\n")
+  git(harness, root, ["add", "--", QUALIFIED_GUARD_PATH])
+  harness.fs.write_text(path_join(root, QUALIFIED_GUARD_PATH), "unselected\n")
+  return {root: root, base: base}
+}
+
+fn answer(harness: Harness, base: string, signed: bool) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    "${API}/repos/burin-labs/.github/git/ref/heads/${QUALIFY_BRANCH}",
+    {
+      status: 200,
+      body: json_stringify(
+        {ref: "refs/heads/${QUALIFY_BRANCH}", object: {sha: base, type: "commit"}},
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "POST",
+    "${API}/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            createCommitOnBranch: {
+              commit: {
+                oid: COMMIT,
+                url: "https://github.com/burin-labs/.github/commit/${COMMIT}",
+                signature: {
+                  isValid: signed,
+                  wasSignedByGitHub: signed,
+                  state: signed ? "VALID" : "UNSIGNED",
+                },
+              },
+              ref: {name: QUALIFY_BRANCH, target: {oid: COMMIT}},
+            },
+          },
+        },
+      ),
+    },
+  )
+}
+
+fn publish(harness: Harness, root: string, base: string) -> any {
+  return commit_record(
+    harness,
+    root,
+    base,
+    "c" * 40,
+    {api_base_url: API, installation_token: "fixture-token"},
+  )
+}
+
+pipeline test_selected_record_and_caller_identity(harness: Harness) {
+  const fixture = fixture(harness)
+  const before = git(harness, fixture.root, ["status", "--porcelain=v1"])
+    + git(harness, fixture.root, ["ls-files", "-s"])
+  answer(harness, fixture.base, true)
+  const receipt = unwrap(publish(harness, fixture.root, fixture.base))
+  assert_eq(receipt.committed, true)
+  assert_eq(receipt.commit_oid, COMMIT)
+  assert_eq(len(receipt.changes), 1)
+  assert_eq(
+    receipt.changes[0].blob_oid,
+    git(harness, fixture.root, ["rev-parse", ":${QUALIFIED_GUARD_PATH}"]),
+  )
+  const calls = harness.testing.http_mock_calls()
+  assert_eq(len(calls), 2)
+  const payload: {
+    variables: {
+      input: {
+        expectedHeadOid: string,
+        fileChanges: {additions: list<{path: string, contents: string}>},
+      },
+    },
+  } = json_parse(to_string(calls[1].body))
+  assert_eq(payload.variables.input.expectedHeadOid, fixture.base)
+  assert_eq(
+    payload.variables.input.fileChanges.additions,
+    [{path: QUALIFIED_GUARD_PATH, contents: base64_encode("selected\n")}],
+  )
+  assert_eq(
+    git(harness, fixture.root, ["status", "--porcelain=v1"])
+      + git(harness, fixture.root, ["ls-files", "-s"]),
+    before,
+  )
+  assert_eq(harness.fs.read_text(path_join(fixture.root, QUALIFIED_GUARD_PATH)), "unselected\n")
+}
+
+pipeline test_stale_signature_and_unsupported_selection_refuse(harness: Harness) {
+  const fixture = fixture(harness)
+  answer(harness, COMMIT, true)
+  assert(is_err(publish(harness, fixture.root, fixture.base)))
+  assert_eq(len(harness.testing.http_mock_calls()), 1)
+  answer(harness, fixture.base, false)
+  assert(is_err(publish(harness, fixture.root, fixture.base)))
+  assert_eq(len(harness.testing.http_mock_calls()), 2)
+  answer(harness, fixture.base, true)
+  git(harness, fixture.root, ["update-index", "--chmod=+x", QUALIFIED_GUARD_PATH])
+  assert(is_err(publish(harness, fixture.root, fixture.base)))
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+  git(harness, fixture.root, ["update-index", "--chmod=-x", QUALIFIED_GUARD_PATH])
+  harness.fs.write_text(path_join(fixture.root, "other"), "selected other\n")
+  git(harness, fixture.root, ["add", "other"])
+  assert(is_err(publish(harness, fixture.root, fixture.base)))
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+  git(harness, fixture.root, ["reset", "-q", "HEAD", "--", "."])
+  assert(is_err(publish(harness, fixture.root, fixture.base)))
+  assert_eq(len(harness.testing.http_mock_calls()), 0, "measured empty selection refuses")
+}

@@ -233,6 +233,12 @@ jobs:
           version: "0.10.170"
       - name: Test Dependabot configuration owner
         run: harn test scripts/dependabot-config
+      - name: Test released guard publication adapter
+        working-directory: scripts/guard-publication
+        run: |
+          harn install --locked
+          harn check publish.harn publish_test.harn
+          harn test publish_test.harn
       # Dogfooding: every repo that wires this action inherits whatever this
       # repo proves about it. Gated on the pull_request event because
       # merge_group and push carry no pull request number.

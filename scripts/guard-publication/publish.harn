@@ -1,0 +1,84 @@
+import { QUALIFIED_GUARD_PATH } from "../harn-required-review/launch-profile.harn"
+import { QUALIFY_BRANCH, publish } from "../harn-required-review/qualify-guard.harn"
+import { live_github } from "../merge-override/github.harn"
+import {
+  GithubClientOptions,
+  GithubConnectorResult,
+  GithubWorktreeCommitReceipt,
+  github_commit_worktree,
+  github_worktree_delta,
+} from "harn-github-connector/worktree"
+
+pub fn commit_record(
+  harness: Harness,
+  root: string,
+  base: string,
+  revision: string,
+  options: GithubClientOptions,
+) -> GithubConnectorResult<GithubWorktreeCommitReceipt> {
+  const delta = github_worktree_delta(
+    harness.process,
+    {repo_dir: root, source: "index", base_oid: base},
+  )
+  if is_err(delta) {
+    return Err(unwrap_err(delta))
+  }
+  const selected = unwrap(delta)
+  if len(selected.changes) != 1 || selected.changes[0]?.path != QUALIFIED_GUARD_PATH
+    || selected.changes[0]?.status != "modified" {
+    return Err(
+      {
+        code: "invalid_guard_selection",
+        category: "validation",
+        message: "qualification requires exactly the modified guard record in the selected index",
+      },
+    )
+  }
+  return github_commit_worktree(
+    harness,
+    {
+      owner: "burin-labs",
+      repo: ".github",
+      branch: QUALIFY_BRANCH,
+      headline: "Qualify the GitHub budget guard from burin-code ${revision[0:12]}",
+      repo_dir: root,
+      source: "index",
+      base_oid: base,
+      create_branch: true,
+      reset_branch: false,
+      options: options,
+    },
+  )
+}
+
+fn main(harness: Harness) {
+  if len(argv) != 3 {
+    throw "usage: publish.harn -- <checkout> <base oid> <burin-code revision>"
+  }
+  const token = trim(harness.env.get("GH_TOKEN") ?? "")
+  if token == "" {
+    throw "GH_TOKEN is required to publish"
+  }
+  const github = live_github(
+    pick(harness, ["fs", "tools"]),
+    token,
+    harness.fs.mkdtemp_in_workspace("guard-publication-gh-"),
+  )
+  const receipt = publish(
+    github,
+    argv[2],
+    fn() {
+      const result = commit_record(harness, argv[0], argv[1], argv[2], {installation_token: token})
+      if is_err(result) {
+        const failure = unwrap_err(result)
+        throw "guard publication refused [${failure.code}]: ${failure.message}"
+      }
+      const committed = unwrap(result)
+      if !committed.committed {
+        throw "guard publication produced no signed commit"
+      }
+      return committed.commit_oid
+    },
+  )
+  harness.stdio.println(json_stringify(receipt))
+}
