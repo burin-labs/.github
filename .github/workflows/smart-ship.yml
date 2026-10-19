@@ -102,6 +102,10 @@ jobs:
     # for one that changes nothing.
     if: >-
       !cancelled()
+      && !(github.event_name == 'pull_request_target'
+      && github.event.action == 'labeled'
+      && github.event.label.name == inputs.ship-label
+      && github.event.pull_request.state == 'closed')
       && (!(inputs.owned-runner-tag != ''
       && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository))
       || (github.event_name == 'schedule'

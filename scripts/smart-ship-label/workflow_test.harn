@@ -116,7 +116,8 @@ pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness)
   // The probe and the owned runner are both limited to the private allowlist:
   // a public repository's run must never land on an owned host, whatever it
   // passes.
-  const allowlist = "contains(fromJSON('[\"burin-labs/burin-code\", \"burin-labs/harn-cloud\"]'), github.repository)"
+  const allowlist =
+    "contains(fromJSON('[\"burin-labs/burin-code\", \"burin-labs/harn-cloud\"]'), github.repository)"
   const probe = workflow.jobs.availability["if"]
   assert(probe.starts_with("inputs.owned-runner-tag != '' && contains("), probe)
   const listed = regex_captures(
@@ -271,6 +272,14 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
 pipeline test_the_shared_jobs_own_wake_admission(harness: Harness) {
   const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
   const shipped = jobs.ship["if"]
+  assert(
+    shipped.contains(
+      "&& !(github.event_name == 'pull_request_target' "
+        + "&& github.event.action == 'labeled' "
+        + "&& github.event.label.name == inputs.ship-label "
+        + "&& github.event.pull_request.state == 'closed')",
+    ),
+  )
   const admission = shipped.substring(shipped.index_of("(github.event_name == 'schedule'"))
   // The rule is written once, in the ship job; the probe takes only sweeps.
   assert(!jobs.availability["if"].contains("workflow_run"), jobs.availability["if"])
