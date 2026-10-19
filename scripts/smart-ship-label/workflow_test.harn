@@ -264,6 +264,24 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
   }
 }
 
+pipeline test_repair_evidence_survives_a_failed_attempt_without_uploading_checkouts(
+  harness: Harness,
+) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const archive = named(steps, "Preserve repair transcripts and usage")
+  assert_eq(archive["if"], expression("always() && steps.shepherd.outputs.deferred != ''"))
+  assert_eq(archive.uses, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+  assert(steps.index_of(archive) > steps.index_of(named(steps, "Repair deferred pull requests")))
+  assert_eq(
+    archive["with"].path,
+    expression("runner.temp") + "/ship/*/repair-*.json\n"
+      + expression("runner.temp")
+      + "/ship/*/repair-*.log\n",
+  )
+  assert_eq(archive["with"]["retention-days"], 7)
+  assert_eq(archive["with"]["if-no-files-found"], "warn")
+}
+
 /**
  * Both jobs admit by one rule. Only a finished same-repository CI verdict of a
  * PR, or of a failed merge-queue branch, wakes the shepherd; a passing queue

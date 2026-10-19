@@ -413,3 +413,14 @@ jobs:
             echo "::endgroup::"
           done
           exit $status
+
+      - name: Preserve repair transcripts and usage
+        if: ${{ always() && steps.shepherd.outputs.deferred != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-repairs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ship/*/repair-*.json
+            ${{ runner.temp }}/ship/*/repair-*.log
+          if-no-files-found: warn
+          retention-days: 7
