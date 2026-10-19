@@ -3,8 +3,9 @@
 # A release publishes exactly the files that main CI built and tested at one
 # commit; nothing is rebuilt after testing. The build run uploads each file as
 # a run artifact, attests it, and records its SHA-256 in a candidate manifest
-# (schemas/candidate-manifest.v1.json). This workflow proves that the run passed
-# at the requested commit and that the files are the ones the manifest names,
+# (schemas/candidate-manifest.v1.json). This workflow requires a successful run
+# or Harn's authenticated late-consumer authorization, and proves that the
+# files are the ones the manifest names at the requested commit,
 # then tags that commit and publishes those same files. It never builds and
 # never writes release content: the release body is the manifest's notes file,
 # and checksums or asset indexes are files the run built like any other.
@@ -35,6 +36,7 @@
 #
 # Publishing to package registries is the caller's next job, gated on this
 # one. It reads the files from the release this workflow outputs.
+# See docs/release-completion-authorization.md for the narrow recovery boundary.
 
 name: Promote release
 
@@ -50,8 +52,13 @@ on:
         required: true
         type: string
       tag:
-        description: Release tag to create at sha, as vX.Y.Z. A vX.Y.Z-suffix tag publishes a prerelease that never becomes latest.
+        description: Release tag as vX.Y.Z or package/vX.Y.Z. A version suffix marks a prerelease; namespaced tags never change repository latest.
         required: true
+        type: string
+      original-consumer-context:
+        description: Optional issued context of the original candidate observer that reached its deadline.
+        required: false
+        default: ''
         type: string
     secrets:
       RELEASE_APP_CLIENT_ID:
@@ -60,6 +67,9 @@ on:
       RELEASE_APP_PRIVATE_KEY:
         description: GitHub App private key.
         required: true
+      CONSUMER_CANARY_REPOSITORY:
+        description: Registered consumer repository name, required only for original deadline recovery.
+        required: false
     outputs:
       tag:
         description: The tag the release was published under.
@@ -105,9 +115,38 @@ jobs:
           persist-credentials: false
 
       - name: Set up exact Harn release
-        uses: burin-labs/harn/.github/actions/setup-harn@667a6bb60582e6fcb08abc74621c5fc89fb77703 # bounded release-asset retries
+        uses: burin-labs/harn/.github/actions/setup-harn@68ab397be4c1b7eece1743e0f8824840e05c2fa2 # bounded release-asset retries
         with:
           version: 0.10.133
+
+      - name: Check out the immutable consumer reader
+        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/harn
+          ref: d1b11367b22acd8b9b03ff3db66d43c89a7d0be9
+          path: .harn/promote-release/consumer-reader
+          persist-credentials: false
+
+      - name: Set up the consumer reader runtime
+        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Mint original consumer read authority
+        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        id: consumer-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            harn
+            ${{ secrets.CONSUMER_CANARY_REPOSITORY }}
+          permission-actions: read
+          permission-contents: read
 
       - name: Verify the run and its files
         shell: bash
@@ -117,6 +156,11 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
+          PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
+          PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
+          PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}
+          PROMOTE_CONSUMER_READER: ${{ github.workspace }}/.harn/promote-release/consumer-reader/scripts/ci/consumer-observer-read-decision.mjs
           PROMOTE_TAG: ${{ inputs.tag }}
           PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh
@@ -131,11 +175,15 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           # Publishing re-reads the run immediately before it creates the
           # release (actions read), then creates the release and its tag
-          # (contents write). A release made with the app token, unlike one
+          # (contents write). A certified older target can differ from main's
+          # workflow files, so GitHub also requires workflows write. The app
+          # already grants it; publication does not edit workflow files.
+          # A release made with the app token, unlike one
           # made with the workflow token, starts the workflows that listen
           # for it.
           permission-actions: read
           permission-contents: write
+          permission-workflows: write
 
       - name: Publish the verified files
         id: publish
@@ -146,6 +194,11 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
+          PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
+          PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
+          PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}
+          PROMOTE_CONSUMER_READER: ${{ github.workspace }}/.harn/promote-release/consumer-reader/scripts/ci/consumer-observer-read-decision.mjs
           PROMOTE_TAG: ${{ inputs.tag }}
           PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh

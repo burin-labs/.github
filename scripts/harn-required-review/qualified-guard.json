@@ -1,0 +1,21 @@
+{
+  "guards": [
+    {
+      "gh_budget_py_sha256": "88828628dab14cc514bfe00fede125c1c417ace6ef2169b49e47a1288a26df3f",
+      "gh_sha256": "aff905b8271021d1a474feb64d1e2c4ce44e1666d748ee8c416fe51b43eca508",
+      "revision": "d0bc83f3fb8cb8c6160586d406d8413e049a9366"
+    },
+    {
+      "gh_budget_py_sha256": "4843ec8020b8b23c0ac7d344ec8b7b9fdcf4db5a4c054954c10063f8e1dfa3b5",
+      "gh_sha256": "aff905b8271021d1a474feb64d1e2c4ce44e1666d748ee8c416fe51b43eca508",
+      "revision": "d0334f82f010c6fa8a7b6246820a310476022e19"
+    },
+    {
+      "gh_budget_py_sha256": "efb0c91125ba5359e6af6a4c1b5ef8afc5572c55cfb04011ddd84015a73666c0",
+      "gh_sha256": "cd824da2b906818fcf0033aa5f865f0fcaab635e30338a9ae416db0e568fe315",
+      "revision": "47b6dd1b95bc88aab1a879abf1462a58973b188c"
+    }
+  ],
+  "schema": "burin-labs.gh-budget-qualified-guard.v1",
+  "source": "burin-labs/burin-code"
+}

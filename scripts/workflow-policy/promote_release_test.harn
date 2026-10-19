@@ -14,14 +14,20 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
   const workflow = promote(harness.fs)
   assert_eq(keys(workflow.on), ["workflow_call"])
   const call = workflow.on.workflow_call
-  assert_eq(keys(call.inputs).sorted(), ["run-id", "sha", "tag"])
-  for name in keys(call.inputs) {
+  assert_eq(keys(call.inputs).sorted(), ["original-consumer-context", "run-id", "sha", "tag"])
+  for name in ["run-id", "sha", "tag"] {
     assert_eq(call.inputs[name].required, true)
     assert_eq(call.inputs[name].type, "string")
   }
-  for name in keys(call.secrets) {
+  for name in ["original-consumer-context"] {
+    assert_eq(call.inputs[name].required, false)
+    assert_eq(call.inputs[name].type, "string")
+    assert_eq(call.inputs[name].default, "")
+  }
+  for name in ["RELEASE_APP_CLIENT_ID", "RELEASE_APP_PRIVATE_KEY"] {
     assert_eq(call.secrets[name].required, true)
   }
+  assert_eq(call.secrets.CONSUMER_CANARY_REPOSITORY.required, false)
   assert_eq(call.outputs.tag.value, expression("jobs.promote.outputs.tag"))
   assert_eq(call.outputs["release-url"].value, expression("jobs.promote.outputs.release-url"))
   assert_eq(workflow.permissions, {contents: "read"})
@@ -40,6 +46,9 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "Require called-workflow identity",
       "Check out workflow implementation",
       "Set up exact Harn release",
+      "Check out the immutable consumer reader",
+      "Set up the consumer reader runtime",
+      "Mint original consumer read authority",
       "Verify the run and its files",
       "Mint the release token",
       "Publish the verified files",
@@ -55,9 +64,43 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "persist-credentials": false,
     },
   )
-  const verify = job.steps[3]
-  const token = job.steps[4]
-  const publish = job.steps[5]
+  const reader = job.steps[3]
+  const runtime = job.steps[4]
+  const reader_token = job.steps[5]
+  const verify = job.steps[6]
+  const token = job.steps[7]
+  const publish = job.steps[8]
+  for step in [reader, runtime, reader_token] {
+    assert_eq(
+      step.if,
+      "inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'",
+    )
+  }
+  assert_eq(reader.uses, implementation.uses)
+  assert_eq(
+    reader.with,
+    {
+      repository: "burin-labs/harn",
+      ref: "d1b11367b22acd8b9b03ff3db66d43c89a7d0be9",
+      path: ".harn/promote-release/consumer-reader",
+      "persist-credentials": false,
+    },
+  )
+  assert_eq(runtime.uses, "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020")
+  assert_eq(runtime.with, {"node-version": "22"})
+  assert_eq(reader_token.uses, token.uses)
+  assert_eq(reader_token.id, "consumer-token")
+  assert_eq(
+    reader_token.with,
+    {
+      "client-id": expression("secrets.RELEASE_APP_CLIENT_ID"),
+      "private-key": expression("secrets.RELEASE_APP_PRIVATE_KEY"),
+      owner: expression("github.repository_owner"),
+      repositories: "harn\n" + expression("secrets.CONSUMER_CANARY_REPOSITORY") + "\n",
+      "permission-actions": "read",
+      "permission-contents": "read",
+    },
+  )
   const entry = "bash .harn/promote-release/implementation/scripts/release-promotion/run.sh"
   assert_eq(verify.run, entry)
   assert_eq(publish.run, entry)
@@ -69,17 +112,41 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     "PROMOTE_REPOSITORY",
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
+    "PROMOTE_ORIGINAL_CONSUMER_CONTEXT",
+    "PROMOTE_CONSUMER_TOKEN",
+    "PROMOTE_CONSUMER_REPOSITORY",
+    "PROMOTE_CONSUMER_WORKFLOW",
+    "PROMOTE_CONSUMER_READER",
     "PROMOTE_TAG",
     "PROMOTE_DIRECTORY",
   ] {
     assert_eq(verify.env[name], publish.env[name])
   }
   assert_eq(verify.env.PROMOTE_REPOSITORY, expression("github.repository"))
+  assert_eq(
+    verify.env.PROMOTE_ORIGINAL_CONSUMER_CONTEXT,
+    expression("inputs.original-consumer-context"),
+  )
+  assert_eq(verify.env.PROMOTE_CONSUMER_TOKEN, expression("steps.consumer-token.outputs.token"))
+  assert_eq(
+    verify.env.PROMOTE_CONSUMER_REPOSITORY,
+    expression("github.repository_owner") + "/" + expression("secrets.CONSUMER_CANARY_REPOSITORY"),
+  )
+  assert_eq(verify.env.PROMOTE_CONSUMER_WORKFLOW, expression("vars.CONSUMER_CANARY_WORKFLOW"))
+  assert_eq(
+    verify.env.PROMOTE_CONSUMER_READER,
+    expression("github.workspace")
+      + "/.harn/promote-release/consumer-reader/scripts/ci/consumer-observer-read-decision.mjs",
+  )
   const grants = keys(token["with"]).filter({ key -> key.starts_with("permission-") })
   // Publish mode re-verifies the run with this token before it publishes.
-  assert_eq(grants.sort(), ["permission-actions", "permission-contents"])
+  assert_eq(
+    grants.sorted().to_list(),
+    ["permission-actions", "permission-contents", "permission-workflows"],
+  )
   assert_eq(token["with"]["permission-actions"], "read")
   assert_eq(token["with"]["permission-contents"], "write")
+  assert_eq(token["with"]["permission-workflows"], "write")
   assert_eq(token["with"].repositories, expression("github.event.repository.name"))
   assert_eq(job.outputs.tag, expression("steps.publish.outputs.tag"))
   assert_eq(job.outputs["release-url"], expression("steps.publish.outputs.release-url"))
@@ -95,6 +162,11 @@ pipeline test_promotion_bootstrap_only_dispatches_harn(harness: Harness) {
     "PROMOTE_REPOSITORY",
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
+    "PROMOTE_ORIGINAL_CONSUMER_CONTEXT",
+    "PROMOTE_CONSUMER_TOKEN",
+    "PROMOTE_CONSUMER_REPOSITORY",
+    "PROMOTE_CONSUMER_WORKFLOW",
+    "PROMOTE_CONSUMER_READER",
     "PROMOTE_TAG",
     "PROMOTE_DIRECTORY",
     "GITHUB_OUTPUT",

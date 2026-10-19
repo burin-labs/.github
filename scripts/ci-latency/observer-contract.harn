@@ -1,0 +1,339 @@
+import { BaselineLimits, validate } from "./baseline.harn"
+import { Policy } from "./policy.harn"
+
+pub const OBSERVER_REPOSITORIES: list<string> = [".github", "harn", "burin-code", "harn-cloud"]
+
+pub type ObservedRun = {id: int, created_at: string}
+
+type Window = {count: int, p90_ms: int, max_ms: int}
+
+type ProducerStatus = "healthy" \
+  | "warning" \
+  | "single_window_p90_breach" \
+  | "sustained_p90_breach" \
+  | "hard_max_breach" \
+  | "insufficient_samples"
+
+type Measurement = {
+  schema_version: 2,
+  policy: {
+    repository: string,
+    workflow: string,
+    event: string,
+    topology_epoch: string,
+    full_run_jobs: list<{name: string, match?: "exact" | "prefix"}>,
+    slo: {
+      warning_ms: int,
+      p90_ms: int,
+      hard_max_ms: int,
+      min_samples: int,
+      window_samples: int,
+      regenerated?: unknown,
+    },
+  },
+  qualifying_runs: list<ObservedRun>,
+  wall: {count: int},
+  evaluation: {status: ProducerStatus, ok: bool, current: Window, previous: Window},
+}
+
+pub fn observer_error(repository: string, message: string) -> dict {
+  return {
+    repository: repository,
+    status: "observer_error",
+    evaluation_status: "observer_error",
+    sample_count: 0,
+    breaches: [],
+    error: message,
+    freshness: {status: "unknown"},
+  }
+}
+
+/** Decode a producer result independently of its threshold-related process exit. */
+fn measurement(raw: unknown, policy: Policy) -> Measurement {
+  if !schema_is(raw, Measurement) {
+    throw "measurement has an incomplete typed contract"
+  }
+  require raw.policy.repository == policy.repository && raw.policy.workflow == policy.workflow
+    && raw.policy.event == policy.event
+    && raw.policy.topology_epoch == policy.topology_epoch
+    && raw.policy.full_run_jobs == policy.full_run_jobs
+    && raw.policy.slo.warning_ms == policy.slo.warning_ms
+    && raw.policy.slo.p90_ms == policy.slo.p90_ms
+    && raw.policy.slo.hard_max_ms == policy.slo.hard_max_ms
+    && raw.policy.slo.min_samples == policy.slo.min_samples
+    && raw.policy.slo.window_samples == policy.slo.window_samples,
+    "measurement policy projection does not match the fetched policy"
+  const expected_ok = ["healthy", "warning", "single_window_p90_breach"].contains(
+    raw.evaluation.status,
+  )
+  require raw.evaluation.ok == expected_ok, "producer verdict contradicts its status"
+  require raw.wall.count == len(raw.qualifying_runs), "wall count differs from qualifying run count"
+  for window in [raw.evaluation.current, raw.evaluation.previous] {
+    require window.count >= 0 && window.p90_ms >= 0 && window.max_ms >= 0,
+      "measurement contains negative window facts"
+  }
+  require len(raw.qualifying_runs) > 0 || raw.evaluation.status == "insufficient_samples",
+    "zero qualifying runs cannot carry a non-pending evaluation"
+  let ids: list<int> = []
+  for run in raw.qualifying_runs {
+    require run.id > 0 && !ids.contains(run.id),
+      "qualifying run identities are invalid or duplicated"
+    const _ = date_parse(run.created_at)
+    ids = ids + [run.id]
+  }
+  return raw
+}
+
+pub fn newest_run(runs: list<ObservedRun>) -> ObservedRun? {
+  return runs.sort_by(fn(run) { return [date_parse(run.created_at), run.id] }).reversed()[0]
+}
+
+fn target_debt(current: Window, policy: Policy) -> list<dict> {
+  let debt: list<dict> = []
+  for entry in [
+    {metric: "evaluation.current.p90_ms", observed: current.p90_ms, target: policy.slo.p90_ms},
+    {metric: "evaluation.current.max_ms", observed: current.max_ms, target: policy.slo.hard_max_ms},
+  ] {
+    if entry.observed >= entry.target {
+      debt = debt
+        + [
+          {
+            metric: entry.metric,
+            observed_ms: entry.observed,
+            target_ms: entry.target,
+            gap_ms: entry.observed - entry.target,
+            sample_count: current.count,
+          },
+        ]
+    }
+  }
+  return debt
+}
+
+fn freshness_failure(
+  expected: ObservedRun?,
+  observed: ObservedRun?,
+  probe_error: string?,
+) -> dict? {
+  if probe_error != nil {
+    return {status: "observer_error", error: probe_error, freshness_status: "unknown"}
+  }
+  if expected == nil && observed != nil {
+    return {
+      status: "observer_error",
+      error: "independent freshness probe found no successful full-coverage run",
+      freshness_status: "unknown",
+    }
+  }
+  if expected != nil && expected.id != observed?.id {
+    return {
+      status: "stale",
+      error: "latest successful full-coverage run is absent from the measured window",
+      freshness_status: "stale",
+    }
+  }
+  return nil
+}
+
+/** Classify freshness, target debt, and measured regression without parallel baseline policy. */
+pub fn classify_observation(
+  raw: unknown,
+  policy: Policy,
+  expected: ObservedRun?,
+  probe_error: string? = nil,
+) -> dict {
+  try {
+    const report = measurement(raw, policy)
+    const observed = newest_run(report.qualifying_runs)
+    const freshness = {
+      status: observed == nil ? "absent" : "current",
+      expected_run_id: expected?.id,
+      expected_created_at: expected?.created_at,
+      observed_run_id: observed?.id,
+      observed_created_at: observed?.created_at,
+    }
+    const base = {
+      repository: policy.repository,
+      evaluation_status: report.evaluation.status,
+      sample_count: report.wall.count,
+      current_window: report.evaluation.current,
+      previous_window: report.evaluation.previous,
+      thresholds: policy.slo,
+      breaches: [],
+    }
+    const failure = freshness_failure(expected, observed, probe_error)
+    if failure != nil {
+      return base
+        + {
+          status: failure.status,
+          error: failure.error,
+          freshness: freshness + {status: failure.freshness_status},
+        }
+    }
+    const current = report.evaluation.current
+    const previous = report.evaluation.previous
+    let limits: BaselineLimits? = nil
+    if policy.observed_baseline != nil {
+      limits = validate(policy, policy.observed_baseline)
+    }
+    let breaches: list<dict> = []
+    let debt: list<dict> = []
+    let regression_window = nil
+    if limits != nil {
+      const post_count = len(
+        report.qualifying_runs.filter(
+          { run -> date_parse(run.created_at) > date_parse(limits.sampled_at) },
+        ),
+      )
+      const required = policy.slo.window_samples * 2
+      regression_window = {
+        post_baseline_sample_count: post_count,
+        required_sample_count: required,
+        p90_status: post_count >= required ? "enforcing" : "warming",
+      }
+      if post_count >= required && current.p90_ms >= limits.p90_regression_limit_ms
+        && previous.p90_ms >= limits.p90_regression_limit_ms {
+        breaches = breaches
+          + [
+            {
+              metric: "evaluation.current.p90_ms",
+              observed_ms: current.p90_ms,
+              threshold_ms: limits.p90_regression_limit_ms,
+              sample_count: current.count,
+            },
+            {
+              metric: "evaluation.previous.p90_ms",
+              observed_ms: previous.p90_ms,
+              threshold_ms: limits.p90_regression_limit_ms,
+              sample_count: previous.count,
+            },
+          ]
+      }
+      if current.max_ms >= limits.max_regression_limit_ms {
+        breaches = breaches
+          + [
+            {
+              metric: "evaluation.current.max_ms",
+              observed_ms: current.max_ms,
+              threshold_ms: limits.max_regression_limit_ms,
+              sample_count: current.count,
+            },
+          ]
+      }
+      debt = target_debt(current, policy)
+    } else if !report.evaluation.ok && report.evaluation.status != "insufficient_samples" {
+      if current.p90_ms >= policy.slo.p90_ms {
+        breaches = breaches
+          + [
+            {
+              metric: "evaluation.current.p90_ms",
+              observed_ms: current.p90_ms,
+              threshold_ms: policy.slo.p90_ms,
+              sample_count: current.count,
+            },
+          ]
+      }
+      if report.evaluation.status == "sustained_p90_breach"
+        && previous.p90_ms >= policy.slo.p90_ms {
+        breaches = breaches
+          + [
+            {
+              metric: "evaluation.previous.p90_ms",
+              observed_ms: previous.p90_ms,
+              threshold_ms: policy.slo.p90_ms,
+              sample_count: previous.count,
+            },
+          ]
+      }
+      if current.max_ms >= policy.slo.hard_max_ms {
+        breaches = breaches
+          + [
+            {
+              metric: "evaluation.current.max_ms",
+              observed_ms: current.max_ms,
+              threshold_ms: policy.slo.hard_max_ms,
+              sample_count: current.count,
+            },
+          ]
+      }
+    }
+    const status = if report.evaluation.status == "insufficient_samples" {
+      "insufficient_samples"
+    } else if len(breaches) > 0 || (limits == nil && !report.evaluation.ok) {
+      "policy_breach"
+    } else if len(debt) > 0 {
+      "target_debt"
+    } else if ["warning", "single_window_p90_breach"].contains(
+      report.evaluation.status,
+    ) {
+      "policy_warning"
+    } else {
+      "pass"
+    }
+    return base
+      + {
+        status: status,
+        breaches: breaches,
+        target_debt: debt,
+        observed_baseline: limits,
+        regression_window: regression_window,
+        freshness: freshness,
+      }
+  } catch (error) {
+    return observer_error(policy.repository, to_string(error))
+  }
+}
+
+pub fn observation_summary(receipts: list<dict>) -> dict {
+  const expected = OBSERVER_REPOSITORIES.map({ name -> "burin-labs/" + name }).sorted()
+  const observed = receipts.map({ receipt -> to_string(receipt.repository) }).sorted()
+  require observed == expected, "the observer must report every repository exactly once"
+  for receipt in receipts {
+    require [
+      "pass",
+      "policy_warning",
+      "target_debt",
+      "policy_breach",
+      "insufficient_samples",
+      "stale",
+      "observer_error",
+    ]
+      .contains(receipt.status),
+      "observer receipt has an unknown status"
+    require type_of(receipt.sample_count) == "int" && receipt.sample_count >= 0,
+      "observer receipt has no measured sample count"
+  }
+  let summary: dict = {schema_version: 2, repository_count: len(receipts), repositories: receipts}
+  for state in [
+    "pass",
+    "policy_warning",
+    "target_debt",
+    "policy_breach",
+    "insufficient_samples",
+    "stale",
+    "observer_error",
+  ] {
+    const names = receipts.filter({ receipt -> receipt.status == state }).map(
+      { receipt -> receipt.repository },
+    )
+      .sorted()
+    const prefix = match state {
+      "pass" -> { "passing" }
+      "policy_warning" -> { "warning" }
+      "policy_breach" -> { "breaching" }
+      "insufficient_samples" -> { "pending" }
+      _ -> { state }
+    }
+    const count_prefix = state == "policy_breach" ? "breach" : prefix
+    summary = summary + {[count_prefix + "_count"]: len(names), [prefix + "_repositories"]: names}
+  }
+  return summary
+}
+
+pub fn observation_succeeded(receipts: list<dict>) -> bool {
+  const summary = observation_summary(receipts)
+  return summary.repository_count == len(OBSERVER_REPOSITORIES)
+    && receipts.all(
+      { receipt -> ["pass", "policy_warning", "target_debt"].contains(receipt.status) },
+    )
+}

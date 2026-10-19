@@ -1,0 +1,283 @@
+import { compare_release } from "std/semver"
+import { swift_dependencies } from "./swift_bounds"
+pub import { BoundedDependency } from "./types"
+
+type Ceiling = {version: string, inclusive: bool}
+
+type Strings = list<string>
+
+type UnknownRows = list<unknown>
+
+type JsonObject = dict
+
+type Text = string
+
+fn object(value: unknown) -> dict {
+  return schema_expect(value, schema_of(JsonObject))
+}
+
+fn version(value: string) -> string {
+  const text = regex_replace(r"^v", "", trim(value))
+  require regex_match(r"^[0-9]+(?:\.[0-9]+){0,2}(?:-[0-9A-Za-z.-]+)?$", text) != nil,
+    "unsupported dependency bound version: ${value}"
+  const pieces = text.split("-")
+  const first = pieces[0]
+  require first != nil, "missing dependency version"
+  let core = first.split(".")
+  while len(core) < 3 {
+    core = core + ["0"]
+  }
+  return core.join(".") + (len(pieces) > 1 ? "-${pieces.slice(1).join("-")}" : "")
+}
+
+fn tighter(left: Ceiling?, right: Ceiling) -> Ceiling {
+  if left == nil {
+    return right
+  }
+  const order = compare_release(left.version, right.version)
+  if order < 0 {
+    return left
+  }
+  if order > 0 {
+    return right
+  }
+  return {version: left.version, inclusive: left.inclusive && right.inclusive}
+}
+
+fn arm_ceiling(arm: string) -> Ceiling? {
+  let found: Ceiling? = nil
+  const normalized = regex_replace(r"(<=|<|~=)\s+", "$1", trim(arm))
+  const matches = regex_captures(r"(?:^|[\s,])(<=|<|~=)([^\s,]+)", normalized)
+  for item in matches {
+    const operator = item.groups[0]
+    const raw = item.groups[1]
+    if operator == "~=" {
+      const parts = raw.split(".")
+      require len(parts) >= 2 && !raw.contains("-"),
+        "unsupported compatible dependency bound: ${arm}"
+      const index = len(parts) == 2 ? 0 : 1
+      const numbers = version(raw).split(".")
+      const increment = to_int(numbers[index])
+      require increment != nil, "invalid compatible dependency bound: ${arm}"
+      const upper = index == 0 ? "${increment + 1}.0.0" : "${numbers[0]}.${increment + 1}.0"
+      found = tighter(found, {version: upper, inclusive: false})
+    } else {
+      found = tighter(found, {version: version(raw), inclusive: operator == "<="})
+    }
+  }
+  require !arm.contains("<") || found != nil, "unsupported dependency upper bound: ${arm}"
+  return found
+}
+
+fn ceiling(requirement: string) -> Ceiling? {
+  let result: Ceiling? = nil
+  for arm in requirement.split("||") {
+    const current = arm_ceiling(arm)
+    // An unbounded alternative makes the union unbounded.
+    if current == nil {
+      return nil
+    }
+    if result == nil || compare_release(current.version, result.version) > 0 {
+      result = current
+    } else if compare_release(current.version, result.version) == 0 {
+      result = {version: current.version, inclusive: result.inclusive || current.inclusive}
+    }
+  }
+  return result
+}
+
+fn dependency(name: string, requirement: string, manifest: string) -> BoundedDependency {
+  return {name: name, bound: ceiling(requirement) == nil ? "" : requirement, manifest: manifest}
+}
+
+fn cargo_dependencies(table: dict, manifest: string) -> list<BoundedDependency> {
+  let result: list<BoundedDependency> = []
+  for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+    if table[section] == nil {
+      continue
+    }
+    const declarations = object(table[section])
+    for alias in keys(declarations).sorted() {
+      const declaration = declarations[alias]
+      if type_of(declaration) == "string" {
+        result = result + [dependency(alias, to_string(declaration), manifest)]
+      } else {
+        const record = object(declaration)
+        const name: string = schema_expect(record.package ?? alias, schema_of(Text))
+        const constraint: string = schema_expect(record.version ?? "", schema_of(Text))
+        result = result + [dependency(name, constraint, manifest)]
+      }
+    }
+  }
+  return result
+}
+
+fn python_dependency(text: string, manifest: string) -> BoundedDependency {
+  const requirement = trim(text.split(";")[0])
+  const parsed = regex_captures(
+    r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[A-Za-z0-9_, .-]+\])?\s*(.*)$",
+    requirement,
+  )
+  require parsed.count == 1, "unsupported direct dependency in ${manifest}: ${text}"
+  const name = regex_replace(r"[-_.]+", "-", parsed[0].groups[0].lower())
+  let constraint = trim(parsed[0].groups[1])
+  if constraint.starts_with("@") {
+    constraint = ""
+  }
+  constraint = regex_replace(r"^\(|\)$", "", constraint)
+  return dependency(name, constraint, manifest)
+}
+
+fn python_list(value: unknown, manifest: string) -> list<BoundedDependency> {
+  const rows: Strings = schema_expect(value, schema_of(Strings))
+  return rows.map({ row -> python_dependency(row, manifest) }).to_list()
+}
+
+fn python_manifest(document: dict, manifest: string) -> list<BoundedDependency> {
+  let result: list<BoundedDependency> = []
+  if document.project != nil {
+    const project = object(document.project)
+    const dynamic: Strings = schema_expect(project.dynamic ?? [], schema_of(Strings))
+    require !dynamic.any({ field -> ["dependencies", "optional-dependencies"].contains(field) }),
+      "Python dependency declarations are dynamic: ${manifest}"
+    if project.dependencies != nil {
+      result = result + python_list(project.dependencies, manifest)
+    }
+    if project["optional-dependencies"] != nil {
+      const groups = object(project["optional-dependencies"])
+      for group in keys(groups).sorted() {
+        result = result + python_list(groups[group], manifest)
+      }
+    }
+  }
+  if document["build-system"] != nil {
+    const build = object(document["build-system"])
+    if build.requires != nil {
+      result = result + python_list(build.requires, manifest)
+    }
+  }
+  if document["dependency-groups"] != nil {
+    const groups = object(document["dependency-groups"])
+    for group in keys(groups).sorted() {
+      const rows: UnknownRows = schema_expect(groups[group], schema_of(UnknownRows))
+      for row in rows {
+        if type_of(row) == "string" {
+          result = result + [python_dependency(to_string(row), manifest)]
+        } else {
+          const include = object(row)
+          const group_name: string = schema_expect(include["include-group"], schema_of(Text))
+          require groups[group_name] != nil, "missing dependency group in ${manifest}"
+        }
+      }
+    }
+  }
+  if document.tool != nil {
+    const tools = object(document.tool)
+    if tools.poetry != nil {
+      throw "Poetry dependency declarations require a supported manifest adapter: ${manifest}"
+    }
+  }
+  return result
+}
+
+pub fn manifest_dependencies(
+  ecosystem: string,
+  manifest: string,
+  text: string,
+  ast: HarnessAst? = nil,
+) -> list<BoundedDependency> {
+  let result: list<BoundedDependency> = []
+  if ecosystem == "swift" {
+    require ast != nil, "Swift manifest discovery requires the structural parser: ${manifest}"
+    return swift_dependencies(ast, manifest, text)
+  } else if ecosystem == "cargo" {
+    const document = object(toml_parse(text))
+    result = cargo_dependencies(document, manifest)
+    if document.workspace != nil {
+      result = result + cargo_dependencies(object(document.workspace), manifest)
+    }
+    if document.target != nil {
+      const targets = object(document.target)
+      for target in keys(targets).sorted() {
+        result = result + cargo_dependencies(object(targets[target]), manifest)
+      }
+    }
+  } else if ecosystem == "npm" {
+    const document = object(json_parse(text))
+    for section in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] {
+      if document[section] == nil {
+        continue
+      }
+      const declarations = object(document[section])
+      for name in keys(declarations).sorted() {
+        const constraint: string = schema_expect(declarations[name], schema_of(Text))
+        require !constraint.starts_with("npm:"),
+          "npm alias dependency identity requires a supported adapter: ${manifest}: ${name}"
+        result = result + [dependency(name, constraint, manifest)]
+      }
+    }
+  } else if ecosystem == "uv" || ecosystem == "pip" {
+    if manifest.ends_with(".txt") || manifest.ends_with(".in") {
+      for line in text.split("\n") {
+        const row = trim(line)
+        if row == "" || row.starts_with("#") {
+          continue
+        }
+        require !row.starts_with("-"),
+          "requirements directives need an owning manifest declaration: ${manifest}: ${row}"
+        result = result + [python_dependency(row, manifest)]
+      }
+      return result
+    }
+    return python_manifest(object(toml_parse(text)), manifest)
+  } else {
+    throw "unsupported dependency manifest ecosystem: ${ecosystem}: ${manifest}"
+  }
+  return result
+}
+
+fn name_matches(pattern: string, name: string) -> bool {
+  require regex_match(r"^[A-Za-z0-9@/_.\-*]+$", pattern) != nil,
+    "unsupported dependency-name pattern: ${pattern}"
+  const literal = regex_replace(r"\.", "\\.", pattern)
+  const expression = regex_replace(r"\*", ".*", literal)
+  return regex_match("^${expression}$", name) != nil
+}
+
+fn ignored_tail(expression: string, cap: Ceiling) -> bool {
+  if trim(expression) == "*" {
+    return true
+  }
+  const matchers = regex_captures(
+    r"^\s*(>=|>)\s*(v?[0-9]+(?:\.[0-9]+){0,2}(?:-[0-9A-Za-z.-]+)?)\s*$",
+    expression,
+  )
+  if matchers.count != 1 {
+    return false
+  }
+  const order = compare_release(version(matchers[0].groups[1]), cap.version)
+  return order < 0 || (order == 0 && (cap.inclusive || matchers[0].groups[0] == ">="))
+}
+
+pub fn ignore_covers(raw: dict, dep: BoundedDependency) -> bool {
+  const name: string = schema_expect(raw["dependency-name"], schema_of(Text))
+  if !name_matches(name, dep.name) {
+    return false
+  }
+  const kinds: Strings = schema_expect(raw["update-types"] ?? [], schema_of(Strings))
+  if len(kinds) > 0
+    && ![
+      "version-update:semver-major",
+      "version-update:semver-minor",
+      "version-update:semver-patch",
+    ]
+      .all({ kind -> kinds.contains(kind) }) {
+    return false
+  }
+  const versions: Strings = schema_expect(raw.versions ?? [], schema_of(Strings))
+  if len(versions) == 0 {
+    return true
+  }
+  const cap = ceiling(dep.bound)
+  return cap != nil && versions.any({ expression -> ignored_tail(expression, cap) })
+}

@@ -1,0 +1,411 @@
+name: Smart Ship
+
+# Reusable: one look at each pull request labeled for shipping, then exit.
+# Callers subscribe to the GitHub events and pass every one through; this
+# workflow alone decides which wake the shepherd, so a wake that cannot change
+# anything never starts a billed job. See burin-labs/burin-code
+# docs/design/smart-ship.md. Memory and history live in a comment on the PR.
+# This lives in the org repo because burin-code is private and a public
+# repository cannot call a private repository's workflows.
+
+on:
+  workflow_call:
+    inputs:
+      burin-ref:
+        description: burin-code ref whose Smart Ship scripts run.
+        type: string
+        default: main
+      ship-label:
+        description: Label that hands a pull request to Smart Ship.
+        type: string
+        default: ship
+      repair:
+        description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
+        type: boolean
+        default: true
+      owned-runner-tag:
+        description: >-
+          Label of an owned Linux runner pool. A sweep runs on it when the
+          availability probe finds one of its runners online, idle or busy; a
+          wake about one PR runs on it without a probe. Empty keeps the hosted
+          runner and skips the probe. Honored only for the private repositories
+          listed at the probe: a public caller always runs on the free hosted
+          runner, so no owned host runs on behalf of a public repository.
+        type: string
+        default: ""
+      runner-groups:
+        description: Runner groups the availability probe reads for the owned pool.
+        type: string
+        default: Default
+      minimum-online:
+        description: Online runners the probe requires in a shared pool.
+        type: number
+        default: 1
+      minimum-online-by-pool:
+        description: JSON object of per-pool online minimums for the probe.
+        type: string
+        default: "{}"
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        required: true
+      OPENAI_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Whether the owned pool has a runner online, read only by a sweep of a
+  # private caller that named one. A sweep recovers every missed wake, so it must
+  # start even when the pool is down: it probes and runs hosted when no runner is
+  # online. A wake about one PR skips the probe and goes to the owned pool, which
+  # saves the probe's hosted minute (a private repository bills every hosted job at
+  # least one); the sweep's stale-wake step bounds a pool that went down since the
+  # last sweep.
+  availability:
+    if: >-
+      inputs.owned-runner-tag != ''
+      && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository)
+      && (github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == ''))
+    uses: burin-labs/.github/.github/workflows/runner-availability.yml@cd5b9a60ece73b7dcb5923963b86ca7b570cfdad
+    with:
+      runner_groups: ${{ inputs.runner-groups }}
+      minimum_online: ${{ inputs.minimum-online }}
+      minimum_online_by_pool: ${{ inputs.minimum-online-by-pool }}
+      linux_probe_runner_tag: ${{ inputs.owned-runner-tag }}
+    secrets:
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+  ship:
+    needs: [availability]
+    # The wake admission rule, written once (burin-code
+    # scripts/tests/test-smart-ship-wake.ts):
+    #
+    # - A sweep (schedule) or a dispatch always runs. A dispatch naming `pr`
+    #   looks at that PR only.
+    # - A PR event wakes only for a PR carrying the label, or one that just lost
+    #   it. Two post-merge echoes change nothing and stay asleep: the queue
+    #   removal of a PR that is already closed (its `closed` event is the wake),
+    #   and a bot taking the label off a closed PR, which is the shepherd
+    #   finishing its own watch. A person unlabeling a merged PR still wakes it.
+    # - A CI completion (workflow_run) wakes only for a finished,
+    #   same-repository run with a verdict, of a pull request or of a failed
+    #   merge-queue branch. A passing queue run merges its PRs and their
+    #   `closed` events wake them. A default-branch push names no PR, so it would
+    #   only repeat the 15-minute sweep.
+    #
+    # A caller without an owned pool runs on every wake; the shepherd does nothing
+    # for one that changes nothing.
+    if: >-
+      !cancelled()
+      && (!(inputs.owned-runner-tag != ''
+      && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository))
+      || (github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
+      && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
+      || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
+      && !(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')
+      && !(github.event.action == 'unlabeled' && github.event.pull_request.state == 'closed'
+      && github.event.sender.type == 'Bot'))
+      || (github.event_name == 'workflow_run'
+      && github.event.action == 'completed'
+      && github.event.workflow_run.id > 0
+      && github.event.workflow_run.status == 'completed'
+      && contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
+      && github.event.workflow_run.repository.full_name == github.repository
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.head_sha != ''
+      && github.event.workflow_run.head_branch != ''
+      && github.event.repository.default_branch != ''
+      && ((github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.pull_requests[0].number > 0)
+      || (github.event.workflow_run.event == 'merge_group'
+      && github.event.workflow_run.conclusion != 'success'
+      && startsWith(github.event.workflow_run.head_branch,
+      format('gh-readonly-queue/{0}/', github.event.repository.default_branch)))))))
+
+    # A run woken by an event about one PR queues behind earlier runs for that
+    # PR, and a CI completion (workflow_run) or a dispatch naming a PR counts as
+    # one for that PR, or for its merge-queue branch. Every other run (schedule,
+    # plain dispatch) is a sweep and queues behind earlier sweeps. GitHub keeps one pending run per
+    # group and a newer one replaces it, so with one group per repository the
+    # PR events replaced the sweeps meant to recover them. Now an event cancels
+    # only an older pending run for its own PR, and a sweep only an older
+    # pending sweep, which the replacing sweep covers. A sweep and an event run
+    # can still be live together, so the shepherd itself keeps one actor per
+    # PR: before acting, a run lists the caller workflow's unfinished runs and
+    # leaves the PR to an earlier one that covers it (burin-code
+    # scripts/lib/ship/github.harn `single_actor`).
+    concurrency:
+      group: >-
+        smart-ship-${{ github.repository }}-${{ (github.event.pull_request.number
+        || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr)
+        && format('pr-{0}', github.event.pull_request.number
+        || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr)
+        || github.event.workflow_run.head_branch
+        && format('run-{0}', github.event.workflow_run.head_branch) || 'sweep' }}
+      cancel-in-progress: false
+    # A private caller that named an owned pool runs on it. A sweep probed the
+    # pool and needs a runner online; a wake about one PR is not probed and goes
+    # straight there, unless a kill switch retires the pool. The light pool
+    # shares its machines with long CI builds, so it is often full, and falling
+    # back then billed a hosted look on top of the probe's minute (24 of 62
+    # looks on 2026-10-17); a light-labelled job queued on that full pool started
+    # within three minutes. Anything else runs hosted.
+    runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    steps:
+      - name: Mint the release app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }},burin-code
+
+      - name: Check out Smart Ship
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/burin-code
+          ref: ${{ inputs.burin-ref }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+
+      - name: Fetch Harn
+        uses: ./.github/actions/fetch-harn
+        with:
+          github-token: ${{ github.token }}
+          # One script runs per look; precompiling every pipeline costs minutes.
+          precompile: "false"
+
+      - name: Check out the Smart Ship control policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/.github
+          # Repository-qualified source, checked by the typed control policy.
+          # github.workflow_sha identifies the caller, not this org repository.
+          ref: df9c75308b05be787532b0d2a827e0ae8a61c095
+          path: .smart-ship-runner
+          persist-credentials: false
+
+      - name: Reconcile the Smart Ship control label
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          ./scripts/harnw run --no-sandbox \
+            .smart-ship-runner/scripts/smart-ship-label/cli.harn -- \
+            --repo "$REPO" \
+            --label "${{ inputs.ship-label }}" \
+            --registry .smart-ship-runner/.github/labels.yml
+
+      # A wake sent to the owned pool without a probe waits there if the pool
+      # went down or stalled since the last sweep, and a queued run that has not
+      # published its targets blocks every other run's look (`single_actor`).
+      # The sweep looks at every labeled PR, so it cancels what has queued past
+      # any normal wait and acts itself.
+      - name: Cancel stale queued Smart Ship runs
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '') }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          workflow="${WORKFLOW_REF#*/.github/workflows/}"
+          workflow="${workflow%%@*}"
+          cutoff="$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          stale="$(gh run list -R "$REPO" --workflow "$workflow" --status queued --limit 100 \
+            --json databaseId,createdAt --jq ".[] | select(.createdAt < \"$cutoff\" and .databaseId != $RUN_ID) | .databaseId")"
+          for id in $stale; do
+            if gh run cancel "$id" -R "$REPO"; then
+              echo "::notice::cancelled run $id, queued since before $cutoff"
+            else
+              echo "::warning::could not cancel stale queued run $id; it may block other looks"
+            fi
+          done
+
+      - name: Let git use the app token
+        uses: ./.github/actions/github-token-git-auth
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Find the pull requests to look at
+        id: prs
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ inputs.ship-label }}
+        run: |
+          set -euo pipefail
+          event="$GITHUB_EVENT_PATH"
+          numbers="$(jq -r '
+            (.pull_request.number // empty),
+            (.workflow_run.pull_requests[]?.number // empty),
+            ((.inputs.pr // "") | tostring | select(test("^[1-9][0-9]*$"))),
+            ((.workflow_run.head_branch // "") | (capture("^gh-readonly-queue/[^/]+/pr-(?<n>[0-9]+)-").n)?),
+            ((.merge_group.head_ref // "") | (capture("/pr-(?<n>[0-9]+)-").n)?)
+          ' "$event" | sort -u)"
+          # A sweep, or an event that names no PR, looks at every labeled one,
+          # plus labeled PRs merged in the last two days: release watch follows
+          # a merged change until its deploy is confirmed healthy.
+          if [ -z "$numbers" ]; then
+            since="$(date -u -d '2 days ago' +%Y-%m-%d)"
+            # Each assignment must succeed in this shell. Combining requests
+            # inside one substitution can hide a failed first census.
+            open_numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number')"
+            merged_numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state merged --search "merged:>=$since" \
+              --json number --jq '.[].number')"
+            numbers="$(printf '%s\n' "$open_numbers" "$merged_numbers" | sort -u)"
+          fi
+          echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
+          echo "Looking at: ${numbers:-none}"
+
+      - name: Check out the Smart Ship target publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 91ad5a4b9c7fe58823e1433808eda60c5cd48cdb
+          path: .smart-ship-targets
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
+
+      - name: Record the selected pull requests
+        env:
+          NUMBERS: ${{ steps.prs.outputs.numbers }}
+        run: >-
+          ./scripts/harnw run --no-sandbox
+          .smart-ship-targets/scripts/smart-ship-targets/cli.harn --
+          --output "$RUNNER_TEMP/ship-targets/targets.json"
+
+      - name: Publish the selected pull requests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ship-targets/targets.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Shepherd
+        id: shepherd
+        if: steps.prs.outputs.numbers != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          # The bot the token acts as. GitHub reports the shepherd's own queue
+          # removals as `manual`, like a person's; the actor tells them apart.
+          BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ inputs.ship-label }}
+          NUMBERS: ${{ steps.prs.outputs.numbers }}
+          REPAIR: ${{ inputs.repair }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          # The calling repository's checked-in policy, read from its default
+          # branch so a pull request cannot rewrite the rules it is judged by.
+          policy="$RUNNER_TEMP/ship.toml"
+          ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn -- \
+            "$REPO" "$DEFAULT_BRANCH" "$policy" || exit $?
+          rm -rf -- "$GITHUB_WORKSPACE/.smart-ship-runner"
+          echo "policy=$policy" >> "$GITHUB_OUTPUT"
+          extra=()
+          if [ "$REPAIR" != "true" ]; then
+            extra+=(--no-repair)
+          fi
+          # Every PR gets its look first. With --defer-repair the shepherd
+          # changes nothing and exits 3 when its next action is a repair; those
+          # PRs are repaired after every look, by the steps below. A sweep that
+          # repaired inline never reached the PRs after it, and the repair
+          # tooling costs about 40 seconds that a look never needs.
+          status=0
+          deferred=()
+          for n in $NUMBERS; do
+            echo "::group::$REPO#$n"
+            rc=0
+            ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
+              --pr "$REPO#$n" --state github --ship-label "$LABEL" \
+              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" "${extra[@]}" --defer-repair || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -eq 3 ]; then
+              deferred+=("$n")
+            elif [ "$rc" -ne 0 ]; then
+              status=1
+            fi
+          done
+          echo "deferred=${deferred[*]}" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      # Repair tooling, set up only when a look deferred a repair.
+      - name: Download the PR agent
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          # The newest burin binary CI built from main or the merge queue.
+          id="$(gh api "repos/burin-labs/burin-code/actions/artifacts?name=burin-linux&per_page=50" \
+            --jq '[.artifacts[] | select(.expired | not)
+                   | select(.workflow_run.head_branch == "main"
+                            or (.workflow_run.head_branch | startswith("gh-readonly-queue/main/")))][0].id')"
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::warning::no burin-linux artifact from main; repairs will hand back"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/burin-bin"
+          gh api "repos/burin-labs/burin-code/actions/artifacts/$id/zip" > "$RUNNER_TEMP/burin.zip"
+          unzip -q -o "$RUNNER_TEMP/burin.zip" -d "$RUNNER_TEMP/burin-bin"
+          chmod +x "$RUNNER_TEMP/burin-bin/burin"
+          echo "BURIN_HEADLESS_BIN=$RUNNER_TEMP/burin-bin/burin" >> "$GITHUB_ENV"
+
+      # A repair worktree runs its repository's own setup, which needs
+      # burin-code's pinned Node and pnpm.
+      - name: Set up Node
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Set up the repair package manager
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          # Read the checked-out packageManager pin; repair worktrees own
+          # dependency installation through their repository setup policy.
+          run_install: false
+          # Owned runners share a home directory, but each job owns its temp directory.
+          dest: ${{ runner.temp }}/smart-ship-pnpm
+
+      - name: Repair deferred pull requests
+        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ inputs.ship-label }}
+          DEFERRED: ${{ steps.shepherd.outputs.deferred }}
+          POLICY: ${{ steps.shepherd.outputs.policy }}
+        run: |
+          set -uo pipefail
+          git config --global user.name "harn-release-bot[bot]"
+          git config --global user.email "harn-release-bot[bot]@users.noreply.github.com"
+          status=0
+          for n in $DEFERRED; do
+            echo "::group::$REPO#$n (repair)"
+            ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
+              --pr "$REPO#$n" --state github --ship-label "$LABEL" \
+              --policy "$POLICY" --ship-root "$RUNNER_TEMP/ship" || status=1
+            echo "::endgroup::"
+          done
+          exit $status

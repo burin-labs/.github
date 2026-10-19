@@ -1,0 +1,194 @@
+import { GitHub } from "../merge-override/github.harn"
+import {
+  QUALIFIED_GUARD_PATH,
+  QUALIFIED_GUARD_SCHEMA,
+  QUALIFIED_GUARD_SOURCE,
+  QualifiedGuard,
+  read_qualified_guards,
+  require_qualified_guard,
+  verify_installed_guard,
+} from "./launch-profile.harn"
+import { QUALIFY_BRANCH, QUALIFY_REPOSITORY, publish, qualify } from "./qualify-guard.harn"
+
+fn refused(action: fn() -> any, reason: string) {
+  const outcome = try {
+    action()
+  } catch (e) {
+    "refused: " + to_string(e)
+  }
+  assert(to_string(outcome).contains(reason), "expected refusal containing: " + reason)
+}
+
+fn revised(index: int, revision: string) -> QualifiedGuard {
+  const digit = to_string(index)
+  return {
+    revision: revision,
+    gh_budget_py_sha256: ("a" + digit) * 32,
+    gh_sha256: ("b" + digit) * 32,
+  }
+}
+
+fn version(index: int) -> QualifiedGuard {
+  return revised(index, to_string(index) * 40)
+}
+
+/** A control home whose installed bundle holds `wrapper` and `entrypoint`. */
+fn control_root(fs: HarnessFs, record: any, wrapper: string, entrypoint: string) -> dict {
+  const root = fs.mkdtemp_in_workspace("qualified-guard-")
+  const bundle = path_join(root, "bundle")
+  fs.mkdir(path_join(root, "scripts/harn-required-review"), true)
+  fs.mkdir(bundle, true)
+  fs.write_text(path_join(root, QUALIFIED_GUARD_PATH), json_stringify(record))
+  fs.write_text(path_join(bundle, "gh_budget.py"), wrapper)
+  fs.write_text(path_join(bundle, "gh"), entrypoint)
+  return {root: root, bundle: bundle}
+}
+
+fn record_of(guards: list) -> dict {
+  return {schema: QUALIFIED_GUARD_SCHEMA, source: QUALIFIED_GUARD_SOURCE, guards: guards}
+}
+
+pipeline test_committed_record_names_a_qualified_version(harness: Harness) {
+  const guards = read_qualified_guards(harness.fs, path_join(harness.fs.cwd(), "../.."))
+  assert(len(guards) >= 1)
+}
+
+pipeline test_installed_bytes_of_any_qualified_version_are_accepted(harness: Harness) {
+  const current = {
+    revision: "1" * 40,
+    gh_budget_py_sha256: sha256("guard v2"),
+    gh_sha256: sha256("entry v2"),
+  }
+  const previous = {
+    revision: "2" * 40,
+    gh_budget_py_sha256: sha256("guard v1"),
+    gh_sha256: sha256("entry v1"),
+  }
+  const record = record_of([current, previous])
+  const newest = control_root(harness.fs, record, "guard v2", "entry v2")
+  require_qualified_guard(harness.fs, newest.root)
+  assert_eq(
+    verify_installed_guard(harness.fs, newest.root, newest.bundle).revision,
+    current.revision,
+  )
+  const older = control_root(harness.fs, record, "guard v1", "entry v1")
+  assert_eq(
+    verify_installed_guard(harness.fs, older.root, older.bundle).revision,
+    previous.revision,
+  )
+  // Negative controls: one changed byte, and two qualified files from different versions.
+  const changed = control_root(harness.fs, record, "guard v2 ", "entry v2")
+  refused(
+    fn() { verify_installed_guard(harness.fs, changed.root, changed.bundle) },
+    "differs from every qualified source",
+  )
+  const mixed = control_root(harness.fs, record, "guard v2", "entry v1")
+  refused(
+    fn() { verify_installed_guard(harness.fs, mixed.root, mixed.bundle) },
+    "entrypoint differs from the qualified source of its guard",
+  )
+}
+
+pipeline test_a_missing_or_malformed_record_refuses_the_grant(harness: Harness) {
+  const good = version(1)
+  for record in [
+    record_of([]),
+    record_of([version(1), version(2), version(3), version(4)]),
+    {schema: "other", source: QUALIFIED_GUARD_SOURCE, guards: [good]},
+    {schema: QUALIFIED_GUARD_SCHEMA, source: "someone/else", guards: [good]},
+    record_of([good + {revision: "main"}]),
+    record_of([good + {gh_sha256: "short"}]),
+    record_of([good + {note: "extra"}]),
+    "not a record",
+  ] {
+    const home = control_root(harness.fs, record, "guard", "entry")
+    refused(
+      fn() { require_qualified_guard(harness.fs, home.root) },
+      "qualified GitHub budget guard",
+    )
+  }
+  const missing = harness.fs.mkdtemp_in_workspace("qualified-guard-missing-")
+  refused(fn() { require_qualified_guard(harness.fs, missing) }, "missing or unreadable")
+}
+
+pipeline test_qualifying_keeps_newest_first_bounded_and_idempotent(harness: Harness) {
+  const first = qualify(nil, version(1))
+  assert_eq(first, record_of([version(1)]))
+  assert_eq(qualify(first, revised(1, "9" * 40)), first)
+  let record = first
+  for index in [2, 3, 4] {
+    record = qualify(record, version(index))
+  }
+  assert_eq(
+    record.guards.map({ entry -> entry.revision }),
+    [version(4).revision, version(3).revision, version(2).revision],
+  )
+  // Reverted bytes move back to the front instead of appearing twice.
+  const reverted = qualify(record, revised(2, "8" * 40))
+  assert_eq(
+    reverted.guards.map({ entry -> entry.revision }),
+    ["8" * 40, version(4).revision, version(3).revision],
+  )
+  refused(fn() { qualify(record, revised(5, "HEAD")) }, "malformed")
+}
+
+/** A GitHub that answers reads from `reads`; `calls()` lists every request. */
+fn fake_github(reads: list, commit_oid: string) -> dict {
+  let calls = []
+  const answer = { path -> reads.filter({ entry -> entry[0] == path }) }
+  const github: GitHub = {
+    read: fn(path) {
+      calls = calls + ["GET " + path]
+      const found = answer(path)
+      if len(found) == 0 {
+        throw "GET " + path + " failed: Not Found"
+      }
+      return found[0][1]
+    },
+    pages: fn(path) { return [] },
+    send: fn(method, path, body) {
+      calls = calls + [method + " " + path + " " + json_stringify(body)]
+      if path == "graphql" {
+        return commit_oid == "" ? {errors: [{message: "head moved"}]} : {
+          data: {createCommitOnBranch: {commit: {oid: commit_oid}}},
+        }
+      }
+      return path.ends_with("/pulls") ? {number: 41} : nil
+    },
+    graphql: fn(_query, _variables) { return nil },
+  }
+  return {
+    github: github,
+    writes: fn() { return calls.filter({ call -> !call.starts_with("GET ") }).to_list() },
+  }
+}
+
+pipeline test_publish_commits_the_record_on_a_branch_cut_from_main_and_ships_it(harness: Harness) {
+  const repo = "repos/" + QUALIFY_REPOSITORY
+  const main_ref = [repo + "/git/ref/heads/main", {object: {sha: "c" * 40}}]
+  const pulls = repo + "/pulls?state=open&base=main&head=burin-labs:" + QUALIFY_BRANCH
+  // First run: no branch, no pull request.
+  const fresh = fake_github([main_ref, [pulls, []]], "d" * 40)
+  assert_eq(
+    publish(fresh.github, "{}\n", "e" * 40),
+    {state: "published", commit: "d" * 40, pull_request: 41},
+  )
+  const writes = fresh.writes()
+  assert(writes[0].starts_with("POST " + repo + "/git/refs "))
+  assert(writes[0].contains("\"sha\":\"" + "c" * 40))
+  assert(writes[1].contains("\"expectedHeadOid\":\"" + "c" * 40))
+  assert(writes[1].contains(base64_encode("{}\n")))
+  assert(writes[2].starts_with("POST " + repo + "/pulls "))
+  assert_eq(writes[3], "POST " + repo + "/issues/41/labels {\"labels\":[\"ship\"]}")
+  // A rerun resets the existing branch to main and reuses the open pull request.
+  const branch = [repo + "/git/ref/heads/" + QUALIFY_BRANCH, {object: {sha: "f" * 40}}]
+  const rerun = fake_github([main_ref, branch, [pulls, [{number: 7}]]], "d" * 40)
+  assert_eq(publish(rerun.github, "{}\n", "e" * 40).pull_request, 7)
+  const rewrites = rerun.writes()
+  assert(rewrites[0].starts_with("PATCH " + repo + "/git/refs/heads/" + QUALIFY_BRANCH))
+  assert(!rewrites.any({ call -> call.starts_with("POST " + repo + "/pulls ") }))
+  // A refused signed commit stops before any pull request or label.
+  const moved = fake_github([main_ref, [pulls, []]], "")
+  refused(fn() { publish(moved.github, "{}\n", "e" * 40) }, "signed commit was not created")
+  assert(!moved.writes().any({ call -> call.contains("/pulls ") || call.contains("/labels") }))
+}

@@ -1,0 +1,44 @@
+name: Automatic review dispatch
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] only trusted base code executes; never checks out a pull request head
+    types: [opened, reopened, ready_for_review, synchronize]
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: Pull request number whose current head should be reviewed.
+        type: string
+        required: true
+      repository:
+        description: Optional same-organization target repository for first-review bootstrap.
+        type: string
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: review-dispatch-${{ inputs.repository || github.repository }}-${{ github.event.pull_request.number || inputs.pull-request }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Request an automatic review
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out trusted dispatcher code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - name: Request a review of the measured head
+        uses: ./.github/actions/review-dispatch
+        with:
+          pull-request: ${{ github.event.pull_request.number || inputs.pull-request }}
+          repository: ${{ github.event_name == 'workflow_dispatch' && inputs.repository || '' }}
+          release-app-client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          release-app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

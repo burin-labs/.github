@@ -1,0 +1,91 @@
+import { assert_error_contains } from "std/testing"
+import { parse_authorization, verify_authorization } from "./authorization.harn"
+
+const SOURCE = "89512fd930c0af99f13f9295d8b236407ad07244"
+
+/**
+ * These controls own request binding only. The pinned shared reader owns
+ * deadline, custody, chronology and reached-product authentication.
+ */
+fn measured() -> dict {
+  return {
+    context: {
+      parent_repository: "burin-labs/harn",
+      parent_run_id: "100",
+      parent_run_attempt: 1,
+      source_revision: SOURCE,
+    },
+    owned: false,
+    deadline: {observed_at: 8200},
+    reading: {product: {verdict: "pass"}},
+  }
+}
+
+pipeline test_original_recovery_binds_the_failed_candidate_request() {
+  const context = json_stringify(measured().context)
+  const authorization = unwrap(parse_authorization(context))
+  let reached = 0
+  verify_authorization(
+    fn(issued: string, source: string) {
+      assert_eq(issued, context)
+      assert_eq(source, SOURCE)
+      reached = reached + 1
+      return measured()
+    },
+    "burin-labs/harn",
+    SOURCE,
+    100,
+    1,
+    authorization,
+  )
+  assert_eq(reached, 1)
+  assert_eq(parse_authorization(""), nil)
+  assert_eq(parse_authorization("  "), nil)
+}
+
+pipeline test_later_promotion_context_cannot_authorize_an_original_failed_candidate() {
+  const context = json_stringify(measured().context)
+  const authorization = unwrap(parse_authorization(context))
+  for request in [
+    {repository: "burin-labs/harn", source: SOURCE, run: 101, attempt: 1},
+    {repository: "burin-labs/harn", source: SOURCE, run: 100, attempt: 2},
+    {
+      repository: "burin-labs/harn",
+      source: "92bbaeb1bed4daf93a8911708246fb8c3cd2c780",
+      run: 100,
+      attempt: 1,
+    },
+  ] {
+    assert_error_contains(
+      fn() { verify_authorization(
+        fn(_issued: string, _source: string) { return measured() },
+        request.repository,
+        request.source,
+        request.run,
+        request.attempt,
+        authorization,
+      ) },
+      "does not bind this producer",
+    )
+  }
+  for decision in [
+    nil,
+    {},
+    measured() + {owned: true},
+    measured() + {deadline: nil},
+    measured() + {reading: {product: nil}},
+    measured() + {reading: {product: {verdict: "fail"}}},
+  ] {
+    assert_error_contains(
+      fn() { verify_authorization(
+        fn(_issued: string, _source: string) { return decision },
+        "burin-labs/harn",
+        SOURCE,
+        100,
+        1,
+        authorization,
+      ) },
+      "does not bind this producer",
+    )
+  }
+}

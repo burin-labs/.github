@@ -1,0 +1,65 @@
+import { GitHub } from "../merge-override/github.harn"
+
+pub type Request = {repository: string, number: int, head_sha: string}
+
+/** A trusted caller may request the first review for another repository in its own organization. */
+pub type Target = {repository: string, owner: string, name: string, cross_repository: bool}
+
+pub fn resolve_target(caller: string, requested: string) -> Target {
+  const repository = trim(requested) == "" ? caller : trim(requested)
+  for value in [caller, repository] {
+    if !regex_match("^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$", value) {
+      throw "invalid review target repository"
+    }
+  }
+  const parts = repository.split("/")
+  const caller_parts = caller.split("/")
+  if lowercase(parts[0]) != lowercase(caller_parts[0]) || [".", ".."].contains(parts[1]) {
+    throw "review target must be a repository in the calling organization"
+  }
+  return {
+    repository: repository,
+    owner: parts[0],
+    name: parts[1],
+    cross_repository: repository != caller,
+  }
+}
+
+/** Refuse unread, closed, fork, draft, and bot-authored heads before minting a token. */
+pub fn resolve(repository: string, number: int, pull: unknown) -> Request? {
+  if !regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repository) || number <= 0 {
+    throw "invalid review request identity"
+  }
+  if type_of(pull) != "dict" || pull?.number != number
+    || pull?.base?.repo?.full_name != repository {
+    throw "review request could not be measured"
+  }
+  if pull?.state != "open" || pull?.draft != false
+    || pull?.head?.repo?.full_name != repository
+    || pull?.user?.type != "User"
+    || trim(pull?.user?.login ?? "") == ""
+    || (pull?.user?.login ?? "").ends_with("[bot]") {
+    return nil
+  }
+  const head = pull?.head?.sha
+  if type_of(head) != "string" || !regex_match("^[0-9a-f]{40}$", head) {
+    throw "review request has no usable head SHA"
+  }
+  return {repository: repository, number: number, head_sha: head}
+}
+
+/** The receiver owns admission, deduplication, and all model spending limits. */
+pub fn dispatch(github: GitHub, request: Request) {
+  github.send(
+    "POST",
+    "repos/burin-labs/burin-code/actions/workflows/burin-review.yml/dispatches",
+    {
+      ref: "main",
+      inputs: {
+        repository: request.repository,
+        pr: to_string(request.number),
+        head_sha: request.head_sha,
+      },
+    },
+  )
+}

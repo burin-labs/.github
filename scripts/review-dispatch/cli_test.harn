@@ -1,0 +1,145 @@
+/** Run the real launcher and private entrypoint on the workflow's pinned runtime. */
+pipeline test_launcher_resolves_and_dispatches_with_its_actual_sandbox_grants(harness: Harness) {
+  const temporary = harness.fs.mkdtemp_in_workspace("review-dispatch-launcher-")
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const fixture = path_join(temporary, "pull.json")
+  const output = path_join(temporary, "github-output")
+  const receipt = path_join(temporary, "request.json")
+  const gh = path_join(temporary, "gh")
+  const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  harness.fs.write_text(
+    gh,
+    "#!/bin/sh\nif [ \"$2\" = \"-X\" ]; then\n"
+      + "test \"$GH_TOKEN\" = public-fixture-dispatch || exit 7\n"
+      + "cat \"$6\" > "
+      + json_stringify(receipt)
+      + "\n"
+      + "else\ntest \"$GH_TOKEN\" = public-fixture-read || exit 7\ncat "
+      + json_stringify(fixture)
+      + "\nfi\n",
+  )
+  assert(harness.process.run({program: "/bin/chmod", args: ["755", gh]}).success)
+  const env = {
+    PATH: temporary + ":" + to_string(harness.env.get("PATH") ?? ""),
+    PR_NUMBER: "184",
+    HEAD_SHA: head,
+    GITHUB_OUTPUT: output,
+    GITHUB_WORKSPACE: root,
+  }
+  for repository in ["burin-labs/.github", "burin-labs/smart-ship-sandbox"] {
+    harness.fs.write_text(
+      fixture,
+      json_stringify(
+        {
+          number: 184,
+          state: "open",
+          draft: false,
+          user: {type: "User", login: "burin-labs-agent"},
+          base: {repo: {full_name: repository, private: true}},
+          head: {sha: head, repo: {full_name: repository}},
+        },
+      ),
+    )
+    harness.fs.write_text(output, "")
+    for phase in ["resolve", "dispatch"] {
+      const result = harness.process.run(
+        {
+          program: "/bin/bash",
+          args: ["scripts/review-dispatch/run.sh", phase],
+          cwd: root,
+          env: env
+            + {
+              TARGET_REPOSITORY: repository,
+              GH_TOKEN: phase == "resolve" ? "public-fixture-read" : "public-fixture-dispatch",
+            },
+          timeout_ms: 30000,
+        },
+      )
+      assert(result.success, phase + ": " + result.stdout + result.stderr)
+    }
+    assert_eq(harness.fs.read_text(output), "eligible=true\nhead_sha=" + head + "\n")
+    assert_eq(
+      json_parse(harness.fs.read_text(receipt)),
+      {ref: "main", inputs: {repository: repository, pr: "184", head_sha: head}},
+    )
+  }
+}
+
+pipeline test_launcher_fails_on_unavailable_target_permission_without_eligible_outputs(
+  harness: Harness,
+) {
+  const temporary = harness.fs.mkdtemp_in_workspace("review-bootstrap-unavailable-")
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const output = path_join(temporary, "github-output")
+  const gh = path_join(temporary, "gh")
+  harness.fs.write_text(output, "")
+  harness.fs.write_text(gh, "#!/bin/sh\necho permission-refused >&2\nexit 1\n")
+  assert(harness.process.run({program: "/bin/chmod", args: ["755", gh]}).success)
+  const result = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: ["scripts/review-dispatch/run.sh", "resolve"],
+      cwd: root,
+      env: {
+        PATH: temporary + ":" + to_string(harness.env.get("PATH") ?? ""),
+        GH_TOKEN: "public-fixture-unavailable",
+        TARGET_REPOSITORY: "burin-labs/smart-ship-sandbox",
+        PR_NUMBER: "22",
+        GITHUB_OUTPUT: output,
+        GITHUB_WORKSPACE: root,
+      },
+      timeout_ms: 30000,
+    },
+  )
+  assert(!result.success)
+  assert_eq(
+    harness.fs.read_text(output),
+    "",
+    "unread target metadata cannot authorize token minting or dispatch",
+  )
+}
+
+pipeline test_launcher_validates_a_cross_repository_target_without_a_credential(harness: Harness) {
+  const temporary = harness.fs.mkdtemp_in_workspace("review-bootstrap-target-")
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const output = path_join(temporary, "github-output")
+  harness.fs.write_text(output, "")
+  const env = {
+    PATH: to_string(harness.env.get("PATH") ?? ""),
+    CALLER_REPOSITORY: "burin-labs/.github",
+    REQUESTED_REPOSITORY: "burin-labs/smart-ship-sandbox",
+    GITHUB_OUTPUT: output,
+    GITHUB_WORKSPACE: root,
+    GH_TOKEN: "",
+  }
+  const result = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: ["scripts/review-dispatch/run.sh", "target"],
+      cwd: root,
+      env: env,
+      timeout_ms: 30000,
+    },
+  )
+  assert(result.success, result.stdout + result.stderr)
+  assert_eq(
+    harness.fs.read_text(output),
+    "repository=burin-labs/smart-ship-sandbox\nowner=burin-labs\nname=smart-ship-sandbox\ncross_repository=true\n",
+  )
+  harness.fs.write_text(output, "")
+  const refused = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: ["scripts/review-dispatch/run.sh", "target"],
+      cwd: root,
+      env: env + {REQUESTED_REPOSITORY: "other-org/project"},
+      timeout_ms: 30000,
+    },
+  )
+  assert(!refused.success)
+  assert_eq(
+    harness.fs.read_text(output),
+    "",
+    "invalid targets must not produce token scope outputs",
+  )
+}

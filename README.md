@@ -27,13 +27,20 @@ contract, local command, and pinned action syntax.
 adapter for branch-only Rust test impact analysis. It reads Cargo's real
 workspace graph, expands directly changed packages through the transitive
 reverse-dependency closure, and emits `full`, `partial`, or `empty` plus Cargo
-package arguments. Merge queues, main pushes, schedules, workflow changes,
+package arguments. Merge queues, main pushes, schedules, declared workflow changes,
 workspace manifests, lockfiles, and unresolved diffs retain the complete
 workspace.
 
 Repositories provide only the Cargo workspace path and genuinely global inputs;
 they do not maintain crate dependency tables. Keep the action pinned to an exact
 commit and pass exact pull-request base/head SHAs.
+
+`workflow-paths` defaults to `.github/workflows` for conservative coverage.
+Replace it with the newline-separated prefixes of workflows that affect Rust
+tests, or pass an explicit empty string when no workflows affect them. Unrelated
+workflow edits can then produce an empty plan. `global-paths` adds other global
+inputs; workspace manifests, lockfiles, `.cargo`, and nextest configuration
+always retain complete coverage.
 
 The planner compares those two exact trees directly. A branch behind its base
 may over-select packages changed on main, but cannot omit a package changed by
@@ -47,40 +54,68 @@ the pull request; this keeps shallow checkouts fast without weakening coverage.
     base: ${{ github.event.pull_request.base.sha || github.sha }}
     head: ${{ github.event.pull_request.head.sha || github.sha }}
     workspace: crates/my-workspace
+    workflow-paths: |
+      .github/workflows/rust.yml
     extra-package-paths: |
       my-api=docs/openapi
 - run: cargo nextest run ${{ steps.rust-impact.outputs.package-args }}
 ```
 
-## Exact-tree CI proof reuse
+## CI job proof reuse
 
-`burin-labs/.github/.github/actions/exact-tree-ci-proof` is the organization-owned
-fail-closed adapter for skipping already-proven jobs on a merge group or landing
-push when the git tree matches the source pull request. Repositories name the
-required jobs and a cache-contract refresh bit; they do not copy the GitHub API
-helpers.
+`burin-labs/.github/.github/actions/ci-job-proof` reuses a passing job when its
+own inputs are unchanged. You give it one sha256 digest per reusable job,
+computed from everything that can change that job's verdict: its definition,
+the jobs it needs, and the files it reads. Every pull request, merge group,
+and main push run registers those digests before any reusable job starts.
 
-Source pull requests produce proof. Merge groups and `main` pushes consume it
-only when every named job concluded `success` (not `skipped`). A
-cache-contract change keeps the push writer running. Restore-only merge
-groups (the default) still reuse: a rebuild there produces nothing.
-Pass `merge-group-writes-cache: "true"` when the merge-group job persists a
-cache, such as a sticky disk. Lookups fail closed.
+A merge group then reuses a job that passed with the same digest in the pull
+request it merges, or in the latest main push. A main push reuses a job that
+passed with the same digest in the merge group at its commit, or in an earlier
+main push. A run that reused a job records the run where that job actually
+executed, and the next run proves the job there. It never accepts a pointer
+alone.
+
+A job counts as passed only when every leg GitHub reports for it succeeded in
+one complete attempt, after that run registered its digests. An unrelated
+failed or cancelled job does not discard the others. The producer must be this
+repository's workflow, completed, with a registration archive whose digest
+matches. Unknown, partial, or unreadable producers prove nothing, so the job
+runs. Lookup reads at most eight runs, with a 40-read budget and a 45-second
+deadline. See the [typed proof owner](scripts/ci-job-proof/contract.harn).
+The [record reference](docs/ci-job-proof-records.md) defines the actual tested
+checkout, the API run head, and the original-run inspection interface.
+
+The [historical reader](scripts/ci-job-proof/history_cli.harn) projects original
+job IDs, run attempts and measured phases for a main run's reused jobs. It
+follows the same qualified registrations, leaves failed or changed evidence
+pending, and never replaces an executed failure. It reads the same consumer
+context variables as the action and accepts the historical run ID and attempt
+as its two arguments. Its JSON output names restored jobs and pending logical
+job IDs.
 
 ```yaml
-- id: rust-proof
-  uses: burin-labs/.github/.github/actions/exact-tree-ci-proof@<full-commit-sha>
+- name: Resolve CI job proof reuse
+  id: job-proof
+  uses: burin-labs/.github/.github/actions/ci-job-proof@<full-commit-sha>
   with:
     workflow-file: ci.yml
-    required-jobs: >-
-      ["Rust TUI fast fmt, clippy & test","Rust TUI harn-linked clippy, test & build"]
-    cache-refresh-required: ${{ steps.filter.outputs.rust_cache_contract }}
-    merge-group-writes-cache: "true"
+    job-identities: ${{ steps.identities.outputs.job_identities }}
+    registrar-job: Detect changes
+    registrar-step: Resolve CI job proof reuse
+    merge-group-head-ref: ${{ github.event.merge_group.head_ref }}
     event-name: ${{ github.event_name }}
-    commit-sha: ${{ github.sha }}
-    event-path: ${{ github.event_path }}
+    commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
     github-token: ${{ github.token }}
 ```
+
+`job-identities` uses schema `burin.ci_job_identity.v1`:
+`{schema, jobs: [{id, names, digest}]}`. `names` lists the job names GitHub
+reports for the job's legs, exact or as an anchored `^...$` pattern for a
+dynamic matrix. `registrar-job` and `registrar-step` must match the job and
+step names GitHub reports. The action returns `reused`, a JSON list of job
+ids; a typed `receipt` path naming where each reused job ran; and `discovery`,
+the lookup reason and read count.
 
 ## Reusable workflows
 
@@ -90,9 +125,17 @@ cache, such as a sticky disk. Lookups fail closed.
 - `.github/workflows/harn-package.yml` checks out a Harn package, installs its
   exact `.harn-version`, runs the Harn-owned package contract, and uploads the
   structured receipts.
+- `.github/workflows/cargo-deny.yml` runs cargo-deny against a Rust
+  workspace's `deny.toml`: security advisories always, plus bans, licenses, and
+  sources unless the caller passes `policy: false` because it keeps those in a
+  required job. The advisories verdict follows the daily RustSec database, so
+  never make it a required check.
 - `.github/workflows/register-package-release.yml` tells the package index that
   a release shipped, so the index reconciles within minutes instead of at the
   next daily run.
+- `.github/workflows/promote-release.yml` publishes the tested files from one
+  successful run. [Package release promotion](docs/promote-package-release.md)
+  keeps a package's version tags separate from the application's latest release.
 
 ## Registering package releases
 
@@ -362,6 +405,16 @@ critical-path allowance or an existing job budget. It also rejects missing or
 stale required-job entries, empty sentinel sets, invalid SLO ordering, and a
 same-topology observed baseline that is removed, tampered with, or loosened.
 
+The baseline read runs before `setup-harn` and requires an existing Node runtime
+with `fetch` and `AbortSignal.timeout`. It retries measured transient HTTP
+statuses at most three times per endpoint, with a 20-second request timeout and
+one 60-second deadline shared by every request and retry delay. A policy read
+that returns 404 requires authenticated commit identity and a complete,
+nonempty immutable tree census before the action treats the policy as absent.
+Permanent errors, truncated bodies, and unmeasured results fail the action.
+Only a complete policy body is published, by atomic replacement; the existing
+checker remains the owner of all budget rules.
+
 Runtime measurement belongs off the pull-request path. The organization-level
 observer runs every six hours and on demand. It uses Harn's
 `scripts/ci_walltime_report.harn` implementation and the existing release-app
@@ -369,7 +422,11 @@ installation token with `actions: read` and `contents: read`. It runs on this
 public repository's standard Linux runner, so observing private repositories
 does not consume their hosted-runner minutes. The observer executes no code or
 artifacts from measured workflow runs. It emits a job summary, retains compact
-JSON reports for seven days. Product-target misses are first-class target-debt
+JSON reports for seven days. The shared Harn baseline validator reproduces
+both installed writers, including Burin's measured per-job evidence. The
+observer independently checks the latest successful full-run job census;
+its summary names pending, stale, and unreadable repositories separately.
+Product-target misses are first-class target-debt
 receipts and remain visible without making every schedule red. The observer
 fails on a sustained p90 regression past the reproducible observed baseline or
 one run past its max-latency regression fuse. Missing, stale, invalid, or empty
@@ -533,86 +590,79 @@ markers and upstream naming schemes are left alone.
 
 ## Merge overrides
 
-Use these labels when the normal merge queue or required `CI status` check is
-the wrong tool for a rare, time-sensitive land. Labels are the trigger;
-organization or repository admin membership is the authority. The reusable
-workflow rejects non-admins and fork pull requests, then acts with the
+Use these labels when the merge queue or the required `CI status` check is the
+wrong tool for a rare, time-sensitive land. Labels are the trigger; organization
+or repository admin is the authority. The workflow acts with the
 `harn-release-bot` installation token (a ruleset bypass actor).
 
 - `bypass-ci`: cancel competing runs for the head SHA and publish a successful
   `CI status` check after those runs stop. Does not merge. If GitHub cannot
-  stop a run within two minutes, the override fails closed instead of racing
-  that run's final status.
-- `bypass-merge-queue`: squash-merge immediately when `CI status` is already
-  green. Skips the merge queue but does not override CI. An in-flight check is
-  reported as in flight, not missing.
-- `force-merge`: publish successful `CI status`, then squash-merge immediately.
-  Skips CI proof and the merge queue.
+  stop a run within two minutes, the override fails instead of racing that
+  run's final status.
+- `bypass-merge-queue`: squash-merge the green head now, without the merge queue.
+- `force-merge`: cancel competing runs, publish a successful `CI status`, and
+  squash-merge now.
 
-### Queue-bypass guard
+### What refuses an override
 
-`force-merge` and `bypass-merge-queue` are refused unless both hold:
+The label is an admin's decision; the workflow does not ask for proof of an
+incident or read the default branch's health. `scripts/merge-override/` refuses
+only what is unsafe whoever asks, before any side effect:
 
-1. **An incident justifies skipping the queue.** Either the default branch is
-   red, meaning the newest default-branch commit with a completed push run of
-   the main CI workflow (`ci.yml` unless the caller passes
-   `main-ci-workflow`) concluded `failure` or `timed_out`; or the pull request
-   carries `release-blocker`, which belongs only on a pull request that
-   unblocks a release.
-2. **The queue has not already rejected this head.** No merge-group run for
-   the pull request failed after GitHub first saw its current head. Pushing a
-   new head clears an earlier rejection.
+- A label actor is not an organization or repository admin, re-checked from
+  the issue event that attached the label. Applying a label needs only triage;
+  this is the authority check.
+- The head lives in a fork. The release app would merge code from outside the
+  organization.
+- The head moved after the label was applied. The admin approved a different
+  commit; the merge also pins the labeled SHA.
+- The pull request is not open. There is nothing to merge.
+- Required approval is missing (GitHub's `reviewDecision` is
+  `REVIEW_REQUIRED` or `CHANGES_REQUESTED`), except for `force-merge`. The
+  release app bypasses review rules; `force-merge` is the label that skips
+  review too.
+- `bypass-merge-queue` on a head whose `CI status` is not green. That label
+  promises CI passed; `force-merge` is the label that says it did not.
 
-`bypass-merge-queue` also needs every check the base branch's rulesets require
-to be green on the head. A refusal posts the reason and the retry path on the
-pull request. `bypass-ci` is not guarded; each use logs a warning in the run
-summary. The guard lives in `scripts/merge-override-guard/`.
-
-**`founder-override` is the emergency escape.** Only the founder applies it,
-by hand; agents never apply it. Add it before the bypass label: with both
-attached, the guard is skipped, the run summary and audit comment say so, and
-the attempt consumes `founder-override` so the next bypass faces the guard
-again.
+Red checks on the head, checks still running, and a missing reason are
+warnings in the record, never refusals.
 
 Override attempts are serialized per pull request. If several labels are
 attached before an attempt starts, the workflow consumes them together and
-selects the strongest request: `force-merge`, then `bypass-merge-queue`, then
+selects the strongest: `force-merge`, then `bypass-merge-queue`, then
 `bypass-ci`. Its cancellation sweep excludes every run of the override
-dispatcher, so concurrent label events cannot cancel one another.
+dispatcher, so concurrent label events cannot cancel one another. The workflow
+removes each consumed label on every terminal path.
 
-### When to use an override
+### Reason and audit record
 
-- The default branch is red and this pull request fixes it forward.
-- This pull request unblocks a release; add `release-blocker` first.
-- Required CI is broken in a way you can fix forward on `main` within the same
-  working session.
+The reason is the newest pull request comment by the label actor that starts
+with `override:`, for example `override: fixes the repin rehearsal that
+deadlocks the queue`. Post it before applying the label. Without one the
+record says `no reason given` and the audit comment asks the actor to reply
+with one; the override never waits for it.
 
-### When not to use an override
+Every attempt, applied, refused, or errored, writes one record with who, which
+label, when, the pull request, the head SHA, the head's check states at decision
+time, the review decision, the reason, the outcome, the actions taken, and the
+merge commit:
 
-- Ordinary feature work, dependency bumps, or “CI is slow today.”
-- A merge-queue backlog or Actions spend alone; the guard refuses it.
-- A head the merge queue already rejected; fix it and push a new head.
-- Changes you cannot fix forward if they break `main`.
-- Pull requests from forks (the workflow refuses them).
+- as a comment on the pull request and in the run's step summary;
+- as one comment on the quarter's `Merge overrides YYYY-Qn` issue in the
+  private `burin-labs/override-log` repository, with the record as JSON.
 
-### How to apply
+The org log is an issue thread rather than a committed file because issue
+comments need no branch protection, never conflict between concurrent
+overrides, and survive deletion of the source pull request or branch. Export a
+quarter as JSON Lines for an auditor's change-management sample:
 
-1. Confirm you are an organization owner/admin or repository admin.
-2. On a same-repo PR, add the label whose meaning matches the intended action.
-3. Read the terminal audit comment. It records the selected request, every
-   consumed label, the re-checked actors, the actions taken, and whether the
-   attempt was applied, refused, or errored.
-4. The workflow removes each consumed label on every terminal path. A label
-   that remains attached therefore represents a pending or active attempt. For
-   a refusal or error, follow the audit comment's reason and re-apply the named
-   label to retry.
-
-Organization admins can also use GitHub’s “Bypass rules and merge” UI: the
-org-wide `main protection` ruleset grants `OrganizationAdmin` bypass in
-`pull_request` mode.
+```bash
+gh api --paginate "repos/burin-labs/override-log/issues/<N>/comments" \
+  --jq '.[].body | capture("```json\n(?<r>.*)\n```").r'
+```
 
 People and agents use these labels, not `gh pr merge --admin`. An admin merge
-skips the merge queue without an audit comment, and the queue is the only check
+skips the merge queue and leaves no record, and the queue is the only check
 that runs on the combined tree. GitHub ignores `-merge` in `.gitattributes`, so
 two pull requests that each regenerate one file can merge into a stale file
 (burin-labs/harn#8817). `burin-labs/harn`'s `merge queue` ruleset has no admin
@@ -624,8 +674,9 @@ Copy `templates/merge-override-dispatch.yml` to
 `.github/workflows/merge-override-dispatch.yml` and pin the reusable workflow
 to the full commit SHA of this repository that introduced or last changed
 `merge-override.yml`. Keep its `issues: write` permission: the reusable workflow
-uses the issue event history to re-check who applied every coalesced label and
-removes those labels at terminal completion. Create the labels once:
+reads the issue event history to re-check who applied every coalesced label,
+reads comments for the reason, and removes consumed labels. Pass the release
+app secrets: the merge and the org log both use it. Create the labels once:
 
 ```bash
 for name in bypass-ci bypass-merge-queue force-merge; do
@@ -634,11 +685,6 @@ for name in bypass-ci bypass-merge-queue force-merge; do
     --description "Privileged merge/CI override (org admin only)" \
     2>/dev/null || true
 done
-gh label create release-blocker --repo burin-labs/<repo> --color D93F0B \
-  --description "Unblocks a release; justifies a queue bypass" 2>/dev/null || true
-gh label create founder-override --repo burin-labs/<repo> --color 000000 \
-  --description "Founder only, by hand: skips the queue-bypass guard. \
-Agents never apply this." 2>/dev/null || true
 ```
 
 Public repositories stay in scope: applying a label still requires triage or
@@ -769,8 +815,21 @@ is blocked with nothing to look at.
   (block or inline `patterns`), every committed lockfile needs a matching
   ecosystem entry, Cargo workspace members and path deps must stay inside the
   configured `directory`, and exact `pnpm-workspace.yaml` overrides need a
-  `# pin:` annotation. It uses Ruby/Psych only — no network, no Harn binary —
-  so always-on hygiene jobs can call it. The reusable `harn-package.yml`
+  `# pin:` annotation. Direct dependencies with explicit upper bounds in Cargo,
+  npm, Python, and Swift manifests need a matching ignore in the same ecosystem
+  and directory entry. Ordinary Cargo/npm caret requirements remain updatable and
+  do not count as explicit ceilings. An unrestricted matching ignore suffices;
+  a version-filtered ignore must cover the forbidden versions, and an ignore
+  limited to update types must cover all three update classes. Diagnostics name
+  the dependency, bound, and manifest, and the receipt reports manifests, direct
+  dependencies, and ceilings examined. The action installs its published Harn
+  runtime by default; `skip-harn-setup: "true"` reuses a compatible installation.
+  Its private runtime is removed after the check, preserving the caller's
+  existing Harn executable on both success and refusal.
+  Manifest parsing is local and makes no provider calls. Unsupported manifest
+  adapters fail with unknown coverage rather than reporting a measured zero.
+  Directory scopes must be literal absolute repository paths; unsupported glob
+  scopes refuse inspection. The reusable `harn-package.yml`
   workflow runs it for every Burin Labs package CI caller. Product monorepos
   that do not use that workflow should call the action from an always-on job.
   Fleet prose for schedule/grouping lives in `harn-bump-fleet`; Harn-local
@@ -868,13 +927,15 @@ shares, plus the unprefixed labels (`bug`, `enhancement`, `epic`,
 repository-specific: each repository derives its own area labels from its
 directory map.
 
-Nothing syncs this file. GitHub does not inherit labels from an organization's
-`.github` repository, and no workflow here writes labels to other
-repositories. The file is reference that a person or an agent applies by hand.
+Shared taxonomy entries remain reference data that a person or agent applies
+additively. GitHub does not inherit labels from an organization's `.github`
+repository. The `delivery/ship` control is the narrow exception: the shared
+Smart Ship workflow reads its exact metadata from this file and creates or
+repairs that label before it discovers pull requests. It never deletes labels.
 Copy the shared categories into a repository's own `.github/labels.yml` rather
-than re-deriving them, and rename an existing label (`area:foo` to
-`area/foo`) instead of deleting and recreating it, so every issue and pull
-request already carrying it stays labeled.
+than re-deriving them, and rename an existing label (`area:foo` to `area/foo`)
+instead of deleting and recreating it, so every issue and pull request already
+carrying it stays labeled.
 
 `docs/decisions/pr-and-label-conventions.md` records why these conventions
 look the way they do, and which alternatives were rejected.

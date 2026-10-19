@@ -2,10 +2,6 @@ fn read(fs: HarnessFs, path: string) -> string {
   return fs.read_text(path_join(path_normalize(path_join(fs.cwd(), "../..")), path))
 }
 
-fn expression(body: string) -> string {
-  return "$" + "{{ " + body + " }}"
-}
-
 fn apply_steps(fs: HarnessFs) -> list {
   const workflow = yaml_parse(read(fs, ".github/workflows/merge-override.yml"))
   return workflow.jobs.apply.steps
@@ -28,91 +24,74 @@ fn position(steps: list, name: string) -> int {
   throw "no step named " + name
 }
 
-pipeline test_queue_skipping_labels_pass_the_guard_before_any_side_effect(harness: Harness) {
-  const workflow = yaml_parse(read(harness.fs, ".github/workflows/merge-override.yml"))
-  assert_eq(workflow.on.workflow_call.inputs["main-ci-workflow"].default, "ci.yml")
-  const steps = workflow.jobs.apply.steps
-  const guard_step = step(steps, "Guard queue-skipping override")
-  assert_eq(guard_step.run, "bash scripts/merge-override-guard/run.sh")
-  assert_eq(guard_step.env.GUARD_LABEL, expression("steps.request.outputs.label"))
-  assert_eq(guard_step.env.GUARD_HEAD_SHA, expression("inputs.head-sha"))
-  assert_eq(guard_step.env.GUARD_PR, expression("inputs.pr-number"))
-  assert_eq(guard_step.env.GUARD_REPOSITORY, expression("github.repository"))
-  assert_eq(guard_step.env.GUARD_MAIN_CI_WORKFLOW, expression("inputs.main-ci-workflow"))
-  // Only bypass-ci skips the guard.
-  assert(guard_step["if"].contains("steps.request.outputs.label != 'bypass-ci'"), guard_step["if"])
-  assert(
-    position(steps, "Authorize every label actor and same-repo head")
-      < position(steps, "Set up exact Harn release"),
-  )
-  assert(
-    position(steps, "Set up exact Harn release") < position(steps, "Guard queue-skipping override"),
-  )
-  // The guard runs before anything cancels runs, publishes a check, or merges.
+fn condition(steps: list, name: string) -> string {
+  return trim(regex_replace("\\s+", " ", step(steps, name)["if"] ?? ""))
+}
+
+const SIDE_EFFECTS = [
+  "Cancel competing workflow runs",
+  "Publish successful CI status check",
+  "Mint release-app token for privileged merge",
+  "Squash-merge pull request",
+]
+
+pipeline test_the_decision_precedes_and_gates_every_side_effect(harness: Harness) {
+  const steps = apply_steps(harness.fs)
+  assert_eq(step(steps, "Decide override").run, "bash scripts/merge-override/run.sh decide")
+  for side_effect in SIDE_EFFECTS {
+    assert(position(steps, "Decide override") < position(steps, side_effect), side_effect)
+  }
+  // A refused or crashed decision fails its step, so nothing chained from it runs.
   for side_effect in [
-    "Resolve cancellation policy",
     "Cancel competing workflow runs",
     "Publish successful CI status check",
-    "Squash-merge pull request",
+    "Mint release-app token for privileged merge",
   ] {
     assert(
-      position(steps, "Guard queue-skipping override") < position(steps, side_effect),
+      condition(steps, side_effect).starts_with("steps.decide.outcome == 'success'"),
       side_effect,
     )
   }
+  assert_eq(condition(steps, "Squash-merge pull request"), "steps.app-token.outcome == 'success'")
+  // A failed cancellation must not race a published status or a merge.
+  for later in ["Publish successful CI status check", "Mint release-app token for privileged merge"] {
+    assert(condition(steps, later).contains("steps.cancel.outcome != 'failure'"), later)
+  }
 }
 
-pipeline test_a_skipped_or_failed_guard_never_reaches_a_side_effect(harness: Harness) {
+pipeline test_every_attempt_is_recorded_after_its_side_effects(harness: Harness) {
   const steps = apply_steps(harness.fs)
-  // Policy is the one gate every later side effect chains from. A guard that
-  // was skipped because an earlier step failed must not read as allowed.
-  const policy = regex_replace("\\s+", " ", step(steps, "Resolve cancellation policy")["if"])
+  const record = step(steps, "Record override")
+  assert_eq(record.run, "bash scripts/merge-override/run.sh record")
   assert_eq(
-    trim(policy),
-    "steps.auth.outcome == 'success' && (steps.request.outputs.label == 'bypass-ci' || steps.guard.outcome == 'success')",
+    condition(steps, "Record override"),
+    "always() && steps.decide.outputs.active != 'false'",
   )
-  assert(step(steps, "Cancel competing workflow runs")["if"].contains("steps.policy.outputs"))
-  assert(
-    step(steps, "Resolve CI status state")["if"].starts_with("steps.policy.outcome == 'success'"),
+  assert_eq(
+    condition(steps, "Mint release-app token for the org log"),
+    condition(steps, "Record override"),
   )
-  assert(step(steps, "Plan override actions")["if"].starts_with("steps.ci.outcome == 'success'"))
-  assert(step(steps, "Publish successful CI status check")["if"].starts_with("steps.plan.outputs."))
-  assert(
-    step(steps, "Squash-merge pull request")["if"].starts_with(
-      "steps.plan.outputs.merge == 'true'",
-    ),
-  )
+  assert(position(steps, "Remove consumed override labels") < position(steps, "Record override"))
+  for name in ["decide", "cancel", "publish", "merge", "cleanup"] {
+    assert(
+      record.env.OVERRIDE_STEPS.contains(
+        "\"" + name + "\": \"$" + "{{ steps." + name + ".outcome }}\"",
+      ),
+      name,
+    )
+  }
+  assert(record.env.OVERRIDE_LOG_TOKEN.contains("steps.log-token.outputs.token"))
 }
 
-pipeline test_refusals_and_founder_overrides_reach_the_pull_request(harness: Harness) {
-  const steps = apply_steps(harness.fs)
-  const audit = step(steps, "Audit terminal outcome")
-  assert_eq(audit.env.GUARD_VERDICT, expression("steps.guard.outputs.verdict"))
-  assert_eq(audit.env.GUARD_REASON, expression("steps.guard.outputs.reason"))
-  assert_eq(audit.env.FOUNDER_ACTOR, expression("steps.guard.outputs.founder_actor"))
-  assert(audit.run.contains("GUARD_VERDICT\" == \"refused\""))
-  assert(audit.run.contains("FOUNDER OVERRIDE"))
-  const cleanup = step(steps, "Remove consumed override labels")
-  assert_eq(cleanup.env.FOUNDER_OVERRIDE, expression("steps.guard.outputs.founder_override"))
-  assert(cleanup.run.contains("labels/founder-override"))
-  const warn = step(steps, "Warn that bypass-ci is unguarded")
-  assert(warn["if"].contains("steps.request.outputs.label == 'bypass-ci'"))
-  assert(warn.run.contains("GITHUB_STEP_SUMMARY"))
-}
-
-pipeline test_the_guard_bootstrap_only_dispatches_harn(harness: Harness) {
-  const bootstrap = read(harness.fs, "scripts/merge-override-guard/run.sh")
-  assert(bootstrap.contains("scripts/merge-override-guard/cli.harn"))
-  for variable in [
-    "GH_TOKEN",
-    "GUARD_REPOSITORY",
-    "GUARD_PR",
-    "GUARD_HEAD_SHA",
-    "GUARD_LABEL",
-    "GUARD_MAIN_CI_WORKFLOW",
-    "GITHUB_OUTPUT",
-    "GITHUB_STEP_SUMMARY",
-  ] {
-    assert(bootstrap.contains("env:" + variable + ",expose=" + variable), variable)
+pipeline test_the_bootstrap_only_dispatches_harn_with_every_variable_granted(harness: Harness) {
+  const bootstrap = read(harness.fs, "scripts/merge-override/run.sh")
+  assert(bootstrap.contains("scripts/merge-override/cli.harn\" -- \"$@\""))
+  const workflow = read(harness.fs, ".github/workflows/merge-override.yml")
+  for line in workflow.split("\n") {
+    const text = trim(line)
+    if regex_match("^(OVERRIDE_[A-Z_]+|GH_TOKEN):", text) != nil {
+      const name = text.split(":")[0]
+      assert(bootstrap.contains(name), name + " reaches the workflow but is never granted")
+    }
   }
 }

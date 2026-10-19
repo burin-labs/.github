@@ -1,0 +1,574 @@
+import { assert_error_contains } from "std/testing"
+import {
+  append_log,
+  cancel_competing,
+  draft_record,
+  finish_record,
+  measure,
+  merge_pull,
+} from "./override.harn"
+import {
+  NO_REASON,
+  log_issue_title,
+  record_markdown,
+  resolve_request,
+  select_competing_runs,
+} from "./policy.harn"
+
+const REPO = "repos/burin-labs/example"
+
+const HEAD = "1111111111111111111111111111111111111111"
+
+const INPUT = {
+  repository: "burin-labs/example",
+  organization: "burin-labs",
+  pr: 42,
+  head_sha: HEAD,
+  run_url: "https://github.com/burin-labs/example/actions/runs/9",
+}
+
+fn labeled(id: int, label: string, actor: string, at: string = "2026-10-04T17:17:27Z") -> dict {
+  return {id: id, event: "labeled", label: {name: label}, actor: {login: actor}, created_at: at}
+}
+
+fn check(name: string, conclusion: string?) -> dict {
+  return conclusion == nil ? {
+    name: name,
+    status: "in_progress",
+    started_at: "2026-10-04T17:00:00Z",
+  } : {
+    name: name,
+    status: "completed",
+    conclusion: conclusion,
+    completed_at: "2026-10-04T17:00:00Z",
+  }
+}
+
+/**
+ * Burin-code #10156 on 2026-10-04: an admin labels a green, approved head
+ * while a scheduled workflow on the default branch is red. Only the paths the
+ * override may read exist; reading anything else (the default branch, its
+ * workflow runs) throws, so a test passing proves the decision never looks.
+ */
+fn world(overrides: dict = {}) -> dict {
+  return {
+    [REPO + "/issues/42"]: {labels: [{name: "bypass-merge-queue"}]},
+    [REPO + "/issues/42/events?per_page=100"]: [
+      [labeled(7, "bypass-merge-queue", "kennethsinder")],
+    ],
+    [REPO + "/pulls/42"]: {
+      title: "Unblock main",
+      html_url: "https://github.com/burin-labs/example/pull/42",
+      state: "open",
+      merged: false,
+      node_id: "PR_42",
+      head: {sha: HEAD, repo: {full_name: "burin-labs/example"}},
+      base: {repo: {full_name: "burin-labs/example"}},
+    },
+    "orgs/burin-labs/memberships/kennethsinder": {role: "admin"},
+    [REPO + "/collaborators/kennethsinder/permission"]: {permission: "admin"},
+    "orgs/burin-labs/memberships/contributor": {role: "member"},
+    [REPO + "/collaborators/contributor/permission"]: {permission: "write"},
+    graphql: {repository: {pullRequest: {reviewDecision: "APPROVED"}}},
+    [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
+      {
+        check_runs: [
+          check("CI status", "success"),
+          check("lint", "success"),
+          check("Dispatch merge override / Apply merge override", nil),
+        ],
+      },
+    ],
+    [REPO + "/issues/42/comments?per_page=100"]: [
+      [
+        {
+          user: {login: "kennethsinder"},
+          body: "override: fixes the repin rehearsal deadlocking the queue",
+          created_at: "2026-10-04T17:16:00Z",
+        },
+      ],
+    ],
+  }
+    + overrides
+}
+
+fn fake(paths: dict) -> dict {
+  let sent = []
+  const read = fn(path) {
+    if !contains(keys(paths), path) {
+      throw "unexpected read " + path
+    }
+    return paths[path]
+  }
+  const gh = {
+    read: read,
+    pages: read,
+    send: fn(method, path, body) {
+      sent = sent + [{method: method, path: path, body: body}]
+      return paths[method + " " + path]
+    },
+    graphql: fn(_query, _variables) { return paths.graphql },
+  }
+  return {gh: gh, sent: fn() { return sent }}
+}
+
+fn decided(paths: dict) -> dict {
+  const facts = measure(fake(paths).gh, INPUT)
+  assert(facts != nil)
+  return draft_record(facts, INPUT, "2026-10-04T17:18:00Z")
+}
+
+pipeline test_an_admin_bypass_lands_a_green_head_without_reading_the_default_branch(
+  harness: Harness,
+) {
+  const result = decided(world())
+  assert_eq(result.decision.verdict, "proceed", to_string(result.decision.refusals))
+  assert_eq(result.decision.plan.merge, true)
+  assert_eq(result.decision.plan.cancel_workflows, false)
+  assert_eq(result.record.reason, "fixes the repin rehearsal deadlocking the queue")
+  assert_eq(result.record.reason_source, "comment")
+  assert_eq(result.record.warnings, [])
+  assert_eq(result.record.checks.total, 2)
+}
+
+pipeline test_a_non_admin_label_is_refused(harness: Harness) {
+  const paths = world(
+    {
+      [REPO + "/issues/42/events?per_page=100"]: [
+        [labeled(7, "bypass-merge-queue", "contributor")],
+      ],
+    },
+  )
+  const result = decided(paths)
+  assert_eq(result.decision.verdict, "refused")
+  assert(
+    result.decision.refusals[0].contains("@contributor is not an organization or repository admin"),
+  )
+}
+
+pipeline test_an_unreadable_admin_role_refuses(harness: Harness) {
+  // No membership or permission paths for this login: both reads throw.
+  const paths = world(
+    {[REPO + "/issues/42/events?per_page=100"]: [[labeled(7, "force-merge", "stranger")]]},
+  )
+    + {[REPO + "/issues/42"]: {labels: [{name: "force-merge"}]}}
+  assert_eq(decided(paths).decision.verdict, "refused")
+}
+
+pipeline test_fork_moved_head_and_closed_pull_requests_are_refused(harness: Harness) {
+  const base = world()[REPO + "/pulls/42"]
+  for pull in [
+    base + {head: {sha: HEAD, repo: {full_name: "someone/fork"}}},
+    base
+      + {
+        head: {
+          sha: "2222222222222222222222222222222222222222",
+          repo: {full_name: "burin-labs/example"},
+        },
+      },
+    base + {state: "closed", merged: true},
+  ] {
+    assert_eq(decided(world({[REPO + "/pulls/42"]: pull})).decision.verdict, "refused")
+  }
+}
+
+pipeline test_required_approval_refuses_every_label_but_force_merge(harness: Harness) {
+  for label in ["bypass-merge-queue", "bypass-ci", "force-merge"] {
+    const paths = world(
+      {
+        [REPO + "/issues/42"]: {labels: [{name: label}]},
+        [REPO + "/issues/42/events?per_page=100"]: [[labeled(7, label, "kennethsinder")]],
+        graphql: {repository: {pullRequest: {reviewDecision: "REVIEW_REQUIRED"}}},
+      },
+    )
+    assert_eq(
+      decided(paths).decision.verdict,
+      label == "force-merge" ? "proceed" : "refused",
+      label,
+    )
+  }
+  // A base that requires no review reports a nil decision and never refuses.
+  const unrequired = world({graphql: {repository: {pullRequest: {reviewDecision: nil}}}})
+  assert_eq(decided(unrequired).decision.verdict, "proceed")
+}
+
+pipeline test_bypass_merge_queue_needs_green_ci_and_force_merge_records_red_as_a_warning(
+  harness: Harness,
+) {
+  const red = {
+    [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
+      {check_runs: [check("CI status", "failure"), check("Harn repin rehearsal", "failure")]},
+    ],
+  }
+  const refused = decided(world(red))
+  assert_eq(refused.decision.verdict, "refused")
+  assert(refused.decision.refusals[0].contains("use `force-merge`"))
+  const running = decided(
+    world(
+      {
+        [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
+          {check_runs: [check("CI status", nil)]},
+        ],
+      },
+    ),
+  )
+  assert_eq(running.decision.checks.ci_status, "in_flight")
+  assert_eq(running.decision.verdict, "refused")
+  const forced = decided(
+    world(
+      red
+        + {
+          [REPO + "/issues/42"]: {labels: [{name: "force-merge"}]},
+          [REPO + "/issues/42/events?per_page=100"]: [[labeled(7, "force-merge", "kennethsinder")]],
+        },
+    ),
+  )
+  assert_eq(forced.decision.verdict, "proceed")
+  assert_eq(
+    forced.decision.checks.failing,
+    ["CI status (failure)", "Harn repin rehearsal (failure)"],
+  )
+  assert(forced.decision.warnings[0].starts_with("head checks not passing"))
+}
+
+pipeline test_the_reason_is_the_actors_newest_override_comment_or_a_recorded_absence(
+  harness: Harness,
+) {
+  const comments = [
+    {user: {login: "kennethsinder"}, body: "override: older", created_at: "2026-10-04T17:00:00Z"},
+    {
+      user: {login: "kennethsinder"},
+      body: "Override: newer\nsecond line",
+      created_at: "2026-10-04T17:10:00Z",
+    },
+    {
+      user: {login: "contributor"},
+      body: "override: not the actor",
+      created_at: "2026-10-04T17:15:00Z",
+    },
+  ]
+  const found = decided(world({[REPO + "/issues/42/comments?per_page=100"]: [comments]}))
+  assert_eq(found.record.reason, "newer")
+  const none = decided(world({[REPO + "/issues/42/comments?per_page=100"]: [[]]}))
+  assert_eq(none.decision.verdict, "proceed")
+  assert_eq(none.record.reason, NO_REASON)
+  assert_eq(none.record.warnings, [NO_REASON])
+  const record = finish_record(
+    none.record,
+    {decide: "success", merge: "success"},
+    {merge_commit: "abc"},
+    "2026-10-04T17:19:00Z",
+  )
+  assert(
+    record_markdown(record).contains(
+      "@kennethsinder please reply with a one-line `override: <reason>`",
+    ),
+  )
+}
+
+pipeline test_attached_labels_resolve_to_the_strongest_and_keep_every_actor(harness: Harness) {
+  const request = resolve_request(
+    ["bypass-ci", "force-merge", "docs"],
+    [
+      labeled(1, "bypass-ci", "b-admin"),
+      labeled(2, "force-merge", "a-admin", "2026-10-04T17:00:00Z"),
+      {
+        id: 3,
+        event: "unlabeled",
+        label: {name: "force-merge"},
+        actor: {login: "bot"},
+        created_at: "2026-10-04T16:00:00Z",
+      },
+    ],
+  )
+  assert_eq(request.label, "force-merge")
+  assert_eq(request.actors, ["a-admin", "b-admin"])
+  assert_eq(request.label_events, {"bypass-ci": 1, "force-merge": 2})
+  assert_eq(resolve_request(["docs"], []).label, nil)
+  assert_error_contains(
+    { ->
+      resolve_request(
+        ["force-merge"],
+        [{id: 9, event: "unlabeled", label: {name: "force-merge"}, actor: {login: "x"}}],
+      )
+    },
+    "could not identify the actor",
+  )
+}
+
+pipeline test_competing_runs_exclude_the_override_and_a_short_census_throws(harness: Harness) {
+  const page = { runs -> [{total_count: len(runs), workflow_runs: runs}] }
+  let pages = {}
+  for status in ["requested", "queued", "waiting", "pending"] {
+    pages = pages + {[status]: page([])}
+  }
+  const selection = select_competing_runs(
+    9,
+    100,
+    pages
+      + {
+        in_progress: page(
+          [{id: 9, workflow_id: 100}, {id: 8, workflow_id: 100}, {id: 5, workflow_id: 200}],
+        ),
+      },
+  )
+  assert_eq(selection.competing_run_ids, [5])
+  assert_eq(selection.override_run_ids, [8])
+  assert_error_contains(
+    { ->
+      select_competing_runs(
+        9,
+        100,
+        pages + {in_progress: [{total_count: 2, workflow_runs: [{id: 5, workflow_id: 200}]}]},
+      )
+    },
+    "measured 1 of 2",
+  )
+}
+
+pipeline test_the_outcome_and_org_log_entry_cover_every_attempt(harness: Harness) {
+  const draft = decided(world()).record
+  const applied = finish_record(
+    draft,
+    {decide: "success", merge: "success", cleanup: "success"},
+    {merge_commit: "abc123", removed_labels: ["bypass-merge-queue"]},
+    "2026-10-04T17:19:00Z",
+  )
+  assert_eq(applied.outcome, "applied")
+  assert_eq(applied.merge_commit, "abc123")
+  const errored = finish_record(
+    draft,
+    {decide: "success", merge: "failure"},
+    {},
+    "2026-10-04T17:19:00Z",
+  )
+  assert_eq(errored.outcome, "errored")
+  assert(errored.error.contains("merge"))
+  const refused = finish_record(
+    draft + {refusals: ["no"]},
+    {decide: "failure"},
+    {},
+    "2026-10-04T17:19:00Z",
+  )
+  assert_eq(refused.outcome, "refused")
+  assert_eq(log_issue_title("2026-10-04T17:19:00Z"), "Merge overrides 2026-Q4")
+  assert_eq(log_issue_title("2027-03-31T23:59:00Z"), "Merge overrides 2027-Q1")
+  const listing = "repos/burin-labs/override-log/issues?labels=override-log&state=all&per_page=100"
+  // First override of the quarter opens the issue, then comments on it.
+  const empty = fake(
+    {
+      [listing]: [[{number: 3, title: "Merge overrides 2026-Q3"}]],
+      "POST repos/burin-labs/override-log/issues": {number: 4},
+      "POST repos/burin-labs/override-log/issues/4/comments": {html_url: "u"},
+    },
+  )
+  assert_eq(append_log(empty.gh, "burin-labs/override-log", applied), "u")
+  const sent = empty.sent()
+  assert_eq(sent[0].body.title, "Merge overrides 2026-Q4")
+  assert(sent[1].body.body.contains("\"merge_commit\":\"abc123\""))
+  assert(sent[1].body.body.starts_with("applied `bypass-merge-queue` on burin-labs/example#42"))
+  // Later overrides reuse it.
+  const existing = fake({[listing]: [[{number: 4, title: "Merge overrides 2026-Q4"}]]})
+  append_log(existing.gh, "burin-labs/override-log", applied)
+  assert_eq(
+    existing.sent().map({ call -> call.path }),
+    ["repos/burin-labs/override-log/issues/4/comments"],
+  )
+}
+
+/** A merge that fails with `failures` in turn; re-reads after the first see `later`. */
+fn merging(
+  failures: list<string>,
+  later: dict = {state: "open", merged: false, head: {sha: HEAD}},
+) -> dict {
+  let attempts = 0
+  let reads = 0
+  let slept = []
+  let windows = []
+  const gh = {
+    read: fn(_path) {
+      reads = reads + 1
+      return reads == 1 ? {
+        node_id: "PR_1",
+        title: "Fix the queue",
+        state: "open",
+        merged: false,
+      } : later
+    },
+    pages: fn(_path) { return [] },
+    send: fn(_method, _path, body) {
+      assert_eq(body.sha, HEAD)
+      attempts = attempts + 1
+      if attempts <= len(failures) {
+        throw failures[attempts - 1]
+      }
+      return {sha: "abc123"}
+    },
+    graphql: fn(_query, _variables) { return nil },
+  }
+  return {
+    gh: gh,
+    attempts: fn() { return attempts },
+    slept: fn() { return slept },
+    windows: fn() { return windows },
+    sleep: fn(ms) { slept = slept + [ms] },
+    // The longest draw, so the budget arithmetic is exact.
+    draw: fn(low, high) {
+      windows = windows + [[low, high]]
+      return high
+    },
+  }
+}
+
+const OVERRIDE = {label: "bypass-merge-queue", actors: ["admin"], reason: "drain"}
+
+const BASE_MOVED_ERROR =
+  "PUT repos/burin-labs/example/pulls/42/merge failed: gh: Base branch was modified. Review and try the merge again. (HTTP 405)"
+
+fn merge(world: dict) -> string {
+  return merge_pull(world.gh, INPUT, OVERRIDE, world.sleep, world.draw)
+}
+
+pipeline test_a_merge_retries_with_jittered_backoff_while_the_base_branch_moves(harness: Harness) {
+  const world = merging([BASE_MOVED_ERROR, BASE_MOVED_ERROR])
+  assert_eq(merge(world), "abc123")
+  assert_eq(world.attempts(), 3)
+  assert_eq(world.windows(), [[0, 2000], [0, 4000]])
+  assert_eq(world.slept(), [3000, 5000])
+}
+
+pipeline test_a_merge_does_not_retry_other_refusals(harness: Harness) {
+  const world = merging(
+    [
+      "PUT repos/burin-labs/example/pulls/42/merge failed: gh: Head branch was modified. (HTTP 409)",
+    ],
+  )
+  assert_error_contains({ -> merge(world) }, "Head branch was modified")
+  assert_eq(world.attempts(), 1)
+  assert_eq(world.slept(), [])
+}
+
+pipeline test_a_merge_keeps_retrying_for_three_minutes_before_giving_up(harness: Harness) {
+  let failures = []
+  for _ in range(40) {
+    failures = failures + [BASE_MOVED_ERROR]
+  }
+  const world = merging(failures)
+  assert_error_contains({ -> merge(world) }, "Base branch was modified")
+  const total = world.slept().reduce(0, { sum, ms -> sum + ms })
+  assert(total >= 180000)
+  assert(total - world.slept()[len(world.slept()) - 1] < 180000)
+  assert_eq(world.windows()[len(world.windows()) - 1], [0, 30000])
+  assert_eq(world.attempts(), len(world.slept()) + 1)
+}
+
+pipeline test_a_retry_stops_when_the_pull_request_already_merged(harness: Harness) {
+  const world = merging(
+    [BASE_MOVED_ERROR],
+    {state: "closed", merged: true, merge_commit_sha: "def456", head: {sha: HEAD}},
+  )
+  assert_eq(merge(world), "def456")
+  assert_eq(world.attempts(), 1)
+  const elsewhere = merging(
+    [BASE_MOVED_ERROR],
+    {state: "closed", merged: true, merge_commit_sha: "def456", head: {sha: "2222"}},
+  )
+  assert_error_contains({ -> merge(elsewhere) }, "not the decided head")
+}
+
+pipeline test_a_retry_stops_when_the_pull_request_closed(harness: Harness) {
+  const world = merging([BASE_MOVED_ERROR], {state: "closed", merged: false, head: {sha: HEAD}})
+  assert_error_contains({ -> merge(world) }, "closed before the override could merge it")
+  assert_eq(world.attempts(), 1)
+}
+
+/**
+ * A run that keeps going after an ordinary cancel is force-cancelled, not refused at two minutes.
+ */
+fn cancel_world(stops_after_force_reads: int?) -> dict {
+  let sent = []
+  let reads_after_force = 0
+  const forced = { -> sent.any({ row -> row.path.ends_with("/5/force-cancel") }) }
+  const empty = [{total_count: 0, workflow_runs: []}]
+  const gh = {
+    read: fn(path) {
+      if path == REPO + "/actions/runs/9" {
+        return {workflow_id: 100}
+      }
+      assert_eq(path, REPO + "/actions/runs/5")
+      if forced() {
+        reads_after_force = reads_after_force + 1
+      }
+      const stopped = stops_after_force_reads != nil && forced()
+        && reads_after_force > stops_after_force_reads
+      return {status: stopped ? "completed" : "in_progress"}
+    },
+    pages: fn(path) { return path.contains("status=in_progress") ? [
+      {total_count: 1, workflow_runs: [{id: 5, workflow_id: 200}]},
+    ] : empty },
+    send: fn(method, path, _body) {
+      sent = sent + [{method: method, path: path}]
+      return nil
+    },
+  }
+  let slept = 0
+  return {
+    gh: gh,
+    sent: fn() { return sent.map({ row -> row.path }).to_list() },
+    sleep: fn(ms) { slept = slept + ms },
+    slept: fn() { return slept },
+  }
+}
+
+pipeline test_a_slow_run_is_force_cancelled_and_waited_for(harness: Harness) {
+  const world = cancel_world(3)
+  cancel_competing(world.gh, INPUT, 9, world.sleep)
+  assert_eq(world.sent(), [REPO + "/actions/runs/5/cancel", REPO + "/actions/runs/5/force-cancel"])
+  assert(world.slept() > 120000, "the old two-minute limit would have refused this run")
+}
+
+pipeline test_a_run_that_never_stops_is_refused_after_the_budget(harness: Harness) {
+  const world = cancel_world(nil)
+  assert_error_contains(
+    { -> cancel_competing(world.gh, INPUT, 9, world.sleep) },
+    "did not stop within 600 seconds, including a force-cancel",
+  )
+  assert_eq(len(world.sent().filter({ path -> path.ends_with("/force-cancel") }).to_list()), 1)
+}
+
+/**
+ * A run that stops on its own between listing and cancelling answers the
+ * cancel with a 409. That is the goal state once a re-read reports it completed.
+ */
+fn refused_cancel_world(error: string) -> dict {
+  let reads = 0
+  const gh = {
+    read: fn(path) {
+      if path == REPO + "/actions/runs/9" {
+        return {workflow_id: 100}
+      }
+      reads = reads + 1
+      return {status: reads > 1 ? "completed" : "in_progress"}
+    },
+    pages: fn(path) { return path.contains("status=queued") ? [
+      {total_count: 1, workflow_runs: [{id: 5, workflow_id: 200}]},
+    ] : [{total_count: 0, workflow_runs: []}] },
+    send: fn(_method, path, _body) {
+      throw "POST " + path + " failed: gh: " + error
+    },
+  }
+  return {gh: gh, reads: fn() { return reads }}
+}
+
+pipeline test_a_run_no_longer_in_progress_counts_as_cancelled_once_reread(harness: Harness) {
+  const world = refused_cancel_world(
+    "Cannot cancel a workflow run that is not in progress. (HTTP 409)",
+  )
+  assert_eq(cancel_competing(world.gh, INPUT, 9, { _ms -> nil }), 1)
+  assert_eq(world.reads(), 2)
+  const denied = refused_cancel_world("Resource not accessible by integration (HTTP 403)")
+  assert_error_contains(
+    { -> cancel_competing(denied.gh, INPUT, 9, { _ms -> nil }) },
+    "could not cancel workflow run 5",
+  )
+}

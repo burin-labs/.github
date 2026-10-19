@@ -1,0 +1,55 @@
+import { assert_error_contains } from "std/testing"
+import { tested_source } from "./source.harn"
+
+fn git(
+  process: HarnessProcess,
+  workspace: string,
+  args: list<string>,
+  input: string = "",
+) -> string {
+  // These identities apply only to disposable fixture objects, never repository config.
+  const result = process.run(
+    {
+      program: "git",
+      args: args,
+      cwd: workspace,
+      stdin: input,
+      env: {
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_AUTHOR_NAME: "CI source fixture",
+        GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+        GIT_COMMITTER_NAME: "CI source fixture",
+        GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+        GIT_AUTHOR_DATE: "2026-10-01T00:00:00Z",
+        GIT_COMMITTER_DATE: "2026-10-01T00:00:00Z",
+      },
+    },
+  )
+  require result.success && result.exit_code == 0, "fixture Git operation failed: " + result.stderr
+  return result.stdout.trim()
+}
+
+pipeline test_actual_checkout_is_measured_and_dirty_or_unreadable_source_refuses(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("ci-proof-source-")
+  defer {
+    harness.fs.delete(root)
+  }
+  git(harness.process, root, ["init", "--quiet"])
+  harness.fs.write_text(path_join(root, "input.txt"), "tested input\n")
+  git(harness.process, root, ["add", "input.txt"])
+  const tree = git(harness.process, root, ["write-tree"])
+  const commit = git(harness.process, root, ["commit-tree", tree], "Tested source fixture\n")
+  git(harness.process, root, ["update-ref", "HEAD", commit])
+  assert_eq(tested_source(harness.process, root), {commit: commit, tree: tree})
+  harness.fs.write_text(path_join(root, "input.txt"), "changed input\n")
+  assert_error_contains(fn() { tested_source(harness.process, root) }, "dirty or unreadable")
+  harness.fs.write_text(path_join(root, "input.txt"), "tested input\n")
+  assert_eq(tested_source(harness.process, root).commit, commit)
+  harness.fs.write_text(path_join(root, "untracked.txt"), "untracked input\n")
+  assert_error_contains(fn() { tested_source(harness.process, root) }, "dirty or unreadable")
+  assert_error_contains(
+    fn() { tested_source(harness.process, root + "/absent") },
+    "No such file or directory",
+  )
+}

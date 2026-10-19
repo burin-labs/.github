@@ -1,0 +1,103 @@
+import { assert_error_contains } from "std/testing"
+import { Run } from "./contract.harn"
+import { ProofSource, job_census, merge_group_pull } from "./reader.harn"
+
+fn run() -> Run {
+  return {
+    id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    event: "merge_group",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "cancelled",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+}
+
+fn job(id: int) -> dict {
+  return {
+    id: id,
+    run_id: 10,
+    run_attempt: 2,
+    head_sha: "a".repeat(40),
+    name: "job " + to_string(id),
+    status: "completed",
+    conclusion: "success",
+    started_at: nil,
+    completed_at: nil,
+    steps: [],
+  }
+}
+
+fn source(pages: dict) -> ProofSource {
+  return {
+    json: fn(endpoint) {
+      if pages[endpoint] == nil {
+        throw "unexpected fixture endpoint " + endpoint
+      }
+      return pages[endpoint]
+    },
+    registration: fn(_repo, _artifact) {
+      throw "unexpected artifact download"
+    },
+  }
+}
+
+const FIRST = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=1"
+
+const SECOND = "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=2"
+
+pipeline test_complete_explicit_attempt_pages_are_measured() {
+  const census = job_census(
+    source({[FIRST]: {total_count: 2, jobs: [job(1)]}, [SECOND]: {total_count: 2, jobs: [job(2)]}}),
+    "acme/product",
+    run(),
+  )
+  assert_eq(census.declared, 2)
+  assert_eq(census.jobs.map({ value -> value.id }), [1, 2])
+}
+
+pipeline test_empty_partial_duplicate_and_changing_census_refuse() {
+  for response in [
+    {total_count: 0, jobs: []},
+    {total_count: 1, jobs: []},
+    {total_count: 1, jobs: [job(1), job(2)]},
+  ] {
+    assert(
+      is_err(
+        try {
+          job_census(source({[FIRST]: response}), "acme/product", run())
+        },
+      ),
+    )
+  }
+  for response in [
+    {total_count: 2, jobs: []},
+    {total_count: 2, jobs: [job(1)]},
+    {total_count: 3, jobs: [job(2)]},
+  ] {
+    assert(
+      is_err(
+        try {
+          job_census(
+            source({[FIRST]: {total_count: 2, jobs: [job(1)]}, [SECOND]: response}),
+            "acme/product",
+            run(),
+          )
+        },
+      ),
+    )
+  }
+  assert_error_contains(
+    fn() { job_census(source({}), "acme/product", run()) },
+    "unexpected fixture endpoint",
+  )
+}
+
+pipeline test_merge_group_names_its_pull_request_only_in_its_queue_ref() {
+  assert_eq(merge_group_pull("refs/heads/gh-readonly-queue/main/pr-10697-" + "a".repeat(40)), 10697)
+  assert_eq(merge_group_pull("refs/heads/gh-readonly-queue/main/pr-10697-short"), nil)
+  assert_eq(merge_group_pull(""), nil)
+}

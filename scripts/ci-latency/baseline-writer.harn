@@ -1,0 +1,11 @@
+import { derive } from "./baseline.harn"
+import { decode } from "./policy.harn"
+
+/** Emit the authoritative shared baseline from measured immutable run evidence. */
+fn main(harness: Harness) {
+  require len(argv) == 1, "expected the measured policy/run input path"
+  const input = json_parse(harness.fs.read_text(unwrap(argv[0])))
+  const policy = decode(input.policy)
+  const baseline = derive(policy, input.runs, "shared-v2")
+  harness.stdio.println(json_stringify(baseline))
+}

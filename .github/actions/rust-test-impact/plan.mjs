@@ -76,15 +76,23 @@ function matchesPrefix(path, prefix) {
   return path === normalized || path.startsWith(`${normalized}/`);
 }
 
+// A merge-group entry prunes only when its caller diffs it against the entry
+// ahead and the queue requires every entry green; HEADGREEN lands entries
+// ahead on this entry's checks alone.
+export function prunesEvent(eventName, pruneMergeGroup) {
+  return eventName === "pull_request" || (eventName === "merge_group" && pruneMergeGroup);
+}
+
 export function planImpact({
   eventName,
+  pruneMergeGroup = false,
   changedFiles,
   packages,
   globalPaths = [],
   extraPackagePaths = [],
 }) {
   const allPackages = packages.map((pkg) => pkg.name).sort();
-  if (eventName !== "pull_request") {
+  if (!prunesEvent(eventName, pruneMergeGroup)) {
     return { mode: "full", packages: allPackages, reason: `${eventName} retains complete coverage` };
   }
   if (changedFiles.some((path) => globalPaths.some((prefix) => matchesPrefix(path, prefix)))) {
@@ -181,7 +189,7 @@ function main() {
   const workspaceRoot = normalize(relative(repoRoot, metadata.workspace_root));
   const workspacePrefix = workspaceRoot ? `${workspaceRoot}/` : "";
   const globalPaths = [
-    ".github/workflows",
+    ...(process.env.RUST_IMPACT_WORKFLOW_PATHS ?? ".github/workflows").split("\n").map((path) => path.trim()).filter(Boolean),
     `${workspacePrefix}Cargo.toml`,
     `${workspacePrefix}Cargo.lock`,
     `${workspacePrefix}.cargo`,
@@ -195,7 +203,8 @@ function main() {
 
   let plan;
   const eventName = process.env.RUST_IMPACT_EVENT_NAME || "";
-  if (eventName !== "pull_request") {
+  const pruneMergeGroup = process.env.RUST_IMPACT_PRUNE_MERGE_GROUP === "true";
+  if (!prunesEvent(eventName, pruneMergeGroup)) {
     plan = fullPlan(packages, `${eventName || "unknown event"} retains complete coverage`);
   } else {
     try {
@@ -204,7 +213,7 @@ function main() {
         process.env.RUST_IMPACT_HEAD || "HEAD",
         repoRoot,
       );
-      plan = planImpact({ eventName, changedFiles: files, packages, globalPaths, extraPackagePaths });
+      plan = planImpact({ eventName, pruneMergeGroup, changedFiles: files, packages, globalPaths, extraPackagePaths });
     } catch (error) {
       plan = fullPlan(packages, `impact could not be resolved safely: ${error.message}`);
     }

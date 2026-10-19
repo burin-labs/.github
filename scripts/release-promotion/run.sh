@@ -8,6 +8,11 @@ readonly workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 # Step outputs are appended to a file under the runner's temp directory, which
 # is outside the workspace. Harn admits write roots as directories only.
 readonly outputs="$(dirname "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}")"
+export PROMOTE_ORIGINAL_CONSUMER_CONTEXT="${PROMOTE_ORIGINAL_CONSUMER_CONTEXT:-}"
+export PROMOTE_CONSUMER_TOKEN="${PROMOTE_CONSUMER_TOKEN:-}"
+export PROMOTE_CONSUMER_REPOSITORY="${PROMOTE_CONSUMER_REPOSITORY:-}"
+export PROMOTE_CONSUMER_WORKFLOW="${PROMOTE_CONSUMER_WORKFLOW:-}"
+export PROMOTE_CONSUMER_READER="${PROMOTE_CONSUMER_READER:-}"
 
 harn run \
   --standalone \
@@ -17,6 +22,11 @@ harn run \
   --grant repository=env:PROMOTE_REPOSITORY,expose=PROMOTE_REPOSITORY \
   --grant sha=env:PROMOTE_SHA,expose=PROMOTE_SHA \
   --grant run_id=env:PROMOTE_RUN_ID,expose=PROMOTE_RUN_ID \
+  --grant original_context=env:PROMOTE_ORIGINAL_CONSUMER_CONTEXT,expose=PROMOTE_ORIGINAL_CONSUMER_CONTEXT \
+  --grant consumer_token=env:PROMOTE_CONSUMER_TOKEN,expose=PROMOTE_CONSUMER_TOKEN \
+  --grant consumer_repository=env:PROMOTE_CONSUMER_REPOSITORY,expose=PROMOTE_CONSUMER_REPOSITORY \
+  --grant consumer_workflow=env:PROMOTE_CONSUMER_WORKFLOW,expose=PROMOTE_CONSUMER_WORKFLOW \
+  --grant consumer_reader=env:PROMOTE_CONSUMER_READER,expose=PROMOTE_CONSUMER_READER \
   --grant tag=env:PROMOTE_TAG,expose=PROMOTE_TAG \
   --grant directory=env:PROMOTE_DIRECTORY,expose=PROMOTE_DIRECTORY \
   --grant github_output=env:GITHUB_OUTPUT,expose=GITHUB_OUTPUT \

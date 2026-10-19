@@ -1,0 +1,318 @@
+import { read_yaml } from "std/fs"
+import { CONTROL_POLICY_SOURCE, control_policy_source, ship_label } from "./policy.harn"
+
+fn expression(value: string) -> string {
+  return "$" + "{{ " + value + " }}"
+}
+
+fn repair_needed() -> string {
+  return expression("!cancelled() && steps.shepherd.outputs.deferred != ''")
+}
+
+fn named(steps: list, name: string) -> dict {
+  const matches = steps.filter(fn(step) { return step?.name == name }).to_list()
+  assert_eq(len(matches), 1, name)
+  return matches[0] ?? {}
+}
+
+pipeline test_repair_bootstrap_provisions_the_declared_package_manager(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const steps = workflow.jobs.ship.steps
+  const node = named(steps, "Set up Node")
+  const package_manager = named(steps, "Set up the repair package manager")
+  const shepherd = named(steps, "Shepherd")
+  const repair = named(steps, "Repair deferred pull requests")
+  assert_eq(package_manager["if"], repair_needed())
+  assert_eq(package_manager.uses, "pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413")
+  // The action reads packageManager from the checked-out repository instead
+  // of duplicating a version here or installing its controller dependencies.
+  assert_eq(package_manager["with"].run_install, false)
+  assert_eq(package_manager["with"].dest, expression("runner.temp") + "/smart-ship-pnpm")
+  assert_eq(package_manager["with"]?.version, nil)
+  assert(steps.index_of(shepherd) < steps.index_of(node))
+  assert(steps.index_of(node) < steps.index_of(package_manager))
+  assert(steps.index_of(package_manager) < steps.index_of(repair))
+}
+
+/** Unset, the shepherd reads its own queue removals as a person's (burin-code#10624). */
+pipeline test_shepherd_knows_the_bot_its_token_acts_as(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const steps = workflow.jobs.ship.steps
+  const shepherd = named(steps, "Shepherd")
+  assert_eq(named(steps, "Mint the release app token").id, "app")
+  assert_eq(shepherd.env.GH_TOKEN, expression("steps.app.outputs.token"))
+  assert_eq(shepherd.env.BURIN_SHIP_BOT_LOGIN, expression("steps.app.outputs.app-slug"))
+}
+
+pipeline test_shared_workflow_reconciles_its_canonical_label_before_discovery(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const steps = workflow.jobs.ship.steps
+  const checkout = named(steps, "Check out the Smart Ship control policy")
+  assert_eq(control_policy_source(checkout["with"]), CONTROL_POLICY_SOURCE)
+  assert_eq(checkout["with"].path, ".smart-ship-runner")
+  assert_eq(checkout["with"]["persist-credentials"], false)
+  const reconcile_step = named(steps, "Reconcile the Smart Ship control label")
+  assert_eq(reconcile_step.env.GH_TOKEN, expression("steps.app.outputs.token"))
+  assert_eq(reconcile_step.env.REPO, expression("github.repository"))
+  assert(reconcile_step.run.contains("scripts/smart-ship-label/cli.harn"))
+  assert(reconcile_step.run.contains("--label \"" + expression("inputs.ship-label") + "\""))
+  assert(reconcile_step.run.contains("--registry .smart-ship-runner/.github/labels.yml"))
+  const reconcile_index = steps.index_of(reconcile_step)
+  const discovery_index = steps.index_of(named(steps, "Find the pull requests to look at"))
+  assert(reconcile_index >= 0 && reconcile_index < discovery_index)
+  assert_eq(ship_label(read_yaml(harness.fs, "../../.github/labels.yml")).name, "ship")
+}
+
+pipeline test_wrong_repository_or_caller_revision_is_refused() {
+  assert_eq(control_policy_source(CONTROL_POLICY_SOURCE), CONTROL_POLICY_SOURCE)
+  for checkout in [
+    {repository: "example/consumer", ref: CONTROL_POLICY_SOURCE.ref},
+    {repository: CONTROL_POLICY_SOURCE.repository, ref: expression("github.workflow_sha")},
+    {repository: CONTROL_POLICY_SOURCE.repository, ref: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {repository: CONTROL_POLICY_SOURCE.repository},
+    nil,
+  ] {
+    const refusal = try {
+      control_policy_source(checkout)
+      ""
+    } catch (error) {
+      to_string(error)
+    }
+    assert(refusal.contains("control policy source"), refusal)
+  }
+}
+
+pipeline test_ci_runs_the_pinned_control_graph_on_the_shipping_runtime(harness: Harness) {
+  const ci = read_yaml(harness.fs, "../../.github/workflows/ci.yml")
+  const job = ci.jobs["smart-ship-control-runtime"]
+  const checkout = named(job.steps, "Check out the immutable shipping control")
+  assert_eq(control_policy_source(checkout["with"]), CONTROL_POLICY_SOURCE)
+  assert_eq(checkout["with"].path, ".smart-ship-control")
+  assert_eq(checkout["with"]["persist-credentials"], false)
+  const setup = named(job.steps, "Install the shipping consumer runtime")
+  assert_eq(setup["with"].version, "0.10.166")
+  const proof = named(job.steps, "Exercise the immutable control script")
+  assert(
+    proof.run.contains("harn test .smart-ship-control/scripts/smart-ship-label/policy_test.harn"),
+  )
+  assert_eq(
+    named(job.steps, "Exercise the candidate policy reader on the shipping runtime").run,
+    "harn test scripts/smart-ship-policy",
+  )
+  assert(ci.jobs["ci-status"].needs.contains("smart-ship-control-runtime"))
+  const gate = named(ci.jobs["ci-status"].steps, "Require reusable package smoke")
+  assert_eq(
+    gate.env.SMART_SHIP_CONTROL_RESULT,
+    expression("needs.smart-ship-control-runtime.result"),
+  )
+  assert(gate.run.contains("test \"$SMART_SHIP_CONTROL_RESULT\" = success"))
+}
+
+pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const input = workflow.on.workflow_call.inputs["owned-runner-tag"]
+  assert_eq(input.type, "string")
+  assert_eq(input["default"], "")
+  // The probe and the owned runner are both limited to the private allowlist:
+  // a public repository's run must never land on an owned host, whatever it
+  // passes.
+  const allowlist = "contains(fromJSON('[\"burin-labs/burin-code\", \"burin-labs/harn-cloud\"]'), github.repository)"
+  const probe = workflow.jobs.availability["if"]
+  assert(probe.starts_with("inputs.owned-runner-tag != '' && contains("), probe)
+  const listed = regex_captures(
+    "contains\\(fromJSON\\('(\\[[^']*\\])'\\), github\\.repository\\)",
+    probe,
+  )
+  assert_eq(len(listed), 1, probe)
+  assert_eq(json_parse(listed[0].groups[0]), ["burin-labs/burin-code", "burin-labs/harn-cloud"])
+  // Only a sweep probes: a wake about one PR goes to the owned pool unprobed.
+  assert(probe.contains("github.event_name == 'schedule'"), probe)
+  assert(probe.contains("github.event.inputs.pr == ''"), probe)
+  assert(!probe.contains("pull_request"), probe)
+  assert(!probe.contains("workflow_run"), probe)
+  const runs_on = workflow.jobs.ship["runs-on"]
+  // Hosted is both the default and the fallback; the allowlist and the kill
+  // switch gate the owned pool, and a probed sweep needs a runner online.
+  assert(runs_on.starts_with("$" + "{{ inputs.owned-runner-tag != '' && " + allowlist), runs_on)
+  assert(runs_on.contains("vars.CI_SELFHOSTED_DISABLED"), runs_on)
+  assert(runs_on.contains("needs.availability.result == 'skipped'"), runs_on)
+  assert(runs_on.contains("needs.availability.outputs.probe_state == 'measured'"), runs_on)
+  assert(runs_on.ends_with("|| 'ubuntu-24.04' }}"), runs_on)
+}
+
+/**
+ * Runs the look step, then the repair step it hands off to, against a fake shepherd; returns its calls in order.
+ */
+fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const workspace = harness.fs.mkdtemp_in_workspace("smart-ship-sweep")
+  const calls = path_join(workspace, "calls")
+  const output = path_join(workspace, "github-output")
+  const bin = path_join(workspace, "bin")
+  harness.fs.mkdir(path_join(workspace, "scripts"), true)
+  harness.fs.mkdir(bin, true)
+  harness.fs.mkdir(path_join(workspace, "home"), true)
+  harness.fs.write_text(calls, "")
+  harness.fs.write_text(output, "")
+  // The fake shepherd defers the one PR whose next action is a repair.
+  const harnw = path_join(workspace, "scripts/harnw")
+  harness.fs.write_text(
+    harnw,
+    "#!/usr/bin/env bash\n"
+      + "if [ \"$3\" = .smart-ship-runner/scripts/smart-ship-policy/cli.harn ]; then : > \"$7\"; exit 0; fi\n"
+      + "echo \"$*\" >> \"$CALLS\"\npr=\"\"; defer=0\n"
+      + "while [ $# -gt 0 ]; do case \"$1\" in --pr) pr=\"$2\"; shift ;; --defer-repair) defer=1 ;; esac; shift; done\n"
+      + "if [ \"$defer\" = 1 ] && [ \"$pr\" = \"$DEFER_PR\" ]; then exit 3; fi\nexit 0\n",
+  )
+  // This fixture isolates look/repair ordering; the policy tests execute the reader.
+  harness.fs.write_text(path_join(bin, "gh"), "#!/usr/bin/env bash\nexit 19\n")
+  harness.fs.write_text(path_join(bin, "git"), "#!/usr/bin/env bash\nexit 0\n")
+  for file in [harnw, path_join(bin, "gh"), path_join(bin, "git")] {
+    assert(harness.process.run({program: "/bin/chmod", args: ["755", file]}).success)
+  }
+  const env = {
+    PATH: bin + ":" + to_string(harness.env.get("PATH") ?? ""),
+    HOME: path_join(workspace, "home"),
+    CALLS: calls,
+    DEFER_PR: defer_pr,
+    GITHUB_OUTPUT: output,
+    GITHUB_WORKSPACE: workspace,
+    REPO: "o/r",
+    LABEL: "ship",
+    NUMBERS: "1 2 3",
+    REPAIR: "true",
+    DEFAULT_BRANCH: "main",
+    RUNNER_TEMP: workspace,
+  }
+  const look = run_step(harness, named(steps, "Shepherd").run, workspace, env)
+  assert(look.success, "Shepherd step failed: " + look.stdout + look.stderr)
+  const outputs = step_outputs(harness.fs.read_text(output))
+  const deferred = outputs.get("deferred") ?? ""
+  if deferred != "" {
+    const repair = run_step(
+      harness,
+      named(steps, "Repair deferred pull requests").run,
+      workspace,
+      env + {DEFERRED: deferred, POLICY: outputs.get("policy") ?? ""},
+    )
+    assert(repair.success, "Repair step failed: " + repair.stdout + repair.stderr)
+  }
+  return harness.fs.read_text(calls).split("\n").filter({ line -> line != "" }).map(
+    { line ->
+      regex_captures("--pr o/r#([0-9]+)", line)[0].groups[0]
+        + if line.contains("--defer-repair") {
+          " look"
+        } else {
+          " run"
+        }
+    },
+  )
+    .to_list()
+}
+
+fn run_step(harness: Harness, script: string, workspace: string, env: dict) {
+  return harness.process.run(
+    {
+      // The runner's bash, not macOS's 3.2, which rejects an empty array under `set -u`.
+      program: "/usr/bin/env",
+      args: ["bash", "-e", "-o", "pipefail", "-c", script],
+      cwd: workspace,
+      env: env,
+      timeout_ms: 30000,
+    },
+  )
+}
+
+fn step_outputs(text: string) -> dict<string, string> {
+  let out = {}
+  for line in text.split("\n") {
+    if line.contains("=") {
+      const eq = line.index_of("=")
+      out[line[0:eq]] = line[eq + 1:]
+    }
+  }
+  return out
+}
+
+/**
+ * Sweep run burin-code 38100680022 repaired #10719 for 38 minutes, hit the
+ * job timeout, and never looked at the PRs after it. Every PR gets its look
+ * before any repair runs, and only a deferred PR is repaired.
+ */
+pipeline test_a_sweep_looks_at_every_pr_before_it_repairs_any(harness: Harness) {
+  assert_eq(run_shepherd_steps(harness, "o/r#2"), ["1 look", "2 look", "3 look", "2 run"])
+  assert_eq(run_shepherd_steps(harness, ""), ["1 look", "2 look", "3 look"])
+}
+
+/**
+ * The agent download, Node and pnpm cost about 40 seconds of every look in
+ * burin-code runs 38312439308 and 38311317858, and only a repair uses them.
+ */
+pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const shepherd = named(steps, "Shepherd")
+  for name in [
+    "Download the PR agent",
+    "Set up Node",
+    "Set up the repair package manager",
+    "Repair deferred pull requests",
+  ] {
+    const step = named(steps, name)
+    assert_eq(step["if"], repair_needed(), name)
+    assert(steps.index_of(shepherd) < steps.index_of(step), name)
+  }
+}
+
+/**
+ * Both jobs admit by one rule. Only a finished same-repository CI verdict of a
+ * PR, or of a failed merge-queue branch, wakes the shepherd; a passing queue
+ * run's PRs wake on `closed`, and a default-branch run names no PR.
+ */
+pipeline test_the_shared_jobs_own_wake_admission(harness: Harness) {
+  const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
+  const shipped = jobs.ship["if"]
+  const admission = shipped.substring(shipped.index_of("(github.event_name == 'schedule'"))
+  // The rule is written once, in the ship job; the probe takes only sweeps.
+  assert(!jobs.availability["if"].contains("workflow_run"), jobs.availability["if"])
+  for clause in [
+    "github.event.action == 'completed'",
+    "github.event.workflow_run.id > 0",
+    "github.event.workflow_run.status == 'completed'",
+    "contains(fromJSON('[\"success\",\"failure\",\"timed_out\"]'), github.event.workflow_run.conclusion)",
+    "github.event.workflow_run.repository.full_name == github.repository",
+    "github.event.workflow_run.head_repository.full_name == github.repository",
+    "github.event.workflow_run.head_branch != ''",
+    "github.event.repository.default_branch != ''",
+    "github.event.workflow_run.pull_requests[0].number > 0",
+    "github.event.workflow_run.conclusion != 'success'",
+    "format('gh-readonly-queue/{0}/', github.event.repository.default_branch)",
+    "contains(github.event.pull_request.labels.*.name, inputs.ship-label)",
+    "!(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')",
+    "github.event.sender.type == 'Bot'",
+  ] {
+    assert(admission.contains(clause), clause)
+  }
+  assert(!admission.contains("'push'"), admission)
+}
+
+/** A CI-completion wake must not share the sweep's group: it would replace a pending sweep. */
+pipeline test_a_ci_completion_wake_never_replaces_a_pending_sweep(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const group = workflow.jobs.ship.concurrency.group
+  assert(group.contains("github.event.workflow_run.pull_requests[0].number"), group)
+  assert(group.contains("format('run-{0}', github.event.workflow_run.head_branch)"), group)
+  assert(group.contains("github.event.inputs.pr"), group)
+  assert(group.ends_with("|| 'sweep' }}"), group)
+}
+
+/** A wake sent to the pool unprobed must not be able to wedge the sweep that recovers it. */
+pipeline test_a_sweep_cancels_stale_queued_runs_but_never_its_own(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const reap = named(steps, "Cancel stale queued Smart Ship runs")
+  assert(reap["if"].contains("github.event_name == 'schedule'"), reap["if"])
+  assert(reap["if"].contains("github.event.inputs.pr == ''"), reap["if"])
+  assert(!reap["if"].contains("pull_request"), reap["if"])
+  assert(reap.run.contains("--status queued"), reap.run)
+  assert(reap.run.contains(".databaseId != $RUN_ID"), reap.run)
+  assert(reap.run.contains("::warning::"), reap.run)
+}

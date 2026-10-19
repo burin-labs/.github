@@ -8,4 +8,4 @@ pub import {
   Plan,
 } from "./model.harn"
 pub import { parse_policy, plan_checks } from "./plan.harn"
-pub import { report, run_checks } from "./run.harn"
+pub import { report, repository_check_environment, run_checks } from "./run.harn"

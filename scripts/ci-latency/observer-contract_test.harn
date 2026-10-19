@@ -1,0 +1,184 @@
+import { validate } from "./baseline.harn"
+import {
+  classify_observation,
+  newest_run,
+  observation_succeeded,
+  observation_summary,
+} from "./observer-contract.harn"
+import { Policy, decode } from "./policy.harn"
+
+fn policy(fs: HarnessFs, name: string = "harn-773f11e") -> Policy {
+  return decode(
+    json_parse(fs.read_text("../../.github/fixtures/ci-latency-policy/" + name + ".json")),
+  )
+}
+
+fn report(policy: Policy) -> dict {
+  return {
+    schema_version: 2,
+    policy: policy,
+    qualifying_runs: range(1, 11).map(
+      fn(id) { return {id: id, created_at: "2026-10-09T06:00:00Z"} },
+    )
+      .to_list(),
+    wall: {count: 10},
+    evaluation: {
+      status: "healthy",
+      ok: true,
+      current: {count: 5, p90_ms: 1, max_ms: 2},
+      previous: {count: 5, p90_ms: 1, max_ms: 2},
+    },
+  }
+}
+
+fn classify(value: dict, policy: Policy) -> dict {
+  return classify_observation(value, policy, {id: 10, created_at: "2026-10-09T06:00:00Z"})
+}
+
+pipeline test_production_writer_contracts_reach_observer_without_schema_error(harness: Harness) {
+  for name in ["harn-773f11e", "burin-4854778"] {
+    const current = policy(harness.fs, name)
+    const receipt = classify(report(current), current)
+    assert_eq(receipt.status, "pass")
+    assert_eq(receipt.sample_count, 10)
+    assert(receipt.observed_baseline.baseline_p90_ms > 0)
+    let dropped = report(current)
+    dropped.policy = pick(
+      current,
+      ["repository", "workflow", "event", "topology_epoch", "full_run_jobs", "slo"],
+    )
+    assert_eq(classify(dropped, current).status, "pass", "baseline belongs to fetched policy")
+  }
+}
+
+pipeline test_target_debt_and_regression_are_distinct_measured_decisions(harness: Harness) {
+  const current = policy(harness.fs)
+  const limits = validate(current, current.observed_baseline)
+  let measured = report(current)
+  measured.evaluation.current.p90_ms = current.slo.p90_ms
+  measured.evaluation.current.max_ms = current.slo.hard_max_ms
+  const receipt = classify(measured, current)
+  assert_eq(receipt.status, "target_debt")
+  assert_eq(len(receipt.target_debt), 2)
+  measured.evaluation.current.max_ms = limits.max_regression_limit_ms
+  assert_eq(classify(measured, current).status, "policy_breach")
+  measured.evaluation.current.max_ms = 2
+  measured.evaluation.current.p90_ms = limits.p90_regression_limit_ms
+  measured.evaluation.previous.p90_ms = limits.p90_regression_limit_ms
+  assert_eq(classify(measured, current).status, "policy_breach")
+  measured.qualifying_runs = measured.qualifying_runs.slice(0, 5)
+  measured.wall.count = 5
+  const warming = classify_observation(
+    measured,
+    current,
+    {id: 5, created_at: "2026-10-09T06:00:00Z"},
+  )
+  assert_eq(
+    warming.status,
+    "target_debt",
+    "one post-baseline window cannot imply sustained regression",
+  )
+  assert_eq(warming.regression_window.p90_status, "warming")
+  measured.evaluation.current.max_ms = limits.max_regression_limit_ms
+  assert_eq(
+    classify_observation(measured, current, {id: 5, created_at: "2026-10-09T06:00:00Z"}).status,
+    "policy_breach",
+    "maximum regression remains immediate while p90 warms",
+  )
+}
+
+pipeline test_measurement_and_freshness_fail_closed(harness: Harness) {
+  const current = policy(harness.fs)
+  let measured = report(current)
+  measured.evaluation.status = "unknown"
+  assert_eq(classify(measured, current).status, "observer_error")
+  measured = report(current)
+  measured.evaluation.ok = false
+  assert_eq(classify(measured, current).status, "observer_error")
+  measured = report(current)
+  measured.policy.slo.p90_ms = current.slo.p90_ms + 1
+  assert_eq(classify(measured, current).status, "observer_error")
+  measured = report(current)
+  assert_eq(classify_observation(measured, current, nil).status, "observer_error")
+  assert_eq(
+    classify_observation(measured, current, {id: 11, created_at: "2026-10-09T06:00:00Z"}).status,
+    "stale",
+  )
+  assert_eq(classify_observation(measured, current, nil, "unreadable API").status, "observer_error")
+  assert_eq(classify_observation(nil, current, nil).status, "observer_error")
+  measured.qualifying_runs = []
+  measured.wall.count = 0
+  assert_eq(classify_observation(measured, current, nil).status, "observer_error")
+  measured.evaluation.status = "insufficient_samples"
+  measured.evaluation.ok = false
+  measured.evaluation.current = {count: 0, p90_ms: 0, max_ms: 0}
+  measured.evaluation.previous = {count: 0, p90_ms: 0, max_ms: 0}
+  assert_eq(classify_observation(measured, current, nil).status, "insufficient_samples")
+  let invalid = current
+  invalid.observed_baseline = {}
+  assert_eq(classify(report(invalid), invalid).status, "observer_error")
+}
+
+pipeline test_observer_summary_requires_a_complete_non_null_census() {
+  const receipts = [
+    {repository: "burin-labs/.github", status: "pass", sample_count: 10},
+    {repository: "burin-labs/harn", status: "policy_breach", sample_count: 10},
+    {repository: "burin-labs/burin-code", status: "target_debt", sample_count: 10},
+    {repository: "burin-labs/harn-cloud", status: "insufficient_samples", sample_count: 0},
+  ]
+  const summary = observation_summary(receipts)
+  assert_eq(summary.repository_count, 4)
+  assert_eq(summary.breach_count, 1)
+  assert_eq(summary.breaching_repositories, ["burin-labs/harn"])
+  assert_eq(summary.pending_count, 1)
+  assert_eq(summary.pending_repositories, ["burin-labs/harn-cloud"])
+  assert_eq(summary.target_debt_count, 1)
+  assert(!observation_succeeded(receipts))
+  const healthy = receipts.map(fn(receipt) { return receipt + {status: "pass", sample_count: 10} })
+    .to_list()
+  assert(observation_succeeded(healthy), "a complete measured healthy census must actually succeed")
+  let unknown = healthy
+  unknown[0].status = "unknown"
+  assert(
+    is_err(
+      try {
+        observation_summary(unknown)
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        observation_summary([])
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        observation_summary(receipts.slice(0, 3))
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        observation_summary(
+          [unwrap(receipts[0]), unwrap(receipts[0]), unwrap(receipts[2]), unwrap(receipts[3])],
+        )
+      },
+    ),
+  )
+  assert_eq(
+    unwrap(
+      newest_run(
+        [
+          {id: 8, created_at: "2026-10-08T00:00:00Z"},
+          {id: 7, created_at: "2026-10-09T00:00:00Z"},
+          {id: 9, created_at: "2026-10-09T00:00:00Z"},
+        ],
+      ),
+    ).id,
+    9,
+  )
+}

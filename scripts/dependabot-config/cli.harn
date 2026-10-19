@@ -1,0 +1,20 @@
+import { check } from "./check"
+
+fn main(harness: Harness) {
+  const root = harness.env.get("DEPENDABOT_CHECK_ROOT") ?? harness.fs.cwd()
+  const report = check(
+    pick(harness, ["fs", "ast"]),
+    root,
+    {
+      require_lockfiles: harness.env.get("DEPENDABOT_CHECK_REQUIRE_LOCKFILES") == "1",
+      require_overrides: harness.env.get("DEPENDABOT_CHECK_REQUIRE_OVERRIDES") == "1",
+    },
+  )
+  harness.stdio.println(json_stringify(report))
+  for problem in report.problems {
+    harness.stdio.eprintln(problem)
+  }
+  if len(report.problems) > 0 {
+    harness.runtime.exit(1)
+  }
+}

@@ -1,0 +1,16 @@
+import { CommandResult } from "std/command"
+
+pub type CapturedCommand = {stdout: string, stderr: string, success: bool}
+
+type CaptureMeasurement = {stdout_truncated: bool, timed_out: bool}
+
+/**
+ * A parsable tail is not a complete report. Require measured capture state
+ * before any consumer interprets structured command output.
+ */
+pub fn complete_command_result(result: CommandResult) -> CapturedCommand {
+  const capture = schema_expect(result, schema_of(CaptureMeasurement))
+  require !capture.stdout_truncated, "command JSON output exceeded the bounded capture"
+  require !capture.timed_out, "command timed out before a complete report"
+  return {stdout: result.stdout, stderr: result.stderr, success: result.success}
+}

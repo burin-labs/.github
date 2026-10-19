@@ -1,0 +1,49 @@
+/**
+ * Request binding over the shared authenticated original-deadline reader.
+ * Private custody, chronology and product authority belong to that reader.
+ */
+pub type AuthorizationRequest = {context: string}
+
+pub type ReadRecovery = fn(string, string) -> unknown
+
+/**
+ * Public process envelope only. The shared reader owns the dictionaries'
+ * closed custody/product/deadline shapes and their authentication.
+ */
+type PublicRecoveryProjection = {owned: bool, context: dict, reading: dict, deadline: dict}
+
+pub fn parse_authorization(context: string) -> AuthorizationRequest? {
+  return trim(context) == "" ? nil : {context: context}
+}
+
+pub fn verify_authorization(
+  read_recovery: ReadRecovery,
+  repository: string,
+  source: string,
+  producer: int,
+  producer_attempt: int,
+  authorization: AuthorizationRequest,
+) {
+  if repository != "burin-labs/harn" || producer < 1 || producer_attempt < 1 {
+    throw "no owning original consumer deadline for this producer"
+  }
+  const checked = schema_parse(
+    read_recovery(authorization.context, source),
+    schema_of(PublicRecoveryProjection),
+  )
+  if !is_ok(checked) {
+    throw "original consumer recovery does not bind this producer"
+  }
+  const decision = unwrap(checked)
+  // The transport owns authentication. This owner binds that measured public
+  // result to the failed candidate being promoted, not a later promotion's
+  // freshly issued context for the same source.
+  if decision.owned != false
+    || decision.context.parent_repository != repository
+    || decision.context.parent_run_id != to_string(producer)
+    || decision.context.parent_run_attempt != producer_attempt
+    || decision.context.source_revision != source
+    || decision.reading.product?.verdict != "pass" {
+    throw "original consumer recovery does not bind this producer"
+  }
+}

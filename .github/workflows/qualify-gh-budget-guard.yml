@@ -1,0 +1,64 @@
+name: Qualify GitHub budget guard
+
+# The review-rule launcher grants network and ledger access only to an
+# installed GitHub budget wrapper whose bytes match a version recorded in
+# scripts/harn-required-review/qualified-guard.json. This keeps that record in
+# step with burin-code main: burin-code dispatches it when a push to main
+# changes scripts/gh-budget/, and it always qualifies main's current wrapper,
+# so a late or repeated dispatch cannot qualify anything else.
+on:
+  repository_dispatch:
+    types: [gh-budget-guard-changed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-gh-budget-guard
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Qualify the wrapper on burin-code main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Mint release-app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |-
+            .github
+            burin-code
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the wrapper on burin-code main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/burin-code
+          ref: main
+          path: .harn/burin-code
+          sparse-checkout: scripts/gh-budget
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Install Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        with:
+          version: "0.10.166"
+
+      - name: Propose the qualified record
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: >-
+          harn run --no-sandbox scripts/harn-required-review/qualify-guard.harn --
+          .harn/burin-code "$(git -C .harn/burin-code rev-parse HEAD)" --publish

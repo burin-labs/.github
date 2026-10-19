@@ -1,0 +1,45 @@
+import { gha_write_output } from "std/gha"
+import { REGISTRATION_SCHEMA, Registration, closed } from "./contract.harn"
+import { tested_source } from "./source.harn"
+
+/** Exercise the composite action's real registration without claiming a reusable CI verdict. */
+fn main(harness: Harness) {
+  require len(argv) >= 2, "identity|verify and workspace required"
+  const actual = tested_source(harness.process, argv[1])
+  const identity = {
+    id: "registration-smoke",
+    names: ["Registration smoke"],
+    digest: sha256_hex(json_stringify(actual)),
+  }
+  if argv[0] == "identity" {
+    require gha_write_output(
+      harness,
+      "identities",
+      json_stringify({schema: "burin.ci_job_identity.v1", jobs: [identity]}),
+    ),
+      "could not publish smoke identity"
+    return
+  }
+  require argv[0] == "verify" && len(argv) == 5,
+    "verify requires registration, run head, and checkout head"
+  const raw = json_parse(harness.fs.read_text(argv[2]))
+  schema_expect(raw, closed(schema_of(Registration)))
+  const record = schema_expect(raw, schema_of(Registration))
+  require record.schema == REGISTRATION_SCHEMA && record.tested_source == actual,
+    "registration does not retain the actual checkout"
+  require record.commit == argv[3] && actual.commit == argv[4],
+    "registration conflates workflow and tested source"
+  require record.jobs == [identity + {provenance: nil}],
+    "registration smoke identity is missing or altered"
+  harness.stdio.println(
+    json_stringify(
+      {
+        status: "passed",
+        run_head: record.commit,
+        tested_source: actual,
+        distinct_tested_merge: actual.commit != record.commit,
+        registered_jobs: len(record.jobs),
+      },
+    ),
+  )
+}

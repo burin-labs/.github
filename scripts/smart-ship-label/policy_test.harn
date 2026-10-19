@@ -1,0 +1,110 @@
+import { reconcile, ship_label } from "./policy.harn"
+
+fn spec() -> dict {
+  return {
+    name: "ship",
+    color: "0e8a16",
+    description: "Ship this pull request with the Smart Ship shepherd",
+  }
+}
+
+fn registry() -> dict {
+  return {delivery: [spec()]}
+}
+
+fn fake(initial: list<dict>) -> dict {
+  let current = initial
+  let writes = []
+  return {
+    github: {
+      read: fn(_path) { return nil },
+      pages: fn(_path) { return [current] },
+      send: fn(method, _path, body) {
+        writes = writes + [{method: method, body: body}]
+        if method == "POST" {
+          current = current + [body]
+        } else if method == "PATCH" {
+          current = current.map(
+            fn(label) { return label?.name == "ship" ? {
+              name: body.new_name,
+              color: body.color,
+              description: body.description,
+            } : label },
+          )
+        }
+        return body
+      },
+      graphql: fn(_query, _variables) { return nil },
+    },
+    writes: fn() { return writes },
+  }
+}
+
+pipeline test_registry_is_the_typed_owner() {
+  assert_eq(ship_label(registry()), spec())
+  const missing = try {
+    ship_label({delivery: []})
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(missing.contains("exactly one"), missing)
+  const malformed = try {
+    ship_label({delivery: [{name: "ship", color: "green", description: "x"}]})
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(malformed.contains("hexadecimal"), malformed)
+}
+
+pipeline test_exact_label_is_a_measured_no_op() {
+  const world = fake([spec(), {name: "bug", color: "d73a4a", description: "Bug"}])
+  const result = reconcile(world.github, "burin-labs/burin-code", ship_label(registry()))
+  assert_eq(result.state, "exact")
+  assert_eq(result.matching_after, 1)
+  assert_eq(result.pending, 0)
+  assert_eq(len(world.writes()), 0)
+}
+
+pipeline test_missing_label_is_created_and_read_back() {
+  const world = fake([{name: "bug", color: "d73a4a", description: "Bug"}])
+  const result = reconcile(world.github, "burin-labs/burin-code", ship_label(registry()))
+  assert_eq(result.state, "created")
+  assert_eq(result.census_before, 1)
+  assert_eq(result.census_after, 2)
+  assert_eq(world.writes()[0].method, "POST")
+}
+
+pipeline test_drifted_label_is_updated_and_read_back() {
+  const world = fake([{name: "ship", color: "ffffff", description: "old"}])
+  const result = reconcile(world.github, "burin-labs/burin-code", ship_label(registry()))
+  assert_eq(result.state, "updated")
+  assert_eq(result.census_before, 1)
+  assert_eq(result.census_after, 1)
+  assert_eq(world.writes()[0].method, "PATCH")
+}
+
+pipeline test_partial_or_duplicate_census_fails_closed() {
+  const empty_pages = {
+    read: fn(_path) { return nil },
+    pages: fn(_path) { return [] },
+    send: fn(_method, _path, _body) { return nil },
+    graphql: fn(_query, _variables) { return nil },
+  }
+  const absent = try {
+    reconcile(empty_pages, "burin-labs/burin-code", ship_label(registry()))
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(absent.contains("no pages"), absent)
+  const duplicate = fake([spec(), spec()])
+  const repeated = try {
+    reconcile(duplicate.github, "burin-labs/burin-code", ship_label(registry()))
+    ""
+  } catch (error) {
+    to_string(error)
+  }
+  assert(repeated.contains("duplicate"), repeated)
+}
