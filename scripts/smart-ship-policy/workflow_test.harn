@@ -118,7 +118,6 @@ pipeline test_actual_workflow_refuses_before_any_shepherd_when_policy_read_fails
             harness.fs.read_text(fixture.output),
             scenario == "present" ? fixture.content : "",
           )
-          assert(harness.fs.read_text(output).contains("policy=" + fixture.output + "\n"))
           for number in [1, 2, 3] {
             assert(children[number - 1].contains("--pr example/consumer#" + to_string(number)))
           }

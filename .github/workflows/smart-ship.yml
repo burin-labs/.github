@@ -23,6 +23,14 @@ on:
         description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
         type: boolean
         default: true
+      repair-environment:
+        description: >-
+          GitHub environment the repair job runs in. Its secrets, such as the
+          repair model's provider key, then reach only the repair job, and its
+          deployment rules decide which runs may use them. Empty runs the
+          repair without an environment, on the caller's passed secrets.
+        type: string
+        default: ""
       owned-runner-tag:
         description: >-
           Label of an owned Linux runner pool. A sweep runs on it when the
@@ -163,6 +171,8 @@ jobs:
     # within three minutes. Anything else runs hosted.
     runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
+    outputs:
+      deferred: ${{ steps.shepherd.outputs.deferred }}
     steps:
       - name: Mint the release app token
         id: app
@@ -307,7 +317,6 @@ jobs:
           # The bot the token acts as. GitHub reports the shepherd's own queue
           # removals as `manual`, like a person's; the actor tells them apart.
           BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REPO: ${{ github.repository }}
           LABEL: ${{ inputs.ship-label }}
           NUMBERS: ${{ steps.prs.outputs.numbers }}
@@ -321,14 +330,13 @@ jobs:
           ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn -- \
             "$REPO" "$DEFAULT_BRANCH" "$policy" || exit $?
           rm -rf -- "$GITHUB_WORKSPACE/.smart-ship-runner"
-          echo "policy=$policy" >> "$GITHUB_OUTPUT"
           extra=()
           if [ "$REPAIR" != "true" ]; then
             extra+=(--no-repair)
           fi
           # Every PR gets its look first. With --defer-repair the shepherd
           # changes nothing and exits 3 when its next action is a repair; those
-          # PRs are repaired after every look, by the steps below. A sweep that
+          # PRs are repaired after every look, by the repair job. A sweep that
           # repaired inline never reached the PRs after it, and the repair
           # tooling costs about 40 seconds that a look never needs.
           status=0
@@ -349,9 +357,69 @@ jobs:
           echo "deferred=${deferred[*]}" >> "$GITHUB_OUTPUT"
           exit $status
 
-      # Repair tooling, set up only when a look deferred a repair.
+  # Repairs run in their own job so a caller can hold the repair model's key in
+  # a GitHub environment that only this job reads. Each deferred PR gets a
+  # fresh look here before its repair, so nothing carries over from the looks.
+  # An environment admits default-branch runs only, so a run on another ref
+  # (a review event) leaves its deferred repairs to the next sweep.
+  repair:
+    needs: [availability, ship]
+    if: ${{ !cancelled() && needs.ship.outputs.deferred != '' && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+    environment: ${{ inputs.repair-environment }}
+    runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    steps:
+      - name: Mint the release app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }},burin-code
+
+      - name: Check out Smart Ship
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/burin-code
+          ref: ${{ inputs.burin-ref }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+
+      - name: Fetch Harn
+        uses: ./.github/actions/fetch-harn
+        with:
+          github-token: ${{ github.token }}
+          precompile: "false"
+
+      - name: Check out the Smart Ship control policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/.github
+          ref: df9c75308b05be787532b0d2a827e0ae8a61c095
+          path: .smart-ship-runner
+          persist-credentials: false
+
+      - name: Let git use the app token
+        uses: ./.github/actions/github-token-git-auth
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Read the repair policy
+        id: policy
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          policy="$RUNNER_TEMP/ship.toml"
+          ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn -- \
+            "$REPO" "$DEFAULT_BRANCH" "$policy"
+          rm -rf -- "$GITHUB_WORKSPACE/.smart-ship-runner"
+          echo "path=$policy" >> "$GITHUB_OUTPUT"
+
       - name: Download the PR agent
-        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
@@ -374,13 +442,11 @@ jobs:
       # A repair worktree runs its repository's own setup, which needs
       # burin-code's pinned Node and pnpm.
       - name: Set up Node
-        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .node-version
 
       - name: Set up the repair package manager
-        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           # Read the checked-out packageManager pin; repair worktrees own
@@ -390,7 +456,6 @@ jobs:
           dest: ${{ runner.temp }}/smart-ship-pnpm
 
       - name: Repair deferred pull requests
-        if: ${{ !cancelled() && steps.shepherd.outputs.deferred != '' }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
@@ -398,8 +463,8 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REPO: ${{ github.repository }}
           LABEL: ${{ inputs.ship-label }}
-          DEFERRED: ${{ steps.shepherd.outputs.deferred }}
-          POLICY: ${{ steps.shepherd.outputs.policy }}
+          DEFERRED: ${{ needs.ship.outputs.deferred }}
+          POLICY: ${{ steps.policy.outputs.path }}
         run: |
           set -uo pipefail
           git config --global user.name "harn-release-bot[bot]"
@@ -415,7 +480,7 @@ jobs:
           exit $status
 
       - name: Preserve repair transcripts and usage
-        if: ${{ always() && steps.shepherd.outputs.deferred != '' }}
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: smart-ship-repairs-${{ github.run_id }}-${{ github.run_attempt }}
