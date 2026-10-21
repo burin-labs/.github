@@ -360,9 +360,11 @@ jobs:
   # Repairs run in their own job so a caller can hold the repair model's key in
   # a GitHub environment that only this job reads. Each deferred PR gets a
   # fresh look here before its repair, so nothing carries over from the looks.
+  # An environment admits default-branch runs only, so a run on another ref
+  # (a review event) leaves its deferred repairs to the next sweep.
   repair:
     needs: [availability, ship]
-    if: ${{ !cancelled() && needs.ship.outputs.deferred != '' }}
+    if: ${{ !cancelled() && needs.ship.outputs.deferred != '' && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
     environment: ${{ inputs.repair-environment }}
     runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
