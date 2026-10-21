@@ -7,6 +7,12 @@ on:
   merge_group:
   workflow_dispatch:
 
+concurrency:
+  # Supersede only older runs of the same pull request. Every main push,
+  # merge group and manual run keeps its own slot and required verdict.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   smart-ship-control-runtime:
     name: Pinned shipping control runtime
