@@ -6,7 +6,7 @@ fn expression(value: string) -> string {
 }
 
 fn repair_needed() -> string {
-  return expression("!cancelled() && steps.shepherd.outputs.deferred != ''")
+  return expression("!cancelled() && needs.ship.outputs.deferred != ''")
 }
 
 fn named(steps: list, name: string) -> dict {
@@ -17,19 +17,16 @@ fn named(steps: list, name: string) -> dict {
 
 pipeline test_repair_bootstrap_provisions_the_declared_package_manager(harness: Harness) {
   const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
-  const steps = workflow.jobs.ship.steps
+  const steps = workflow.jobs.repair.steps
   const node = named(steps, "Set up Node")
   const package_manager = named(steps, "Set up the repair package manager")
-  const shepherd = named(steps, "Shepherd")
   const repair = named(steps, "Repair deferred pull requests")
-  assert_eq(package_manager["if"], repair_needed())
   assert_eq(package_manager.uses, "pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413")
   // The action reads packageManager from the checked-out repository instead
   // of duplicating a version here or installing its controller dependencies.
   assert_eq(package_manager["with"].run_install, false)
   assert_eq(package_manager["with"].dest, expression("runner.temp") + "/smart-ship-pnpm")
   assert_eq(package_manager["with"]?.version, nil)
-  assert(steps.index_of(shepherd) < steps.index_of(node))
   assert(steps.index_of(node) < steps.index_of(package_manager))
   assert(steps.index_of(package_manager) < steps.index_of(repair))
 }
@@ -145,7 +142,8 @@ pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness)
  * Runs the look step, then the repair step it hands off to, against a fake shepherd; returns its calls in order.
  */
 fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
-  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
+  const steps = jobs.ship.steps
   const workspace = harness.fs.mkdtemp_in_workspace("smart-ship-sweep")
   const calls = path_join(workspace, "calls")
   const output = path_join(workspace, "github-output")
@@ -187,14 +185,21 @@ fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
   }
   const look = run_step(harness, named(steps, "Shepherd").run, workspace, env)
   assert(look.success, "Shepherd step failed: " + look.stdout + look.stderr)
-  const outputs = step_outputs(harness.fs.read_text(output))
-  const deferred = outputs.get("deferred") ?? ""
+  const deferred = step_outputs(harness.fs.read_text(output)).get("deferred") ?? ""
   if deferred != "" {
+    const read = run_step(
+      harness,
+      named(jobs.repair.steps, "Read the repair policy").run,
+      workspace,
+      env,
+    )
+    assert(read.success, "Policy step failed: " + read.stdout + read.stderr)
     const repair = run_step(
       harness,
-      named(steps, "Repair deferred pull requests").run,
+      named(jobs.repair.steps, "Repair deferred pull requests").run,
       workspace,
-      env + {DEFERRED: deferred, POLICY: outputs.get("policy") ?? ""},
+      env
+        + {DEFERRED: deferred, POLICY: step_outputs(harness.fs.read_text(output)).get("path") ?? ""},
     )
     assert(repair.success, "Repair step failed: " + repair.stdout + repair.stderr)
   }
@@ -248,28 +253,38 @@ pipeline test_a_sweep_looks_at_every_pr_before_it_repairs_any(harness: Harness) 
 /**
  * The agent download, Node and pnpm cost about 40 seconds of every look in
  * burin-code runs 38312439308 and 38311317858, and only a repair uses them.
+ * The repair model's key reaches only the repair job, which may hold it in an
+ * environment.
  */
 pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Harness) {
-  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
-  const shepherd = named(steps, "Shepherd")
+  const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
+  assert_eq(jobs.ship.outputs.deferred, expression("steps.shepherd.outputs.deferred"))
+  assert_eq(jobs.repair["if"], repair_needed())
+  assert(jobs.repair.needs.contains("ship"))
+  assert_eq(jobs.repair.environment, expression("inputs.repair-environment"))
+  assert_eq(jobs.repair["runs-on"], jobs.ship["runs-on"])
+  assert_eq(named(jobs.ship.steps, "Shepherd").env?.OPENAI_API_KEY, nil)
+  assert_eq(
+    named(jobs.repair.steps, "Repair deferred pull requests").env.OPENAI_API_KEY,
+    expression("secrets.OPENAI_API_KEY"),
+  )
   for name in [
     "Download the PR agent",
     "Set up Node",
     "Set up the repair package manager",
     "Repair deferred pull requests",
   ] {
-    const step = named(steps, name)
-    assert_eq(step["if"], repair_needed(), name)
-    assert(steps.index_of(shepherd) < steps.index_of(step), name)
+    assert_eq(len(jobs.ship.steps.filter({ step -> step?.name == name }).to_list()), 0, name)
+    assert_eq(named(jobs.repair.steps, name)["if"], nil, name)
   }
 }
 
 pipeline test_repair_evidence_survives_a_failed_attempt_without_uploading_checkouts(
   harness: Harness,
 ) {
-  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.repair.steps
   const archive = named(steps, "Preserve repair transcripts and usage")
-  assert_eq(archive["if"], expression("always() && steps.shepherd.outputs.deferred != ''"))
+  assert_eq(archive["if"], "always()")
   assert_eq(archive.uses, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
   assert(steps.index_of(archive) > steps.index_of(named(steps, "Repair deferred pull requests")))
   assert_eq(
