@@ -27,8 +27,10 @@ on:
         description: >-
           GitHub environment the repair job runs in. Its secrets, such as the
           repair model's provider key, then reach only the repair job, and its
-          deployment rules decide which runs may use them. Empty runs the
-          repair without an environment, on the caller's passed secrets.
+          deployment rules decide which runs may use them. GitHub shows a
+          called job its environment's secrets only when the caller passes
+          `secrets: inherit`; an explicit secrets map hides them. Empty runs
+          the repair without an environment, on the caller's passed secrets.
         type: string
         default: ""
       owned-runner-tag:
