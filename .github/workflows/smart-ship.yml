@@ -359,6 +359,28 @@ jobs:
           echo "deferred=${deferred[*]}" >> "$GITHUB_OUTPUT"
           exit $status
 
+      # Once every look is done this run acts only on the PRs its repair job
+      # takes. Publishing that subset lets other runs act on the rest instead
+      # of deferring to this run until its repairs finish.
+      - name: Record the pull requests left for repair
+        if: ${{ !cancelled() && steps.prs.outputs.numbers != '' }}
+        env:
+          NUMBERS: ${{ steps.shepherd.outputs.deferred }}
+        run: >-
+          ./scripts/harnw run --no-sandbox
+          .smart-ship-targets/scripts/smart-ship-targets/cli.harn --
+          --output "$RUNNER_TEMP/ship-repair-targets/targets.json"
+
+      - name: Publish the pull requests left for repair
+        if: ${{ !cancelled() && steps.prs.outputs.numbers != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}-repair
+          path: ${{ runner.temp }}/ship-repair-targets/targets.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   # Repairs run in their own job so a caller can hold the repair model's key in
   # a GitHub environment that only this job reads. Each deferred PR gets a
   # fresh look here before its repair, so nothing carries over from the looks.

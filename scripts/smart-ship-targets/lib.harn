@@ -16,7 +16,9 @@ pub type SelectionInput = {
   numbers: string?,
 }
 
-/** NUMBERS comes from the selector, never from its deferred repair subset. */
+/**
+ * NUMBERS is the selector's population, or the repair subset for the separate narrowed artifact.
+ */
 pub fn selected_targets(input: SelectionInput) -> TargetSelection {
   const {repository, run_id, attempt, numbers} = input
   const prefix = repository + "/.github/workflows/"

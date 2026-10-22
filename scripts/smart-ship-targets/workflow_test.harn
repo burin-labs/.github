@@ -39,6 +39,18 @@ pipeline test_the_exact_selection_is_finalized_before_any_shepherd(harness: Harn
   assert(ship.index_of(discovery) < ship.index_of(record))
   assert(ship.index_of(record) < ship.index_of(publish))
   assert(ship.index_of(publish) < ship.index_of(shepherd))
+  // After the looks, only the repair subset stays owned; it is a separate artifact.
+  const narrow = named(ship, "Record the pull requests left for repair")
+  const narrowed = named(ship, "Publish the pull requests left for repair")
+  assert_eq(narrow.env.NUMBERS, "$" + "{{ steps.shepherd.outputs.deferred }}")
+  assert(narrow.run.contains("--output \"$RUNNER_TEMP/ship-repair-targets/targets.json\""))
+  assert_eq(narrowed.uses, publish.uses)
+  assert_eq(
+    narrowed["with"].name,
+    "smart-ship-targets-$" + "{{ github.run_id }}-$" + "{{ github.run_attempt }}-repair",
+  )
+  assert(ship.index_of(shepherd) < ship.index_of(narrow))
+  assert(ship.index_of(narrow) < ship.index_of(narrowed))
   const repair = named(jobs.repair.steps, "Repair deferred pull requests")
   assert_eq(repair.env.NUMBERS, nil)
   assert_eq(repair.env.DEFERRED, "$" + "{{ needs.ship.outputs.deferred }}")
