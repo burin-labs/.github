@@ -22,6 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Check out the immutable shipping control
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -110,6 +111,21 @@ jobs:
           harn run --read-only-root "$GITHUB_WORKSPACE"
           scripts/ci-job-proof/smoke.harn -- verify "$GITHUB_WORKSPACE"
           "$REGISTRATION" "$RUN_HEAD" "$GITHUB_SHA"
+      - name: Capture CI comparison commits
+        id: comparison
+        uses: ./.github/actions/ci-comparison
+        with:
+          base-ref: HEAD
+      - name: Verify comparison output and actual CLI controls
+        env:
+          COMPARISON_HEAD: ${{ steps.comparison.outputs.head-sha }}
+          COMPARISON_BASE: ${{ steps.comparison.outputs.base-sha }}
+          COMPARISON_TIP: ${{ steps.comparison.outputs.base-tip-sha }}
+        run: |
+          test "$COMPARISON_HEAD" = "$GITHUB_SHA"
+          test "$COMPARISON_BASE" = "$GITHUB_SHA"
+          test "$COMPARISON_TIP" = "$GITHUB_SHA"
+          harn test .github/actions/ci-comparison/cli_test.harn
 
   package-smoke:
     name: Reusable Harn package smoke (${{ matrix.strict && 'strict' || 'default' }})

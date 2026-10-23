@@ -1,0 +1,82 @@
+type Comparison = {base_sha: string, base_tip_sha: string, head_sha: string}
+
+fn git(process: HarnessProcess, root: string, args: list<string>) -> string {
+  const result = process.run({program: "git", args: args, cwd: root, timeout_ms: 10000})
+  require result.success, result.stderr
+  return trim(result.stdout)
+}
+
+pipeline test_comparison_cli_includes_the_stack_and_excludes_advancing_main(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("comparison-")
+  defer {
+    harness.fs.delete(root)
+  }
+  const source = path_join(harness.fs.cwd(), "cli.harn")
+  const harn = trim(harness.process.run({program: "which", args: ["harn"]}).stdout)
+  assert(harn != "", "the actual Harn CLI is required")
+  git(harness.process, root, ["init", "-q", "-b", "main"])
+  git(harness.process, root, ["config", "user.name", "Fixture"])
+  git(harness.process, root, ["config", "user.email", "fixture@example.com"])
+  git(harness.process, root, ["config", "commit.gpgsign", "false"])
+  harness.fs.write_text("${root}/base.txt", "base")
+  git(harness.process, root, ["add", "."])
+  git(harness.process, root, ["commit", "-qm", "base"])
+  const base = git(harness.process, root, ["rev-parse", "HEAD"])
+  git(harness.process, root, ["checkout", "-qb", "parent"])
+  harness.fs.write_text("${root}/parent.rs", "parent change")
+  git(harness.process, root, ["add", "."])
+  git(harness.process, root, ["commit", "-qm", "parent"])
+  git(harness.process, root, ["checkout", "-qb", "child"])
+  harness.fs.write_text("${root}/child.md", "child change")
+  git(harness.process, root, ["add", "."])
+  git(harness.process, root, ["commit", "-qm", "child"])
+  const head = git(harness.process, root, ["rev-parse", "HEAD"])
+  git(harness.process, root, ["checkout", "-q", "main"])
+  harness.fs.write_text("${root}/main-only.md", "advancing main")
+  git(harness.process, root, ["add", "."])
+  git(harness.process, root, ["commit", "-qm", "advance main"])
+  const tip = git(harness.process, root, ["rev-parse", "HEAD"])
+  git(harness.process, root, ["update-ref", "refs/remotes/origin/main", tip])
+  git(harness.process, root, ["checkout", "-q", "child"])
+  const output = "${root}/output"
+  const invoke = { base_ref: string ->
+    harness.fs.write_text(output, "")
+    harness.process.run(
+      {
+        program: harn,
+        args: ["run", "--standalone", "--read-only-root", dirname(source), source],
+        cwd: root,
+        env: {
+          CI_COMPARISON_WORKSPACE: root,
+          CI_COMPARISON_BASE_REF: base_ref,
+          CI_COMPARISON_HEAD_REF: "HEAD",
+          GITHUB_OUTPUT: output,
+        },
+        timeout_ms: 60000,
+      },
+    )
+  }
+  const result = invoke("refs/remotes/origin/main")
+  assert(result.success, json_stringify(result))
+  const observed = json_decode(result.stdout, schema_of(Comparison))?
+  assert_eq(observed, {base_sha: base, base_tip_sha: tip, head_sha: head})
+  assert_eq(
+    git(harness.process, root, ["diff", "--name-only", observed.base_sha, observed.head_sha]),
+    "child.md\nparent.rs",
+  )
+  assert(len(harness.fs.read_text(output)) > 0)
+  const identical = invoke("HEAD")
+  assert(identical.success, identical.stderr)
+  const same = json_decode(identical.stdout, schema_of(Comparison))?
+  assert_eq(same.base_sha, head)
+  const missing = invoke("refs/remotes/origin/missing")
+  assert(!missing.success)
+  assert_eq(harness.fs.read_text(output), "")
+  git(harness.process, root, ["checkout", "-q", "--orphan", "unrelated"])
+  git(harness.process, root, ["commit", "--allow-empty", "-qm", "unrelated"])
+  git(harness.process, root, ["update-ref", "refs/remotes/origin/main", "HEAD"])
+  git(harness.process, root, ["checkout", "-q", "child"])
+  const unrelated = invoke("refs/remotes/origin/main")
+  assert(!unrelated.success)
+  assert_eq(harness.fs.read_text(output), "")
+}
