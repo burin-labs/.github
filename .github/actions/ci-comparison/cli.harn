@@ -1,0 +1,41 @@
+import { gha_write_output } from "std/gha"
+import { require_env } from "std/os"
+
+fn git_commit(process: HarnessProcess, root: string, args: list<string>) -> string {
+  const result = process.run(
+    {
+      program: "git",
+      args: args,
+      cwd: root,
+      env: {GIT_CONFIG_GLOBAL: "", GIT_CONFIG_NOSYSTEM: "1"},
+      timeout_ms: 10000,
+    },
+  )
+  require result.success, "CI comparison cannot read Git history: ${result.stderr}"
+  const value = trim(result.stdout)
+  require regex_match(r"^[a-f0-9]{40}$", value) != nil, "CI comparison expected exactly one commit"
+  return value
+}
+
+fn main(harness: Harness) -> nil {
+  const root = require_env(harness.env, "CI_COMPARISON_WORKSPACE")
+  const base = require_env(harness.env, "CI_COMPARISON_BASE_REF")
+  const head = require_env(harness.env, "CI_COMPARISON_HEAD_REF")
+  const tip = git_commit(
+    harness.process,
+    root,
+    ["rev-parse", "--verify", "--end-of-options", "${base}^{commit}"],
+  )
+  const candidate = git_commit(
+    harness.process,
+    root,
+    ["rev-parse", "--verify", "--end-of-options", "${head}^{commit}"],
+  )
+  const ancestor = git_commit(harness.process, root, ["merge-base", "--all", tip, candidate])
+  for row in {"base-sha": ancestor, "base-tip-sha": tip, "head-sha": candidate}.entries() {
+    require gha_write_output(harness, row.key, row.value), "GITHUB_OUTPUT is required"
+  }
+  harness.stdio.println(
+    json_stringify({base_sha: ancestor, base_tip_sha: tip, head_sha: candidate}),
+  )
+}

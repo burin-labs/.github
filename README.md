@@ -23,6 +23,10 @@ contract, local command, and pinned action syntax.
 
 ## Selective Rust tests
 
+Capture exact path-filter and planner inputs with the
+[CI comparison action](docs/ci-comparison.md). It uses a stack's merge base
+with main and reports missing history as a failure.
+
 `burin-labs/.github/.github/actions/rust-test-impact` is the organization-owned
 adapter for branch-only Rust test impact analysis. It reads Cargo's real
 workspace graph, expands directly changed packages through the transitive
