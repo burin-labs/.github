@@ -53,5 +53,35 @@ pipeline test_the_exact_selection_is_finalized_before_any_shepherd(harness: Harn
   assert(ship.index_of(narrow) < ship.index_of(narrowed))
   const repair = named(jobs.repair.steps, "Repair deferred pull requests")
   assert_eq(repair.env.NUMBERS, nil)
-  assert_eq(repair.env.DEFERRED, "$" + "{{ needs.ship.outputs.deferred }}")
+  assert_eq(repair.env.DEFERRED, "$" + "{{ matrix.pr }}")
+}
+
+/** A cancelled or timed-out repair leaves no PR held behind the rest of its run. */
+pipeline test_each_repair_releases_its_pr_however_it_ends(harness: Harness) {
+  const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
+  assert_eq(jobs.ship.outputs.deferred_json, "$" + "{{ steps.shepherd.outputs.deferred_json }}")
+  assert_eq(jobs.repair.strategy["fail-fast"], false)
+  assert_eq(
+    jobs.repair.strategy.matrix.pr,
+    "$" + "{{ fromJSON(needs.ship.outputs.deferred_json) }}",
+  )
+  const steps = jobs.repair.steps
+  const repair = named(steps, "Repair deferred pull requests")
+  const record = named(steps, "Record the finished repair")
+  const release = named(steps, "Release the pull request")
+  const look = named(steps, "Look at the released pull request again")
+  assert_eq(record["if"], "always()")
+  assert_eq(release["if"], "always()")
+  assert(look["if"].contains("always()"))
+  assert_eq(
+    release["with"].name,
+    "smart-ship-targets-$" + "{{ github.run_id }}-$" + "{{ github.run_attempt }}-repaired-$"
+      + "{{ matrix.pr }}",
+  )
+  assert_eq(release["with"].path, "$" + "{{ runner.temp }}/ship-released/released.json")
+  assert(look.run.contains("-f \"pr=$PR\""))
+  assert(steps.index_of(repair) < steps.index_of(record))
+  assert(steps.index_of(record) < steps.index_of(release))
+  // The fresh look must find the PR already released.
+  assert(steps.index_of(release) < steps.index_of(look))
 }

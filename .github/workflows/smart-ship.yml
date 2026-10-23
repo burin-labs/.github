@@ -175,6 +175,7 @@ jobs:
     timeout-minutes: 40
     outputs:
       deferred: ${{ steps.shepherd.outputs.deferred }}
+      deferred_json: ${{ steps.shepherd.outputs.deferred_json }}
     steps:
       - name: Mint the release app token
         id: app
@@ -357,6 +358,7 @@ jobs:
             fi
           done
           echo "deferred=${deferred[*]}" >> "$GITHUB_OUTPUT"
+          echo "deferred_json=[$(IFS=,; echo "${deferred[*]}")]" >> "$GITHUB_OUTPUT"
           exit $status
 
       # Once every look is done this run acts only on the PRs its repair job
@@ -386,12 +388,19 @@ jobs:
   # fresh look here before its repair, so nothing carries over from the looks.
   # An environment admits default-branch runs only, so a run on another ref
   # (a review event) leaves its deferred repairs to the next sweep.
+  # One leg per PR: serial repairs held every PR until the slowest ended, and
+  # the job timeout cancelled the PRs still waiting their turn.
   repair:
     needs: [availability, ship]
     if: ${{ !cancelled() && needs.ship.outputs.deferred != '' && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
     environment: ${{ inputs.repair-environment }}
     runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        pr: ${{ fromJSON(needs.ship.outputs.deferred_json) }}
     steps:
       - name: Mint the release app token
         id: app
@@ -487,7 +496,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REPO: ${{ github.repository }}
           LABEL: ${{ inputs.ship-label }}
-          DEFERRED: ${{ needs.ship.outputs.deferred }}
+          DEFERRED: ${{ matrix.pr }}
           POLICY: ${{ steps.policy.outputs.path }}
         run: |
           set -uo pipefail
@@ -503,11 +512,47 @@ jobs:
           done
           exit $status
 
+      # However the repair ended, including a cancel or timeout, this run stops
+      # holding the PR (burin-code scripts/lib/ship/coverage.harn
+      # `released_prs`) and a fresh look picks it up instead of the next sweep.
+      - name: Record the finished repair
+        if: always()
+        env:
+          PR: ${{ matrix.pr }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ship-released"
+          printf '{"pr":%s}\n' "$PR" > "$RUNNER_TEMP/ship-released/released.json"
+
+      - name: Release the pull request
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}-repaired-${{ matrix.pr }}
+          path: ${{ runner.temp }}/ship-released/released.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Look at the released pull request again
+        if: ${{ always() && steps.app.outputs.token != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ matrix.pr }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          workflow="${WORKFLOW_REF#*/.github/workflows/}"
+          workflow="${workflow%%@*}"
+          if ! gh workflow run "$workflow" --repo "$REPO" --ref "$DEFAULT_BRANCH" -f "pr=$PR"; then
+            echo "::warning::could not request a look at #$PR; the next sweep picks it up"
+          fi
+
       - name: Preserve repair transcripts and usage
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: smart-ship-repairs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: smart-ship-repairs-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
           path: |
             ${{ runner.temp }}/ship/*/repair-*.json
             ${{ runner.temp }}/ship/*/repair-*.log
