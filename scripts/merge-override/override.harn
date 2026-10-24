@@ -32,6 +32,13 @@ const CANCEL_WAIT_MS = 600000
 
 const FORCE_CANCEL_AFTER_MS = 120000
 
+// GitHub's run list can report a total_count its own page does not hold while
+// runs start or finish, which failed two overrides on harn#10443. Re-read a
+// few times; a census that never agrees still throws.
+const CENSUS_ATTEMPTS = 5
+
+const CENSUS_RETRY_MS = 3000
+
 const REVIEW_QUERY =
   "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision}}}"
 
@@ -395,16 +402,29 @@ pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int)
   if type_of(workflow_id) != "int" {
     throw "could not read this override run's workflow id"
   }
-  let status_pages = {}
-  for status in ["requested", "queued", "in_progress", "waiting", "pending"] {
-    status_pages = status_pages
-      + {
-        [status]: gh.pages(
-          repo + "/actions/runs?head_sha=" + input.head_sha + "&status=" + status + "&per_page=100",
-        ),
+  let selection = nil
+  let attempt = 1
+  while selection == nil {
+    let status_pages = {}
+    for status in ["requested", "queued", "in_progress", "waiting", "pending"] {
+      status_pages = status_pages
+        + {
+          [status]: gh.pages(
+            repo + "/actions/runs?head_sha=" + input.head_sha + "&status=" + status
+              + "&per_page=100",
+          ),
+        }
+    }
+    try {
+      selection = select_competing_runs(run_id, workflow_id, status_pages)
+    } catch (error) {
+      if attempt >= CENSUS_ATTEMPTS || !to_string(error).contains(" workflow-run census ") {
+        throw error
       }
+      attempt = attempt + 1
+      sleep_ms(CENSUS_RETRY_MS)
+    }
   }
-  const selection = select_competing_runs(run_id, workflow_id, status_pages)
   for id in selection.competing_run_ids {
     request_stop(gh, repo, id, "cancel")
   }
