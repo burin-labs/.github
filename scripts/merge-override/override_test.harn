@@ -51,7 +51,14 @@ const MAIN_RED_SEARCH =
 const CANCELLED_RED_SEARCH =
   "search/issues?q=repo:burin-labs/example+is:issue+is:open+in:title+%22%5BCI%5D+Main+red+inside+a+cancelled+run%22"
 
-const MAIN_RUNS = REPO + "/actions/runs?branch=main&exclude_pull_requests=true&per_page=50"
+/**
+ * Main's runs are read from the CI workflow's own history, never from a
+ * repository-wide window that Smart Ship and comment runs can fill.
+ */
+const WORKFLOWS = REPO + "/actions/workflows?per_page=100"
+
+const MAIN_RUNS = REPO
+  + "/actions/workflows/777/runs?branch=main&exclude_pull_requests=true&status=completed&per_page=50"
 
 const PR_FILES = REPO + "/pulls/42/files?per_page=100"
 
@@ -129,6 +136,7 @@ fn world(overrides: dict = {}) -> dict {
       incomplete_results: false,
     },
     [CANCELLED_RED_SEARCH]: {items: [], incomplete_results: false},
+    [WORKFLOWS]: {workflows: [{id: 5, name: "Smart Ship"}, {id: 777, name: "CI"}]},
     [MAIN_RUNS]: {workflow_runs: []},
     [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
       {
@@ -672,7 +680,7 @@ pipeline test_an_approved_green_head_outside_an_incident_is_refused_with_the_mea
     const result = decided(paths)
     assert_eq(result.decision.verdict, "refused", label)
     const refusal = result.decision.refusals[0]
-    assert(refusal.contains("moves main outside the merge queue"), refusal)
+    assert(refusal.contains("no incident was found"), refusal)
     assert(refusal.contains("main is red: no"), refusal)
     assert(refusal.contains("release-train pull request: no"), refusal)
     assert(
@@ -684,8 +692,13 @@ pipeline test_an_approved_green_head_outside_an_incident_is_refused_with_the_mea
       record_markdown(
         result.record + {outcome: "refused", error: "", actions: [], merge_commit: ""},
       )
-        .contains("Incident evidence"),
+        .contains("<details><summary>Audit record</summary>"),
     )
+    // The actor's reason stays above the toggle.
+    const shown = record_markdown(
+      result.record + {outcome: "refused", error: "", actions: [], merge_commit: ""},
+    )
+    assert(shown.index_of("- Reason: ") < shown.index_of("<details>"), shown)
   }
   // The reason text is not evidence: a reason that claims an incident changes nothing.
   const claimed = world(
@@ -826,6 +839,9 @@ pipeline test_an_unmeasurable_signal_never_reads_as_an_incident(harness: Harness
   )
   assert_eq(result.record.incident.main_red.state, "unmeasured")
   assert_eq(result.record.incident.queue_wedged.state, "unmeasured")
+  // A repository with no CI workflow cannot show main is calm.
+  const nameless = world(calm({[WORKFLOWS]: {workflows: [{id: 5, name: "Smart Ship"}]}}))
+  assert_eq(decided(nameless).record.incident.main_red.state, "unmeasured")
   // One source down and the other reading green is unmeasured, not "no".
   const half = world(calm({[MAIN_RED_SEARCH]: OUTAGE}))
   assert_eq(decided(half).record.incident.main_red.state, "unmeasured")

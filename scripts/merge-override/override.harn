@@ -8,6 +8,7 @@ import {
   Actor,
   Facts,
   Incident,
+  MAIN_CI_WORKFLOW,
   MAIN_RED_TITLES,
   QUEUE_BYPASS_LABELS,
   REQUIRED_CHECK,
@@ -119,9 +120,20 @@ fn main_red(gh: GitHub, input: Input, base_branch: string) {
     }
   }
   try {
+    // Ask the CI workflow for its own runs. A repository-wide window fills with
+    // Smart Ship, comment and cleanup runs, pushes CI off it, and then reads
+    // as "no conclusive CI run" while main is red.
+    const workflows = gh.read("repos/" + input.repository + "/actions/workflows?per_page=100")
+    const ci = (workflows?.workflows ?? []).filter({ item -> item?.name == MAIN_CI_WORKFLOW })
+      .to_list()[0]
+    if ci == nil {
+      throw "no `" + MAIN_CI_WORKFLOW + "` workflow in " + input.repository
+    }
     runs = gh.read(
-      "repos/" + input.repository + "/actions/runs?branch=" + base_branch
-        + "&exclude_pull_requests=true&per_page="
+      "repos/" + input.repository + "/actions/workflows/" + to_string(ci.id)
+        + "/runs?branch="
+        + base_branch
+        + "&exclude_pull_requests=true&status=completed&per_page="
         + to_string(MAIN_RUN_WINDOW),
     )?.workflow_runs
       ?? []

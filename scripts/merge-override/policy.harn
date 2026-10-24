@@ -432,12 +432,9 @@ fn incident_refusal(label: string, incident: Incident?) -> string? {
       + evidence
   }
   return "`" + label
-    + "` moves main outside the merge queue, which rebuilds every queued merge group and cancels the verdicts main needs; the queue already lands approved, green pull requests. It is allowed only when main is red, the pull request is a release-train pull request (a repin, a version-only bump, or labeled `"
-    + RELEASE_BLOCKER_LABEL
-    + "`), or the queue is wedged (queued over "
-    + to_string(QUEUE_WEDGE_MINUTES)
-    + " min with no merge group running). None holds: "
+    + "` was not applied: no incident was found ("
     + evidence
+    + "). It lands outside the merge queue only when main is red, this is a release-train pull request, or the queue is wedged."
 }
 
 fn is_admin(actor: Actor) -> bool {
@@ -603,16 +600,56 @@ fn bullet_list(items: list) -> string {
   return len(items) == 0 ? "none" : join(items, "; ")
 }
 
-/** The PR comment and step summary for one attempt. */
+/** Why an incident-only label is held to the queue; shown in the comment's details. */
+const QUEUE_BYPASS_RATIONALE =
+  "Landing outside the merge queue rebuilds every queued merge group and cancels the verdicts main needs, and the queue already lands approved, green pull requests. Evidence is measured, never taken from the reason text. Main is red when an open `[CI] Main is red` issue exists or the newest conclusive `"
+  + MAIN_CI_WORKFLOW
+  + "` run on the base branch failed. A pull request is release-train when it repins, only bumps the version, or is labeled `"
+  + RELEASE_BLOCKER_LABEL
+  + "`. The queue is wedged when the pull request has been queued over "
+  + to_string(QUEUE_WEDGE_MINUTES)
+  + " min with no merge group running."
+
+fn signal_line(name: string, signal: Signal) -> string {
+  return name + ": " + signal.state + " (" + signal.detail + ")"
+}
+
+/**
+ * The PR comment and step summary for one attempt: the outcome and the reason
+ * first, the audit trail behind a toggle.
+ */
 pub fn record_markdown(record: dict) -> string {
   const heading = {applied: "applied", refused: "refused", errored: "errored"}[record.outcome]
   const checks = record.checks
+  const actors = join(record.actors.map({ actor -> "@" + actor }), ", ")
   let lines = [
     "### Merge override " + heading + ": `" + record.label + "`",
     "",
-    "- Requested by: " + join(record.actors.map({ actor -> "@" + actor }), ", ") + " at "
-      + record.labeled_at,
+    "- Requested by " + actors,
     "- Reason: " + record.reason,
+  ]
+  if len(record.refusals) > 0 {
+    lines = lines + record.refusals.map({ refusal -> "- " + refusal })
+  }
+  if record.error != "" {
+    lines = lines + ["- Error: " + record.error]
+  }
+  if record.merge_commit != "" {
+    lines = lines + ["- Merged as `" + record.merge_commit + "`"]
+  }
+  if record.reason_source == "none" {
+    lines = lines
+      + [
+        "",
+        actors
+          + " please reply with a one-line `override: <reason>` comment for the change record.",
+      ]
+  }
+  if record.outcome != "applied" {
+    lines = lines + ["", "Re-apply `" + record.label + "` once the cause above is fixed."]
+  }
+  let detail = [
+    "- Requested at: " + record.labeled_at,
     "- Head: `" + record.head_sha + "`",
     "- Checks on the head: `" + REQUIRED_CHECK + "` " + checks.ci_status + "; "
       + to_string(checks.passing)
@@ -625,47 +662,25 @@ pub fn record_markdown(record: dict) -> string {
     "- Review decision: " + (record.review_decision ?? "no review required"),
   ]
   if record?.incident != nil {
-    lines = lines
+    detail = detail
       + [
-        "- Incident evidence: main red " + record.incident.main_red.state + " ("
-          + record.incident.main_red.detail
-          + "); release train "
-          + record.incident.release_train.state
-          + " ("
-          + record.incident.release_train.detail
-          + "); queue wedged "
-          + record.incident.queue_wedged.state
-          + " ("
-          + record.incident.queue_wedged.detail
-          + ")",
+        "- Incident evidence:",
+        "  - " + signal_line("main red", record.incident.main_red),
+        "  - " + signal_line("release train", record.incident.release_train),
+        "  - " + signal_line("queue wedged", record.incident.queue_wedged),
       ]
   }
-  if len(record.refusals) > 0 {
-    lines = lines + ["- Refused because: " + join(record.refusals, "; ")]
-  }
-  if record.error != "" {
-    lines = lines + ["- Error: " + record.error]
-  }
-  lines = lines + ["- Actions: " + bullet_list(record.actions)]
-  if record.merge_commit != "" {
-    lines = lines + ["- Merge commit: `" + record.merge_commit + "`"]
-  }
+  detail = detail + ["- Actions: " + bullet_list(record.actions)]
   if len(record.warnings) > 0 {
-    lines = lines + ["- Warnings: " + join(record.warnings, "; ")]
+    detail = detail + ["- Warnings: " + join(record.warnings, "; ")]
   }
-  lines = lines + ["- Run: " + record.run_url]
-  if record.reason_source == "none" {
-    lines = lines
-      + [
-        "",
-        join(record.actors.map({ actor -> "@" + actor }), " ")
-          + " please reply with a one-line `override: <reason>` comment for the change record.",
-      ]
+  detail = detail + ["- Run: " + record.run_url]
+  if record.outcome == "refused" && QUEUE_BYPASS_LABELS.contains(record.label) {
+    detail = detail + ["", QUEUE_BYPASS_RATIONALE]
   }
-  if record.outcome != "applied" {
-    lines = lines + ["", "Re-apply `" + record.label + "` once the cause above is fixed."]
-  }
-  return join(lines, "\n")
+  return join(lines, "\n") + "\n\n<details><summary>Audit record</summary>\n\n"
+    + join(detail, "\n")
+    + "\n\n</details>"
 }
 
 /** One org-log comment: a readable line plus the machine record. */
