@@ -8,8 +8,8 @@ name: runner-availability (reusable)
 #     runner-availability:
 #       uses: burin-labs/.github/.github/workflows/runner-availability.yml@main
 #       secrets:
-#         RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
-#         RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+#         RUNNER_PROBE_APP_CLIENT_ID: ${{ secrets.RUNNER_PROBE_APP_CLIENT_ID }}
+#         RUNNER_PROBE_APP_PRIVATE_KEY: ${{ secrets.RUNNER_PROBE_APP_PRIVATE_KEY }}
 #     build:
 #       needs: runner-availability
 #       runs-on: ${{ needs.runner-availability.outputs.linux == 'true'
@@ -120,10 +120,11 @@ on:
     # Declared explicitly so callers can avoid `secrets: inherit` and pass only
     # the GitHub App credentials this detector needs. Both are optional:
     # fork/dependabot runs without them and fall through to hosted runners.
+    # The probe has its own app so release automation cannot drain its rate limit.
     secrets:
-      RELEASE_APP_CLIENT_ID:
+      RUNNER_PROBE_APP_CLIENT_ID:
         required: false
-      RELEASE_APP_PRIVATE_KEY:
+      RUNNER_PROBE_APP_PRIVATE_KEY:
         required: false
     outputs:
       linux:
@@ -242,7 +243,7 @@ jobs:
     env:
       # Promote to job env so step-level `if:` can gate on secret presence; the
       # `secrets` context is unavailable directly in step `if:` expressions.
-      HAS_RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+      HAS_RUNNER_PROBE_APP_CLIENT_ID: ${{ secrets.RUNNER_PROBE_APP_CLIENT_ID != '' }}
       # Dependabot pull requests are served the Dependabot secret store, so the
       # app credentials above are absent by design and the probe cannot run.
       # That is a credentials state, not a statement about the fleet, and the
@@ -263,11 +264,11 @@ jobs:
     steps:
       - name: Mint GitHub App token
         id: app-token
-        if: ${{ env.HAS_RELEASE_APP_CLIENT_ID == 'true' }}
+        if: ${{ env.HAS_RUNNER_PROBE_APP_CLIENT_ID == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.RUNNER_PROBE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RUNNER_PROBE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           # Required for /orgs/{org}/actions/runners; without it the app token
