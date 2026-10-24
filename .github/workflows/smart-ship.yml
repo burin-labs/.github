@@ -226,7 +226,10 @@ jobs:
       # went down or stalled since the last sweep, and a queued run that has not
       # published its targets blocks every other run's look (`single_actor`).
       # The sweep looks at every labeled PR, so it cancels what has queued past
-      # any normal wait and acts itself.
+      # any normal wait and acts itself. GitHub also reports a live run as
+      # queued while its later jobs wait for runners, so only a run none of
+      # whose jobs has started or done work is cancelled; on 2026-10-24 a
+      # sweep cancelled the previous sweep's seven running repairs.
       - name: Cancel stale queued Smart Ship runs
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '') }}
         env:
@@ -242,6 +245,15 @@ jobs:
           stale="$(gh run list -R "$REPO" --workflow "$workflow" --status queued --limit 100 \
             --json databaseId,createdAt --jq ".[] | select(.createdAt < \"$cutoff\" and .databaseId != $RUN_ID) | .databaseId")"
           for id in $stale; do
+            if ! started="$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" --jq \
+              '[.jobs[] | select(.status == "in_progress" or (.status == "completed" and .conclusion != "skipped"))] | length')"; then
+              echo "::warning::could not read the jobs of queued run $id; leaving it"
+              continue
+            fi
+            if [ "$started" != "0" ]; then
+              echo "Leaving run $id: $started of its jobs started, so it is live"
+              continue
+            fi
             if gh run cancel "$id" -R "$REPO"; then
               echo "::notice::cancelled run $id, queued since before $cutoff"
             else
