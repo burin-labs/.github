@@ -651,6 +651,50 @@ pipeline test_a_run_no_longer_in_progress_counts_as_cancelled_once_reread(harnes
   )
 }
 
+/**
+ * GitHub can report a run total its page does not hold while runs change state
+ * (harn#10443: "measured 2 of 3"). The census is re-read; one that never agrees
+ * still throws instead of reading as nothing to cancel.
+ */
+fn torn_census_world(torn_reads: int) -> dict {
+  let census_reads = 0
+  let sleeps = 0
+  const gh = {
+    read: fn(path) { return path == REPO + "/actions/runs/9" ? {workflow_id: 100} : {
+      status: "completed",
+    } },
+    pages: fn(path) {
+      if !path.contains("status=in_progress") {
+        return [{total_count: 0, workflow_runs: []}]
+      }
+      census_reads = census_reads + 1
+      return census_reads <= torn_reads ? [
+        {total_count: 2, workflow_runs: [{id: 5, workflow_id: 200}]},
+      ] : [{total_count: 1, workflow_runs: [{id: 5, workflow_id: 200}]}]
+    },
+    send: fn(_method, _path, _body) { return nil },
+  }
+  return {
+    gh: gh,
+    sleep: fn(_ms) { sleeps = sleeps + 1 },
+    census_reads: fn() { return census_reads },
+    sleeps: fn() { return sleeps },
+  }
+}
+
+pipeline test_a_torn_run_census_is_re_read_until_it_agrees(harness: Harness) {
+  const world = torn_census_world(2)
+  assert_eq(cancel_competing(world.gh, INPUT, 9, world.sleep), 1)
+  assert_eq(world.census_reads(), 3)
+  assert_eq(world.sleeps(), 2)
+}
+
+pipeline test_a_run_census_that_never_agrees_still_throws(harness: Harness) {
+  const world = torn_census_world(100)
+  assert_error_contains({ -> cancel_competing(world.gh, INPUT, 9, world.sleep) }, "measured 1 of 2")
+  assert_eq(world.census_reads(), 5)
+}
+
 fn forced(paths: dict) -> dict {
   return paths
     + {
