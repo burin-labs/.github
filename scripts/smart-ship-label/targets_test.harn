@@ -13,6 +13,11 @@ pipeline test_target_collection_requires_every_census_before_publishing(harness:
     {mode: "success", calls: 2, success: true, output: "numbers=7 9"},
     {mode: "empty", calls: 2, success: true, output: "numbers="},
     {mode: "direct", calls: 0, success: true, output: "numbers=11"},
+    // A finished run on main looks only at the PRs the lister says wait on main.
+    {mode: "main-waiting", calls: 0, success: true, output: "numbers=4 5"},
+    {mode: "main-none", calls: 0, success: true, output: "numbers="},
+    {mode: "main-unreadable", calls: 2, success: true, output: "numbers=7 9"},
+    {mode: "main-failed", calls: 0, success: false, output: ""},
   ] {
     with_temp_dir(
       harness.fs,
@@ -26,7 +31,33 @@ pipeline test_target_collection_requires_every_census_before_publishing(harness:
         harness.fs.write_text(output, "")
         harness.fs.write_text(
           event,
-          json_stringify(row.mode == "direct" ? {pull_request: {number: 11}} : {}),
+          json_stringify(
+            if row.mode == "direct" {
+              {pull_request: {number: 11}}
+            } else if row.mode.starts_with("main-") {
+              {workflow_run: {event: "push", head_branch: "main", pull_requests: []}}
+            } else {
+              {}
+            },
+          ),
+        )
+        harness.fs.mkdir(root + "/scripts")
+        harness.fs.write_text(
+          root + "/scripts/harnw",
+          """
+#!/bin/sh
+case "$*" in
+  *"scripts/smart-ship-waiting.harn -- --repo example/repo --label ship") ;;
+  *) exit 94 ;;
+esac
+echo "harn: fetched"
+case "$FIXTURE_MODE" in
+  main-waiting) echo "4 5" ;;
+  main-none) echo "" ;;
+  main-unreadable) echo "--all" ;;
+  *) exit 95 ;;
+esac
+""",
         )
         harness.fs.write_text(source, collector)
         harness.fs.write_text(root + "/date", "#!/bin/sh\nprintf '%s\\n' '2026-10-10'\n")
@@ -49,8 +80,10 @@ esac
 """,
         )
         assert(
-          command_run(harness.tools, {argv: ["/bin/chmod", "+x", root + "/gh", root + "/date"]})
-            .success,
+          command_run(
+            harness.tools,
+            {argv: ["/bin/chmod", "+x", root + "/gh", root + "/date", root + "/scripts/harnw"]},
+          ).success,
         )
         const result = command_run(
           harness.tools,
@@ -68,6 +101,7 @@ esac
               "/bin/bash",
               source,
             ],
+            cwd: root,
           },
         )
         assert_eq(result.success, row.success, row.mode + ": " + to_string(result))
