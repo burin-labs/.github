@@ -1,3 +1,5 @@
+import { with_temp_dir } from "std/testing"
+
 fn read(fs: HarnessFs, path: string) -> string {
   return fs.read_text(path_join(path_normalize(path_join(fs.cwd(), "../..")), path))
 }
@@ -31,20 +33,135 @@ pipeline test_no_step_can_report_success_while_failing(harness: Harness) {
   }
 }
 
-pipeline test_advisories_always_run_and_reject_stale_ignores(harness: Harness) {
+pipeline test_advisories_always_run_and_the_lockfile_scan_owns_stale_ignores(harness: Harness) {
   const advisories = step(steps(harness.fs), "Security advisories")
   assert(!advisories.has("if"), "advisories must run for every caller")
   assert(
-    advisories.run.contains(
-      "cargo-deny --all-features check advisories --deny advisory-not-detected $"
-        + "{ADVISORY_LINTS}",
-    ),
-    "advisories reject stale ignores on every event",
+    advisories.run.contains("cargo-deny --all-features check advisories $" + "{ADVISORY_LINTS}"),
+    "cargo-deny advisories run on every event",
+  )
+  // cargo-deny cannot see a lockfile-only crate, so it would fail an ignore
+  // for one as stale. The lockfile scan owns that verdict instead.
+  assert(
+    !advisories.run.contains("advisory-not-detected"),
+    "cargo-deny must not judge staleness over a graph narrower than the lockfile",
+  )
+  assert(
+    advisories.run.contains("cargo-audit audit --json --file Cargo.lock"),
+    "the whole lockfile is scanned",
   )
   assert(
     advisories.run.contains("exit \"$" + "{status}\""),
-    "the cargo-deny verdict is the step's verdict",
+    "the combined verdict is the step's verdict",
   )
+}
+
+pipeline test_cargo_audit_is_checksum_verified_before_use(harness: Harness) {
+  const install = step(steps(harness.fs), "Install cargo-audit")
+  assert(regex_match("^[0-9a-f]{64}$", install.env.CARGO_AUDIT_SHA256) != nil, "a full sha256 pin")
+  assert(install.run.contains("sha256sum -c -"), "the archive is verified")
+  assert(install.run.contains("set -euo pipefail"), "a failed verification stops the step")
+}
+
+fn lockfile_script(fs: HarnessFs) -> string {
+  const run = step(steps(fs), "Security advisories").run
+  const start = run.index_of("<<'PY'\n") + 7
+  const end = run.index_of("\nPY\n")
+  assert(start > 7 && end > start, "the lockfile script is embedded in the step")
+  return run.substring(start, end + 1)
+}
+
+fn audit_report(vulnerabilities: list, warnings: dict) -> string {
+  return json_stringify(
+    {vulnerabilities: {found: len(vulnerabilities) > 0, list: vulnerabilities}, warnings: warnings},
+  )
+}
+
+fn quinn(id: string) -> dict {
+  return {advisory: {id: id, title: "t"}, package: {name: "quinn-proto", version: "0.11.16"}}
+}
+
+fn run_lockfile_scan(harness: Harness, deny: string, report: string, today: string) -> dict {
+  let result = nil
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      harness.fs.write_text(path_join(work, "scan.py"), lockfile_script(harness.fs))
+      harness.fs.write_text(path_join(work, "deny.toml"), deny)
+      harness.fs.write_text(path_join(work, "audit.json"), report)
+      const ran = harness.process.run(
+        {
+          program: "python3",
+          args: ["-I", path_join(work, "scan.py"), today, path_join(work, "audit.json")],
+          cwd: work,
+          timeout_ms: 30000,
+        },
+      )
+      result = {exit_code: ran.exit_code, stdout: ran.stdout, stderr: ran.stderr}
+    },
+  )
+  return result
+}
+
+const DENY_HEAD = "[advisories]\nignore = [\n"
+
+pipeline test_an_unignored_lockfile_vulnerability_fails_the_scan(harness: Harness) {
+  const report = audit_report([quinn("RUSTSEC-2026-0342")], {})
+  const result = run_lockfile_scan(harness, "[advisories]\n", report, "2026-10-24")
+  assert_eq(result.exit_code, 1)
+  assert(result.stdout.contains("RUSTSEC-2026-0342 `quinn-proto` 0.11.16"), "names the crate")
+}
+
+pipeline test_a_dated_ignore_silences_only_its_advisory(harness: Harness) {
+  const deny = DENY_HEAD
+    + "{ id = \"RUSTSEC-2026-0342\", reason = \"lockfile only. Review by 2027-01-24\" },\n]\n"
+  const report = audit_report([quinn("RUSTSEC-2026-0342")], {})
+  assert_eq(run_lockfile_scan(harness, deny, report, "2026-10-24").exit_code, 0)
+  const other = audit_report([quinn("RUSTSEC-2026-0342"), quinn("RUSTSEC-2026-0339")], {})
+  const partial = run_lockfile_scan(harness, deny, other, "2026-10-24")
+  assert_eq(partial.exit_code, 1)
+  assert(partial.stdout.contains("RUSTSEC-2026-0339"), "the unignored advisory still fails")
+  assert(!partial.stdout.contains("RUSTSEC-2026-0342"), "the ignored advisory is quiet")
+}
+
+pipeline test_an_ignore_needs_a_future_review_date(harness: Harness) {
+  const report = audit_report([quinn("RUSTSEC-2026-0342")], {})
+  const undated = DENY_HEAD + "{ id = \"RUSTSEC-2026-0342\", reason = \"because\" },\n]\n"
+  const missing = run_lockfile_scan(harness, undated, report, "2026-10-24")
+  assert_eq(missing.exit_code, 1)
+  assert(missing.stdout.contains("no `Review by YYYY-MM-DD`"), "an undated ignore is a finding")
+  assert(
+    missing.stdout.contains("RUSTSEC-2026-0342 `quinn-proto`"),
+    "an invalid ignore silences nothing",
+  )
+  const expired = DENY_HEAD
+    + "{ id = \"RUSTSEC-2026-0342\", reason = \"old. Review by 2026-10-23\" },\n]\n"
+  assert(
+    run_lockfile_scan(harness, expired, report, "2026-10-24").stdout.contains(
+      "expired on 2026-10-23",
+    ),
+    "an ignore past its date expires",
+  )
+  const bare = "[advisories]\nignore = [\"RUSTSEC-2026-0342\"]\n"
+  assert_eq(run_lockfile_scan(harness, bare, report, "2026-10-24").exit_code, 1)
+}
+
+pipeline test_an_ignore_matching_nothing_in_the_lockfile_is_stale(harness: Harness) {
+  const deny = DENY_HEAD
+    + "{ id = \"RUSTSEC-2024-0436\", reason = \"paste. Review by 2027-01-24\" },\n]\n"
+  const stale = run_lockfile_scan(harness, deny, audit_report([], {}), "2026-10-24")
+  assert_eq(stale.exit_code, 1)
+  assert(stale.stdout.contains("matches nothing in Cargo.lock"), "a stale ignore is a finding")
+  // An unmaintained advisory is a warning, so an ignore for it is still in use.
+  const warned = audit_report([], {unmaintained: [{advisory: {id: "RUSTSEC-2024-0436"}}]})
+  assert_eq(run_lockfile_scan(harness, deny, warned, "2026-10-24").exit_code, 0)
+}
+
+pipeline test_an_unreadable_report_is_not_a_clean_scan(harness: Harness) {
+  const result = run_lockfile_scan(harness, "[advisories]\n", "", "2026-10-24")
+  assert_eq(result.exit_code, 3)
+  assert(result.stderr.contains("cargo-audit report unreadable"), "says why")
+  assert_eq(result.stdout.trim(), "", "no finding is invented for a tool failure")
 }
 
 pipeline test_only_pull_requests_downgrade_unmaintained_and_unsound(harness: Harness) {
