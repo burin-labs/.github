@@ -38,6 +38,12 @@ pub const MAIN_RED_TITLES = ["[CI] Main is red", "[CI] Main red inside a cancell
 /** The workflow whose newest conclusive run on the base branch says whether it is red. */
 pub const MAIN_CI_WORKFLOW = "CI"
 
+/** The automated reviewer's own marker on a review that did not finish for a head. */
+pub const REVIEW_UNFINISHED_MARKER = "automated-review-unfinished: "
+
+/** The only account whose review can carry that marker; a collaborator's copy is not evidence. */
+pub const REVIEWER_LOGIN = "harn-release-bot[bot]"
+
 pub const RELEASE_BLOCKER_LABEL = "release-blocker"
 
 /** A pull request that changes this file is a Harn repin. */
@@ -98,7 +104,12 @@ pub type Facts = {
 /** One incident signal: `yes`, `no`, or `unmeasured` (the read failed), with the evidence. */
 pub type Signal = {state: string, detail: string}
 
-pub type Incident = {main_red: Signal, release_train: Signal, queue_wedged: Signal}
+pub type Incident = {
+  main_red: Signal,
+  release_train: Signal,
+  queue_wedged: Signal,
+  reviewer_down: Signal,
+}
 
 pub type Plan = {cancel_workflows: bool, publish_ci_status: bool, merge: bool}
 
@@ -365,6 +376,34 @@ pub fn release_train_signal(files: list<string>, labels: list<string>) -> Signal
 }
 
 /**
+ * Whether the automated reviewer is down for this head: it posted its
+ * "did not finish" marker for the current head and nothing has approved that
+ * head since. Only the reviewer's own account can carry the marker: anyone
+ * else can type the same text. An approval of the head, human or bot, means the reviewer is no
+ * longer what blocks the merge, and a head with no review at all is just a
+ * review that has not run yet, which reads as `no`.
+ */
+pub fn reviewer_down_signal(reviews: list, head: string) -> Signal {
+  const marker = REVIEW_UNFINISHED_MARKER + head
+  let unfinished = false
+  for review in reviews {
+    if review?.commit_id != head {
+      continue
+    }
+    if review?.state == "APPROVED" {
+      return {state: "no", detail: "the current head already has an approval"}
+    }
+    if review?.user?.login == REVIEWER_LOGIN && to_string(review?.body).contains(marker) {
+      unfinished = true
+    }
+  }
+  if unfinished {
+    return {state: "yes", detail: "the automated review did not finish for head " + head[0:12]}
+  }
+  return {state: "no", detail: "the automated review has not failed on the current head"}
+}
+
+/**
  * Whether the merge queue is wedged for this pull request: it has sat queued
  * past the threshold while no merge-group run is active on the base branch.
  * `entries` are the queue's entries; `queue_total` is the queue's reported size,
@@ -418,6 +457,7 @@ fn incident_refusal(label: string, incident: Incident?) -> string? {
     {name: "main is red", signal: incident.main_red},
     {name: "release-train pull request", signal: incident.release_train},
     {name: "merge queue wedged", signal: incident.queue_wedged},
+    {name: "automated reviewer down", signal: incident.reviewer_down},
   ]
   if signals.any({ pair -> pair.signal.state == "yes" }) {
     return nil
@@ -434,7 +474,7 @@ fn incident_refusal(label: string, incident: Incident?) -> string? {
   return "`" + label
     + "` was not applied: no incident was found ("
     + evidence
-    + "). It lands outside the merge queue only when main is red, this is a release-train pull request, or the queue is wedged."
+    + "). It lands outside the merge queue only when main is red, this is a release-train pull request, the queue is wedged, or the automated reviewer failed to finish on this head."
 }
 
 fn is_admin(actor: Actor) -> bool {
@@ -608,7 +648,7 @@ const QUEUE_BYPASS_RATIONALE =
   + RELEASE_BLOCKER_LABEL
   + "`. The queue is wedged when the pull request has been queued over "
   + to_string(QUEUE_WEDGE_MINUTES)
-  + " min with no merge group running."
+  + " min with no merge group running. The reviewer is down when it posted its did-not-finish marker for the current head and nothing has approved that head since."
 
 fn signal_line(name: string, signal: Signal) -> string {
   return name + ": " + signal.state + " (" + signal.detail + ")"
@@ -667,6 +707,7 @@ pub fn record_markdown(record: dict) -> string {
         "- Incident evidence:",
         "  - " + signal_line("main red", record.incident.main_red),
         "  - " + signal_line("release train", record.incident.release_train),
+        "  - " + signal_line("reviewer down", record.incident.reviewer_down),
         "  - " + signal_line("queue wedged", record.incident.queue_wedged),
       ]
   }

@@ -21,6 +21,7 @@ import {
   queue_wedged_signal,
   release_train_signal,
   resolve_request,
+  reviewer_down_signal,
   select_competing_runs,
   unmeasured,
 } from "./policy.harn"
@@ -159,6 +160,19 @@ fn release_train(gh: GitHub, input: Input, labels: list) {
   }
 }
 
+fn reviewer_down(gh: GitHub, input: Input) {
+  try {
+    const reviews = flat(
+      gh.pages(
+        "repos/" + input.repository + "/pulls/" + to_string(input.pr) + "/reviews?per_page=100",
+      ),
+    )
+    return reviewer_down_signal(reviews, input.head_sha)
+  } catch (error) {
+    return unmeasured("pull request reviews: " + to_string(error))
+  }
+}
+
 fn queue_wedged(gh: GitHub, input: Input, base_branch: string) {
   try {
     const owner_name = input.repository.split("/")
@@ -209,12 +223,14 @@ fn measure_incident(gh: GitHub, input: Input, base_branch: string, labels: list)
       main_red: missing,
       release_train: release_train(gh, input, labels),
       queue_wedged: missing,
+      reviewer_down: reviewer_down(gh, input),
     }
   }
   return {
     main_red: main_red(gh, input, base_branch),
     release_train: release_train(gh, input, labels),
     queue_wedged: queue_wedged(gh, input, base_branch),
+    reviewer_down: reviewer_down(gh, input),
   }
 }
 
