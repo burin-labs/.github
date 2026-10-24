@@ -645,7 +645,8 @@ what is unsafe whoever asks, before any side effect:
   - The merge queue is wedged: the pull request has been queued for 90 minutes
     or more and no merge group run is active on the base branch.
   - The automated reviewer is down: it posted its `automated-review-unfinished`
-    marker (from the reviewer's own account) for the current head and nothing has approved that head since.
+    marker (from the reviewer's own account) for the current head and nothing
+    has approved that head since.
 
   A signal that cannot be read counts as not holding, and if no signal holds
   and any could not be read, the refusal says so. The record lists each
