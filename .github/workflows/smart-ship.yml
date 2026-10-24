@@ -118,8 +118,8 @@ jobs:
     #   cancels most main runs after their jobs have already reported.
     #
     # - A label event wakes only for the ship label or a `wake-labels` label, and
-    #   never when a bot removed the label: the shepherd removes `ship` itself,
-    #   and that echo would cancel the look that removed it.
+    #   never for the shepherd's own removal of a label (an echo that would
+    #   cancel the look that made it) or a bot's removal from a closed PR.
     #
     # The rule applies to every caller. Each wake costs a look's API calls from
     # the release app's shared hourly limit, whoever pays for the runner.
@@ -135,7 +135,8 @@ jobs:
       && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
       || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
       && !(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')
-      && !(github.event.action == 'unlabeled' && github.event.sender.type == 'Bot')
+      && !(github.event.action == 'unlabeled' && (github.event.sender.login == 'harn-release-bot[bot]'
+      || (github.event.pull_request.state == 'closed' && github.event.sender.type == 'Bot')))
       && !((github.event.action == 'labeled' || github.event.action == 'unlabeled')
       && github.event.label.name != inputs.ship-label
       && !contains(fromJSON(inputs.wake-labels), github.event.label.name)))
