@@ -41,6 +41,9 @@ pub const MAIN_CI_WORKFLOW = "CI"
 /** The automated reviewer's own marker on a review that did not finish for a head. */
 pub const REVIEW_UNFINISHED_MARKER = "automated-review-unfinished: "
 
+/** The only account whose review can carry that marker; a collaborator's copy is not evidence. */
+pub const REVIEWER_LOGIN = "harn-release-bot[bot]"
+
 pub const RELEASE_BLOCKER_LABEL = "release-blocker"
 
 /** A pull request that changes this file is a Harn repin. */
@@ -375,7 +378,8 @@ pub fn release_train_signal(files: list<string>, labels: list<string>) -> Signal
 /**
  * Whether the automated reviewer is down for this head: it posted its
  * "did not finish" marker for the current head and nothing has approved that
- * head since. An approval of the head, human or bot, means the reviewer is no
+ * head since. Only the reviewer's own account can carry the marker: anyone
+ * else can type the same text. An approval of the head, human or bot, means the reviewer is no
  * longer what blocks the merge, and a head with no review at all is just a
  * review that has not run yet, which reads as `no`.
  */
@@ -389,7 +393,7 @@ pub fn reviewer_down_signal(reviews: list, head: string) -> Signal {
     if review?.state == "APPROVED" {
       return {state: "no", detail: "the current head already has an approval"}
     }
-    if to_string(review?.body).contains(marker) {
+    if review?.user?.login == REVIEWER_LOGIN && to_string(review?.body).contains(marker) {
       unfinished = true
     }
   }

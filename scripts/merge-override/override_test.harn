@@ -865,6 +865,7 @@ pipeline test_an_unmeasurable_signal_never_reads_as_an_incident(harness: Harness
 pipeline test_a_reviewer_that_did_not_finish_on_the_head_allows_the_override(harness: Harness) {
   const unfinished = {
     commit_id: HEAD,
+    user: {login: "harn-release-bot[bot]"},
     state: "COMMENTED",
     body: "<!-- automated-review-unfinished: " + HEAD + " -->\n*Review did not finish.*",
   }
@@ -896,6 +897,10 @@ pipeline test_a_reviewer_that_did_not_finish_on_the_head_allows_the_override(har
     ),
   )
   assert_eq(decided(stale).record.incident.reviewer_down.state, "no")
+  // A collaborator typing the marker is not the reviewer failing.
+  const forged = world(calm({[PR_REVIEWS]: [[unfinished + {user: {login: "contributor"}}]]}))
+  assert_eq(decided(forged).record.incident.reviewer_down.state, "no")
+  assert_eq(decided(forged).decision.verdict, "refused")
   assert_eq(decided(world(calm())).record.incident.reviewer_down.state, "no")
   // An unreadable review list is unmeasured, never an incident.
   const outage = world(calm({[PR_REVIEWS]: OUTAGE}))
