@@ -7,9 +7,12 @@
  * label, a pull request that is no longer open, missing required approval
  * (except `force-merge`), and `bypass-merge-queue` on a head whose `CI status`
  * is not green, because that label promises CI passed and `force-merge` is the
- * label that says it did not. Everything else (the default branch's health,
- * other red checks, a missing reason) is recorded as a warning and never
- * refuses.
+ * label that says it did not. The two labels that land outside the merge queue
+ * (`bypass-merge-queue`, `force-merge`) are also refused unless measured state
+ * shows an incident: main is red, the pull request is a release-train pull
+ * request, or the queue is wedged. The reason text never counts as evidence, and
+ * an unmeasurable signal never reads as an incident. Everything else (other red
+ * checks, a missing reason) is recorded as a warning and never refuses.
  *
  * Every function here is pure; `measure` in decide.harn reads GitHub.
  */
@@ -25,6 +28,30 @@ pub const REQUIRED_CHECK = "CI status"
 pub const REASON_PREFIX = "override:"
 
 pub const NO_REASON = "no reason given"
+
+/** The labels that land a pull request outside the merge queue. */
+pub const QUEUE_BYPASS_LABELS = ["bypass-merge-queue", "force-merge"]
+
+/** An open issue whose title starts with one of these says the base branch is red. */
+pub const MAIN_RED_TITLES = ["[CI] Main is red", "[CI] Main red inside a cancelled run"]
+
+/** The workflow whose newest conclusive run on the base branch says whether it is red. */
+pub const MAIN_CI_WORKFLOW = "CI"
+
+pub const RELEASE_BLOCKER_LABEL = "release-blocker"
+
+/** A pull request that changes this file is a Harn repin. */
+pub const REPIN_FILE = ".harn-version"
+
+/** A pull request touching only these files is a version-only release or dev bump. */
+pub const RELEASE_BUMP_FILES = [
+  "VERSION",
+  "Sources/BurinApp/Info.plist",
+  "site/src/data/release-info.json",
+]
+
+/** A queued pull request with no running merge group for this long has a wedged queue. */
+pub const QUEUE_WEDGE_MINUTES = 90
 
 /** GitHub counts these conclusions as satisfying a required check. */
 const PASSING = ["success", "neutral", "skipped"]
@@ -64,7 +91,14 @@ pub type Facts = {
   review_decision: string?,
   check_runs: list,
   comments: list,
+  /** Measured only for a queue-bypass label; nil otherwise. */
+  incident: Incident?,
 }
+
+/** One incident signal: `yes`, `no`, or `unmeasured` (the read failed), with the evidence. */
+pub type Signal = {state: string, detail: string}
+
+pub type Incident = {main_red: Signal, release_train: Signal, queue_wedged: Signal}
 
 pub type Plan = {cancel_workflows: bool, publish_ci_status: bool, merge: bool}
 
@@ -84,6 +118,7 @@ pub type Decision = {
   reason: string,
   reason_source: string,
   checks: CheckSummary,
+  incident: Incident?,
 }
 
 fn latest_label_event(events: list, label: string) -> dict? {
@@ -266,6 +301,145 @@ pub fn override_reason(comments: list, actors: list) -> string? {
   return len(text) > 500 ? text[0:500] + "..." : text
 }
 
+pub fn unmeasured(error: unknown) -> Signal {
+  return {state: "unmeasured", detail: to_string(error)}
+}
+
+/**
+ * Whether the base branch is red. `issues` are the open issues found by title;
+ * `runs` are the newest-first workflow runs on the base branch. A source that
+ * could not be read is passed as an `errors` entry: it never reads as "no", so
+ * a red it might have shown cannot be missed.
+ */
+pub fn main_red_signal(issues: list, runs: list, errors: list) -> Signal {
+  for issue in issues {
+    return {
+      state: "yes",
+      detail: "open issue #" + to_string(issue?.number) + " " + to_string(issue?.title),
+    }
+  }
+  let newest = nil
+  for run in runs {
+    if run?.name == MAIN_CI_WORKFLOW
+      && ["success", "failure", "timed_out"].contains(run?.conclusion)
+      && (newest == nil || (run?.created_at ?? "") > (newest?.created_at ?? "")) {
+      newest = run
+    }
+  }
+  if newest != nil && newest.conclusion != "success" {
+    return {
+      state: "yes",
+      detail: "the last conclusive `" + MAIN_CI_WORKFLOW + "` run on the base branch "
+        + to_string(newest.conclusion)
+        + ": "
+        + to_string(newest?.html_url),
+    }
+  }
+  if len(errors) > 0 {
+    return unmeasured(join(errors, "; "))
+  }
+  return {
+    state: "no",
+    detail: newest == nil ? "no open main-red issue and no conclusive `" + MAIN_CI_WORKFLOW
+      + "` run on the base branch" : "no open main-red issue; the last conclusive `"
+      + MAIN_CI_WORKFLOW
+      + "` run succeeded",
+  }
+}
+
+/** Whether the pull request is a repin, a version-only bump, or labeled `release-blocker`. */
+pub fn release_train_signal(files: list<string>, labels: list<string>) -> Signal {
+  if labels.contains(RELEASE_BLOCKER_LABEL) {
+    return {state: "yes", detail: "labeled `" + RELEASE_BLOCKER_LABEL + "`"}
+  }
+  if files.contains(REPIN_FILE) {
+    return {state: "yes", detail: "repin: changes `" + REPIN_FILE + "`"}
+  }
+  if len(files) > 0 && files.all({ file -> RELEASE_BUMP_FILES.contains(file) }) {
+    return {state: "yes", detail: "version-only release or dev bump"}
+  }
+  return {
+    state: "no",
+    detail: "changes " + to_string(len(files)) + " file(s) outside the release train",
+  }
+}
+
+/**
+ * Whether the merge queue is wedged for this pull request: it has sat queued
+ * past the threshold while no merge-group run is active on the base branch.
+ * `entries` are the queue's entries; `queue_total` is the queue's reported size,
+ * so a truncated census never reads as "not queued".
+ */
+pub fn queue_wedged_signal(
+  entries: list,
+  queue_total: int,
+  pr: int,
+  active_merge_group_runs: list,
+  now: string,
+) -> Signal {
+  const entry = entries.filter({ item -> item?.pullRequest?.number == pr }).to_list()[0]
+  if entry == nil {
+    if queue_total > len(entries) {
+      return unmeasured(
+        "the queue census holds " + to_string(len(entries)) + " of " + to_string(queue_total)
+          + " entries",
+      )
+    }
+    return {state: "no", detail: "the pull request is not in the merge queue"}
+  }
+  const minutes = to_int((date_parse(now) - date_parse(entry.enqueuedAt)) / 60)
+  if minutes < QUEUE_WEDGE_MINUTES {
+    return {
+      state: "no",
+      detail: "queued " + to_string(minutes) + " min, under the " + to_string(QUEUE_WEDGE_MINUTES)
+        + " min threshold",
+    }
+  }
+  if len(active_merge_group_runs) > 0 {
+    return {
+      state: "no",
+      detail: "queued " + to_string(minutes) + " min but "
+        + to_string(len(active_merge_group_runs))
+        + " merge group run(s) are active",
+    }
+  }
+  return {
+    state: "yes",
+    detail: "queued " + to_string(minutes) + " min with no active merge group run",
+  }
+}
+
+fn incident_refusal(label: string, incident: Incident?) -> string? {
+  if incident == nil {
+    return "`" + label
+      + "` lands outside the merge queue only during an incident, and no incident evidence was measured"
+  }
+  const signals = [
+    {name: "main is red", signal: incident.main_red},
+    {name: "release-train pull request", signal: incident.release_train},
+    {name: "merge queue wedged", signal: incident.queue_wedged},
+  ]
+  if signals.any({ pair -> pair.signal.state == "yes" }) {
+    return nil
+  }
+  const evidence = join(
+    signals.map({ pair -> pair.name + ": " + pair.signal.state + " (" + pair.signal.detail + ")" }),
+    "; ",
+  )
+  if signals.any({ pair -> pair.signal.state == "unmeasured" }) {
+    return "`" + label
+      + "` lands outside the merge queue only during an incident, and the evidence could not be fully measured, so it is refused rather than guessed. "
+      + evidence
+  }
+  return "`" + label
+    + "` moves main outside the merge queue, which rebuilds every queued merge group and cancels the verdicts main needs; the queue already lands approved, green pull requests. It is allowed only when main is red, the pull request is a release-train pull request (a repin, a version-only bump, or labeled `"
+    + RELEASE_BLOCKER_LABEL
+    + "`), or the queue is wedged (queued over "
+    + to_string(QUEUE_WEDGE_MINUTES)
+    + " min with no merge group running). None holds: "
+    + evidence
+}
+
 fn is_admin(actor: Actor) -> bool {
   return actor.membership_role == "admin" || actor.repository_permission == "admin"
 }
@@ -319,6 +493,12 @@ pub fn decide(facts: Facts) -> Decision {
           + " on the head; `bypass-merge-queue` lands only a green head, so use `force-merge` to land it anyway",
       ]
   }
+  if QUEUE_BYPASS_LABELS.contains(label) {
+    const refusal = incident_refusal(label, facts.incident)
+    if refusal != nil {
+      refusals = refusals + [refusal]
+    }
+  }
   const reason = override_reason(facts.comments, facts.request.actors)
   let warnings = []
   if reason == nil {
@@ -338,6 +518,7 @@ pub fn decide(facts: Facts) -> Decision {
     reason: reason ?? NO_REASON,
     reason_source: reason == nil ? "none" : "comment",
     checks: checks,
+    incident: facts.incident,
   }
 }
 
@@ -443,6 +624,22 @@ pub fn record_markdown(record: dict) -> string {
       + bullet_list(checks.pending),
     "- Review decision: " + (record.review_decision ?? "no review required"),
   ]
+  if record?.incident != nil {
+    lines = lines
+      + [
+        "- Incident evidence: main red " + record.incident.main_red.state + " ("
+          + record.incident.main_red.detail
+          + "); release train "
+          + record.incident.release_train.state
+          + " ("
+          + record.incident.release_train.detail
+          + "); queue wedged "
+          + record.incident.queue_wedged.state
+          + " ("
+          + record.incident.queue_wedged.detail
+          + ")",
+      ]
+  }
   if len(record.refusals) > 0 {
     lines = lines + ["- Refused because: " + join(record.refusals, "; ")]
   }

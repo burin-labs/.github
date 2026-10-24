@@ -4,16 +4,24 @@
  */
 import { GitHub } from "./github.harn"
 import {
+  ACTIVE_RUN_STATUSES,
   Actor,
   Facts,
+  Incident,
+  MAIN_RED_TITLES,
+  QUEUE_BYPASS_LABELS,
   REQUIRED_CHECK,
   Request,
   decide,
   issue_events_from_pages,
   log_entry_markdown,
   log_issue_title,
+  main_red_signal,
+  queue_wedged_signal,
+  release_train_signal,
   resolve_request,
   select_competing_runs,
+  unmeasured,
 } from "./policy.harn"
 
 pub const LOG_LABEL = "override-log"
@@ -34,6 +42,8 @@ pub type Input = {
   pr: int,
   head_sha: string,
   run_url: string,
+  /** ISO time of the decision, the clock the queue-wedge threshold reads. */
+  now: string,
 }
 
 fn issue(input: Input) -> string {
@@ -76,6 +86,126 @@ fn actor(gh: GitHub, input: Input, login: string) -> Actor {
   return {login: login, membership_role: role, repository_permission: permission}
 }
 
+const QUEUE_QUERY =
+  "query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){totalCount nodes{enqueuedAt pullRequest{number}}}}}}"
+
+const MAIN_RUN_WINDOW = 50
+
+/** Percent-encode the characters an issue-title search term carries. */
+fn query_term(title: string) -> string {
+  return "%22" + title.replace(" ", "+").replace("[", "%5B").replace("]", "%5D") + "%22"
+}
+
+fn main_red(gh: GitHub, input: Input, base_branch: string) {
+  let issues = []
+  let runs = []
+  let errors = []
+  for title in MAIN_RED_TITLES {
+    try {
+      const found = gh.read(
+        "search/issues?q=repo:" + input.repository + "+is:issue+is:open+in:title+"
+          + query_term(title),
+      )
+      const matches = (found?.items ?? []).filter(
+        { item -> to_string(item?.title).starts_with(title) },
+      )
+        .to_list()
+      if len(matches) == 0 && found?.incomplete_results == true {
+        throw "the issue search was incomplete"
+      }
+      issues = issues + matches
+    } catch (error) {
+      errors = errors + ["issue search for `" + title + "`: " + to_string(error)]
+    }
+  }
+  try {
+    runs = gh.read(
+      "repos/" + input.repository + "/actions/runs?branch=" + base_branch
+        + "&exclude_pull_requests=true&per_page="
+        + to_string(MAIN_RUN_WINDOW),
+    )?.workflow_runs
+      ?? []
+  } catch (error) {
+    errors = errors + ["base branch runs: " + to_string(error)]
+  }
+  return main_red_signal(issues, runs, errors)
+}
+
+fn release_train(gh: GitHub, input: Input, labels: list) {
+  try {
+    const files = flat(
+      gh.pages(
+        "repos/" + input.repository + "/pulls/" + to_string(input.pr) + "/files?per_page=100",
+      ),
+    )
+    return release_train_signal(
+      files.map({ file -> to_string(file?.filename) }),
+      labels.map({ label -> to_string(label?.name) }),
+    )
+  } catch (error) {
+    return unmeasured("pull request files: " + to_string(error))
+  }
+}
+
+fn queue_wedged(gh: GitHub, input: Input, base_branch: string) {
+  try {
+    const owner_name = input.repository.split("/")
+    const queue = gh.graphql(
+      QUEUE_QUERY,
+      {owner: owner_name[0], name: owner_name[1], branch: base_branch},
+    )?.repository?.mergeQueue?.entries
+    if queue == nil {
+      return {state: "no", detail: "the base branch has no merge queue"}
+    }
+    const entries = queue?.nodes ?? []
+    const entry = entries.filter({ item -> item?.pullRequest?.number == input.pr }).to_list()[0]
+    let active = []
+    // Active merge group runs matter only once the entry is old enough to be wedged.
+    if entry != nil {
+      for status in ACTIVE_RUN_STATUSES {
+        active = active
+          + (gh.read(
+            "repos/" + input.repository + "/actions/runs?event=merge_group&status=" + status
+              + "&per_page=100",
+          )?.workflow_runs
+            ?? [])
+            .filter(
+              { run ->
+                to_string(run?.head_branch).starts_with("gh-readonly-queue/" + base_branch + "/")
+              },
+            )
+            .to_list()
+      }
+    }
+    return queue_wedged_signal(
+      entries,
+      to_int(queue?.totalCount ?? len(entries)),
+      input.pr,
+      active,
+      input.now,
+    )
+  } catch (error) {
+    return unmeasured("merge queue: " + to_string(error))
+  }
+}
+
+/** Every incident signal, each measured on its own so one failed read hides no other. */
+fn measure_incident(gh: GitHub, input: Input, base_branch: string, labels: list) -> Incident {
+  if base_branch == "" {
+    const missing = unmeasured("the pull request names no base branch")
+    return {
+      main_red: missing,
+      release_train: release_train(gh, input, labels),
+      queue_wedged: missing,
+    }
+  }
+  return {
+    main_red: main_red(gh, input, base_branch),
+    release_train: release_train(gh, input, labels),
+    queue_wedged: queue_wedged(gh, input, base_branch),
+  }
+}
+
 /** Measure everything the decision reads. Nil when no override label is attached. */
 pub fn measure(gh: GitHub, input: Input) -> Facts? {
   const request = current_request(gh, input)
@@ -108,6 +238,12 @@ pub fn measure(gh: GitHub, input: Input) -> Facts? {
         .map({ page -> page?.check_runs ?? [] }),
     ),
     comments: flat(gh.pages(issue(input) + "/comments?per_page=100")),
+    incident: QUEUE_BYPASS_LABELS.contains(request.label) ? measure_incident(
+      gh,
+      input,
+      to_string(pull?.base?.ref ?? ""),
+      pull?.labels ?? [],
+    ) : nil,
   }
 }
 
@@ -131,6 +267,7 @@ pub fn draft_record(facts: Facts, input: Input, now: string) -> dict {
       head_sha: input.head_sha,
       review_decision: facts.review_decision,
       checks: decision.checks,
+      incident: decision.incident,
       reason: decision.reason,
       reason_source: decision.reason_source,
       refusals: decision.refusals,

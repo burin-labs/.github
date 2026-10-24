@@ -25,6 +25,7 @@ const INPUT = {
   pr: 42,
   head_sha: HEAD,
   run_url: "https://github.com/burin-labs/example/actions/runs/9",
+  now: "2026-10-04T17:18:00Z",
 }
 
 fn labeled(id: int, label: string, actor: string, at: string = "2026-10-04T17:17:27Z") -> dict {
@@ -44,11 +45,61 @@ fn check(name: string, conclusion: string?) -> dict {
   }
 }
 
+const MAIN_RED_SEARCH =
+  "search/issues?q=repo:burin-labs/example+is:issue+is:open+in:title+%22%5BCI%5D+Main+is+red%22"
+
+const CANCELLED_RED_SEARCH =
+  "search/issues?q=repo:burin-labs/example+is:issue+is:open+in:title+%22%5BCI%5D+Main+red+inside+a+cancelled+run%22"
+
+const MAIN_RUNS = REPO + "/actions/runs?branch=main&exclude_pull_requests=true&per_page=50"
+
+const PR_FILES = REPO + "/pulls/42/files?per_page=100"
+
+/** A read that fails the way an API outage does. */
+const OUTAGE = {__error: "GET failed: HTTP 502"}
+
+fn merge_group_runs(status: string) -> string {
+  return REPO + "/actions/runs?event=merge_group&status=" + status + "&per_page=100"
+}
+
+fn queue_with(entered: string) -> dict {
+  return {
+    repository: {
+      mergeQueue: {
+        entries: {totalCount: 1, nodes: [{enqueuedAt: entered, pullRequest: {number: 42}}]},
+      },
+    },
+  }
+}
+
+fn idle_queue() -> dict {
+  let paths = {}
+  for status in ["requested", "queued", "in_progress", "waiting", "pending"] {
+    paths = paths + {[merge_group_runs(status)]: {workflow_runs: []}}
+  }
+  return paths
+}
+
+/** Main is green, the pull request is ordinary code, and it is not queued: no incident holds. */
+fn calm(overrides: dict = {}) -> dict {
+  return {
+    [MAIN_RED_SEARCH]: {items: [], incomplete_results: false},
+    [CANCELLED_RED_SEARCH]: {items: [], incomplete_results: false},
+    [MAIN_RUNS]: {
+      workflow_runs: [
+        {name: "CI", conclusion: "success", created_at: "2026-10-04T16:00:00Z"},
+        {name: "CI", conclusion: "cancelled", created_at: "2026-10-04T17:00:00Z"},
+      ],
+    },
+  }
+    + overrides
+}
+
 /**
  * Burin-code #10156 on 2026-10-04: an admin labels a green, approved head
- * while a scheduled workflow on the default branch is red. Only the paths the
- * override may read exist; reading anything else (the default branch, its
- * workflow runs) throws, so a test passing proves the decision never looks.
+ * while an open issue says main is red. Only the paths the override may read
+ * exist; reading anything else throws, so a test passing proves the decision
+ * reads nothing more.
  */
 fn world(overrides: dict = {}) -> dict {
   return {
@@ -62,14 +113,23 @@ fn world(overrides: dict = {}) -> dict {
       state: "open",
       merged: false,
       node_id: "PR_42",
+      labels: [],
       head: {sha: HEAD, repo: {full_name: "burin-labs/example"}},
-      base: {repo: {full_name: "burin-labs/example"}},
+      base: {ref: "main", repo: {full_name: "burin-labs/example"}},
     },
     "orgs/burin-labs/memberships/kennethsinder": {role: "admin"},
     [REPO + "/collaborators/kennethsinder/permission"]: {permission: "admin"},
     "orgs/burin-labs/memberships/contributor": {role: "member"},
     [REPO + "/collaborators/contributor/permission"]: {permission: "write"},
     graphql: {repository: {pullRequest: {reviewDecision: "APPROVED"}}},
+    "graphql:queue": {repository: {mergeQueue: {entries: {totalCount: 0, nodes: []}}}},
+    [PR_FILES]: [[{filename: "src/lib.rs"}]],
+    [MAIN_RED_SEARCH]: {
+      items: [{number: 10150, title: "[CI] Main is red: lint"}],
+      incomplete_results: false,
+    },
+    [CANCELLED_RED_SEARCH]: {items: [], incomplete_results: false},
+    [MAIN_RUNS]: {workflow_runs: []},
     [REPO + "/commits/" + HEAD + "/check-runs?per_page=100"]: [
       {
         check_runs: [
@@ -98,6 +158,9 @@ fn fake(paths: dict) -> dict {
     if !contains(keys(paths), path) {
       throw "unexpected read " + path
     }
+    if paths[path]?.__error != nil {
+      throw paths[path].__error
+    }
     return paths[path]
   }
   const gh = {
@@ -107,7 +170,13 @@ fn fake(paths: dict) -> dict {
       sent = sent + [{method: method, path: path, body: body}]
       return paths[method + " " + path]
     },
-    graphql: fn(_query, _variables) { return paths.graphql },
+    graphql: fn(query, _variables) {
+      const key = query.contains("mergeQueue") ? "graphql:queue" : "graphql"
+      if paths[key]?.__error != nil {
+        throw paths[key].__error
+      }
+      return paths[key]
+    },
   }
   return {gh: gh, sent: fn() { return sent }}
 }
@@ -118,9 +187,7 @@ fn decided(paths: dict) -> dict {
   return draft_record(facts, INPUT, "2026-10-04T17:18:00Z")
 }
 
-pipeline test_an_admin_bypass_lands_a_green_head_without_reading_the_default_branch(
-  harness: Harness,
-) {
+pipeline test_an_admin_bypass_lands_a_green_head_while_main_is_red(harness: Harness) {
   const result = decided(world())
   assert_eq(result.decision.verdict, "proceed", to_string(result.decision.refusals))
   assert_eq(result.decision.plan.merge, true)
@@ -571,4 +638,207 @@ pipeline test_a_run_no_longer_in_progress_counts_as_cancelled_once_reread(harnes
     { -> cancel_competing(denied.gh, INPUT, 9, { _ms -> nil }) },
     "could not cancel workflow run 5",
   )
+}
+
+fn forced(paths: dict) -> dict {
+  return paths
+    + {
+      [REPO + "/issues/42"]: {labels: [{name: "force-merge"}]},
+      [REPO + "/issues/42/events?per_page=100"]: [[labeled(7, "force-merge", "kennethsinder")]],
+    }
+}
+
+/** The 2026-10-23 pattern: an approved, green head with no incident. */
+fn routine_reason() -> dict {
+  return {
+    [REPO + "/issues/42/comments?per_page=100"]: [
+      [
+        {
+          user: {login: "kennethsinder"},
+          body: "override: approved, 0 unresolved threads, every PR check green",
+          created_at: "2026-10-04T17:16:00Z",
+        },
+      ],
+    ],
+  }
+}
+
+pipeline test_an_approved_green_head_outside_an_incident_is_refused_with_the_measured_evidence(
+  harness: Harness,
+) {
+  for label in ["bypass-merge-queue", "force-merge"] {
+    const base = world(calm(routine_reason()))
+    const paths = label == "force-merge" ? forced(base) : base
+    const result = decided(paths)
+    assert_eq(result.decision.verdict, "refused", label)
+    const refusal = result.decision.refusals[0]
+    assert(refusal.contains("moves main outside the merge queue"), refusal)
+    assert(refusal.contains("main is red: no"), refusal)
+    assert(refusal.contains("release-train pull request: no"), refusal)
+    assert(
+      refusal.contains("merge queue wedged: no (the pull request is not in the merge queue)"),
+      refusal,
+    )
+    assert_eq(result.record.incident.main_red.state, "no")
+    assert(
+      record_markdown(
+        result.record + {outcome: "refused", error: "", actions: [], merge_commit: ""},
+      )
+        .contains("Incident evidence"),
+    )
+  }
+  // The reason text is not evidence: a reason that claims an incident changes nothing.
+  const claimed = world(
+    calm(
+      {
+        [REPO + "/issues/42/comments?per_page=100"]: [
+          [
+            {
+              user: {login: "kennethsinder"},
+              body: "override: main is red, release critical, queue wedged",
+              created_at: "2026-10-04T17:16:00Z",
+            },
+          ],
+        ],
+      },
+    ),
+  )
+  assert_eq(decided(claimed).decision.verdict, "refused")
+}
+
+pipeline test_bypass_ci_still_goes_through_the_queue_and_reads_no_incident(harness: Harness) {
+  const paths = world(
+    {
+      [REPO + "/issues/42"]: {labels: [{name: "bypass-ci"}]},
+      [REPO + "/issues/42/events?per_page=100"]: [[labeled(7, "bypass-ci", "kennethsinder")]],
+    },
+  )
+  const stripped = paths + {[MAIN_RED_SEARCH]: OUTAGE}
+  const result = decided(stripped)
+  assert_eq(result.decision.verdict, "proceed")
+  assert_eq(result.record.incident, nil)
+}
+
+pipeline test_main_red_by_a_failed_last_conclusive_run_allows_the_bypass(harness: Harness) {
+  const paths = world(
+    calm(
+      {
+        [MAIN_RUNS]: {
+          workflow_runs: [
+            {name: "CI", conclusion: "cancelled", created_at: "2026-10-04T17:00:00Z"},
+            {
+              name: "CI",
+              conclusion: "failure",
+              created_at: "2026-10-04T16:00:00Z",
+              html_url: "https://example/run/1",
+            },
+            {name: "CI", conclusion: "success", created_at: "2026-10-04T15:00:00Z"},
+          ],
+        },
+      },
+    ),
+  )
+  const result = decided(paths)
+  assert_eq(result.decision.verdict, "proceed", to_string(result.decision.refusals))
+  assert_eq(result.record.incident.main_red.state, "yes")
+  // The cancelled-run title counts as red too.
+  const inside = world(
+    calm(
+      {
+        [CANCELLED_RED_SEARCH]: {
+          items: [{number: 10200, title: "[CI] Main red inside a cancelled run: lint"}],
+          incomplete_results: false,
+        },
+      },
+    ),
+  )
+  assert_eq(decided(inside).decision.verdict, "proceed")
+}
+
+pipeline test_release_train_pull_requests_are_allowed(harness: Harness) {
+  const cases = [
+    {
+      files: [".harn-version", "Sources/BurinCore/ACP/HarnProtocol.generated.swift"],
+      labels: [],
+      detail: "repin",
+    },
+    {
+      files: ["VERSION", "Sources/BurinApp/Info.plist", "site/src/data/release-info.json"],
+      labels: [],
+      detail: "version-only",
+    },
+    {files: ["src/lib.rs"], labels: [{name: "release-blocker"}], detail: "release-blocker"},
+  ]
+  for item in cases {
+    const paths = world(calm({[PR_FILES]: [item.files.map({ name -> {filename: name} })]}))
+    const pull = paths[REPO + "/pulls/42"]
+    const result = decided(paths + {[REPO + "/pulls/42"]: pull + {labels: item.labels}})
+    assert_eq(result.decision.verdict, "proceed", item.detail)
+    assert(result.record.incident.release_train.detail.contains(item.detail), item.detail)
+  }
+  // A version bump that also touches code is ordinary work.
+  const mixed = world(calm({[PR_FILES]: [[{filename: "VERSION"}, {filename: "src/lib.rs"}]]}))
+  assert_eq(decided(mixed).decision.verdict, "refused")
+}
+
+pipeline test_a_queued_entry_with_no_running_merge_group_is_wedged_after_ninety_minutes(
+  harness: Harness,
+) {
+  const queued = fn(entered, runs) { return world(
+    calm(idle_queue() + {"graphql:queue": queue_with(entered)} + runs),
+  ) }
+  const wedged = decided(queued("2026-10-04T15:30:00Z", {}))
+  assert_eq(wedged.decision.verdict, "proceed", to_string(wedged.decision.refusals))
+  assert_eq(wedged.record.incident.queue_wedged.state, "yes")
+  const young = decided(queued("2026-10-04T16:00:00Z", {}))
+  assert_eq(young.decision.verdict, "refused")
+  assert(young.record.incident.queue_wedged.detail.contains("under the 90 min threshold"))
+  const running = decided(
+    queued(
+      "2026-10-04T15:30:00Z",
+      {
+        [merge_group_runs("in_progress")]: {
+          workflow_runs: [{head_branch: "gh-readonly-queue/main/pr-41-abc"}],
+        },
+      },
+    ),
+  )
+  assert_eq(running.decision.verdict, "refused")
+  assert(running.record.incident.queue_wedged.detail.contains("merge group run(s) are active"))
+}
+
+pipeline test_an_unmeasurable_signal_never_reads_as_an_incident(harness: Harness) {
+  // Every source down: refused, with the failure named.
+  const down = world(
+    {
+      [MAIN_RED_SEARCH]: OUTAGE,
+      [CANCELLED_RED_SEARCH]: OUTAGE,
+      [MAIN_RUNS]: OUTAGE,
+      [PR_FILES]: OUTAGE,
+      "graphql:queue": OUTAGE,
+    },
+  )
+  const result = decided(down)
+  assert_eq(result.decision.verdict, "refused")
+  assert(
+    result.decision.refusals[0].contains("could not be fully measured"),
+    result.decision.refusals[0],
+  )
+  assert_eq(result.record.incident.main_red.state, "unmeasured")
+  assert_eq(result.record.incident.queue_wedged.state, "unmeasured")
+  // One source down and the other reading green is unmeasured, not "no".
+  const half = world(calm({[MAIN_RED_SEARCH]: OUTAGE}))
+  assert_eq(decided(half).record.incident.main_red.state, "unmeasured")
+  assert_eq(decided(half).decision.verdict, "refused")
+  // An incomplete search that found nothing cannot prove main is calm.
+  const partial = world(calm({[MAIN_RED_SEARCH]: {items: [], incomplete_results: true}}))
+  assert_eq(decided(partial).record.incident.main_red.state, "unmeasured")
+  // A measured incident still stands when another signal is down.
+  const mixed = world({[MAIN_RUNS]: OUTAGE, [PR_FILES]: OUTAGE, "graphql:queue": OUTAGE})
+  assert_eq(decided(mixed).decision.verdict, "proceed")
+  // A queue census that cannot hold the pull request is unmeasured.
+  const truncated = world(
+    calm({"graphql:queue": {repository: {mergeQueue: {entries: {totalCount: 150, nodes: []}}}}}),
+  )
+  assert_eq(decided(truncated).record.incident.queue_wedged.state, "unmeasured")
 }

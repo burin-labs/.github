@@ -39,13 +39,15 @@ fn output(harness: Harness, name: string, value: string) {
   }
 }
 
-fn input(vars: HarnessEnv) -> Input {
+fn input(harness: Harness) -> Input {
+  const vars = harness.env
   return {
     repository: required(vars, "OVERRIDE_REPOSITORY"),
     organization: required(vars, "OVERRIDE_ORGANIZATION"),
     pr: to_int(required(vars, "OVERRIDE_PR")),
     head_sha: required(vars, "OVERRIDE_HEAD_SHA"),
     run_url: env(vars, "OVERRIDE_RUN_URL"),
+    now: harness.clock.date_iso(),
   }
 }
 
@@ -58,7 +60,7 @@ fn github(harness: Harness, token_env: string) {
 }
 
 fn decide_step(harness: Harness) {
-  const request = input(harness.env)
+  const request = input(harness)
   const facts = measure(github(harness, "GH_TOKEN"), request)
   if facts == nil {
     output(harness, "active", "false")
@@ -99,7 +101,7 @@ fn draft(vars: HarnessEnv) -> dict {
 fn cancel_step(harness: Harness) {
   const count = cancel_competing(
     github(harness, "GH_TOKEN"),
-    input(harness.env),
+    input(harness),
     to_int(required(harness.env, "OVERRIDE_RUN_ID")),
     { ms -> harness.clock.sleep_ms(ms) },
   )
@@ -107,13 +109,13 @@ fn cancel_step(harness: Harness) {
 }
 
 fn publish_step(harness: Harness) {
-  publish_status(github(harness, "GH_TOKEN"), input(harness.env), draft(harness.env))
+  publish_status(github(harness, "GH_TOKEN"), input(harness), draft(harness.env))
 }
 
 fn merge_step(harness: Harness) {
   const sha = merge_pull(
     github(harness, "GH_TOKEN"),
-    input(harness.env),
+    input(harness),
     draft(harness.env),
     fn(ms) { harness.clock.sleep_ms(ms) },
     fn(low, high) { return harness.random.range(low, high) },
@@ -125,7 +127,7 @@ fn merge_step(harness: Harness) {
 fn cleanup_step(harness: Harness) {
   const removed = remove_consumed_labels(
     github(harness, "GH_TOKEN"),
-    input(harness.env),
+    input(harness),
     json_parse(required(harness.env, "OVERRIDE_LABEL_EVENTS")),
   )
   output(harness, "removed_labels", json_stringify(removed))
@@ -136,7 +138,7 @@ fn cleanup_step(harness: Harness) {
  * write that fails turns this step red but never undoes the override.
  */
 fn record_step(harness: Harness) {
-  const request = input(harness.env)
+  const request = input(harness)
   const raw = env(harness.env, "OVERRIDE_RECORD")
   const drafted = raw == "" ? fallback_record(
     request,
