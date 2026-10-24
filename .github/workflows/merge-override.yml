@@ -6,8 +6,10 @@
 # or repository admin (re-checked from the issue event that attached each
 # label), a fork head, a head that moved after the label, a pull request that
 # is not open, required approval missing (except force-merge), and
-# bypass-merge-queue on a head whose `CI status` is not green. Everything else
-# is recorded as a warning.
+# bypass-merge-queue on a head whose `CI status` is not green. The two queue
+# bypass labels are also refused unless measured state shows an incident: main
+# is red, the pull request is a release-train pull request, or the queue is
+# wedged. Everything else is recorded as a warning.
 #
 # Every attempt, applied, refused, or errored, leaves one audit record on the
 # pull request, in the step summary, and in the org log

@@ -612,9 +612,9 @@ or repository admin is the authority. The workflow acts with the
 
 ### What refuses an override
 
-The label is an admin's decision; the workflow does not ask for proof of an
-incident or read the default branch's health. `scripts/merge-override/` refuses
-only what is unsafe whoever asks, before any side effect:
+The label is an admin's decision, but the two labels that land outside the
+merge queue also need a measured incident. `scripts/merge-override/` refuses
+what is unsafe whoever asks, before any side effect:
 
 - A label actor is not an organization or repository admin, re-checked from
   the issue event that attached the label. Applying a label needs only triage;
@@ -630,6 +630,25 @@ only what is unsafe whoever asks, before any side effect:
   review too.
 - `bypass-merge-queue` on a head whose `CI status` is not green. That label
   promises CI passed; `force-merge` is the label that says it did not.
+- `bypass-merge-queue` or `force-merge` when none of three measured signals
+  holds. Each one moves main outside the queue and rebuilds every queued merge
+  group; on 2026-10-23 that cost 214 of 259 merge group runs, and the queue
+  already lands approved green pull requests. The reason text is never
+  evidence. The workflow allows the land when any one holds:
+  - Main is red: an open issue whose title starts `[CI] Main is red` or
+    `[CI] Main red inside a cancelled run`, or the newest conclusive `CI` run
+    on the base branch failed.
+  - The pull request is a release-train pull request: it changes
+    `.harn-version` (a repin), changes only `VERSION`,
+    `Sources/BurinApp/Info.plist`, and `site/src/data/release-info.json` (a
+    version-only bump), or carries the `release-critical` label.
+  - The merge queue is wedged: the pull request has been queued for 90 minutes
+    or more and no merge group run is active on the base branch.
+
+  A signal that cannot be read counts as not holding, and if no signal holds
+  and any could not be read, the refusal says so. The record lists each
+  signal's state and evidence. `bypass-ci` is unaffected because it still goes
+  through the queue.
 
 Red checks on the head, checks still running, and a missing reason are
 warnings in the record, never refusals.
