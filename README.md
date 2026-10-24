@@ -641,7 +641,7 @@ what is unsafe whoever asks, before any side effect:
   - The pull request is a release-train pull request: it changes
     `.harn-version` (a repin), changes only `VERSION`,
     `Sources/BurinApp/Info.plist`, and `site/src/data/release-info.json` (a
-    version-only bump), or carries the `release-critical` label.
+    version-only bump), or carries the `release-blocker` label.
   - The merge queue is wedged: the pull request has been queued for 90 minutes
     or more and no merge group run is active on the base branch.
 

@@ -38,7 +38,7 @@ pub const MAIN_RED_TITLES = ["[CI] Main is red", "[CI] Main red inside a cancell
 /** The workflow whose newest conclusive run on the base branch says whether it is red. */
 pub const MAIN_CI_WORKFLOW = "CI"
 
-pub const RELEASE_CRITICAL_LABEL = "release-critical"
+pub const RELEASE_BLOCKER_LABEL = "release-blocker"
 
 /** A pull request that changes this file is a Harn repin. */
 pub const REPIN_FILE = ".harn-version"
@@ -347,10 +347,10 @@ pub fn main_red_signal(issues: list, runs: list, errors: list) -> Signal {
   }
 }
 
-/** Whether the pull request is a repin, a version-only bump, or labeled `release-critical`. */
+/** Whether the pull request is a repin, a version-only bump, or labeled `release-blocker`. */
 pub fn release_train_signal(files: list<string>, labels: list<string>) -> Signal {
-  if labels.contains(RELEASE_CRITICAL_LABEL) {
-    return {state: "yes", detail: "labeled `" + RELEASE_CRITICAL_LABEL + "`"}
+  if labels.contains(RELEASE_BLOCKER_LABEL) {
+    return {state: "yes", detail: "labeled `" + RELEASE_BLOCKER_LABEL + "`"}
   }
   if files.contains(REPIN_FILE) {
     return {state: "yes", detail: "repin: changes `" + REPIN_FILE + "`"}
@@ -433,7 +433,7 @@ fn incident_refusal(label: string, incident: Incident?) -> string? {
   }
   return "`" + label
     + "` moves main outside the merge queue, which rebuilds every queued merge group and cancels the verdicts main needs; the queue already lands approved, green pull requests. It is allowed only when main is red, the pull request is a release-train pull request (a repin, a version-only bump, or labeled `"
-    + RELEASE_CRITICAL_LABEL
+    + RELEASE_BLOCKER_LABEL
     + "`), or the queue is wedged (queued over "
     + to_string(QUEUE_WEDGE_MINUTES)
     + " min with no merge group running). None holds: "

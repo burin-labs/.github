@@ -767,7 +767,7 @@ pipeline test_release_train_pull_requests_are_allowed(harness: Harness) {
       labels: [],
       detail: "version-only",
     },
-    {files: ["src/lib.rs"], labels: [{name: "release-critical"}], detail: "release-critical"},
+    {files: ["src/lib.rs"], labels: [{name: "release-blocker"}], detail: "release-blocker"},
   ]
   for item in cases {
     const paths = world(calm({[PR_FILES]: [item.files.map({ name -> {filename: name} })]}))
