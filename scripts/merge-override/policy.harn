@@ -622,7 +622,12 @@ pub fn record_markdown(record: dict) -> string {
   const heading = {applied: "applied", refused: "refused", errored: "errored"}[record.outcome]
   const checks = record.checks
   const actors = join(record.actors.map({ actor -> "@" + actor }), ", ")
-  let lines = ["### Merge override " + heading + ": `" + record.label + "`", ""]
+  let lines = [
+    "### Merge override " + heading + ": `" + record.label + "`",
+    "",
+    "- Requested by " + actors,
+    "- Reason: " + record.reason,
+  ]
   if len(record.refusals) > 0 {
     lines = lines + record.refusals.map({ refusal -> "- " + refusal })
   }
@@ -631,9 +636,6 @@ pub fn record_markdown(record: dict) -> string {
   }
   if record.merge_commit != "" {
     lines = lines + ["- Merged as `" + record.merge_commit + "`"]
-  }
-  if len(record.refusals) == 0 && record.error == "" && record.merge_commit == "" {
-    lines = lines + ["- Requested by " + actors]
   }
   if record.reason_source == "none" {
     lines = lines
@@ -647,8 +649,7 @@ pub fn record_markdown(record: dict) -> string {
     lines = lines + ["", "Re-apply `" + record.label + "` once the cause above is fixed."]
   }
   let detail = [
-    "- Requested by: " + actors + " at " + record.labeled_at,
-    "- Reason: " + record.reason,
+    "- Requested at: " + record.labeled_at,
     "- Head: `" + record.head_sha + "`",
     "- Checks on the head: `" + REQUIRED_CHECK + "` " + checks.ci_status + "; "
       + to_string(checks.passing)

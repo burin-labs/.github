@@ -694,6 +694,11 @@ pipeline test_an_approved_green_head_outside_an_incident_is_refused_with_the_mea
       )
         .contains("<details><summary>Audit record</summary>"),
     )
+    // The actor's reason stays above the toggle.
+    const shown = record_markdown(
+      result.record + {outcome: "refused", error: "", actions: [], merge_commit: ""},
+    )
+    assert(shown.index_of("- Reason: ") < shown.index_of("<details>"), shown)
   }
   // The reason text is not evidence: a reason that claims an incident changes nothing.
   const claimed = world(
