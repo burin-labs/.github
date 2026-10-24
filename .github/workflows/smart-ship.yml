@@ -19,6 +19,14 @@ on:
         description: Label that hands a pull request to Smart Ship.
         type: string
         default: ship
+      wake-labels:
+        description: >-
+          JSON list of the other labels whose addition or removal can change
+          whether a PR may land: the policy's hold labels and its repair
+          opt-out label. Any other label event (the shepherd's own status
+          label included) does not wake a look.
+        type: string
+        default: '["do-not-merge", "hold", "no-auto-repair"]'
       repair:
         description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
         type: boolean
@@ -109,24 +117,29 @@ jobs:
     #   cancelled included, wakes only the PRs waiting on main: a newer push
     #   cancels most main runs after their jobs have already reported.
     #
-    # A caller without an owned pool runs on every wake; the shepherd does nothing
-    # for one that changes nothing.
+    # - A label event wakes only for the ship label or a `wake-labels` label, and
+    #   never for the shepherd's own removal of a label (an echo that would
+    #   cancel the look that made it) or a bot's removal from a closed PR.
+    #
+    # The rule applies to every caller. Each wake costs a look's API calls from
+    # the release app's shared hourly limit, whoever pays for the runner.
     if: >-
       !cancelled()
       && !(github.event_name == 'pull_request_target'
       && github.event.action == 'labeled'
       && github.event.label.name == inputs.ship-label
       && github.event.pull_request.state == 'closed')
-      && (!(inputs.owned-runner-tag != ''
-      && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository))
-      || (github.event_name == 'schedule'
+      && (github.event_name == 'schedule'
       || github.event_name == 'workflow_dispatch'
       || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
       && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
       || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
       && !(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')
-      && !(github.event.action == 'unlabeled' && github.event.pull_request.state == 'closed'
-      && github.event.sender.type == 'Bot'))
+      && !(github.event.action == 'unlabeled' && (github.event.sender.login == 'harn-release-bot[bot]'
+      || (github.event.pull_request.state == 'closed' && github.event.sender.type == 'Bot')))
+      && !((github.event.action == 'labeled' || github.event.action == 'unlabeled')
+      && github.event.label.name != inputs.ship-label
+      && !contains(fromJSON(inputs.wake-labels), github.event.label.name)))
       || (github.event_name == 'workflow_run'
       && github.event.action == 'completed'
       && github.event.workflow_run.id > 0
@@ -145,7 +158,7 @@ jobs:
       format('gh-readonly-queue/{0}/', github.event.repository.default_branch)))
       || (github.event.workflow_run.event == 'push'
       && contains(fromJSON('["success","failure","timed_out","cancelled"]'), github.event.workflow_run.conclusion)
-      && github.event.workflow_run.head_branch == github.event.repository.default_branch)))))
+      && github.event.workflow_run.head_branch == github.event.repository.default_branch))))
 
     # A run woken by an event about one PR queues behind earlier runs for that
     # PR, and a CI completion (workflow_run) or a dispatch naming a PR counts as
@@ -160,6 +173,12 @@ jobs:
     # PR: before acting, a run lists the caller workflow's unfinished runs and
     # leaves the PR to an earlier one that covers it (burin-code
     # scripts/lib/ship/github.harn `single_actor`).
+    #
+    # A newer event about a PR also cancels that PR's look in progress: the
+    # newer look reads the PR fresh, and every step the kernel takes is
+    # re-derived from GitHub state, so a look cut off mid-way loses nothing. The
+    # repair job sits outside this group and is never cancelled. Sweeps and
+    # branch runs keep running, because no newer run covers all they cover.
     concurrency:
       group: >-
         smart-ship-${{ github.repository }}-${{ (github.event.pull_request.number
@@ -168,7 +187,7 @@ jobs:
         || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr)
         || github.event.workflow_run.head_branch
         && format('run-{0}', github.event.workflow_run.head_branch) || 'sweep' }}
-      cancel-in-progress: false
+      cancel-in-progress: ${{ (github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr) && true || false }}
     # A private caller that named an owned pool runs on it. A sweep probed the
     # pool and needs a runner online; a wake about one PR is not probed and goes
     # straight there, unless a kill switch retires the pool. The light pool
