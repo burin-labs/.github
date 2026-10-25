@@ -9,6 +9,7 @@ readonly workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 # is outside the workspace. Harn admits write roots as directories only.
 readonly outputs="$(dirname "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}")"
 export PROMOTE_ORIGINAL_CONSUMER_CONTEXT="${PROMOTE_ORIGINAL_CONSUMER_CONTEXT:-}"
+export PROMOTE_CONSUMER_REPAIR="${PROMOTE_CONSUMER_REPAIR:-}"
 export PROMOTE_CONSUMER_TOKEN="${PROMOTE_CONSUMER_TOKEN:-}"
 export PROMOTE_CONSUMER_REPOSITORY="${PROMOTE_CONSUMER_REPOSITORY:-}"
 export PROMOTE_CONSUMER_WORKFLOW="${PROMOTE_CONSUMER_WORKFLOW:-}"
@@ -23,6 +24,7 @@ harn run \
   --grant sha=env:PROMOTE_SHA,expose=PROMOTE_SHA \
   --grant run_id=env:PROMOTE_RUN_ID,expose=PROMOTE_RUN_ID \
   --grant original_context=env:PROMOTE_ORIGINAL_CONSUMER_CONTEXT,expose=PROMOTE_ORIGINAL_CONSUMER_CONTEXT \
+  --grant consumer_repair=env:PROMOTE_CONSUMER_REPAIR,expose=PROMOTE_CONSUMER_REPAIR \
   --grant consumer_token=env:PROMOTE_CONSUMER_TOKEN,expose=PROMOTE_CONSUMER_TOKEN \
   --grant consumer_repository=env:PROMOTE_CONSUMER_REPOSITORY,expose=PROMOTE_CONSUMER_REPOSITORY \
   --grant consumer_workflow=env:PROMOTE_CONSUMER_WORKFLOW,expose=PROMOTE_CONSUMER_WORKFLOW \

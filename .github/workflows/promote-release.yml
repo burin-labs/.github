@@ -4,7 +4,7 @@
 # commit; nothing is rebuilt after testing. The build run uploads each file as
 # a run artifact, attests it, and records its SHA-256 in a candidate manifest
 # (schemas/candidate-manifest.v1.json). This workflow requires a successful run
-# or Harn's authenticated late-consumer authorization, and proves that the
+# or Harn's authenticated consumer recovery, and proves that the
 # files are the ones the manifest names at the requested commit,
 # then tags that commit and publishes those same files. It never builds and
 # never writes release content: the release body is the manifest's notes file,
@@ -60,6 +60,11 @@ on:
         required: false
         default: ''
         type: string
+      consumer-repair:
+        description: Optional Harn-issued repair selector binding a fresh consumer measurement to the original candidate archives.
+        required: false
+        default: ''
+        type: string
     secrets:
       RELEASE_APP_CLIENT_ID:
         description: GitHub App client id with contents write on the calling repository.
@@ -68,7 +73,7 @@ on:
         description: GitHub App private key.
         required: true
       CONSUMER_CANARY_REPOSITORY:
-        description: Registered consumer repository name, required only for original deadline recovery.
+        description: Registered consumer repository name, required for consumer recovery.
         required: false
     outputs:
       tag:
@@ -120,22 +125,22 @@ jobs:
           version: 0.10.133
 
       - name: Check out the immutable consumer reader
-        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: burin-labs/harn
-          ref: d1b11367b22acd8b9b03ff3db66d43c89a7d0be9
+          ref: 98395fd57845149560e7854947f029adf1b1a615
           path: .harn/promote-release/consumer-reader
           persist-credentials: false
 
       - name: Set up the consumer reader runtime
-        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+        if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
 
-      - name: Mint original consumer read authority
-        if: inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'
+      - name: Mint consumer read authority
+        if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'
         id: consumer-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -147,6 +152,7 @@ jobs:
             ${{ secrets.CONSUMER_CANARY_REPOSITORY }}
           permission-actions: read
           permission-contents: read
+          permission-pull-requests: read
 
       - name: Verify the run and its files
         shell: bash
@@ -157,6 +163,7 @@ jobs:
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
           PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
+          PROMOTE_CONSUMER_REPAIR: ${{ inputs.consumer-repair }}
           PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
           PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
           PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}
@@ -195,6 +202,7 @@ jobs:
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
           PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
+          PROMOTE_CONSUMER_REPAIR: ${{ inputs.consumer-repair }}
           PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
           PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
           PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}

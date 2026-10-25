@@ -99,6 +99,7 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
     tag: nil,
     tagged_first: nil,
     requests: [],
+    bound_downloads: 0,
   }
   const forged = options?.forged ?? []
   const stored_override = options?.stored ?? {}
@@ -133,6 +134,19 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
           fs.write_text(path_join(directory, item.file), files[item.file])
         }
       }
+      return nil
+    },
+    download_bound: fn(run_id, name, identity, directory) {
+      state.bound_downloads = state.bound_downloads + 1
+      require state.bound_downloads <= (options?.bound_limit ?? 100),
+        "bound manifest became unavailable"
+      assert_eq(to_string(run_id), RUN_ID)
+      assert_eq(name, "candidate-manifest-" + SHA)
+      assert_eq(
+        identity,
+        options?.manifest_identity ?? {id: 9, digest: "sha256:" + sha256("manifest archive")},
+      )
+      fs.write_text(path_join(directory, CANDIDATE_MANIFEST_FILE), json_stringify(manifest))
       return nil
     },
     attest: fn(path, expect) {
@@ -461,6 +475,95 @@ pipeline test_refuses_a_run_that_did_not_succeed(harness: Harness) {
     fn() { verify(harness.fs, {run: {status: "in_progress", conclusion: nil}}) },
     "did not succeed: status in_progress",
   )
+}
+
+pipeline test_incomplete_producer_requires_an_authenticated_completion_reader(harness: Harness) {
+  for record in [
+    {status: "completed", conclusion: "failure"},
+    {status: "in_progress", conclusion: nil},
+  ] {
+    const world = fixture(harness.fs, {run: record})
+    let measured = 0
+    verify_run(
+      world.github,
+      request(),
+      fn(attempt: int) {
+        assert_eq(attempt, 1)
+        measured = measured + 1
+      },
+    )
+    assert_eq(measured, 1)
+    assert_error_contains(
+      fn() { verify_run(
+        world.github,
+        request(),
+        fn(_attempt: int) {
+          throw "consumer product remains unproven"
+        },
+      ) },
+      "consumer product remains unproven",
+    )
+  }
+  for conclusion in ["cancelled", "timed_out", "skipped", nil] {
+    const world = fixture(harness.fs, {run: {status: "completed", conclusion: conclusion}})
+    let measured = 0
+    assert_error_contains(
+      fn() { verify_run(world.github, request(), fn(_attempt: int) { measured = measured + 1 }) },
+      "did not succeed",
+    )
+    assert_eq(measured, 0)
+  }
+}
+
+pipeline test_explicit_repair_remains_required_after_the_producer_succeeds(harness: Harness) {
+  const world = fixture(harness.fs)
+  assert_error_contains(
+    fn() { verify_run(
+      world.github,
+      request(),
+      fn(_attempt: int) {
+        throw "fresh repair remains unproven"
+      },
+    ) },
+    "fresh repair remains unproven",
+  )
+}
+
+pipeline test_repair_manifest_cannot_come_from_an_earlier_attempt(harness: Harness) {
+  const world = fixture(harness.fs, {run: {run_attempt: 2}})
+  const directory = harness.fs.mkdtemp_in_workspace("repair-attempt-")
+  assert_error_contains(
+    fn() { verify_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      directory,
+      fn(_attempt: int) { return {id: 9, digest: "sha256:" + sha256("manifest archive")} },
+    ) },
+    "authenticated producing attempt",
+  )
+}
+
+pipeline test_repair_manifest_is_reauthenticated_before_publication_writes(harness: Harness) {
+  const world = fixture(harness.fs, {bound_limit: 1})
+  const directory = harness.fs.mkdtemp_in_workspace("repair-publication-")
+  const authorize =
+    fn(_attempt: int) { return {id: 9, digest: "sha256:" + sha256("manifest archive")} }
+  verify_candidate(world.github, harness.fs, request(), directory, authorize)
+  assert_eq(world.state().bound_downloads, 1)
+  assert_error_contains(
+    fn() { publish_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      verify_run(world.github, request(), authorize),
+      directory,
+    ) },
+    "bound manifest became unavailable",
+  )
+  assert_eq(world.state().bound_downloads, 2)
+  assert_eq(world.state().drafts, [])
+  assert_eq(world.state().tagged_first, nil)
 }
 
 pipeline test_refuses_a_file_whose_digest_differs(harness: Harness) {

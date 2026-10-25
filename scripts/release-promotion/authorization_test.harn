@@ -89,3 +89,87 @@ pipeline test_later_promotion_context_cannot_authorize_an_original_failed_candid
     )
   }
 }
+
+fn repaired() -> dict {
+  return {
+    schema: "harn.release.consumer_repair_decision.v1",
+    context: measured().context + {parent_run_id: "101"},
+    owned: false,
+    reading: {product: {verdict: "pass"}},
+    producer: {
+      schema: "harn.release.producer_readiness.v1",
+      stage: "candidate-archives",
+      next_action: "measure-consumer-repair",
+      source_sha: SOURCE,
+      producer_run: "100",
+      producer_attempt: 1,
+      verdict: "pass",
+      pending: 0,
+      failed_jobs: [],
+      observed_jobs: 17,
+      proven_artifacts: 7,
+      manifest: {id: 9, digest: "sha256:" + sha256("immutable manifest archive")},
+    },
+    consumer_pull: "7",
+  }
+}
+
+pipeline test_repair_binds_a_new_measurement_to_the_original_archive_producer() {
+  const selector = "issued repair selector"
+  const authorization = unwrap(parse_authorization("", selector))
+  let reached = 0
+  const manifest = verify_authorization(
+    fn(issued: string, source: string) {
+      assert_eq(issued, selector)
+      assert_eq(source, SOURCE)
+      reached = reached + 1
+      return repaired()
+    },
+    "burin-labs/harn",
+    SOURCE,
+    100,
+    1,
+    authorization,
+  )
+  assert_eq(manifest, repaired().producer.manifest)
+  assert_eq(reached, 1)
+  assert_eq(authorization.mode, "repair")
+  assert_error_contains(
+    fn() { parse_authorization("original", selector) },
+    "one consumer authorization mode",
+  )
+  const proof = repaired().producer
+  for decision in [
+    nil,
+    {},
+    measured(),
+    repaired() + {schema: "unobserved"},
+    repaired() + {owned: true},
+    repaired() + {context: measured().context},
+    repaired() + {context: repaired().context + {source_revision: "different"}},
+    repaired() + {reading: {product: nil}},
+    repaired() + {reading: {product: {verdict: "fail"}}},
+    repaired() + {producer: proof + {source_sha: "different"}},
+    repaired() + {producer: proof + {producer_run: "101"}},
+    repaired() + {producer: proof + {producer_attempt: 2}},
+    repaired() + {producer: proof + {verdict: "pending"}},
+    repaired() + {producer: proof + {pending: 1}},
+    repaired() + {producer: proof + {failed_jobs: ["smoke"]}},
+    repaired() + {producer: proof + {observed_jobs: 0}},
+    repaired() + {producer: proof + {proven_artifacts: 0}},
+    repaired() + {producer: proof + {manifest: {id: 0, digest: proof.manifest.digest}}},
+    repaired() + {producer: proof + {manifest: {id: 9, digest: "unmeasured"}}},
+  ] {
+    assert_error_contains(
+      fn() { verify_authorization(
+        fn(_issued: string, _source: string) { return decision },
+        "burin-labs/harn",
+        SOURCE,
+        100,
+        1,
+        authorization,
+      ) },
+      "does not bind this producer",
+    )
+  }
+}

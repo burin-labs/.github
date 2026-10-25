@@ -1,10 +1,12 @@
 /**
- * Request binding over the shared authenticated original-deadline reader.
+ * Request binding over the shared authenticated consumer reader.
  * Private custody, chronology and product authority belong to that reader.
  */
-pub type AuthorizationRequest = {context: string}
+pub type AuthorizationRequest = {context: string, mode: string}
 
 pub type ReadRecovery = fn(string, string) -> unknown
+
+pub type ManifestIdentity = {id: int, digest: string}
 
 /**
  * Public process envelope only. The shared reader owns the dictionaries'
@@ -12,8 +14,34 @@ pub type ReadRecovery = fn(string, string) -> unknown
  */
 type PublicRecoveryProjection = {owned: bool, context: dict, reading: dict, deadline: dict}
 
-pub fn parse_authorization(context: string) -> AuthorizationRequest? {
-  return trim(context) == "" ? nil : {context: context}
+type RepairProducer = {
+  source_sha: string,
+  producer_run: string,
+  producer_attempt: int,
+  verdict: string,
+  pending: int,
+  failed_jobs: list<string>,
+  observed_jobs: int,
+  proven_artifacts: int,
+  manifest: ManifestIdentity,
+}
+
+type PublicRepairProjection = {
+  schema: string,
+  owned: bool,
+  context: dict,
+  reading: dict,
+  producer: RepairProducer,
+}
+
+pub fn parse_authorization(context: string, repair: string = "") -> AuthorizationRequest? {
+  if trim(context) != "" && trim(repair) != "" {
+    throw "one consumer authorization mode is required"
+  }
+  if trim(repair) != "" {
+    return {context: repair, mode: "repair"}
+  }
+  return trim(context) == "" ? nil : {context: context, mode: "original"}
 }
 
 pub fn verify_authorization(
@@ -23,9 +51,41 @@ pub fn verify_authorization(
   producer: int,
   producer_attempt: int,
   authorization: AuthorizationRequest,
-) {
+) -> ManifestIdentity? {
   if repository != "burin-labs/harn" || producer < 1 || producer_attempt < 1 {
     throw "no owning original consumer deadline for this producer"
+  }
+  if authorization.mode == "repair" {
+    const checked = schema_parse(
+      read_recovery(authorization.context, source),
+      schema_of(PublicRepairProjection),
+    )
+    if !is_ok(checked) {
+      throw "consumer repair does not bind this producer"
+    }
+    const decision = unwrap(checked)
+    const proof = decision.producer
+    if decision.schema != "harn.release.consumer_repair_decision.v1" || decision.owned != false
+      || decision.context.parent_repository != repository
+      || decision.context.parent_run_id == to_string(producer)
+      || decision.context.source_revision != source
+      || decision.reading.product?.verdict != "pass"
+      || proof.source_sha != source
+      || proof.producer_run != to_string(producer)
+      || proof.producer_attempt != producer_attempt
+      || proof.verdict != "pass"
+      || proof.pending != 0
+      || len(proof.failed_jobs) != 0
+      || proof.observed_jobs < 1
+      || proof.proven_artifacts < 1
+      || proof.manifest.id < 1
+      || regex_match("^sha256:[0-9a-f]{64}$", proof.manifest.digest) == nil {
+      throw "consumer repair does not bind this producer"
+    }
+    return proof.manifest
+  }
+  if authorization.mode != "original" {
+    throw "unknown consumer authorization mode"
   }
   const checked = schema_parse(
     read_recovery(authorization.context, source),
@@ -46,4 +106,5 @@ pub fn verify_authorization(
     || decision.reading.product?.verdict != "pass" {
     throw "original consumer recovery does not bind this producer"
   }
+  return nil
 }
