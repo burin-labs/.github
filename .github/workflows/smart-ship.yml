@@ -137,7 +137,8 @@ jobs:
       && github.event.pull_request.state == 'closed')
       && (github.event_name == 'schedule'
       || github.event_name == 'workflow_dispatch'
-      || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
+      || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review'
+      || github.event_name == 'pull_request_review_thread')
       && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
       || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
       && !(github.event.action == 'dequeued' && github.event.pull_request.state == 'closed')

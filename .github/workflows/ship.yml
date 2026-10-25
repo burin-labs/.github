@@ -9,6 +9,8 @@ on:
     types: [labeled, unlabeled, synchronize, ready_for_review, dequeued, closed]
   pull_request_review:
     types: [submitted]
+  pull_request_review_thread:
+    types: [resolved, unresolved]
   # The shared runner decides which CI completions it acts on, so a green PR
   # joins the merge queue when CI finishes instead of at the next sweep.
   workflow_run: # zizmor: ignore[dangerous-triggers] the shared runner admits only completed same-repository runs, reads metadata through the API, and never checks out the parent-run ref

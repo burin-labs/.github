@@ -315,6 +315,13 @@ pipeline test_the_shared_jobs_own_wake_admission(harness: Harness) {
     ),
   )
   const admission = shipped.substring(shipped.index_of("(github.event_name == 'schedule'"))
+  // Resolving or reopening a review thread wakes the PR it belongs to, under the
+  // same labeled-PR rule as a review, so a thread-only block clears in seconds.
+  assert(
+    admission.contains(
+      "github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_thread')",
+    ),
+  )
   // The rule is written once, in the ship job; the probe takes only sweeps.
   assert(!jobs.availability["if"].contains("workflow_run"), jobs.availability["if"])
   for clause in [
