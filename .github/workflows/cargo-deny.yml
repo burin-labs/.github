@@ -133,6 +133,9 @@ jobs:
           ADVISORY_LINTS: ${{ github.event_name == 'pull_request' && '--warn unmaintained --warn unsound' || '' }}
         run: |
           set -uo pipefail
+          # GitHub runs `bash -e`, and `set -uo` leaves -e on: the first failing
+          # scan would exit here before any finding reached the log or the issue.
+          set +e
           # shellcheck disable=SC2086 # ADVISORY_LINTS is a flag list
           cargo-deny --all-features check advisories ${ADVISORY_LINTS}
           status=$?
