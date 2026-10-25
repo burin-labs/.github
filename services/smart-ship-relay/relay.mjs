@@ -126,14 +126,17 @@ export function createRelay(config) {
     }
     if (delivery === "") return { status: 400, body: "missing delivery id" }
     if (seen.has(delivery)) return skip(delivery, "duplicate")
+    // Reserve before the first await, so a redelivery that arrives while this
+    // request is still dispatching is skipped instead of dispatching again.
+    remember(delivery)
     try {
       await dispatch(payload, workflow)
     } catch (error) {
-      // Not remembered, so GitHub's redelivery of a failed delivery can retry.
+      // Released, so GitHub's redelivery of a failed delivery can retry.
+      seen.delete(delivery)
       log({ outcome: "failed", delivery, repo, pr: pull.number, error: String(error.message) })
       return { status: 502, body: "dispatch failed" }
     }
-    remember(delivery)
     log({ outcome: "dispatched", delivery, repo, pr: pull.number, action: payload.action })
     return { status: 202, body: "dispatched" }
   }

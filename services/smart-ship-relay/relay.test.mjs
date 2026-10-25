@@ -192,3 +192,67 @@ test("an unexpected throw answers 500 and the server keeps serving", async () =>
     server.close()
   }
 })
+
+test("a redelivery that arrives while the first request is still dispatching dispatches once", async () => {
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const calls = []
+  const relay = createRelay({
+    secret: SECRET,
+    appId: "123",
+    privateKey,
+    repos: parseRepos('{"burin-labs/harn":"smart-ship.yml"}'),
+    fetch: async (url, init) => {
+      calls.push(url)
+      await gate
+      if (url.endsWith("/access_tokens")) return new Response(JSON.stringify({ token: "t" }), { status: 201 })
+      return new Response(null, { status: 204 })
+    },
+    now: () => 1_800_000_000_000,
+  })
+  const first = relay.handle(delivery(payload(), { id: "slow" }))
+  const second = await relay.handle(delivery(payload(), { id: "slow" }))
+  assert.equal(second.body, "skipped: duplicate")
+  release()
+  assert.equal((await first).body, "dispatched")
+  assert.equal(calls.filter((url) => url.endsWith("/dispatches")).length, 1)
+})
+
+test("a failed dispatch releases its reservation so the retry can dispatch", async () => {
+  let dispatchStatus = 422
+  const relay = createRelay({
+    secret: SECRET,
+    appId: "123",
+    privateKey,
+    repos: parseRepos('{"burin-labs/harn":"smart-ship.yml"}'),
+    fetch: async (url) => {
+      if (url.endsWith("/access_tokens")) return new Response(JSON.stringify({ token: "t" }), { status: 201 })
+      return new Response(null, { status: dispatchStatus })
+    },
+    now: () => 1_800_000_000_000,
+  })
+  assert.equal((await relay.handle(delivery(payload(), { id: "again" }))).status, 502)
+  dispatchStatus = 204
+  assert.equal((await relay.handle(delivery(payload(), { id: "again" }))).body, "dispatched")
+})
+
+test("a client that disconnects mid-body does not take the server down", async () => {
+  const server = await startServer(createRelay({
+    secret: SECRET, appId: "1", privateKey, repos: parseRepos('{"burin-labs/harn":"smart-ship.yml"}'),
+  }), 0)
+  try {
+    const { port } = server.address()
+    const net = await import("node:net")
+    await new Promise((resolve) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write("POST /hooks/github HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\npartial")
+        setTimeout(() => { socket.destroy(); resolve() }, 20)
+      })
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const alive = await fetch(`http://127.0.0.1:${port}/healthz`)
+    assert.equal(alive.status, 200)
+  } finally {
+    server.close()
+  }
+})

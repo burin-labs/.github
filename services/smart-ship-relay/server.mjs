@@ -13,13 +13,19 @@ export function startServer(relay, port) {
   const server = createServer(async (request, response) => {
     const chunks = []
     let size = 0
-    for await (const chunk of request) {
-      size += chunk.length
-      if (size > MAX_BODY) {
-        response.writeHead(413).end("too large")
-        return
+    try {
+      for await (const chunk of request) {
+        size += chunk.length
+        if (size > MAX_BODY) {
+          response.writeHead(413).end("too large")
+          return
+        }
+        chunks.push(chunk)
       }
-      chunks.push(chunk)
+    } catch {
+      // The client went away mid-body; there is nobody to answer.
+      response.destroy()
+      return
     }
     const path = (request.url ?? "").split("?")[0]
     let result
