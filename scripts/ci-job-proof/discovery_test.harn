@@ -225,6 +225,42 @@ pipeline test_enrolled_checkpoint_reuses_only_qualified_inputs_and_keeps_failed_
   assert_eq(changed.admitted, [])
 }
 
+pipeline test_checkpoint_checks_newer_failed_attempt_before_old_success_of_the_same_run() {
+  const earlier = producer(
+    run(25, "push"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const later = producer(
+    run(25, "push") + {run_attempt: 2, conclusion: "failure"},
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const complete = source([earlier, later], fn(_endpoint) { return nil })
+  const changing: ProofSource = {
+    json: fn(endpoint) {
+      if endpoint.contains("event=push&head_sha=" + COMMIT) {
+        return {total_count: 1, workflow_runs: [earlier.run]}
+      }
+      if endpoint.contains("event=push&branch=main") {
+        return {total_count: 1, workflow_runs: [later.run]}
+      }
+      return complete.json(endpoint)
+    },
+    registration: complete.registration,
+  }
+  const result = discover(
+    changing,
+    current() + {event: "workflow_dispatch"},
+    wanted(),
+    nil,
+    fn() { return 0 },
+    true,
+  )
+  assert_eq(result.blocked, ["lint", "suite"])
+  assert_eq(result.admitted, [])
+}
+
 pipeline test_a_reused_job_is_proven_at_the_run_that_executed_it() {
   let calls: list<string> = []
   const producers = [

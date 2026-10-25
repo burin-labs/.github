@@ -355,7 +355,7 @@ fn candidates(source: ProofSource, current: RunContext, pull: int?) -> list<Run>
       + pushes)
       .filter({ run -> run.id < current.runId })
       .to_list()
-      .sorted_by({ run -> -run.id })
+      .sorted_by({ run -> [-run.id, -run.run_attempt] })
   }
   if pull == nil {
     return pushes.slice(0, 1)
