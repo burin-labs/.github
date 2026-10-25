@@ -97,6 +97,9 @@ fn repaired() -> dict {
     owned: false,
     reading: {product: {verdict: "pass"}},
     producer: {
+      schema: "harn.release.producer_readiness.v1",
+      stage: "candidate-archives",
+      next_action: "measure-consumer-repair",
       source_sha: SOURCE,
       producer_run: "100",
       producer_attempt: 1,
@@ -107,6 +110,7 @@ fn repaired() -> dict {
       proven_artifacts: 7,
       manifest: {id: 9, digest: "sha256:" + sha256("immutable manifest archive")},
     },
+    consumer_pull: "7",
   }
 }
 

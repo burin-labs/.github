@@ -102,6 +102,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       repositories: "harn\n" + expression("secrets.CONSUMER_CANARY_REPOSITORY") + "\n",
       "permission-actions": "read",
       "permission-contents": "read",
+      "permission-pull-requests": "read",
     },
   )
   const entry = "bash .harn/promote-release/implementation/scripts/release-promotion/run.sh"

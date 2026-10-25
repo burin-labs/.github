@@ -152,6 +152,7 @@ jobs:
             ${{ secrets.CONSUMER_CANARY_REPOSITORY }}
           permission-actions: read
           permission-contents: read
+          permission-pull-requests: read
 
       - name: Verify the run and its files
         shell: bash
