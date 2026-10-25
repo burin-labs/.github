@@ -120,9 +120,11 @@ pub fn verify_run(
     throw run_label(request) + " built a commit from " + to_string(head_owner) + ", not "
       + request.repository
   }
-  if run?.status != "completed"
-    || (run?.conclusion != "success"
-      && (run?.conclusion != "failure" || authorize_completion == nil)) {
+  const succeeded = run?.status == "completed" && run?.conclusion == "success"
+  const recoverable = (run?.status == "completed" && run?.conclusion == "failure")
+    || (["queued", "requested", "waiting", "pending", "in_progress"].contains(run?.status)
+      && run?.conclusion == nil)
+  if !succeeded && (!recoverable || authorize_completion == nil) {
     throw run_label(request) + " did not succeed: status " + to_string(run?.status)
       + ", conclusion "
       + to_string(run?.conclusion)
@@ -149,7 +151,7 @@ pub fn verify_run(
   if type_of(attempt) != "int" || attempt < 1 {
     throw run_label(request) + " reported no run attempt"
   }
-  if run?.conclusion == "failure" {
+  if !succeeded {
     authorize_completion(attempt)
   }
   return {url: to_string(run?.html_url), attempt: attempt}

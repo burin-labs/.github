@@ -38,6 +38,7 @@ fn main(harness: Harness) {
   const mode = required_env(harness.env, "PROMOTE_MODE")
   const authorization = parse_authorization(
     harness.env.get("PROMOTE_ORIGINAL_CONSUMER_CONTEXT") ?? "",
+    harness.env.get("PROMOTE_CONSUMER_REPAIR") ?? "",
   )
   const authorize_completion = authorization == nil ? nil : fn(attempt: int) { verify_authorization(
     live_consumer_recovery(
@@ -48,6 +49,7 @@ fn main(harness: Harness) {
         workflow: required_env(harness.env, "PROMOTE_CONSUMER_WORKFLOW"),
         reader: required_env(harness.env, "PROMOTE_CONSUMER_READER"),
       },
+      authorization.mode == "repair" ? "--repair" : "--recover",
     ),
     request.repository,
     request.sha,

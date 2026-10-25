@@ -463,6 +463,44 @@ pipeline test_refuses_a_run_that_did_not_succeed(harness: Harness) {
   )
 }
 
+pipeline test_incomplete_producer_requires_an_authenticated_completion_reader(harness: Harness) {
+  for record in [
+    {status: "completed", conclusion: "failure"},
+    {status: "in_progress", conclusion: nil},
+  ] {
+    const world = fixture(harness.fs, {run: record})
+    let measured = 0
+    verify_run(
+      world.github,
+      request(),
+      fn(attempt: int) {
+        assert_eq(attempt, 1)
+        measured = measured + 1
+      },
+    )
+    assert_eq(measured, 1)
+    assert_error_contains(
+      fn() { verify_run(
+        world.github,
+        request(),
+        fn(_attempt: int) {
+          throw "consumer product remains unproven"
+        },
+      ) },
+      "consumer product remains unproven",
+    )
+  }
+  for conclusion in ["cancelled", "timed_out", "skipped", nil] {
+    const world = fixture(harness.fs, {run: {status: "completed", conclusion: conclusion}})
+    let measured = 0
+    assert_error_contains(
+      fn() { verify_run(world.github, request(), fn(_attempt: int) { measured = measured + 1 }) },
+      "did not succeed",
+    )
+    assert_eq(measured, 0)
+  }
+}
+
 pipeline test_refuses_a_file_whose_digest_differs(harness: Harness) {
   const tampered = "archive for x86_64-unknown-linux-gnu, rebuilt\n"
   const built = candidate(harness.fs)

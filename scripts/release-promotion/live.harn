@@ -14,11 +14,18 @@ pub type ConsumerRecoveryConfig = {
  * Invoke the immutable shared reader. Its closed output contains public
  * context/counts only; arbitrary subprocess diagnostics never reach logs.
  */
-pub fn live_consumer_recovery(tools: HarnessTools, config: ConsumerRecoveryConfig) -> ReadRecovery {
+pub fn live_consumer_recovery(
+  tools: HarnessTools,
+  config: ConsumerRecoveryConfig,
+  operation: string = "--recover",
+) -> ReadRecovery {
+  if !["--recover", "--repair"].contains(operation) {
+    throw "unknown consumer recovery operation"
+  }
   return fn(context: string, source: string) {
     const result = command_run(
       tools,
-      ["node", config.reader, "--recover"],
+      ["node", config.reader, operation],
       {
         capture: {max_inline_bytes: 16384},
         timeout_ms: 1200000,
@@ -28,7 +35,7 @@ pub fn live_consumer_recovery(tools: HarnessTools, config: ConsumerRecoveryConfi
           CANARY_WORKFLOW: config.workflow,
           OBSERVER_CONTEXT: context,
           SOURCE_REVISION: source,
-          REQUIRE_CURRENT_DEFAULT: "true",
+          REQUIRE_CURRENT_DEFAULT: operation == "--repair" ? "false" : "true",
         },
       },
     )
