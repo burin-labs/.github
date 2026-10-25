@@ -213,6 +213,8 @@ jobs:
 
           if [ "${status}" -ne 0 ]; then
             findings="$(printf '%s' "${findings}" | sed '/^$/d')"
+            # The run log is where a red pull request is read.
+            printf '::error title=Advisory findings::%s\n' "${findings//$'\n'/%0A}"
             delimiter="findings-$(openssl rand -hex 8)"
             printf 'findings<<%s\n%s\n%s\n' "${delimiter}" "${findings}" "${delimiter}" >> "${GITHUB_OUTPUT}"
           fi
