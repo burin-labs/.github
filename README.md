@@ -80,6 +80,15 @@ main push. A run that reused a job records the run where that job actually
 executed, and the next run proves the job there. It never accepts a pointer
 alone.
 
+A canonical full checkpoint can supply `checkpoint-enrollment`: JSON containing
+`actorId`, `actorLogin` and `headBranch` from its trusted admission policy.
+The resolver verifies that identity against the actual workflow run, requires
+the clean tested commit to match, and checks that main contains it. Every
+unmatched job runs. A newer failed producer blocks older proof for matching
+inputs; unreadable failed evidence blocks reuse for the remaining jobs.
+Without enrollment, dispatches only register original evidence. Scheduled
+backstops remain fresh.
+
 A job counts as passed only when every leg GitHub reports for it succeeded in
 one complete attempt, after that run registered its digests. An unrelated
 failed or cancelled job does not discard the others. The producer must be this

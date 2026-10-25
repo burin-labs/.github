@@ -9,7 +9,7 @@ import {
   registration,
   registration_artifact_name,
 } from "./contract.harn"
-import { current_run, live_source } from "./live.harn"
+import { checkpoint_enrolled, current_run, live_source } from "./live.harn"
 import { READ_BUDGET, discover, merge_group_pull } from "./reader.harn"
 import { tested_source } from "./source.harn"
 
@@ -50,6 +50,12 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
   }
   const workspace = required(harness.env, "GITHUB_WORKSPACE")
   const actual_source = tested_source(harness.process, workspace)
+  const checkpoint = checkpoint_enrolled(
+    source,
+    current,
+    actual_source,
+    harness.env.get("CI_JOB_PROOF_CHECKPOINT_ENROLLMENT") ?? "",
+  )
   const discovery = try {
     discover(
       source,
@@ -57,6 +63,7 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
       wanted,
       merge_group_pull(harness.env.get("CI_JOB_PROOF_MERGE_GROUP_HEAD_REF") ?? ""),
       fn() { return harness.clock.now_ms() },
+      checkpoint,
     )
   }
   const found = is_ok(discovery) ? unwrap(discovery) : {
@@ -65,8 +72,13 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
     reads: nil,
     budget: READ_BUDGET,
     reason: "discovery_failed",
+    blocked: [],
   }
-  output(harness, "discovery", json_stringify(pick(found, ["probed", "reads", "budget", "reason"])))
+  output(
+    harness,
+    "discovery",
+    json_stringify(pick(found, ["probed", "reads", "budget", "reason", "blocked"])),
+  )
   // Registration records where each reused job actually ran, so a later run
   // proves it there instead of trusting this run's pointer.
   require tested_source(harness.process, workspace) == actual_source,

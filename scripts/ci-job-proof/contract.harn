@@ -26,6 +26,9 @@ pub type RunContext = {
   registrarStep: string,
 }
 
+/** Expected canonical checkpoint identity, emitted by the caller's trusted admission policy. */
+pub type CheckpointEnrollment = {actorId: int, actorLogin: string, headBranch: string}
+
 /** Implemented producer events; dispatch observation requires explicit enrollment. */
 pub type ProducerEvent = "pull_request" | "merge_group" | "push" | "workflow_dispatch"
 
@@ -101,7 +104,9 @@ pub const CONSUMER_EVENTS = ["merge_group", "push"]
 /** Existing history may reuse only these producer events. */
 pub const REUSE_PRODUCER_EVENTS: list<ProducerEvent> = ["pull_request", "merge_group", "push"]
 
-/** Dispatches publish original evidence too, but never discover or grant reused proofs. */
+/**
+ * Dispatches publish original evidence; discovery requires separate canonical checkpoint enrollment.
+ */
 pub const REGISTRATION_EVENTS: list<ProducerEvent> = REUSE_PRODUCER_EVENTS + ["workflow_dispatch"]
 
 /** Derive closed wire schemas from the types rather than copying their field lists. */

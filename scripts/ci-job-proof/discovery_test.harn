@@ -6,7 +6,7 @@ import {
   Run,
   registration,
 } from "./contract.harn"
-import { ProofSource, discover } from "./reader.harn"
+import { ProofSource, READ_BUDGET, discover } from "./reader.harn"
 
 const DIGEST = "a".repeat(64)
 
@@ -125,7 +125,10 @@ fn source(producers: list, calls: fn(string) -> nil) -> ProofSource {
     json: fn(endpoint) {
       calls(endpoint)
       if endpoint.contains("event=push&branch=main") {
-        return {total_count: 1, workflow_runs: [run(25, "push")]}
+        return {total_count: 1, workflow_runs: [at(25, 1)?.run ?? run(25, "push")]}
+      }
+      if endpoint.contains("event=push&head_sha=" + COMMIT) {
+        return {total_count: 0, workflow_runs: []}
       }
       if endpoint.contains("event=merge_group&head_sha=" + COMMIT) {
         return {total_count: 1, workflow_runs: [run(20, "merge_group")]}
@@ -163,6 +166,63 @@ fn source(producers: list, calls: fn(string) -> nil) -> ProofSource {
     registration:
       fn(_repo, artifact) { return at(artifact.id / 10, artifact.id % 10).registration },
   }
+}
+
+pipeline test_enrolled_checkpoint_reuses_only_qualified_inputs_and_keeps_failed_inputs_fresh() {
+  const context = current() + {event: "workflow_dispatch"}
+  const older = producer(
+    run(20, "merge_group"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const latest = producer(run(25, "push"), {lint: {digest: DIGEST}}, ["Lint"])
+  const accepted = discover(
+    source([latest, older], fn(_endpoint) { return nil }),
+    context,
+    wanted(),
+    nil,
+    fn() { return 0 },
+    true,
+  )
+  assert_eq(
+    accepted.admitted.map({ proof -> [proof.id, proof.provenance.runId] }),
+    [["lint", 25], ["suite", 20]],
+  )
+  assert_eq(accepted.blocked, [])
+  assert(accepted.reads > 0 && accepted.reads <= READ_BUDGET)
+  const failed = latest + {run: latest.run + {conclusion: "failure"}}
+  const refused = discover(
+    source([failed, older], fn(_endpoint) { return nil }),
+    context,
+    wanted(),
+    nil,
+    fn() { return 0 },
+    true,
+  )
+  assert_eq(refused.blocked, ["lint"])
+  assert_eq(refused.admitted.map({ proof -> proof.id }), ["suite"])
+  const complete = source([failed, older], fn(_endpoint) { return nil })
+  const unreadable: ProofSource = {
+    json: complete.json,
+    registration: fn(repo, artifact) {
+      if artifact.workflow_run.id == 25 {
+        throw "failed producer registration is unreadable"
+      }
+      return complete.registration(repo, artifact)
+    },
+  }
+  const unknown = discover(unreadable, context, wanted(), nil, fn() { return 0 }, true)
+  assert_eq(unknown.blocked, ["lint", "suite"])
+  assert_eq(unknown.admitted, [])
+  const changed = discover(
+    source([latest, older], fn(_endpoint) { return nil }),
+    context,
+    [{id: "lint", names: ["Lint"], digest: "b".repeat(64)}],
+    nil,
+    fn() { return 0 },
+    true,
+  )
+  assert_eq(changed.admitted, [])
 }
 
 pipeline test_a_reused_job_is_proven_at_the_run_that_executed_it() {

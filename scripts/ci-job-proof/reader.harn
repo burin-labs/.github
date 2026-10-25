@@ -1,6 +1,7 @@
 import {
   Admission,
   Artifact,
+  CONSUMER_EVENTS,
   IDENTITY_SCHEMA,
   Job,
   JobIdentity,
@@ -286,6 +287,7 @@ pub type Discovery = {
   reads: int,
   budget: int,
   reason: string,
+  blocked: list<string>,
 }
 
 type BudgetSource = {source: ProofSource, reads: fn() -> int, exhausted: fn() -> bool}
@@ -347,6 +349,14 @@ fn candidates(source: ProofSource, current: RunContext, pull: int?) -> list<Run>
   if current.event == "push" {
     return runs(source, current, "event=merge_group&head_sha=" + sha(current.commit)) + pushes
   }
+  if current.event == "workflow_dispatch" {
+    return (runs(source, current, "event=push&head_sha=" + sha(current.commit))
+      + runs(source, current, "event=merge_group&head_sha=" + sha(current.commit))
+      + pushes)
+      .filter({ run -> run.id < current.runId })
+      .to_list()
+      .sorted_by({ run -> -run.id })
+  }
   if pull == nil {
     return pushes.slice(0, 1)
   }
@@ -365,16 +375,20 @@ pub fn discover(
   wanted: list<JobIdentity>,
   pull: int?,
   now: fn() -> int,
+  checkpoint: bool = false,
 ) -> Discovery {
   const bounded = bounded_source(source, now)
+  let blocked: list<string> = []
   const result = fn(admitted, probed, reason) { return {
     admitted: admitted.sorted_by({ admission -> admission.id }),
     probed: probed,
     reads: bounded.reads(),
     budget: READ_BUDGET,
     reason: reason,
+    blocked: blocked.sorted(),
   } }
-  if !["push", "merge_group"].contains(current.event) {
+  if !CONSUMER_EVENTS.contains(current.event)
+    && !(checkpoint && current.event == "workflow_dispatch") {
     return result([], 0, "unsupported_event")
   }
   const listed = try {
@@ -422,15 +436,41 @@ pub fn discover(
       continue
     }
     const open = wanted.filter(
-      { identity -> !admitted.any({ admission -> admission.id == identity.id }) },
+      { identity ->
+        !blocked.contains(identity.id)
+          && !admitted.any({ admission -> admission.id == identity.id })
+      },
     )
       .to_list()
     const outcome = try {
-      read_run(bounded.source, current, unwrap(run), open)
+      inspect_run(bounded.source, current, unwrap(run), open)
+    }
+    if checkpoint && is_err(outcome) && unwrap(run).conclusion != "success" {
+      blocked = (blocked + open.map({ identity -> identity.id }).to_list()).unique()
     }
     if is_ok(outcome) {
-      admitted = admitted + unwrap(outcome).admitted
-      queue = queue + unwrap(outcome).deferred.map({ deferral -> deferral.provenance }).to_list()
+      const measured = unwrap(outcome)
+      // A checkpoint must execute an input already observed in a newer failed run.
+      if checkpoint && measured.producer.conclusion != "success" {
+        for identity in open {
+          if measured.registered.registration.jobs.any(
+            { claim ->
+              claim.id == identity.id && claim.digest == identity.digest
+                && claim.names == identity.names
+            },
+          ) {
+            blocked = (blocked + [identity.id]).unique()
+          }
+        }
+      }
+      admitted = admitted
+        + measured.admission.admitted.filter({ admission -> !blocked.contains(admission.id) })
+          .to_list()
+      queue = queue
+        + measured.admission.deferred.filter({ deferral -> !blocked.contains(deferral.id) }).map(
+          { deferral -> deferral.provenance },
+        )
+          .to_list()
     }
   }
   return result(admitted, probed, len(admitted) > 0 ? "qualified" : "no_qualified_registration")

@@ -1,6 +1,87 @@
 import { read_yaml } from "std/fs"
 import { assert_error_contains } from "std/testing"
-import { registration_from_archive } from "./live.harn"
+import { RunContext } from "./contract.harn"
+import { checkpoint_enrolled, registration_from_archive } from "./live.harn"
+import { ProofSource } from "./reader.harn"
+
+pipeline test_checkpoint_enrollment_authenticates_actual_run_checkout_and_main_ancestry() {
+  const commit = "a".repeat(40)
+  const context: RunContext = {
+    repository: "acme/product",
+    workflow: "ci.yml",
+    event: "workflow_dispatch",
+    commit: commit,
+    runId: 30,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register",
+  }
+  const tested = {commit: commit, tree: "b".repeat(40)}
+  const expected = {actorId: 42, actorLogin: "release[bot]", headBranch: "main"}
+  const run = {
+    ...context,
+    id: 30,
+    run_attempt: 1,
+    head_sha: commit,
+    path: ".github/workflows/ci.yml",
+    status: "in_progress",
+    conclusion: nil,
+    head_branch: "main",
+    actor: {id: 42, login: "release[bot]"},
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+  const source = fn(actual, relation) -> ProofSource { return {
+    json: fn(endpoint) { return endpoint.contains("/compare/") ? {status: relation} : actual },
+    registration: fn(_repo, _artifact) {
+      throw "enrollment reads no producer artifact"
+    },
+  } }
+  assert(checkpoint_enrolled(source(run, "identical"), context, tested, json_stringify(expected)))
+  assert(checkpoint_enrolled(source(run, "ahead"), context, tested, json_stringify(expected)))
+  for altered in [
+    run + {actor: {id: 43, login: "release[bot]"}},
+    run + {actor: {id: 42, login: "someone"}},
+    run + {head_branch: "another"},
+    run + {head_sha: "c".repeat(40)},
+    run + {run_attempt: 2},
+    run + {event: "push"},
+    run + {path: ".github/workflows/other.yml"},
+    run + {head_repository: {full_name: "foreign/product"}},
+  ] {
+    assert(
+      !checkpoint_enrolled(source(altered, "ahead"), context, tested, json_stringify(expected)),
+    )
+  }
+  for relation in ["behind", "diverged"] {
+    assert(!checkpoint_enrolled(source(run, relation), context, tested, json_stringify(expected)))
+  }
+  assert(
+    !checkpoint_enrolled(
+      source(run, "ahead"),
+      context,
+      tested + {commit: "c".repeat(40)},
+      json_stringify(expected),
+    ),
+  )
+  const forbidden: ProofSource = {
+    json: fn(_endpoint) {
+      throw "unenrolled event must not read history"
+    },
+    registration: fn(_repo, _artifact) {
+      throw "unenrolled event must not read artifacts"
+    },
+  }
+  assert(!checkpoint_enrolled(forbidden, context, tested, ""))
+  assert(
+    !checkpoint_enrolled(
+      forbidden,
+      context + {event: "schedule"},
+      tested,
+      json_stringify(expected),
+    ),
+  )
+}
 
 fn document() -> dict {
   return {
