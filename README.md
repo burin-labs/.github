@@ -281,7 +281,8 @@ Copy `templates/dependabot-waivers.json` into the affected repository at
 `.github/dependabot-waivers.json` and check it with:
 
 ```console
-harn run scripts/dependabot-waivers/cli.harn -- verify .github/dependabot-waivers.json owner/repo
+harn run scripts/dependabot-waivers/cli.harn -- verify \
+  .github/dependabot-waivers.json owner/repo
 ```
 
 The registry deliberately lives in the repository it describes, not here: this
