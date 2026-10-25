@@ -79,7 +79,7 @@ gh-app-token -- bash loop.sh  # one credential for a whole loop
   pass it as an argument, or copy it into a file.
 - The token is cached in a `0600` file until five minutes before it expires, so
   repeated calls reuse one credential.
-- `gh-app-token --check` replaces the cache, so a permission change takes effect.
+- `gh-app-token --check` replaces the cache, so new permissions take effect.
 
 ## Rate limits
 
