@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { createHmac, createPublicKey, createVerify, generateKeyPairSync } from "node:crypto"
 import { test } from "node:test"
-import { createRelay, parseRepos, signatureValid } from "./relay.mjs"
+import { createRelay, normalizePem, parseRepos, signatureValid } from "./relay.mjs"
 import { startServer } from "./server.mjs"
 
 const SECRET = "test-secret"
@@ -168,6 +168,26 @@ test("the HTTP server reaches the relay and bounds the body", async () => {
     assert.equal(unsigned.status, 401)
     const huge = await fetch(`${base}/hooks/github`, { method: "POST", body: Buffer.alloc(1024 * 1024 + 1) }).catch(() => ({ status: 413 }))
     assert.equal(huge.status, 413)
+  } finally {
+    server.close()
+  }
+})
+
+test("a one-line PEM with escaped newlines is restored, and a real PEM is left alone", () => {
+  const escaped = privateKey.trim().replace(/\n/g, "\\n")
+  assert.ok(!escaped.includes("\n"))
+  assert.equal(normalizePem(escaped).trim(), privateKey.trim())
+  assert.equal(normalizePem(privateKey), privateKey)
+})
+
+test("an unexpected throw answers 500 and the server keeps serving", async () => {
+  const server = await startServer({ handle: async () => { throw new Error("boom") } }, 0)
+  try {
+    const url = `http://127.0.0.1:${server.address().port}/hooks/github`
+    const first = await fetch(url, { method: "POST", body: "{}" })
+    assert.equal(first.status, 500)
+    const second = await fetch(url, { method: "POST", body: "{}" })
+    assert.equal(second.status, 500)
   } finally {
     server.close()
   }

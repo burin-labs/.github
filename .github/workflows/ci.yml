@@ -246,10 +246,12 @@ jobs:
           LOCAL_CHECK_CONTRACT_RESULT: ${{ needs.local-check-contract.result }}
           PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
           SMART_SHIP_CONTROL_RESULT: ${{ needs.smart-ship-control-runtime.result }}
+          SMART_SHIP_RELAY_RESULT: ${{ needs.smart-ship-relay.result }}
         run: |
           test "$LOCAL_CHECK_CONTRACT_RESULT" = success
           test "$PACKAGE_SMOKE_RESULT" = success
           test "$SMART_SHIP_CONTROL_RESULT" = success
+          test "$SMART_SHIP_RELAY_RESULT" = success
       - name: Check Dependabot config
         uses: ./.github/actions/check-dependabot-config
       - name: Test package workflow policy

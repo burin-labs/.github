@@ -1,5 +1,5 @@
 import { createServer } from "node:http"
-import { createRelay, parseRepos } from "./relay.mjs"
+import { createRelay, normalizePem, parseRepos } from "./relay.mjs"
 
 const MAX_BODY = 1024 * 1024
 
@@ -22,7 +22,14 @@ export function startServer(relay, port) {
       chunks.push(chunk)
     }
     const path = (request.url ?? "").split("?")[0]
-    const result = await relay.handle({ method: request.method, path, headers: request.headers, body: Buffer.concat(chunks) })
+    let result
+    try {
+      result = await relay.handle({ method: request.method, path, headers: request.headers, body: Buffer.concat(chunks) })
+    } catch (error) {
+      // An unexpected throw must answer 500, not take the process down with it.
+      console.log(JSON.stringify({ outcome: "error", error: String(error?.message) }))
+      result = { status: 500, body: "internal error" }
+    }
     response.writeHead(result.status, { "Content-Type": "text/plain" }).end(result.body)
   })
   return new Promise((resolve) => server.listen(port, () => resolve(server)))
@@ -32,7 +39,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const relay = createRelay({
     secret: required("GITHUB_WEBHOOK_SECRET"),
     appId: required("GITHUB_APP_ID"),
-    privateKey: required("GITHUB_APP_PRIVATE_KEY"),
+    privateKey: normalizePem(required("GITHUB_APP_PRIVATE_KEY")),
     repos: parseRepos(required("RELAY_REPOS")),
     log: (line) => console.log(JSON.stringify(line)),
   })

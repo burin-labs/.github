@@ -27,6 +27,11 @@ export function parseRepos(text) {
   return new Map(entries)
 }
 
+/** A PEM pasted into a one-line environment value carries `\n` escapes; restore the newlines. */
+export function normalizePem(text) {
+  return text.includes("\n") ? text : text.replace(/\\n/g, "\n")
+}
+
 export function signatureValid(secret, body, header) {
   if (typeof header !== "string" || !header.startsWith("sha256=")) return false
   const expected = createHmac("sha256", secret).update(body).digest()
