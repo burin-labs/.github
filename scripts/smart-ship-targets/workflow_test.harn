@@ -63,16 +63,19 @@ pipeline test_each_repair_releases_its_pr_however_it_ends(harness: Harness) {
   assert_eq(jobs.repair.strategy["fail-fast"], false)
   assert_eq(
     jobs.repair.strategy.matrix.pr,
-    "$" + "{{ fromJSON(needs.ship.outputs.deferred_json) }}",
+    "$"
+      + "{{ github.event.inputs.main_red != '' && fromJSON('[\"main-red\"]') || fromJSON(needs.ship.outputs.deferred_json) }}",
   )
   const steps = jobs.repair.steps
   const repair = named(steps, "Repair deferred pull requests")
   const record = named(steps, "Record the finished repair")
   const release = named(steps, "Release the pull request")
   const look = named(steps, "Look at the released pull request again")
-  assert_eq(record["if"], "always()")
-  assert_eq(release["if"], "always()")
-  assert(look["if"].contains("always()"))
+  // A fix-forward repair holds no pull request, so it has none to release.
+  assert_eq(record["if"], "$" + "{{ always() && matrix.pr != 'main-red' }}")
+  assert_eq(release["if"], "$" + "{{ always() && matrix.pr != 'main-red' }}")
+  assert(look["if"].contains("always()") && look["if"].contains("matrix.pr != 'main-red'"))
+  assert(repair.run.contains("--main-red \"$MAIN_RED\""))
   assert_eq(
     release["with"].name,
     "smart-ship-targets-$" + "{{ github.run_id }}-$" + "{{ github.run_attempt }}-repaired-$"
@@ -84,4 +87,19 @@ pipeline test_each_repair_releases_its_pr_however_it_ends(harness: Harness) {
   assert(steps.index_of(record) < steps.index_of(release))
   // The fresh look must find the PR already released.
   assert(steps.index_of(release) < steps.index_of(look))
+}
+
+pipeline test_a_main_red_dispatch_repairs_main_one_at_a_time_and_starts_no_sweep(harness: Harness) {
+  const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
+  assert(jobs.availability["if"].contains("github.event.inputs.main_red == ''"))
+  assert(
+    jobs.ship["if"].contains(
+      "github.event_name == 'workflow_dispatch' && github.event.inputs.main_red == ''",
+    ),
+  )
+  assert(jobs.repair["if"].contains("github.event.inputs.main_red != ''"))
+  assert(
+    jobs.repair.concurrency.group.contains("format('smart-ship-main-red-{0}', github.repository)"),
+  )
+  assert_eq(jobs.repair.concurrency["cancel-in-progress"], false)
 }
