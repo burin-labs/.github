@@ -224,6 +224,20 @@ pipeline test_a_non_admin_label_is_refused(harness: Harness) {
   )
 }
 
+pipeline test_the_control_app_label_is_admitted(harness: Harness) {
+  // GitHub reads an App's membership and permission as none: neither path exists here.
+  const paths = world(
+    {
+      [REPO + "/issues/42/events?per_page=100"]: [
+        [labeled(7, "bypass-merge-queue", "burin-control[bot]")],
+      ],
+    },
+  )
+  const result = decided(paths)
+  assert_eq(result.decision.verdict, "proceed", to_string(result.decision.refusals))
+  assert_eq(result.record.actors, ["burin-control[bot]"])
+}
+
 pipeline test_an_unreadable_admin_role_refuses(harness: Harness) {
   // No membership or permission paths for this login: both reads throw.
   const paths = world(
