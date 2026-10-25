@@ -14,7 +14,7 @@ pull request carrying the `ship` label.
 
 Routes: `POST /hooks/github` (webhook), `GET /healthz`.
 
-- `GITHUB_WEBHOOK_SECRET`: the App webhook secret. Every delivery is verified
+- `GITHUB_WEBHOOK_SECRET`: the organization webhook secret. Every delivery is verified
   with `X-Hub-Signature-256` in constant time.
 - `GITHUB_APP_ID`: the App whose installation token dispatches the workflow.
 - `GITHUB_APP_PRIVATE_KEY`: the App's PEM private key.
@@ -22,8 +22,11 @@ Routes: `POST /hooks/github` (webhook), `GET /healthz`.
   example `{"burin-labs/harn":"smart-ship.yml"}`.
 - `PORT`: the listen port, default 10000.
 
-The App needs the `pull_request_review_thread` event and `actions: write`. The
-installation token is minted per dispatch and limited to the one repository
+The organization webhook sends only `pull_request_review_thread`. The dedicated
+App needs `actions: write` and is installed only on the admitted repositories;
+it needs no webhook subscription. The relay resolves that App's installation
+for the admitted repository, because organization deliveries have no App
+installation field. Each dispatch token is limited to that one repository
 with `actions: write`.
 
 Each caller workflow must declare a `pr` input under `workflow_dispatch`;

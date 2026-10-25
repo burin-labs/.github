@@ -80,7 +80,15 @@ export function createRelay(config) {
   async function dispatch(payload, workflow) {
     const [owner, name] = payload.repository.full_name.split("/")
     const jwt = appJwt(config.appId, config.privateKey, Math.floor(now() / 1000))
-    const minted = await github(`/app/installations/${payload.installation.id}/access_tokens`, jwt, {
+    // Organization webhooks carry no App installation. Resolve the configured
+    // App's repository installation instead of trusting a payload's identity.
+    const installed = await github(`/repos/${owner}/${name}/installation`, jwt)
+    if (installed.status !== 200) throw new Error(`repository installation request answered ${installed.status}`)
+    const installation = await installed.json()
+    if (!Number.isSafeInteger(installation.id) || installation.id <= 0) {
+      throw new Error("repository installation returned no valid id")
+    }
+    const minted = await github(`/app/installations/${installation.id}/access_tokens`, jwt, {
       method: "POST",
       body: JSON.stringify({ repositories: [name], permissions: { actions: "write" } }),
     })
@@ -121,8 +129,8 @@ export function createRelay(config) {
     if (!workflow) return skip(delivery, "repository")
     if (!Number.isInteger(pull?.number) || pull.number <= 0 || pull.state !== "open") return skip(delivery, "pull-request")
     if (!(pull.labels ?? []).some((entry) => entry?.name === label)) return skip(delivery, "unlabeled")
-    if (!Number.isInteger(payload.installation?.id) || !payload.repository?.default_branch) {
-      return skip(delivery, "installation")
+    if (!payload.repository?.default_branch) {
+      return skip(delivery, "default-branch")
     }
     if (delivery === "") return { status: 400, body: "missing delivery id" }
     if (seen.has(delivery)) return skip(delivery, "duplicate")

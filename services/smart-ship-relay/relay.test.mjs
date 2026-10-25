@@ -16,6 +16,9 @@ function harness(overrides = {}) {
   const answers = overrides.answers ?? { token: 201, dispatch: 204 }
   const fetch = async (url, init) => {
     calls.push({ url, init })
+    if (url.endsWith("/installation")) {
+      return new Response(JSON.stringify({ id: 77 }), { status: answers.installation ?? 200 })
+    }
     if (url.endsWith("/access_tokens")) {
       return new Response(JSON.stringify({ token: "installation-token" }), { status: answers.token })
     }
@@ -38,7 +41,6 @@ const payload = (patch = {}) => ({
   action: "resolved",
   pull_request: { number: 42, state: "open", labels: [{ name: "ship" }] },
   repository: { full_name: "burin-labs/harn", default_branch: "main" },
-  installation: { id: 77 },
   ...patch,
 })
 
@@ -58,19 +60,26 @@ test("a resolved thread on a labeled PR dispatches one look at that PR", async (
   const result = await relay.handle(delivery(payload()))
   assert.equal(result.status, 202)
   assert.equal(result.body, "dispatched")
-  assert.equal(calls.length, 2)
-  assert.equal(calls[0].url, "https://api.github.com/app/installations/77/access_tokens")
-  assert.deepEqual(JSON.parse(calls[0].init.body), { repositories: ["harn"], permissions: { actions: "write" } })
-  assert.equal(calls[1].url, "https://api.github.com/repos/burin-labs/harn/actions/workflows/smart-ship.yml/dispatches")
-  assert.equal(calls[1].init.headers.Authorization, "Bearer installation-token")
-  assert.deepEqual(JSON.parse(calls[1].init.body), { ref: "main", inputs: { pr: "42" } })
+  assert.equal(calls.length, 3)
+  assert.equal(calls[0].url, "https://api.github.com/repos/burin-labs/harn/installation")
+  assert.equal(calls[1].url, "https://api.github.com/app/installations/77/access_tokens")
+  assert.deepEqual(JSON.parse(calls[1].init.body), { repositories: ["harn"], permissions: { actions: "write" } })
+  assert.equal(calls[2].url, "https://api.github.com/repos/burin-labs/harn/actions/workflows/smart-ship.yml/dispatches")
+  assert.equal(calls[2].init.headers.Authorization, "Bearer installation-token")
+  assert.deepEqual(JSON.parse(calls[2].init.body), { ref: "main", inputs: { pr: "42" } })
 })
 
 test("a reopened thread dispatches too, and each repository uses its own caller file", async () => {
   const { relay, calls } = harness()
   const body = payload({ action: "unresolved", repository: { full_name: "burin-labs/.github", default_branch: "main" } })
   assert.equal((await relay.handle(delivery(body))).body, "dispatched")
-  assert.match(calls[1].url, /workflows\/ship\.yml\/dispatches$/)
+  assert.match(calls[2].url, /workflows\/ship\.yml\/dispatches$/)
+})
+
+test("a payload cannot select another App installation", async () => {
+  const { relay, calls } = harness()
+  assert.equal((await relay.handle(delivery(payload({ installation: { id: 999 } })))).body, "dispatched")
+  assert.equal(calls[1].url, "https://api.github.com/app/installations/77/access_tokens")
 })
 
 test("the App JWT is a valid RS256 token for the App", async () => {
@@ -91,7 +100,7 @@ const silent = [
   ["a repository outside the allowlist", delivery(payload({ repository: { full_name: "other/repo", default_branch: "main" } })), "repository"],
   ["an unexpected action", delivery(payload({ action: "edited" })), "action"],
   ["another event", delivery(payload(), { event: "pull_request_review" }), "event"],
-  ["a missing installation", delivery(payload({ installation: undefined })), "installation"],
+  ["a missing default branch", delivery(payload({ repository: { full_name: "burin-labs/harn" } })), "default-branch"],
 ]
 for (const [name, request, reason] of silent) {
   test(`${name} starts no dispatch`, async () => {
@@ -122,12 +131,12 @@ test("a redelivered delivery id dispatches once", async () => {
   const { relay, calls } = harness()
   assert.equal((await relay.handle(delivery(payload(), { id: "same" }))).body, "dispatched")
   assert.equal((await relay.handle(delivery(payload(), { id: "same" }))).body, "skipped: duplicate")
-  assert.equal(calls.length, 2)
+  assert.equal(calls.length, 3)
   assert.equal((await relay.handle(delivery(payload(), { id: "other" }))).body, "dispatched")
 })
 
 test("a failed dispatch answers 502 and lets GitHub's redelivery retry", async () => {
-  for (const answers of [{ token: 401, dispatch: 204 }, { token: 201, dispatch: 422 }]) {
+  for (const answers of [{ installation: 404 }, { token: 401, dispatch: 204 }, { token: 201, dispatch: 422 }]) {
     const failing = harness({ answers })
     assert.equal((await failing.relay.handle(delivery(payload(), { id: "retry" }))).status, 502)
     assert.equal(failing.logs.at(-1).outcome, "failed")
@@ -205,6 +214,7 @@ test("a redelivery that arrives while the first request is still dispatching dis
     fetch: async (url, init) => {
       calls.push(url)
       await gate
+      if (url.endsWith("/installation")) return new Response(JSON.stringify({ id: 77 }), { status: 200 })
       if (url.endsWith("/access_tokens")) return new Response(JSON.stringify({ token: "t" }), { status: 201 })
       return new Response(null, { status: 204 })
     },
@@ -226,6 +236,7 @@ test("a failed dispatch releases its reservation so the retry can dispatch", asy
     privateKey,
     repos: parseRepos('{"burin-labs/harn":"smart-ship.yml"}'),
     fetch: async (url) => {
+      if (url.endsWith("/installation")) return new Response(JSON.stringify({ id: 77 }), { status: 200 })
       if (url.endsWith("/access_tokens")) return new Response(JSON.stringify({ token: "t" }), { status: 201 })
       return new Response(null, { status: dispatchStatus })
     },
