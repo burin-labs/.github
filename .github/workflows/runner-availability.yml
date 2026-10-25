@@ -107,6 +107,15 @@ on:
         type: string
         default: ""
         required: false
+      require_measured:
+        description: >-
+          Fail this job when the fleet was not counted, instead of publishing
+          an unmeasured capacity. A caller whose next job cannot proceed
+          without a count sets this, so a failed-jobs rerun measures again
+          rather than reusing the unmeasured output of a passed job.
+        type: boolean
+        default: false
+        required: false
       macos_runner_tag:
         description: "macOS-specific self-hosted runner label"
         type: string
@@ -755,3 +764,13 @@ jobs:
             echo "capacity=${capacity}"
           } >> "$GITHUB_OUTPUT"
           echo "::notice::runner-availability capacity=${capacity}"
+      - name: Fail an unmeasured fleet the caller requires
+        if: ${{ inputs.require_measured }}
+        env:
+          PROBE_STATE: ${{ steps.detect.outputs.probe_state }}
+        run: |
+          set -euo pipefail
+          if [ "${PROBE_STATE}" != "measured" ]; then
+            echo "::error::Runner list unreadable (probe_state=${PROBE_STATE:-unset}); the fleet was not counted. This is not evidence that a runner is offline. Check the probe app's rate limit and credentials, then rerun the failed jobs."
+            exit 1
+          fi

@@ -82,3 +82,33 @@ pipeline test_optional_linux_pool_reports_its_physical_host_load(harness: Harnes
   assert_eq(capacity.linux_probe.hosts, {"hetzner-1": {online: 10, busy: 9, idle_big: 1}})
   assert_eq(capacity.linux_fetch.hosts, {"hetzner-1": {online: 10, busy: 9, idle_big: 1}})
 }
+
+pipeline test_required_measurement_fails_the_probe_job_itself(harness: Harness) {
+  const detect_job = workflow(harness.fs).jobs.detect
+  const step = detect_job.steps.find(
+    { item -> item?.name == "Fail an unmeasured fleet the caller requires" },
+  )
+  assert(step != nil, "a caller that requires a count needs a step that fails the probe job")
+  assert_eq(step["if"], "$" + "{{ inputs.require_measured }}")
+  assert_eq(workflow(harness.fs).on.workflow_call.inputs.require_measured.default, false)
+  for state in ["measured", "unmeasured", "probe_unavailable:dependabot_secret_store"] {
+    const result = harness.process.run(
+      {
+        program: "/bin/bash",
+        args: ["-e", "-o", "pipefail", "-c", step.run],
+        cwd: root(harness.fs),
+        env: {PROBE_STATE: state},
+        timeout_ms: 10000,
+      },
+    )
+    if state == "measured" {
+      assert(result.success, "a measured fleet must pass: " + result.stderr)
+    } else {
+      assert(!result.success, "state " + state + " must fail the job, not pass vacuously")
+      assert(
+        (result.stdout + result.stderr).contains("Runner list unreadable"),
+        "the failure must name the unreadable list: " + result.stdout + result.stderr,
+      )
+    }
+  }
+}
