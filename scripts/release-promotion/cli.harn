@@ -31,6 +31,7 @@ fn main(harness: Harness) {
   const github = live_github(
     harness.net,
     harness.tools,
+    harness.fs,
     required_env(harness.env, "GH_TOKEN"),
     request.repository,
     harness.fs.mkdtemp_in_workspace("promote-release-gh-"),
@@ -40,7 +41,8 @@ fn main(harness: Harness) {
     harness.env.get("PROMOTE_ORIGINAL_CONSUMER_CONTEXT") ?? "",
     harness.env.get("PROMOTE_CONSUMER_REPAIR") ?? "",
   )
-  const authorize_completion = authorization == nil ? nil : fn(attempt: int) { verify_authorization(
+  const authorize_completion =
+    authorization == nil ? nil : fn(attempt: int) { return verify_authorization(
     live_consumer_recovery(
       harness.tools,
       {

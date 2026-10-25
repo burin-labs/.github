@@ -1,0 +1,131 @@
+import { command_run } from "std/command"
+import { assert_error_contains, with_temp_dir } from "std/testing"
+import { download_bound_manifest } from "./bound-manifest.harn"
+import { CANDIDATE_MANIFEST_FILE } from "./manifest.harn"
+
+const NAME = "candidate-manifest-fixture"
+
+pipeline test_bound_manifest_download_authenticates_exact_zip_bytes_before_extraction(
+  harness: Harness,
+) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const source = harness.fs.read_text("fixtures/harn-candidate-manifest.json")
+      const manifest = path_join(work, CANDIDATE_MANIFEST_FILE)
+      const archive = path_join(work, "manifest.zip")
+      harness.fs.write_text(manifest, source)
+      const zipped = command_run(harness.tools, ["zip", "-j", archive, manifest])
+      assert(zipped.success)
+      const bytes = harness.fs.read_bytes(archive)
+      const identity = {id: 9, digest: "sha256:" + sha256(bytes)}
+      const metadata = {
+        id: 9,
+        name: NAME,
+        digest: identity.digest,
+        expired: false,
+        size_in_bytes: len(bytes),
+        workflow_run: {id: 100},
+      }
+      let reads = 0
+      let commands = []
+      const run = fn(argv: list<string>, options: dict) {
+        commands = commands + [argv]
+        if argv[0] == "gh" {
+          assert_eq(argv, ["gh", "api", "/repos/acme/producer/actions/artifacts/9/zip"])
+          assert_eq(options.env.GH_TOKEN, "fixture-token")
+          assert(!json_stringify(argv).contains("fixture-token"))
+          return command_run(harness.tools, ["cat", archive], options)
+        }
+        return command_run(harness.tools, argv, options)
+      }
+      const read = fn(endpoint: string) {
+        reads = reads + 1
+        assert_eq(endpoint, "/repos/acme/producer/actions/artifacts/9")
+        return metadata
+      }
+      const output = path_join(work, "downloaded")
+      download_bound_manifest(
+        harness.fs,
+        run,
+        read,
+        {GH_TOKEN: "fixture-token"},
+        "acme/producer",
+        100,
+        NAME,
+        identity,
+        output,
+      )
+      assert_eq(reads, 1)
+      assert_eq(harness.fs.read_text(path_join(output, CANDIDATE_MANIFEST_FILE)), source)
+      const changed = identity + {digest: "sha256:" + sha256("different ZIP")}
+      commands = []
+      assert_error_contains(
+        fn() { download_bound_manifest(
+          harness.fs,
+          run,
+          fn(_endpoint: string) { return metadata + {digest: changed.digest} },
+          {GH_TOKEN: "fixture-token"},
+          "acme/producer",
+          100,
+          NAME,
+          changed,
+          output,
+        ) },
+        "digest does not match",
+      )
+      assert_eq(len(commands.filter({ argv -> argv[0] == "unzip" })), 0)
+      for invalid in [
+        metadata + {id: 10},
+        metadata + {digest: changed.digest},
+        metadata + {name: "another manifest"},
+        metadata + {expired: true},
+        metadata + {workflow_run: {id: 101}},
+        metadata + {size_in_bytes: 0},
+        metadata + {size_in_bytes: 1048577},
+        {},
+      ] {
+        commands = []
+        assert(
+          is_err(
+            try {
+              download_bound_manifest(
+                harness.fs,
+                run,
+                fn(_endpoint: string) { return invalid },
+                {},
+                "acme/producer",
+                100,
+                NAME,
+                identity,
+                output,
+              )
+            },
+          ),
+        )
+        assert_eq(commands, [], "unproved metadata must refuse before downloading")
+      }
+      harness.fs.write_text(path_join(work, "extra.txt"), "unexpected")
+      assert(
+        command_run(harness.tools, ["zip", "-j", archive, path_join(work, "extra.txt")]).success,
+      )
+      const expanded = harness.fs.read_bytes(archive)
+      const extra_identity = identity + {digest: "sha256:" + sha256(expanded)}
+      assert_error_contains(
+        fn() { download_bound_manifest(
+          harness.fs,
+          run,
+          fn(_endpoint: string) { return metadata
+            + {digest: extra_identity.digest, size_in_bytes: len(expanded)} },
+          {GH_TOKEN: "fixture-token"},
+          "acme/producer",
+          100,
+          NAME,
+          extra_identity,
+          output,
+        ) },
+        "must contain exactly",
+      )
+    },
+  )
+}

@@ -118,7 +118,7 @@ pipeline test_repair_binds_a_new_measurement_to_the_original_archive_producer() 
   const selector = "issued repair selector"
   const authorization = unwrap(parse_authorization("", selector))
   let reached = 0
-  verify_authorization(
+  const manifest = verify_authorization(
     fn(issued: string, source: string) {
       assert_eq(issued, selector)
       assert_eq(source, SOURCE)
@@ -131,6 +131,7 @@ pipeline test_repair_binds_a_new_measurement_to_the_original_archive_producer() 
     1,
     authorization,
   )
+  assert_eq(manifest, repaired().producer.manifest)
   assert_eq(reached, 1)
   assert_eq(authorization.mode, "repair")
   assert_error_contains(

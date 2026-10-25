@@ -6,6 +6,8 @@ pub type AuthorizationRequest = {context: string, mode: string}
 
 pub type ReadRecovery = fn(string, string) -> unknown
 
+pub type ManifestIdentity = {id: int, digest: string}
+
 /**
  * Public process envelope only. The shared reader owns the dictionaries'
  * closed custody/product/deadline shapes and their authentication.
@@ -21,7 +23,7 @@ type RepairProducer = {
   failed_jobs: list<string>,
   observed_jobs: int,
   proven_artifacts: int,
-  manifest: {id: int, digest: string},
+  manifest: ManifestIdentity,
 }
 
 type PublicRepairProjection = {
@@ -49,7 +51,7 @@ pub fn verify_authorization(
   producer: int,
   producer_attempt: int,
   authorization: AuthorizationRequest,
-) {
+) -> ManifestIdentity? {
   if repository != "burin-labs/harn" || producer < 1 || producer_attempt < 1 {
     throw "no owning original consumer deadline for this producer"
   }
@@ -80,7 +82,7 @@ pub fn verify_authorization(
       || regex_match("^sha256:[0-9a-f]{64}$", proof.manifest.digest) == nil {
       throw "consumer repair does not bind this producer"
     }
-    return
+    return proof.manifest
   }
   if authorization.mode != "original" {
     throw "unknown consumer authorization mode"
@@ -104,4 +106,5 @@ pub fn verify_authorization(
     || decision.reading.product?.verdict != "pass" {
     throw "original consumer recovery does not bind this producer"
   }
+  return nil
 }
