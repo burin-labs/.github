@@ -1,0 +1,183 @@
+pub type ReleaseFile = {name: string, path: string, sha256: string}
+
+pub type ReleasePlan = {
+  repository: string,
+  sha: string,
+  tag: string,
+  prerelease: bool,
+  latest: bool,
+  notes_file: string,
+  body: string,
+  files: list<ReleaseFile>,
+}
+
+pub type PublicationGitHub = {
+  json: fn(string) -> unknown,
+  create_draft: fn(dict) -> nil,
+  upload_assets: fn(string, list<string>) -> nil,
+  create_tag: fn(string, string, string) -> nil,
+  publish_draft: fn(int, bool) -> unknown,
+}
+
+type Release = {
+  id: int,
+  tag_name: string,
+  target_commitish: string,
+  name: string,
+  body: string,
+  draft: bool,
+  prerelease: bool,
+  html_url: string,
+}
+
+type Asset = {name: string, digest: string?, state: string}
+
+type ReleasePage = list<dict>
+
+type AssetPage = list<Asset>
+
+fn prefix(plan: ReleasePlan) -> string {
+  return "/repos/${plan.repository}"
+}
+
+fn release_record(raw: unknown, plan: ReleasePlan) -> Release {
+  const release = schema_expect(raw, schema_of(Release))
+  require release.id > 0 && release.tag_name == plan.tag
+    && release.target_commitish == plan.sha
+    && release.name == plan.tag
+    && release.prerelease == plan.prerelease
+    && trim(release.body) == trim(plan.body)
+    && release.html_url.starts_with("https://github.com/${plan.repository}/releases/"),
+    "existing release identity or body conflicts with the candidate"
+  return release
+}
+
+fn release_for(github: PublicationGitHub, plan: ReleasePlan) -> Release? {
+  const published = github.json("${prefix(plan)}/releases/tags/${url_encode(plan.tag)}")
+  let found = published == nil ? nil : release_record(published, plan)
+  for page in range(1, 11) {
+    const suffix = page == 1 ? "" : "&page=${page}"
+    const records = schema_expect(
+      github.json("${prefix(plan)}/releases?per_page=100${suffix}"),
+      schema_of(ReleasePage),
+    )
+    require len(records) <= 100, "release census exceeded its page bound"
+    for raw in records {
+      if raw?.tag_name == plan.tag {
+        const release = release_record(raw, plan)
+        require found == nil || found.id == release.id, "multiple releases claim the candidate tag"
+        found = release
+      }
+    }
+    if len(records) < 100 {
+      return found
+    }
+  }
+  throw "release census is incomplete after 1000 records"
+}
+
+fn tag_commit(github: PublicationGitHub, plan: ReleasePlan) -> string? {
+  const ref = github.json("${prefix(plan)}/git/ref/tags/${url_encode(plan.tag)}")
+  if ref == nil {
+    return nil
+  }
+  if ref?.object?.type == "commit" {
+    return to_string(ref.object.sha)
+  }
+  require ref?.object?.type == "tag", "release tag has an invalid object type"
+  const annotated = github.json("${prefix(plan)}/git/tags/${to_string(ref?.object?.sha)}")
+  require annotated?.object?.type == "commit", "release tag does not name a commit"
+  return to_string(annotated?.object?.sha)
+}
+
+fn assets_for(github: PublicationGitHub, plan: ReleasePlan, release: Release) -> list<Asset> {
+  let assets = []
+  for page in range(1, 11) {
+    const records = schema_expect(
+      github.json("${prefix(plan)}/releases/${release.id}/assets?per_page=100&page=${page}"),
+      schema_of(AssetPage),
+    )
+    require len(records) <= 100, "release asset census exceeded its page bound"
+    assets = assets + records
+    if len(records) < 100 {
+      return assets
+    }
+  }
+  throw "release asset census is incomplete after 1000 records"
+}
+
+fn missing_files(
+  github: PublicationGitHub,
+  plan: ReleasePlan,
+  release: Release,
+) -> list<ReleaseFile> {
+  const assets = assets_for(github, plan, release)
+  let seen = []
+  for asset in assets {
+    require !seen.contains(asset.name), "release has duplicate asset ${asset.name}"
+    seen = seen + [asset.name]
+    const file = plan.files.find({ file -> file.name == asset.name })
+    require file != nil, "release asset ${asset.name} is not a candidate file"
+    require asset.state == "uploaded" && asset.digest == "sha256:${file.sha256}",
+      "release asset ${asset.name} stored as ${to_string(asset.digest)}, expected sha256:${file.sha256}"
+  }
+  return plan.files.filter({ file -> !seen.contains(file.name) }).to_list()
+}
+
+fn require_complete(github: PublicationGitHub, plan: ReleasePlan, release: Release) -> nil {
+  const missing = missing_files(github, plan, release)
+  require len(missing) == 0,
+    "release has ${len(missing)} pending assets: ${join(missing.map({ file -> file.name }), ", ")}"
+  require tag_commit(github, plan) == plan.sha,
+    "published ${plan.tag} but the tag does not point at ${plan.sha}"
+  return nil
+}
+
+pub fn reconcile_publication(
+  github: PublicationGitHub,
+  plan: ReleasePlan,
+) -> {tag: string, url: string} {
+  const tagged = tag_commit(github, plan)
+  require tagged == nil || tagged == plan.sha,
+    "tag ${plan.tag} already points at ${to_string(tagged)}, not ${plan.sha}"
+  let release = release_for(github, plan)
+  if release == nil {
+    github.create_draft(
+      {
+        tag: plan.tag,
+        sha: plan.sha,
+        title: plan.tag,
+        notes_file: plan.notes_file,
+        prerelease: plan.prerelease,
+        files: [],
+      },
+    )
+    release = release_for(github, plan)
+    require release != nil && release.draft, "the candidate draft did not appear"
+  }
+  if !release.draft {
+    require_complete(github, plan, release)
+    return {tag: plan.tag, url: release.html_url}
+  }
+  const missing = missing_files(github, plan, release)
+  if len(missing) > 0 {
+    github.upload_assets(plan.tag, missing.map({ file -> file.path }))
+  }
+  const observed = release_for(github, plan)
+  require observed != nil && observed.id == release.id && observed.draft,
+    "candidate draft changed during asset upload"
+  const pending = missing_files(github, plan, observed)
+  require len(pending) == 0,
+    "candidate draft has ${len(pending)} pending assets: ${join(pending.map({ file -> file.name }), ", ")}"
+  const current_tag = tag_commit(github, plan)
+  require current_tag == nil || current_tag == plan.sha, "candidate tag moved before publication"
+  if current_tag == nil {
+    github.create_tag(plan.tag, plan.sha, "Release ${plan.tag}")
+  }
+  github.publish_draft(observed.id, plan.latest)
+  const published = release_for(github, plan)
+  require published != nil && published.id == observed.id && !published.draft,
+    "publication did not report the candidate release as published"
+  require_complete(github, plan, published)
+  return {tag: plan.tag, url: published.html_url}
+}

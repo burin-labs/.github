@@ -91,6 +91,9 @@ jobs:
     name: Promote tested files
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    concurrency:
+      group: publish-tested-files-${{ github.repository }}-${{ inputs.tag }}
+      cancel-in-progress: false
     # Reading the run, its artifacts, and its attestations uses the caller's
     # own token. Only publishing uses the app token, and only after every
     # check has passed.
@@ -171,6 +174,15 @@ jobs:
           PROMOTE_TAG: ${{ inputs.tag }}
           PROMOTE_DIRECTORY: ${{ github.workspace }}/.harn/promote-release/candidate
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh
+
+      - name: Preserve the verified publication intent
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: publication-intent-${{ github.run_attempt }}-${{ hashFiles('.harn/promote-release/candidate/publication-intent.json') }}
+          path: .harn/promote-release/candidate/publication-intent.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Mint the release token
         id: token
