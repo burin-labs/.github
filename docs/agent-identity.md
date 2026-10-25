@@ -21,7 +21,7 @@ rate limits.
 
 | Action | Identity |
 | --- | --- |
-| Commits, branches, pull requests, issues, thread replies | `burin-labs-agent` |
+| Commits, branches, pull requests, issues, replies | `burin-labs-agent` |
 | Automated review | `burin-code-reviewer[bot]` |
 | Control approval after a fresh-context review | `burin-control[bot]` |
 | Merge override and `review-override` labels | `burin-control[bot]` |
