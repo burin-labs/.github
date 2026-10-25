@@ -447,7 +447,8 @@ jobs:
     environment: ${{ inputs.repair-environment }}
     runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
-    # Fix-forward repairs of one repository's main run one at a time and are never cancelled.
+    # Fix-forward repairs of one repository's main run one at a time; a running one is never
+    # cancelled. A newer pending request replaces an older one, since each starts from main's tip.
     concurrency:
       group: ${{ matrix.pr == 'main-red' && format('smart-ship-main-red-{0}', github.repository) || format('smart-ship-repair-{0}-{1}-{2}', github.repository, github.run_id, matrix.pr) }}
       cancel-in-progress: false
