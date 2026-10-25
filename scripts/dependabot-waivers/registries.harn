@@ -1,0 +1,159 @@
+import { Blocker, BlockerState } from "./policy.harn"
+
+/** Public registries never receive the GitHub credential. An outage is no evidence of a fix. */
+pub type Registry = {json: fn(string) -> unknown, available: fn(string) -> bool}
+
+pub type FixObservation = {state: "known", installable: bool} | {state: "pending", detail: string}
+
+pub type BlockerObservation = {state: "known", value: BlockerState} \
+  | {state: "pending", detail: string}
+
+type CrateMetadata = {crate: {max_stable_version: string?}}
+
+type CrateDependencies = {dependencies: list<{crate_id: string, req: string}>}
+
+type PyPI = {info: {version: string, requires_dist?: list<string>?}}
+
+type Packument = dict
+
+type Tags = {latest?: string?}
+
+type Versions = dict<string, {dependencies?: dict<string, string>}>
+
+pub type RegistryResponse = {status: int, ok: bool, body: string}
+
+pub fn registry_transport(request: fn(string) -> RegistryResponse) -> Registry {
+  return {
+    json: fn(url) {
+      const response = request(url)
+      require response.ok, "public registry request failed"
+      return json_parse(response.body)
+    },
+    available: fn(url) {
+      const response = request(url)
+      if response.status == 404 {
+        return false
+      }
+      require response.ok, "public registry request failed with HTTP ${response.status}"
+      return true
+    },
+  }
+}
+
+pub fn live_registry(net: HarnessNet) -> Registry {
+  return registry_transport(
+    fn(url) { return net.get(
+      url,
+      {timeout_ms: 10000, headers: {"User-Agent": "burin-labs-dependabot-waiver-audit"}},
+    ) },
+  )
+}
+
+pub fn fix_installable(
+  registry: Registry,
+  ecosystem: string,
+  package: string,
+  version: string?,
+) -> FixObservation {
+  if version == nil || version == "" {
+    return {state: "known", installable: false}
+  }
+  try {
+    if ecosystem == "go" {
+      for suffix in ["", "+incompatible"] {
+        if registry.available(
+          "https://proxy.golang.org/${package.lower()}/@v/v${version}${suffix}.info",
+        ) {
+          return {state: "known", installable: true}
+        }
+      }
+      return {state: "known", installable: false}
+    }
+    if ecosystem == "npm" {
+      return {
+        state: "known",
+        installable: registry.available("https://registry.npmjs.org/${package}/${version}"),
+      }
+    }
+    return {state: "known", installable: true}
+  } catch (error) {
+    return {state: "pending", detail: "fix lookup for ${ecosystem}:${package}: ${to_string(error)}"}
+  }
+}
+
+/** Unknown evidence never reopens an alert and never certifies its waiver. */
+pub fn blocker_state(registry: Registry, blocker: Blocker) -> BlockerObservation {
+  try {
+    const package = blocker.package
+    const dependency = blocker.constrains
+    if blocker.ecosystem == "cargo" {
+      const metadata = schema_expect(
+        registry.json("https://crates.io/api/v1/crates/${package}"),
+        schema_of(CrateMetadata),
+      )
+      const version = metadata.crate.max_stable_version
+      if version == nil {
+        throw "registry returned no current stable version"
+      }
+      const body = schema_expect(
+        registry.json("https://crates.io/api/v1/crates/${package}/${version}/dependencies"),
+        schema_of(CrateDependencies),
+      )
+      return {
+        state: "known",
+        value: {
+          version: version,
+          requirement: join(
+            body.dependencies.filter(fn(dep) { return dep.crate_id == dependency }).map(
+              fn(dep) { return dep.req },
+            )
+              .to_list()
+              .sorted(),
+            ", ",
+          ),
+        },
+      }
+    }
+    if blocker.ecosystem == "pip" {
+      const body = schema_expect(
+        registry.json("https://pypi.org/pypi/${package}/json"),
+        schema_of(PyPI),
+      )
+      const requirements = (body.info.requires_dist ?? []).filter(
+        fn(req) {
+          const name = regex_split(req, "[\\s<>=!~;\\[]")[0]
+          return name == dependency && !req.contains(";")
+        },
+      )
+        .to_list()
+        .sorted()
+      return {
+        state: "known",
+        value: {version: body.info.version, requirement: join(requirements, ", ")},
+      }
+    }
+    if blocker.ecosystem == "npm" {
+      const body = schema_expect(
+        registry.json("https://registry.npmjs.org/${package}"),
+        schema_of(Packument),
+      )
+      const tags = schema_expect(body["dist-tags"], schema_of(Tags))
+      const versions = schema_expect(body["versions"], schema_of(Versions))
+      const version = tags.latest
+      if version == nil {
+        throw "registry returned no current latest version"
+      }
+      require versions[version] != nil, "registry omitted the current latest version"
+      return {
+        state: "known",
+        value: {version: version, requirement: versions[version]?.dependencies?.[dependency] ?? ""},
+      }
+    }
+  } catch (error) {
+    return {
+      state: "pending",
+      detail: "blocker lookup for ${blocker.ecosystem}:${blocker.package}: ${to_string(error)}",
+    }
+  }
+  return {state: "pending", detail: "unsupported blocker registry: ${blocker.ecosystem}"}
+}

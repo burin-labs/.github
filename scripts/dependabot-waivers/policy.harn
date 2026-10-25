@@ -1,0 +1,233 @@
+pub type Blocker = {
+  package: string,
+  ecosystem: string,
+  version: string,
+  requirement: string,
+  constrains: string,
+  override_rejected: string,
+}
+
+pub type Observed = {
+  severity: string,
+  fix_available: bool,
+  first_patched_version: unknown,
+  blocked_by?: Blocker?,
+}
+
+pub type Waiver = {
+  alert_number: int,
+  ghsa_id: string,
+  package: string,
+  ecosystem: string,
+  dismissed_reason: string,
+  why: string,
+  review_by: string,
+  observed: Observed,
+}
+
+pub type Document = {schema_version: int, repository: string, waivers: list<Waiver>}
+
+pub type Alert = {
+  number: int,
+  state: string,
+  dismissed_reason?: string?,
+  security_advisory: {ghsa_id: string, severity: "low" | "medium" | "high" | "critical"},
+  security_vulnerability: {package: {name: string}, first_patched_version: {identifier: string}?},
+}
+
+pub type BlockerState = {version: string, requirement: string}
+
+pub type Decision = {verdict: "ok" | "reopen" | "stale" | "overdue", detail: string}
+
+pub type AuditResult = {
+  repository: string,
+  alert_number: int,
+  ghsa_id: string?,
+  package: string?,
+  verdict: string,
+  detail: string,
+  reopened: bool,
+  pending_details?: list<string>,
+}
+
+pub type Inventory = {
+  repositories: int,
+  registries: int,
+  dismissed_alerts: int,
+  skipped_repositories: list<string>,
+}
+
+pub type Report = {
+  schema_version: "burin.dependabot_waiver_audit.v1",
+  checked: int,
+  reopened: int,
+  stale: int,
+  overdue: int,
+  unwaived: int,
+  ok: int,
+  pending: int,
+  pending_names: list<string>,
+  failing_names: list<string>,
+  inventory: Inventory,
+  results: list<AuditResult>,
+}
+
+const SEVERITIES = ["low", "medium", "high", "critical"]
+
+const REASONS = ["fix_started", "inaccurate", "no_bandwidth", "not_used", "tolerable_risk"]
+
+/** Decode the existing v1 policy once; extra JSON fields remain permitted. */
+pub fn validate(value: unknown, repository: string?) -> Document {
+  const document = schema_expect(value, schema_of(Document))
+  require document.schema_version == 1, "schema_version must be 1"
+  require document.repository.contains("/"), "repository must be a non-empty owner/name string"
+  require repository == nil || repository == document.repository,
+    "waiver repository does not match the repository the file lives in"
+  let numbers: list<int> = []
+  for waiver in document.waivers {
+    require waiver.alert_number > 0, "alert_number must be a positive integer"
+    require !numbers.contains(waiver.alert_number), "waivers must not repeat an alert_number"
+    numbers.push(waiver.alert_number)
+    require waiver.ghsa_id.starts_with("GHSA-"), "ghsa_id must look like GHSA-..."
+    require waiver.package != "" && waiver.ecosystem != "",
+      "package and ecosystem must be non-empty"
+    require REASONS.contains(waiver.dismissed_reason), "unknown dismissed_reason"
+    require len(waiver.why) >= 40, "why must explain the evidence in at least 40 characters"
+    require regex_match("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", waiver.review_by) != nil,
+      "review_by must be an ISO date"
+    const observed = waiver.observed
+    require SEVERITIES.contains(observed.severity), "unknown observed severity"
+    const blocker = observed.blocked_by
+    if observed.fix_available && waiver.dismissed_reason != "fix_started" {
+      require blocker != nil, "an available fix must not be waived without its upstream blocker"
+      const bound = blocker
+        ?? {
+          package: "",
+          ecosystem: "",
+          version: "",
+          requirement: "",
+          constrains: "",
+          override_rejected: "",
+        }
+      require bound.package != "" && bound.ecosystem != "" && bound.version != ""
+        && bound.requirement != ""
+        && bound.constrains != "",
+        "blocker fields must be non-empty"
+      require ["cargo", "pip", "npm"].contains(bound.ecosystem), "unsupported blocker registry"
+      require len(bound.override_rejected) >= 40,
+        "override_rejected must explain why forcing the fix is unsafe"
+    } else {
+      require blocker == nil, "blocked_by only means something when a fix is blocked"
+    }
+  }
+  return document
+}
+
+fn severity_rank(value: string) -> int {
+  for index in range(0, len(SEVERITIES)) {
+    if SEVERITIES[index] == value {
+      return index
+    }
+  }
+  return -1
+}
+
+/** Reopening takes precedence over expiry, as in the v1 audit. */
+pub fn reconcile(
+  waiver: Waiver,
+  alert: Alert?,
+  fix_installable: bool,
+  today: string,
+  blocker_state: BlockerState?,
+) -> Decision {
+  if alert == nil {
+    return {verdict: "stale", detail: "alert ${waiver.alert_number} no longer exists"}
+  }
+  const live = alert
+  if !["dismissed", "auto_dismissed"].contains(live.state) {
+    return {
+      verdict: "stale",
+      detail: "alert is ${live.state}, not dismissed; the waiver no longer applies",
+    }
+  }
+  const advisory = live.security_advisory
+  const ghsa = advisory.ghsa_id
+  if ghsa != waiver.ghsa_id {
+    return {
+      verdict: "reopen",
+      detail: "alert now points at ${ghsa}, not the waived ${waiver.ghsa_id}",
+    }
+  }
+  const severity = advisory.severity
+  if severity_rank(severity) > severity_rank(waiver.observed.severity) {
+    return {
+      verdict: "reopen",
+      detail: "severity rose from ${waiver.observed.severity} to ${severity}",
+    }
+  }
+  if fix_installable && !waiver.observed.fix_available {
+    const patched = live.security_vulnerability.first_patched_version?.identifier ?? ""
+    return {
+      verdict: "reopen",
+      detail: "an installable fix now exists (${patched}); the waiver assumed none",
+    }
+  }
+  const blocker = waiver.observed.blocked_by
+  if blocker != nil && blocker_state != nil {
+    const bound = blocker
+      ?? {
+        package: "",
+        ecosystem: "",
+        version: "",
+        requirement: "",
+        constrains: "",
+        override_rejected: "",
+      }
+    const current = blocker_state ?? {version: "", requirement: ""}
+    if current.version != bound.version || current.requirement != bound.requirement {
+      return {
+        verdict: "reopen",
+        detail:
+          "${bound.package} moved from ${bound.version} (${bound.requirement}) to ${current.version} (${current.requirement}); re-check whether the fix is reachable now",
+      }
+    }
+  }
+  if waiver.review_by < today {
+    return {verdict: "overdue", detail: "review_by ${waiver.review_by} has passed"}
+  }
+  return {verdict: "ok", detail: "no installable fix; severity unchanged at ${severity}"}
+}
+
+pub fn unwaived(alerts: list<Alert>, waivers: list<Waiver>) -> list<Alert> {
+  const numbers = waivers.map(fn(waiver) { return waiver.alert_number }).to_list()
+  return alerts.filter(fn(alert) { return !numbers.contains(alert.number) }).to_list().sorted_by(
+    fn(alert) { return alert.number },
+  )
+}
+
+pub fn summarize(results: list<AuditResult>, inventory: Inventory) -> Report {
+  const count = fn(verdict) { return len(
+    results.filter(fn(row) { return row.verdict == verdict }).to_list(),
+  ) }
+  return {
+    schema_version: "burin.dependabot_waiver_audit.v1",
+    checked: len(results),
+    reopened: count("reopen"),
+    stale: count("stale"),
+    overdue: count("overdue"),
+    unwaived: count("unwaived"),
+    ok: count("ok"),
+    pending: len(results.filter(fn(row) { return len(row.pending_details ?? []) > 0 }).to_list()),
+    pending_names: results.filter(fn(row) { return len(row.pending_details ?? []) > 0 }).map(
+      fn(row) { return "${row.repository}#${row.alert_number}" },
+    )
+      .to_list(),
+    failing_names: results.filter(
+      fn(row) { return ["stale", "overdue", "unwaived", "pending"].contains(row.verdict) },
+    )
+      .map(fn(row) { return "${row.repository}#${row.alert_number}:${row.verdict}" })
+      .to_list(),
+    inventory: inventory,
+    results: results,
+  }
+}

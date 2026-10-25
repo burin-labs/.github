@@ -1,0 +1,135 @@
+import { blocker } from "./fixtures.harn"
+import { Registry, blocker_state, fix_installable, registry_transport } from "./registries.harn"
+
+pipeline test_patch_claim_requires_a_real_go_or_npm_version(harness: Harness) {
+  let paths: list<string> = []
+  const registry: Registry = {
+    json: fn(_) {
+      throw "not used"
+    },
+    available: fn(url) {
+      paths.push(url)
+      return url.ends_with("+incompatible.info")
+    },
+  }
+  assert_eq(
+    fix_installable(registry, "go", "Example/Package", nil),
+    {state: "known", installable: false},
+  )
+  assert_eq(
+    fix_installable(registry, "go", "Example/Package", ""),
+    {state: "known", installable: false},
+  )
+  assert_eq(
+    fix_installable(registry, "go", "Example/Package", "2.0.0"),
+    {state: "known", installable: true},
+  )
+  assert_eq(
+    paths,
+    [
+      "https://proxy.golang.org/example/package/@v/v2.0.0.info",
+      "https://proxy.golang.org/example/package/@v/v2.0.0+incompatible.info",
+    ],
+  )
+  assert_eq(
+    fix_installable(registry, "npm", "package", "2.0.0"),
+    {state: "known", installable: false},
+  )
+  assert_eq(
+    fix_installable(registry, "pip", "package", "2.0.0"),
+    {state: "known", installable: true},
+  )
+}
+
+pipeline test_blockers_read_the_named_edge_in_all_supported_registries(harness: Harness) {
+  let paths: list<string> = []
+  const registry: Registry = {
+    available: fn(_) {
+      throw "not used"
+    },
+    json: fn(url) {
+      paths.push(url)
+      if url == "https://crates.io/api/v1/crates/parent" {
+        return {crate: {max_stable_version: "1.1.0"}}
+      }
+      if url.ends_with("/dependencies") {
+        return {
+          dependencies: [
+            {crate_id: "child", req: ">=1"},
+            {crate_id: "other", req: "^9"},
+            {crate_id: "child", req: "<3"},
+          ],
+        }
+      }
+      if url == "https://pypi.org/pypi/parent/json" {
+        return {
+          info: {
+            version: "1.2.0",
+            requires_dist: [
+              "child>=1",
+              "other>=9",
+              "child<3",
+              "child[extra]>=8; python_version > '3'",
+            ],
+          },
+        }
+      }
+      if url == "https://registry.npmjs.org/parent" {
+        return {"dist-tags": {latest: "1.3.0"}, versions: {"1.3.0": {dependencies: {child: "^2"}}}}
+      }
+      throw "unexpected registry request"
+    },
+  }
+  assert_eq(
+    blocker_state(registry, blocker()),
+    {state: "known", value: {version: "1.1.0", requirement: "<3, >=1"}},
+  )
+  assert_eq(
+    blocker_state(registry, blocker({ecosystem: "pip"})),
+    {state: "known", value: {version: "1.2.0", requirement: "child<3, child>=1"}},
+  )
+  assert_eq(
+    blocker_state(registry, blocker({ecosystem: "npm"})),
+    {state: "known", value: {version: "1.3.0", requirement: "^2"}},
+  )
+  assert_eq(len(paths), 4)
+}
+
+pipeline test_registry_outage_is_not_a_lifted_cap(harness: Harness) {
+  for value in [nil, {}, {crate: {max_stable_version: nil}}] {
+    const registry: Registry = {json: fn(_) { return value }, available: fn(_) { return false }}
+    for ecosystem in ["cargo", "pip", "npm"] {
+      assert_eq(blocker_state(registry, blocker({ecosystem: ecosystem})).state, "pending")
+    }
+  }
+  const unavailable: Registry = {
+    json: fn(_) {
+      throw "registry outage"
+    },
+    available: fn(_) {
+      throw "registry outage"
+    },
+  }
+  assert_eq(blocker_state(unavailable, blocker()).state, "pending")
+  assert_eq(fix_installable(unavailable, "go", "package", "2").state, "pending")
+}
+
+pipeline test_real_404_is_known_absence_but_permission_5xx_and_malformed_are_pending(
+  harness: Harness,
+) {
+  for status in [200, 404, 403, 500] {
+    const registry = registry_transport(
+      fn(_) { return {status: status, ok: status == 200, body: "not JSON"} },
+    )
+    const observation = fix_installable(registry, "npm", "package", "2")
+    assert_eq(observation.state, [200, 404].contains(status) ? "known" : "pending")
+    assert_eq(blocker_state(registry, blocker()).state, "pending")
+  }
+  const timeout = registry_transport(
+    fn(_) {
+      throw "timeout"
+    },
+  )
+  assert_eq(fix_installable(timeout, "go", "package", "2").state, "pending")
+  assert_eq(blocker_state(timeout, blocker()).state, "pending")
+}

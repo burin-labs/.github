@@ -265,7 +265,6 @@ jobs:
           ruby .github/actions/check-commit-signatures/check_commit_signatures_test.rb
           ruby .github/workflows/harn-package_test.rb
           ruby .github/workflows/runner-availability_test.rb
-          ruby scripts/dependabot_waivers_test.rb
           ruby scripts/reusable_pin_drift_test.rb
       - name: Set up checker test runtime
         uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
@@ -273,6 +272,8 @@ jobs:
           version: "0.10.170"
       - name: Test Dependabot configuration owner
         run: harn test scripts/dependabot-config
+      - name: Test Dependabot waiver owner
+        run: harn test scripts/dependabot-waivers
       - name: Test released guard publication adapter
         working-directory: scripts/guard-publication
         run: |
@@ -299,6 +300,7 @@ jobs:
           bash -n .github/actions/ci-latency-policy/run.sh
           bash -n .github/actions/pr-title-check/check.sh
           bash -n .github/actions/check-dependabot-config/run.sh
+          bash -n .github/actions/dependabot-waiver-audit/run.sh
           bash -n .github/actions/ci-job-proof/run.sh
           bash -n scripts/ci-routing.sh
           bash -n scripts/runner-fleet-health.sh

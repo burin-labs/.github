@@ -1,0 +1,93 @@
+import { gha_append_summary, gha_write_output } from "std/gha"
+import { live_github, optional_read } from "../merge-override/github.harn"
+import { audit } from "./audit.harn"
+import { Report, validate } from "./policy.harn"
+import { blocker_state, fix_installable, live_registry } from "./registries.harn"
+
+fn required(env: HarnessEnv, name: string) -> string {
+  const value = trim(env.get(name) ?? "")
+  require value != "", "${name} is required"
+  return value
+}
+
+fn summary(report: Report) -> string {
+  let lines = [
+    "## Dependabot waiver audit",
+    "",
+    "Inventoried ${report.inventory.repositories} repositories; read ${report.inventory.registries} waiver registries and ${report.inventory.dismissed_alerts} dismissed alerts.",
+    "Checked ${report.checked} waivers: ${report.ok} still parked, ${report.reopened} require reopening, ${report.stale} stale, ${report.overdue} overdue, ${report.unwaived} unwaived; ${report.pending} pending.",
+    "",
+  ]
+  for result in report.results {
+    if result.verdict != "ok" {
+      lines.push(
+        "- **${result.verdict}** `${result.repository}` #${result.alert_number} (${result.package ?? ""}): ${result.detail}",
+      )
+    }
+  }
+  return join(lines, "\n") + "\n"
+}
+
+fn main(harness: Harness) {
+  const mode = len(argv) > 0 ? argv[0] : ""
+  if mode == "verify" {
+    require len(argv) >= 2 && len(argv) <= 3, "usage: verify <waivers.json> [owner/repo]"
+    const document = validate(
+      json_parse(harness.fs.read_text(argv[1])),
+      len(argv) == 3 ? argv[2] : nil,
+    )
+    harness.stdio.println(
+      "dependabot waivers: ok (${len(document.waivers)} in ${document.repository})",
+    )
+    return
+  }
+  require mode == "audit",
+    "usage: verify <waivers.json> [owner/repo] | audit [--org <org>] [--apply]"
+  let org = "burin-labs"
+  let apply = false
+  let index = 1
+  while index < len(argv) {
+    if argv[index] == "--apply" {
+      apply = true
+    } else if argv[index] == "--org" && index + 1 < len(argv) {
+      index = index + 1
+      org = argv[index]
+    } else {
+      throw "unknown audit argument: ${argv[index]}"
+    }
+    index = index + 1
+  }
+  const token = required(harness.env, "GH_TOKEN")
+  const scratch = harness.fs.mkdtemp_in_workspace("dependabot-waiver-gh-")
+  const host = pick(harness, ["fs", "tools"])
+  const registry = live_registry(harness.net)
+  const report = audit(
+    {
+      github: live_github(host, token, scratch),
+      contents: fn(path) { return optional_read(host, token, scratch, path) },
+      fix_installable: fn(ecosystem, package, version) { return fix_installable(
+        registry,
+        ecosystem,
+        package,
+        version,
+      ) },
+      blocker_state: fn(blocker) { return blocker_state(registry, blocker) },
+    },
+    required(harness.env, "GITHUB_REPOSITORY"),
+    org,
+    harness.clock.date_iso()[0:10],
+    apply,
+  )
+  const serialized = json_stringify(report)
+  const report_path = harness.env.get("DEPENDABOT_WAIVER_REPORT")
+  if report_path != nil && report_path != "" {
+    harness.fs.write_text(report_path, serialized + "\n")
+    require gha_write_output(harness, "report", report_path),
+      "GITHUB_OUTPUT is required for the workflow report"
+  }
+  gha_append_summary(harness.env, harness.fs, summary(report))
+  harness.stdio.println(serialized)
+  if len(report.failing_names) > 0 || report.pending > 0 {
+    harness.runtime.exit(1)
+  }
+}

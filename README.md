@@ -228,8 +228,10 @@ dismissed by a human or through `PATCH /repos/{owner}/{repo}/dependabot/alerts/
 {alert_number}` is never resurfaced — including on the day upstream finally
 ships the fix. Nothing in a dismissal expires by itself.
 
-`scripts/dependabot_waivers.rb` closes that gap. The weekly
-`Dependabot waiver audit` workflow reads every repository's waiver file,
+`scripts/dependabot-waivers/cli.harn` closes that gap. The weekly
+`Dependabot waiver audit` workflow in the private `harn-bump-fleet` repository
+calls this repository's pinned `.github/actions/dependabot-waiver-audit` action.
+It reads every repository's waiver file,
 compares it against the live alert, and **reopens** the alert when the waiver
 stops being true: an installable fix appeared, the severity rose, or the alert
 now points at a different advisory. It fails the job when a waiver has gone
@@ -279,7 +281,7 @@ Copy `templates/dependabot-waivers.json` into the affected repository at
 `.github/dependabot-waivers.json` and check it with:
 
 ```console
-ruby scripts/dependabot_waivers.rb verify .github/dependabot-waivers.json owner/repo
+harn run scripts/dependabot-waivers/cli.harn -- verify .github/dependabot-waivers.json owner/repo
 ```
 
 The registry deliberately lives in the repository it describes, not here: this
@@ -290,21 +292,52 @@ GitHub has no dismissal reason meaning "upstream shipped no patch" — the
 checker rejects a waiver that omits it, and rejects one whose own recorded
 evidence admits an available fix.
 
+The implementation is public; its execution and reports are private. Before
+reading any alert or waiver, the audit reads the execution repository's GitHub
+metadata and requires `private: true`. Missing metadata or a public repository
+fails closed. The private caller owns the single schedule, token minting and
+report retention. Do not restore a public scheduled caller: logs, summaries and
+artifacts can reveal private dependency and advisory details.
+
+The Contents reader decodes the full JSON response before its base64 content.
+Only a structured HTTP 404 skips a missing registry; permission and transport
+errors fail the run. Organization and alert inventories use slurped API pages.
+Reports include repository, registry and dismissed-alert counts, skipped
+repositories, pending count and failing names. A zero active-repository
+inventory fails instead of reporting a vacuous clean audit.
+
+A registry timeout, permission error, server error or malformed response is
+unmeasured evidence. The audit keeps the alert dismissed, names the pending
+waiver and fails the run. A published-version lookup returning HTTP 404 means
+the version is absent; it is distinct from an unreadable registry. Known
+reopening and expiry decisions still take precedence, and an overdue waiver
+also reports any pending evidence.
+
 ### Arming the audit
 
-The workflow is gated on the `DEPENDABOT_WAIVER_AUDIT` variable and stays
-skipped until two things a workflow cannot do for itself are done by hand:
+The private caller is gated on the `DEPENDABOT_WAIVER_AUDIT` variable and stays
+skipped until setup and its permission check are complete:
 
 1. Grant the `harn-release-bot` GitHub App the **Dependabot alerts:
    read and write** repository permission (App settings → Permissions), and
    accept the permission change on the organization installation. Reopening an
    alert is a write; nothing less will do.
-2. Set the repository or organization variable `DEPENDABOT_WAIVER_AUDIT` to
-   `enabled`.
+2. Confirm the installation can read a nonempty private waiver file and its
+   dismissed alerts. A token declaration does not prove the App has the grant.
+3. Set `DEPENDABOT_WAIVER_AUDIT` to `enabled` in the private `harn-bump-fleet`
+   repository (or its inherited organization variables).
 
 Until then the job reports as skipped rather than running red every week, since
 a permanently failing alarm is the failure mode this whole mechanism exists to
 prevent.
+
+When moving a dependency to another repository, enable its dependency graph and
+alerts, then match the live advisory, package, ecosystem and manifest path in
+that repository. Alert numbers belong to one repository, so never copy the old
+number or invent a placeholder. Keep the existing review date and evidence
+unless the new dependency graph warrants a reviewed change. Repositories are
+discovered from the organization; the fleet's Dependabot configuration projection
+does not register waiver files or grant alert permissions.
 
 ## Eval fixture repositories
 
