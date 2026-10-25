@@ -14,13 +14,13 @@ pull request carrying the `ship` label.
 
 Routes: `POST /hooks/github` (webhook), `GET /healthz`.
 
-| Variable | Meaning |
-| --- | --- |
-| `GITHUB_WEBHOOK_SECRET` | App webhook secret; every delivery is verified with `X-Hub-Signature-256` in constant time. |
-| `GITHUB_APP_ID` | App ID of the App whose installation token dispatches the workflow. |
-| `GITHUB_APP_PRIVATE_KEY` | The App's PEM private key. |
-| `RELAY_REPOS` | JSON object of `owner/name` to caller workflow file, for example `{"burin-labs/harn":"smart-ship.yml"}`. |
-| `PORT` | Listen port, default 10000. |
+- `GITHUB_WEBHOOK_SECRET`: the App webhook secret. Every delivery is verified
+  with `X-Hub-Signature-256` in constant time.
+- `GITHUB_APP_ID`: the App whose installation token dispatches the workflow.
+- `GITHUB_APP_PRIVATE_KEY`: the App's PEM private key.
+- `RELAY_REPOS`: a JSON object of `owner/name` to caller workflow file, for
+  example `{"burin-labs/harn":"smart-ship.yml"}`.
+- `PORT`: the listen port, default 10000.
 
 The App needs the `pull_request_review_thread` event and `actions: write`. The
 installation token is minted per dispatch and limited to the one repository
