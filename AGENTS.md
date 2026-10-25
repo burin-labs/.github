@@ -11,6 +11,12 @@ Keep policy in typed contracts and verify every projection that consumes it.
 - Do not add Ruby scripts. When work touches an existing Ruby script, migrate
   that script to Harn as part of the change.
 
+## GitHub identity
+
+Author as `burin-labs-agent`, act as control through the `burin-control` App,
+and keep bulk reads off user tokens. See
+[Agent GitHub identities](docs/agent-identity.md).
+
 Pull request areas are `CI`, `Actions`, `Labels`, `Templates`, `Docs`, and
 `Skills`.
 
