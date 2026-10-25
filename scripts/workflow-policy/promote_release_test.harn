@@ -53,6 +53,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "Set up the consumer reader runtime",
       "Mint consumer read authority",
       "Verify the run and its files",
+      "Preserve the verified publication intent",
       "Mint the release token",
       "Publish the verified files",
     ],
@@ -71,8 +72,22 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   const runtime = job.steps[4]
   const reader_token = job.steps[5]
   const verify = job.steps[6]
-  const token = job.steps[7]
-  const publish = job.steps[8]
+  const checkpoint = job.steps[7]
+  const token = job.steps[8]
+  const publish = job.steps[9]
+  assert_eq(
+    job.concurrency,
+    {
+      group: "publish-tested-files-" + expression("github.repository") + "-"
+        + expression("inputs.tag"),
+      "cancel-in-progress": false,
+    },
+  )
+  assert_eq(checkpoint.uses, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+  assert_eq(checkpoint.with.path, ".harn/promote-release/candidate/publication-intent.json")
+  assert_eq(checkpoint.with["if-no-files-found"], "error")
+  assert_eq(checkpoint.with["include-hidden-files"], true)
+  assert_eq(checkpoint.with["retention-days"], 30)
   for step in [reader, runtime, reader_token] {
     assert_eq(
       step.if,

@@ -241,6 +241,15 @@ pub fn live_github(
       )
       return nil
     },
+    upload_assets: fn(tag, paths) {
+      gh_ok(
+        tools,
+        env,
+        ["release", "upload", tag, "--repo", repository] + paths,
+        "uploading missing release assets",
+      )
+      return nil
+    },
     create_tag: fn(tag, sha, message) {
       const created = gh_ok(
         tools,
