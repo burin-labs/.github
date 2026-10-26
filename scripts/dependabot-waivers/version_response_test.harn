@@ -1,0 +1,21 @@
+import { fix_installable, registry_transport } from "./registries.harn"
+
+pipeline test_malformed_success_cannot_claim_a_published_fix(harness: Harness) {
+  for body in ["not JSON", "{}", "{\"version\":3}", "{\"version\":\"3\"}", "{\"Version\":\"2\"}"] {
+    const registry = registry_transport(fn(_) { return {status: 200, ok: true, body: body} })
+    assert_eq(fix_installable(registry, "npm", "package", "2").state, "pending")
+  }
+}
+
+pipeline test_published_version_identity_matches_each_registry_protocol(harness: Harness) {
+  const npm = registry_transport(
+    fn(_) { return {status: 200, ok: true, body: "{\"version\":\"2\"}"} },
+  )
+  const go = registry_transport(
+    fn(_) { return {status: 200, ok: true, body: "{\"Version\":\"v2\"}"} },
+  )
+  assert_eq(fix_installable(npm, "npm", "package", "2"), {state: "known", installable: true})
+  assert_eq(fix_installable(go, "go", "package", "2"), {state: "known", installable: true})
+  assert_eq(fix_installable(npm, "go", "package", "2").state, "pending")
+  assert_eq(fix_installable(go, "npm", "package", "2").state, "pending")
+}

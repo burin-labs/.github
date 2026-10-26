@@ -6,7 +6,7 @@ pipeline test_unknown_fix_lookup_is_pending(harness: Harness) {
     json: fn(_) {
       throw "registry timeout"
     },
-    available: fn(_) {
+    available: fn(_, _) {
       throw "registry timeout"
     },
   }
@@ -20,7 +20,7 @@ pipeline test_unknown_blocker_lookup_is_pending(harness: Harness) {
     json: fn(_) {
       throw "registry timeout"
     },
-    available: fn(_) {
+    available: fn(_, _) {
       throw "registry timeout"
     },
   }

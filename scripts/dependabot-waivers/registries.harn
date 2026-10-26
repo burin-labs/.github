@@ -1,7 +1,9 @@
 import { Blocker, BlockerState } from "./policy.harn"
 
 /** Public registries never receive the GitHub credential. An outage is no evidence of a fix. */
-pub type Registry = {json: fn(string) -> unknown, available: fn(string) -> bool}
+pub type VersionIdentity = {field: "Version" | "version", version: string}
+
+pub type Registry = {json: fn(string) -> unknown, available: fn(string, VersionIdentity) -> bool}
 
 pub type FixObservation = {state: "known", installable: bool} | {state: "pending", detail: string}
 
@@ -20,6 +22,10 @@ type Tags = {latest?: string?}
 
 type Versions = dict<string, {dependencies?: dict<string, string>}>
 
+type PublishedMetadata = dict
+
+type Text = string
+
 pub type RegistryResponse = {status: int, ok: bool, body: string}
 
 pub fn registry_transport(request: fn(string) -> RegistryResponse) -> Registry {
@@ -29,12 +35,16 @@ pub fn registry_transport(request: fn(string) -> RegistryResponse) -> Registry {
       require response.ok, "public registry request failed"
       return json_parse(response.body)
     },
-    available: fn(url) {
+    available: fn(url, identity) {
       const response = request(url)
       if response.status == 404 {
         return false
       }
       require response.ok, "public registry request failed with HTTP ${response.status}"
+      const metadata = schema_expect(json_parse(response.body), schema_of(PublishedMetadata))
+      const version = schema_expect(metadata[identity.field], schema_of(Text))
+      require version == identity.version,
+        "published version response did not match the requested version"
       return true
     },
   }
@@ -63,6 +73,7 @@ pub fn fix_installable(
       for suffix in ["", "+incompatible"] {
         if registry.available(
           "https://proxy.golang.org/${package.lower()}/@v/v${version}${suffix}.info",
+          {field: "Version", version: "v${version}${suffix}"},
         ) {
           return {state: "known", installable: true}
         }
@@ -72,7 +83,10 @@ pub fn fix_installable(
     if ecosystem == "npm" {
       return {
         state: "known",
-        installable: registry.available("https://registry.npmjs.org/${package}/${version}"),
+        installable: registry.available(
+          "https://registry.npmjs.org/${package}/${version}",
+          {field: "version", version: version},
+        ),
       }
     }
     return {state: "known", installable: true}

@@ -228,10 +228,9 @@ dismissed by a human or through `PATCH /repos/{owner}/{repo}/dependabot/alerts/
 {alert_number}` is never resurfaced — including on the day upstream finally
 ships the fix. Nothing in a dismissal expires by itself.
 
-`scripts/dependabot-waivers/cli.harn` closes that gap. The weekly
-`Dependabot waiver audit` workflow in the private `harn-bump-fleet` repository
-calls this repository's pinned `.github/actions/dependabot-waiver-audit` action.
-It reads every repository's waiver file,
+`scripts/dependabot-waivers/cli.harn` closes that gap. Its
+`.github/actions/dependabot-waiver-audit` composite action requires a private
+caller pinned to a reviewed commit. It reads every repository's waiver file,
 compares it against the live alert, and **reopens** the alert when the waiver
 stops being true: an installable fix appeared, the severity rose, or the alert
 now points at a different advisory. It fails the job when a waiver has gone
@@ -296,9 +295,10 @@ evidence admits an available fix.
 The implementation is public; its execution and reports are private. Before
 reading any alert or waiver, the audit reads the execution repository's GitHub
 metadata and requires `private: true`. Missing metadata or a public repository
-fails closed. The private caller owns the single schedule, token minting and
-report retention. Do not restore a public scheduled caller: logs, summaries and
-artifacts can reveal private dependency and advisory details.
+fails closed. Host the single schedule and token minting in the private caller;
+the action retains its report in that private run. Do not restore a public
+scheduled caller: logs, summaries and artifacts can reveal private dependency
+and advisory details.
 
 The Contents reader decodes the full JSON response before its base64 content.
 Only a structured HTTP 404 skips a missing registry; permission and transport
@@ -325,8 +325,8 @@ skipped until setup and its permission check are complete:
    alert is a write; nothing less will do.
 2. Confirm the installation can read a nonempty private waiver file and its
    dismissed alerts. A token declaration does not prove the App has the grant.
-3. Set `DEPENDABOT_WAIVER_AUDIT` to `enabled` in the private `harn-bump-fleet`
-   repository (or its inherited organization variables).
+3. Set `DEPENDABOT_WAIVER_AUDIT` to `enabled` in the measured private caller's
+   repository. Check the effective value, including inherited variables.
 
 Until then the job reports as skipped rather than running red every week, since
 a permanently failing alarm is the failure mode this whole mechanism exists to

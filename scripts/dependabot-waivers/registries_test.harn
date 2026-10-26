@@ -7,7 +7,7 @@ pipeline test_patch_claim_requires_a_real_go_or_npm_version(harness: Harness) {
     json: fn(_) {
       throw "not used"
     },
-    available: fn(url) {
+    available: fn(url, _) {
       paths.push(url)
       return url.ends_with("+incompatible.info")
     },
@@ -44,7 +44,7 @@ pipeline test_patch_claim_requires_a_real_go_or_npm_version(harness: Harness) {
 pipeline test_blockers_read_the_named_edge_in_all_supported_registries(harness: Harness) {
   let paths: list<string> = []
   const registry: Registry = {
-    available: fn(_) {
+    available: fn(_, _) {
       throw "not used"
     },
     json: fn(url) {
@@ -97,7 +97,7 @@ pipeline test_blockers_read_the_named_edge_in_all_supported_registries(harness: 
 
 pipeline test_registry_outage_is_not_a_lifted_cap(harness: Harness) {
   for value in [nil, {}, {crate: {max_stable_version: nil}}] {
-    const registry: Registry = {json: fn(_) { return value }, available: fn(_) { return false }}
+    const registry: Registry = {json: fn(_) { return value }, available: fn(_, _) { return false }}
     for ecosystem in ["cargo", "pip", "npm"] {
       assert_eq(blocker_state(registry, blocker({ecosystem: ecosystem})).state, "pending")
     }
@@ -106,7 +106,7 @@ pipeline test_registry_outage_is_not_a_lifted_cap(harness: Harness) {
     json: fn(_) {
       throw "registry outage"
     },
-    available: fn(_) {
+    available: fn(_, _) {
       throw "registry outage"
     },
   }
@@ -119,7 +119,7 @@ pipeline test_real_404_is_known_absence_but_permission_5xx_and_malformed_are_pen
 ) {
   for status in [200, 404, 403, 500] {
     const registry = registry_transport(
-      fn(_) { return {status: status, ok: status == 200, body: "not JSON"} },
+      fn(_) { return {status: status, ok: status == 200, body: "{\"version\":\"2\"}"} },
     )
     const observation = fix_installable(registry, "npm", "package", "2")
     assert_eq(observation.state, [200, 404].contains(status) ? "known" : "pending")
