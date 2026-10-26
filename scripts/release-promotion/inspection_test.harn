@@ -73,7 +73,7 @@ pipeline test_actual_http_reader_reports_missing_then_visible_draft_without_writ
   assert_eq(len(calls), 4)
   for call in calls {
     assert_eq(call.method, "GET")
-    assert_eq(call.headers.authorization, "Bearer fixture-token")
+    assert_eq(call.headers.authorization, "[redacted]")
   }
   reads(harness, true, true)
   assert_error_contains(fn() { inspect_publication({json: github.json}, plan()) }, "conflicts")
