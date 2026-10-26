@@ -54,6 +54,10 @@ pipeline test_advisories_always_run_and_the_lockfile_scan_owns_stale_ignores(har
     advisories.run.contains("exit \"$" + "{status}\""),
     "the combined verdict is the step's verdict",
   )
+  assert(
+    advisories.run.contains("set +e\n"),
+    "GitHub runs bash -e, so the step must turn errexit off to reach its findings",
+  )
 }
 
 pipeline test_cargo_audit_is_checksum_verified_before_use(harness: Harness) {
