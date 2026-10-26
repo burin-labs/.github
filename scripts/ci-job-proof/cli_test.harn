@@ -1,4 +1,4 @@
-pipeline test_real_bootstrap_without_identities_reuses_nothing(harness: Harness) {
+fn launch(harness: Harness, raw: string) -> dict {
   const temporary = harness.fs.mkdtemp_in_workspace("ci-job-proof-launcher-")
   const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
   const output = path_join(temporary, "github-output")
@@ -18,7 +18,7 @@ pipeline test_real_bootstrap_without_identities_reuses_nothing(harness: Harness)
         CI_JOB_PROOF_COMMIT: "a".repeat(40),
         CI_JOB_PROOF_REPOSITORY: "acme/product",
         CI_JOB_PROOF_WORKFLOW: "ci.yml",
-        CI_JOB_PROOF_IDENTITIES: "",
+        CI_JOB_PROOF_IDENTITIES: raw,
         CI_JOB_PROOF_MERGE_GROUP_HEAD_REF: "",
         CI_JOB_PROOF_REGISTRAR_JOB: "Changes",
         CI_JOB_PROOF_REGISTRAR_STEP: "Register",
@@ -28,9 +28,22 @@ pipeline test_real_bootstrap_without_identities_reuses_nothing(harness: Harness)
       timeout_ms: 30000,
     },
   )
+  return result + {output: harness.fs.read_text(output)}
+}
+
+fn decisions(stdout: string) -> list<dict> {
+  return stdout.split("\n").filter({ line -> line.starts_with("{") }).map(
+    { line -> json_parse(line) },
+  )
+    .filter({ record -> record.schema == "burin.ci_job_proof_discovery.v1" })
+    .to_list()
+}
+
+pipeline test_real_bootstrap_without_identities_reuses_nothing(harness: Harness) {
+  const result = launch(harness, "")
   assert(result.success, result.stdout + result.stderr)
   assert(result.stdout.contains("Job identities are unmeasured"))
-  const lines = trim(harness.fs.read_text(output)).split("\n")
+  const lines = trim(result.output).split("\n")
   assert_eq(len(lines), 6)
   const reused = lines[0].split("<<")
   assert_eq(reused[0], "reused")
@@ -43,4 +56,28 @@ pipeline test_real_bootstrap_without_identities_reuses_nothing(harness: Harness)
     json_parse(lines[4]),
     {reason: "identities_unmeasured", probed: nil, reads: nil, budget: 40},
   )
+  const reports = decisions(result.stdout)
+  assert_eq(len(reports), 1)
+  assert_eq(reports[0].discovery, json_parse(lines[4]))
+  assert_eq(reports[0].requested, nil)
+  assert_eq(reports[0].unproven, nil)
+  assert_eq(reports[0].reused, [])
+}
+
+pipeline test_real_bootstrap_refuses_malformed_input_without_logging_it(harness: Harness) {
+  const private_value = "fixture-private-plan-value"
+  const result = launch(harness, private_value)
+  assert(result.success, result.stdout + result.stderr)
+  assert(!result.stdout.contains(private_value))
+  assert(!result.stdout.contains("fixture-token"))
+  const reports = decisions(result.stdout)
+  assert_eq(len(reports), 1)
+  assert_eq(reports[0].discovery.reason, "registration_unqualified")
+  assert_eq(reports[0].discovery.reads, nil)
+  assert_eq(reports[0].requested, nil)
+  assert_eq(reports[0].unproven, nil)
+  assert_eq(reports[0].reused, [])
+  const lines = trim(result.output).split("\n")
+  assert_eq(lines[1], "[]")
+  assert_eq(json_parse(lines[4]), reports[0].discovery)
 }

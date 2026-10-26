@@ -16,6 +16,8 @@ import { checkpoint_enrollment, current_run, live_source } from "./live.harn"
 import { READ_BUDGET, discover, merge_group_pull } from "./reader.harn"
 import { tested_source } from "./source.harn"
 
+type Decision = {discovery: dict, requested: int?, reused: list<string>, unproven: int?}
+
 fn required(env: HarnessEnv, name: string) -> string {
   const value = env.get(name) ?? ""
   if trim(value) == "" {
@@ -42,14 +44,19 @@ fn register(harness: Harness, published: Registration) {
   )
 }
 
-fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?) {
+fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?) -> Decision {
   const source = live_source(harness.net, harness.fs, required(harness.env, "GH_TOKEN"))
   const current = current_run(harness.env, source, universe)
   if !REGISTRATION_EVENTS.contains(current.event) {
     harness.stdio.println(
       "This event neither registers nor reuses job proofs; every selected job runs.",
     )
-    return
+    return {
+      discovery: {reason: "unsupported_event", probed: 0, reads: 0, budget: READ_BUDGET},
+      requested: len(wanted),
+      reused: [],
+      unproven: len(wanted),
+    }
   }
   const workspace = required(harness.env, "GITHUB_WORKSPACE")
   const actual_source = tested_source(harness.process, workspace)
@@ -80,16 +87,15 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?
     negative_runs: nil,
     negative_probed: nil,
   }
-  output(
-    harness,
-    "discovery",
-    json_stringify(
-      pick(
-        found,
-        ["probed", "reads", "budget", "reason", "blocked", "negative_runs", "negative_probed"],
-      ),
+  const decision: Decision = {
+    discovery: pick(
+      found,
+      ["probed", "reads", "budget", "reason", "blocked", "negative_runs", "negative_probed"],
     ),
-  )
+    requested: len(wanted),
+    reused: found.admitted.map({ admission -> admission.id }).to_list(),
+    unproven: len(wanted) - len(found.admitted),
+  }
   // Registration records where each reused job actually ran, so a later run
   // proves it there instead of trusting this run's pointer.
   require tested_source(harness.process, workspace) == actual_source,
@@ -98,7 +104,7 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?
   register(harness, published)
   if len(found.admitted) == 0 {
     harness.stdio.println("No qualified job proof; selected jobs will run.")
-    return
+    return decision
   }
   const directory = harness.fs.mkdtemp_in_workspace("ci-job-proof-")
   const path = directory + "/proof.json"
@@ -117,31 +123,33 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?
         + to_string(admission.provenance.attempt),
     )
   }
+  return decision
 }
 
 fn main(harness: Harness) {
   harness.net.egress_policy({default: "allow", block_private: "private"})
   output(harness, "reused", "[]")
-  output(
-    harness,
-    "discovery",
-    json_stringify({reason: "identities_unmeasured", probed: nil, reads: nil, budget: READ_BUDGET}),
-  )
+  let decision: Decision = {
+    discovery: {reason: "identities_unmeasured", probed: nil, reads: nil, budget: READ_BUDGET},
+    requested: nil,
+    reused: [],
+    unproven: nil,
+  }
   const raw = trim(harness.env.get("CI_JOB_PROOF_IDENTITIES") ?? "")
   if raw == "" {
     harness.stdio.println("Job identities are unmeasured; selected jobs will run.")
-    return
-  }
-  try {
-    const universe = proof_universe(harness.env.get("CI_JOB_PROOF_UNIVERSE") ?? "")
-    resolve(harness, universe_identities(identities(json_parse(raw)), universe), universe)
-  } catch (_error) {
-    // Diagnostics never expose API responses, tokens, or caller-provided plan values.
-    output(
-      harness,
-      "discovery",
-      json_stringify(
-        {
+  } else {
+    try {
+      const universe = proof_universe(harness.env.get("CI_JOB_PROOF_UNIVERSE") ?? "")
+      decision = resolve(
+        harness,
+        universe_identities(identities(json_parse(raw)), universe),
+        universe,
+      )
+    } catch (_error) {
+      // Diagnostics never expose API responses, tokens, or caller-provided plan values.
+      decision = {
+        discovery: {
           reason: "registration_unqualified",
           probed: nil,
           reads: nil,
@@ -149,8 +157,13 @@ fn main(harness: Harness) {
           negative_runs: nil,
           negative_probed: nil,
         },
-      ),
-    )
-    harness.stdio.println("Job proofs could not be qualified; selected jobs will run.")
+        requested: nil,
+        reused: [],
+        unproven: nil,
+      }
+      harness.stdio.println("Job proofs could not be qualified; selected jobs will run.")
+    }
   }
+  output(harness, "discovery", json_stringify(decision.discovery))
+  harness.stdio.println(json_stringify({schema: "burin.ci_job_proof_discovery.v1", ...decision}))
 }
