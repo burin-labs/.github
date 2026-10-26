@@ -53,6 +53,9 @@ refuses.
 The host filesystem retains command-owned output bytes before archive
 inspection through the existing scoped read/write APIs. ZIP size, digest and
 sole-member checks remain mandatory before the extracted manifest is installed.
+The launcher allocates new command captures in a private temporary directory
+inside its existing writable workspace. It does not grant access to captures
+from an earlier invocation outside that scope.
 
 This authorization changes only the producer-success prerequisite. Manifest,
 archive digests, attestations, source ancestry, signing and publication checks
