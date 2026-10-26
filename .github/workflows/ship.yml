@@ -19,6 +19,11 @@ on:
   # The review-thread relay (services/smart-ship-relay) dispatches with `pr`.
   workflow_dispatch:
     inputs:
+      main_red:
+        description: Optional fix-forward request for a red default branch.
+        required: false
+        type: string
+        default: ""
       pr:
         description: Pull request number to look at; empty runs a sweep.
         type: string
@@ -32,6 +37,7 @@ jobs:
     # The shared runner decides which events wake the shepherd.
     uses: burin-labs/.github/.github/workflows/smart-ship.yml@main
     with:
+      main-red: ${{ inputs.main_red }}
       # .github/smart-ship.toml limits repair to merge conflicts.
       repair: true
     secrets:

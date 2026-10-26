@@ -31,6 +31,11 @@ on:
         description: Allow the shepherd to run the PR agent to fix conflicts, failures, and review feedback.
         type: boolean
         default: true
+      main-red:
+        description: A fix-forward request from a caller's manual dispatch. Empty runs the normal PR look.
+        type: string
+        required: false
+        default: ""
       repair-environment:
         description: >-
           GitHub environment the repair job runs in. Its secrets, such as the
@@ -95,7 +100,7 @@ jobs:
       inputs.owned-runner-tag != ''
       && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository)
       && (github.event_name == 'schedule'
-      || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == ''))
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '' && inputs.main-red == ''))
     uses: burin-labs/.github/.github/workflows/runner-availability.yml@370f9dc42f634c9bbac79cd21a7888b50c7fbace
     with:
       runner_groups: ${{ inputs.runner-groups }}
@@ -138,7 +143,7 @@ jobs:
       && github.event.label.name == inputs.ship-label
       && github.event.pull_request.state == 'closed')
       && (github.event_name == 'schedule'
-      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'workflow_dispatch' && inputs.main-red == '')
       || ((github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
       && (contains(github.event.pull_request.labels.*.name, inputs.ship-label)
       || (github.event.action == 'unlabeled' && github.event.label.name == inputs.ship-label))
@@ -449,15 +454,22 @@ jobs:
   # the job timeout cancelled the PRs still waiting their turn.
   repair:
     needs: [availability, ship]
-    if: ${{ !cancelled() && needs.ship.outputs.deferred != '' && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+    # A `main_red` dispatch (burin-code scripts/ci/main-red-response.ts) is one
+    # fix-forward repair of the default branch, not a PR look.
+    if: ${{ !cancelled() && (needs.ship.outputs.deferred != '' || (github.event_name == 'workflow_dispatch' && inputs.main-red != '')) && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
     environment: ${{ inputs.repair-environment }}
     runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
+    # Fix-forward repairs of one repository's main run one at a time; a running one is never
+    # cancelled. A newer pending request replaces an older one, since each starts from main's tip.
+    concurrency:
+      group: ${{ matrix.pr == 'main-red' && format('smart-ship-main-red-{0}', github.repository) || format('smart-ship-repair-{0}-{1}-{2}', github.repository, github.run_id, matrix.pr) }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 3
       matrix:
-        pr: ${{ fromJSON(needs.ship.outputs.deferred_json) }}
+        pr: ${{ inputs.main-red != '' && fromJSON('["main-red"]') || fromJSON(needs.ship.outputs.deferred_json) }}
     steps:
       - name: Mint the release app token
         id: app
@@ -555,11 +567,17 @@ jobs:
           REPO: ${{ github.repository }}
           LABEL: ${{ inputs.ship-label }}
           DEFERRED: ${{ matrix.pr }}
+          MAIN_RED: ${{ inputs.main-red }}
           POLICY: ${{ steps.policy.outputs.path }}
         run: |
           set -uo pipefail
           git config --global user.name "harn-release-bot[bot]"
           git config --global user.email "harn-release-bot[bot]@users.noreply.github.com"
+          if [ "$DEFERRED" = main-red ]; then
+            exec ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
+              --main-red "$MAIN_RED" --ship-label "$LABEL" \
+              --policy "$POLICY" --ship-root "$RUNNER_TEMP/ship"
+          fi
           status=0
           for n in $DEFERRED; do
             echo "::group::$REPO#$n (repair)"
@@ -574,7 +592,7 @@ jobs:
       # holding the PR (burin-code scripts/lib/ship/coverage.harn
       # `released_prs`) and a fresh look picks it up instead of the next sweep.
       - name: Record the finished repair
-        if: always()
+        if: ${{ always() && matrix.pr != 'main-red' }}
         env:
           PR: ${{ matrix.pr }}
         run: |
@@ -582,7 +600,7 @@ jobs:
           printf '{"pr":%s}\n' "$PR" > "$RUNNER_TEMP/ship-released/released.json"
 
       - name: Release the pull request
-        if: always()
+        if: ${{ always() && matrix.pr != 'main-red' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}-repaired-${{ matrix.pr }}
@@ -592,7 +610,7 @@ jobs:
           retention-days: 1
 
       - name: Look at the released pull request again
-        if: ${{ always() && steps.app.outputs.token != '' }}
+        if: ${{ always() && steps.app.outputs.token != '' && matrix.pr != 'main-red' }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
