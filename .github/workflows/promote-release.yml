@@ -115,6 +115,13 @@ jobs:
       tag: ${{ steps.publish.outputs.tag }}
       release-url: ${{ steps.publish.outputs.release-url }}
     steps:
+      - name: Require standalone inspection scope
+        if: inputs.inspect-only && (!inputs.standalone-harn || github.repository != 'burin-labs/harn')
+        shell: bash
+        run: |
+          echo "::error::Publication inspection requires standalone Harn qualification."
+          exit 2
+
       - name: Require called-workflow identity
         if: ${{ fromJSON(toJSON(job)).workflow_repository == '' || fromJSON(toJSON(job)).workflow_sha == '' }}
         shell: bash

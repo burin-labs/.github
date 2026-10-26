@@ -52,6 +52,8 @@ fn main(harness: Harness) {
   require ["true", "false"].contains(standalone), "standalone qualification choice is unreported"
   require standalone != "true" || authorization == nil,
     "standalone publication cannot claim consumer completion"
+  require mode != "inspect" || standalone == "true",
+    "publication inspection requires standalone Harn qualification"
   const authorize_completion = standalone == "true" ? standalone_completion(
     harness.tools,
     {
