@@ -70,6 +70,11 @@ on:
         required: false
         default: false
         type: boolean
+      inspect-only:
+        description: Inspect an existing verified publication through the release App without publishing or uploading.
+        required: false
+        default: false
+        type: boolean
     secrets:
       RELEASE_APP_CLIENT_ID:
         description: GitHub App client id with contents write on the calling repository.
@@ -110,6 +115,13 @@ jobs:
       tag: ${{ steps.publish.outputs.tag }}
       release-url: ${{ steps.publish.outputs.release-url }}
     steps:
+      - name: Require standalone inspection scope
+        if: inputs.inspect-only && (!inputs.standalone-harn || github.repository != 'burin-labs/harn')
+        shell: bash
+        run: |
+          echo "::error::Publication inspection requires standalone Harn qualification."
+          exit 2
+
       - name: Require called-workflow identity
         if: ${{ fromJSON(toJSON(job)).workflow_repository == '' || fromJSON(toJSON(job)).workflow_sha == '' }}
         shell: bash
@@ -212,12 +224,12 @@ jobs:
           permission-contents: write
           permission-workflows: write
 
-      - name: Publish the verified files
+      - name: Inspect or publish the verified files
         id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
-          PROMOTE_MODE: publish
+          PROMOTE_MODE: ${{ inputs.inspect-only && 'inspect' || 'publish' }}
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}

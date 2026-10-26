@@ -6,7 +6,12 @@ import {
   expect_manifest_identity,
   validate_candidate_manifest,
 } from "./manifest.harn"
-import { ReleasePlan, reconcile_publication } from "./publication.harn"
+import {
+  PublicationInspection,
+  ReleasePlan,
+  inspect_publication,
+  reconcile_publication,
+} from "./publication.harn"
 
 /**
  * Everything promotion asks of GitHub. The live adapter implements it with
@@ -356,6 +361,56 @@ fn publication_intent(
   }
 }
 
+type SealedPublication = {plan: ReleasePlan, intent: PublicationIntent, intent_sha256: string}
+
+pub type CandidateInspection = {
+  publication: PublicationInspection,
+  producer_run_id: string,
+  producer_attempt: string,
+  candidate_manifest_sha256: string,
+  publication_intent_sha256: string,
+}
+
+fn sealed_publication(
+  github: GitHub,
+  fs: HarnessFs,
+  request: PromotionRequest,
+  run: VerifiedRun,
+  directory: string,
+) -> SealedPublication {
+  if run.manifest_identity != nil {
+    download_manifest(github, request, run, directory)
+  }
+  const candidate = check_candidate(fs, request, run, directory)
+  const intent_text = fs.read_text(path_join(directory, "publication-intent.json"))
+  const intent = schema_expect(json_parse(intent_text), schema_of(PublicationIntent))
+  require intent == publication_intent(fs, request, candidate),
+    "publication intent no longer matches the verified candidate"
+  return {
+    plan: publication_plan(fs, request, candidate),
+    intent: intent,
+    intent_sha256: sha256(intent_text),
+  }
+}
+
+/** Inspect the sealed candidate through the production reader without mutation functions. */
+pub fn inspect_candidate(
+  github: GitHub,
+  fs: HarnessFs,
+  request: PromotionRequest,
+  run: VerifiedRun,
+  directory: string,
+) -> CandidateInspection {
+  const sealed = sealed_publication(github, fs, request, run, directory)
+  return {
+    publication: inspect_publication({json: github.json}, sealed.plan),
+    producer_run_id: sealed.intent.runId,
+    producer_attempt: sealed.intent.runAttempt,
+    candidate_manifest_sha256: sealed.intent.manifestSha256,
+    publication_intent_sha256: sealed.intent_sha256,
+  }
+}
+
 /** Recheck the sealed candidate, then reconcile only matching publication state. */
 pub fn publish_candidate(
   github: GitHub,
@@ -364,15 +419,6 @@ pub fn publish_candidate(
   run: VerifiedRun,
   directory: string,
 ) -> {tag: string, url: string} {
-  if run.manifest_identity != nil {
-    download_manifest(github, request, run, directory)
-  }
-  const candidate = check_candidate(fs, request, run, directory)
-  const intent = schema_expect(
-    json_parse(fs.read_text(path_join(directory, "publication-intent.json"))),
-    schema_of(PublicationIntent),
-  )
-  require intent == publication_intent(fs, request, candidate),
-    "publication intent no longer matches the verified candidate"
-  return reconcile_publication(github, publication_plan(fs, request, candidate))
+  const sealed = sealed_publication(github, fs, request, run, directory)
+  return reconcile_publication(github, sealed.plan)
 }

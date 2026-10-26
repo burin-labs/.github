@@ -1,5 +1,15 @@
 # Release completion authorization
 
+`inspect-only: true` runs the existing publisher's `inspect` mode after archive
+verification and normal release-App token minting. It validates the same sealed
+candidate and publication intent, then passes only the production JSON reader
+to release discovery and asset census. It cannot create a draft, upload files,
+create a tag or publish. Its JSON reports source, tag state, draft ID, notes
+hashes, intent/manifest hashes and pending asset names/counts. A missing release
+or changed notes fails inspection. It does not report publication outputs;
+callers must skip downstream publication jobs. A successful inspection proves
+only observed state, and a later ordinary publication rechecks every guard.
+
 Ordinary promotion requires a completed successful producer at the requested
 source. Harn may also provide `original-consumer-context` when its original
 consumer observer reached its deadline and the exact admitted child later

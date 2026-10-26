@@ -6,6 +6,7 @@ import {
 } from "./manifest.harn"
 import {
   PromotionRequest,
+  inspect_candidate,
   parse_request,
   publish_candidate,
   verify_candidate,
@@ -294,6 +295,48 @@ pipeline test_resume_preserves_every_accepted_publication_effect(harness: Harnes
     assert_eq(world.state().publishes, 1)
     assert_eq(world.state().tags, 1)
   }
+}
+
+pipeline test_inspection_reuses_sealed_intent_without_reaching_mutations(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("publication-inspection-")
+  const world = fixture(harness.fs, {fault: "after-draft"})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  const run = verify_run(world.github, request())
+  assert_error_contains(
+    fn() { publish_candidate(world.github, harness.fs, request(), run, directory) },
+    "connection lost after draft creation",
+  )
+  const before = world.state()
+  const trapped = world.github
+    + {
+      create_draft: fn(_release) {
+        throw "inspection reached create"
+      },
+      upload_assets: fn(_tag, _paths) {
+        throw "inspection reached upload"
+      },
+      create_tag: fn(_tag, _sha, _message) {
+        throw "inspection reached tag"
+      },
+      publish_draft: fn(_id, _latest) {
+        throw "inspection reached publish"
+      },
+    }
+  const snapshot = inspect_candidate(trapped, harness.fs, request(), run, directory)
+  assert_eq(snapshot.publication.release_id, 7)
+  assert_eq(snapshot.publication.draft, true)
+  assert_eq(snapshot.publication.tag_commit, nil)
+  assert_eq(snapshot.publication.existing_asset_count, 0)
+  assert_eq(snapshot.publication.pending_asset_count, snapshot.publication.expected_asset_count)
+  assert_eq(snapshot.producer_run_id, RUN_ID)
+  assert_eq(
+    snapshot.publication_intent_sha256,
+    sha256(harness.fs.read_text(path_join(directory, "publication-intent.json"))),
+  )
+  assert_eq(world.state().creates, before.creates)
+  assert_eq(world.state().uploaded, before.uploaded)
+  assert_eq(world.state().tags, before.tags)
+  assert_eq(world.state().publishes, before.publishes)
 }
 
 pipeline test_publication_intent_is_required_and_bound_before_external_writes(harness: Harness) {
