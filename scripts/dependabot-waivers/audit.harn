@@ -6,6 +6,7 @@ import {
   BlockerState,
   Document,
   Report,
+  overdue_review,
   reconcile,
   summarize,
   unwaived,
@@ -164,7 +165,8 @@ pub fn audit(
         installable,
         today,
         current,
-      ) : {verdict: "pending", detail: "waiver identity does not match the live alert"}
+      ) : overdue_review(waiver, today)
+        ?? {verdict: "pending", detail: "waiver identity does not match the live alert"}
       const reopened = decision.verdict == "reopen" && apply
       if reopened {
         source.github.send(
