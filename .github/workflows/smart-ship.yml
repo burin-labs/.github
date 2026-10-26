@@ -70,6 +70,8 @@ on:
         required: true
       OPENAI_API_KEY:
         required: false
+      ANTHROPIC_API_KEY:
+        required: false
       # The runner probe's own app, so the probe cannot drain the release
       # app's rate limit. Only callers with an owned pool need it.
       RUNNER_PROBE_APP_CLIENT_ID:
@@ -549,6 +551,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
           BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REPO: ${{ github.repository }}
           LABEL: ${{ inputs.ship-label }}
           DEFERRED: ${{ matrix.pr }}
@@ -560,7 +563,7 @@ jobs:
           status=0
           for n in $DEFERRED; do
             echo "::group::$REPO#$n (repair)"
-            ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
+            ./scripts/harnw run --no-sandbox --approve-risky git.push scripts/smart-ship.harn -- \
               --pr "$REPO#$n" --state github --ship-label "$LABEL" \
               --policy "$POLICY" --ship-root "$RUNNER_TEMP/ship" || status=1
             echo "::endgroup::"
