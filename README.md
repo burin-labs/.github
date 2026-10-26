@@ -111,6 +111,12 @@ negative history, with a 128-read budget and at most eight recent negative
 attempt inspections. Creation-range partitioning defeats GitHub's result cap;
 it keeps every rerun within the generation. Exhaustion returns no reused jobs.
 See the [typed proof owner](scripts/ci-job-proof/contract.harn).
+Every invocation logs one final JSON record with schema
+`burin.ci_job_proof_discovery.v1`. It contains the same discovery reason and
+counts as the action output, plus requested and unproven identity counts and
+the reused job IDs. These describe proof eligibility, not executed or skipped
+jobs. Unknown counts stay `null`; malformed caller input and API errors are not
+copied into the record. Admission and failure-history rules are unchanged.
 The [record reference](docs/ci-job-proof-records.md) defines the actual tested
 checkout, the API run head, and the original-run inspection interface.
 
