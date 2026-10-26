@@ -265,10 +265,15 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
   assert_eq(jobs.repair.environment, expression("inputs.repair-environment"))
   assert_eq(jobs.repair["runs-on"], jobs.ship["runs-on"])
   assert_eq(named(jobs.ship.steps, "Shepherd").env?.OPENAI_API_KEY, nil)
+  assert_eq(named(jobs.ship.steps, "Shepherd").env?.ANTHROPIC_API_KEY, nil)
   assert_eq(
     named(jobs.repair.steps, "Repair deferred pull requests").env.OPENAI_API_KEY,
     expression("secrets.OPENAI_API_KEY"),
   )
+  const repair = named(jobs.repair.steps, "Repair deferred pull requests")
+  assert_eq(repair.env.ANTHROPIC_API_KEY, expression("secrets.ANTHROPIC_API_KEY"))
+  assert(repair.run.contains("--approve-risky git.push"), "the repair controller can publish a leased rebase")
+  assert(!named(jobs.ship.steps, "Shepherd").run.contains("--approve-risky"))
   for name in [
     "Download the PR agent",
     "Set up Node",
@@ -278,6 +283,14 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
     assert_eq(len(jobs.ship.steps.filter({ step -> step?.name == name }).to_list()), 0, name)
     assert_eq(named(jobs.repair.steps, name)["if"], nil, name)
   }
+}
+
+pipeline test_repository_caller_forwards_the_optional_repair_key(harness: Harness) {
+  const caller = read_yaml(harness.fs, "../../.github/workflows/ship.yml")
+  assert_eq(
+    caller.jobs.ship.secrets.ANTHROPIC_API_KEY,
+    expression("secrets.ANTHROPIC_API_KEY"),
+  )
 }
 
 pipeline test_repair_evidence_survives_a_failed_attempt_without_uploading_checkouts(
