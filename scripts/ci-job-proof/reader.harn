@@ -511,9 +511,10 @@ fn negative_audit(
       )
       require observed.id == latest.id && observed.run_attempt == attempt,
         "negative attempt identity changed"
-      if observed.status != "completed" || date_parse(observed.updated_at) < oldest {
+      if date_parse(observed.updated_at) < oldest {
         continue
       }
+      require observed.status == "completed", "negative attempt has not settled"
       require probed < RUN_BUDGET, "negative attempt inspection budget exhausted"
       probed = probed + 1
       const census = job_census(source, current.repository, observed)

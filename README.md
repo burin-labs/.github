@@ -88,7 +88,7 @@ unmatched job runs. The resolver inventories main runs and canonical checkpoints
 then compares matching job failures by execution time, including old runs rerun
 later and earlier attempts of the current checkpoint. A passing job remains
 reusable when an unrelated sibling fails. Unreadable failure attribution or
-incomplete history prevents reuse.
+incomplete history or an unsettled relevant attempt prevents reuse.
 Without enrollment, dispatches only register original evidence. Scheduled
 backstops remain fresh.
 

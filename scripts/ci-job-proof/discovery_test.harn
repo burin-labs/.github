@@ -364,6 +364,27 @@ pipeline test_later_failed_checkpoint_is_negative_evidence_but_never_positive_pr
   assert_eq(only_dispatch.admitted, [])
 }
 
+pipeline test_active_checkpoint_with_finished_failure_cannot_hide_behind_old_success() {
+  const good = producer(run(20, "merge_group"), {lint: {digest: DIGEST}}, ["Lint"])
+  const bad = failing(
+    producer(run(25, "workflow_dispatch"), {lint: {digest: DIGEST}}, ["Lint"]),
+    ["Lint"],
+  )
+  const active = bad + {run: bad.run + {status: "in_progress", conclusion: nil}}
+  const result = discover(
+    source([good, active], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    [wanted()[0]],
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(result.admitted, [])
+  assert_eq(result.reason, "negative_history_unmeasured")
+  assert_eq(result.negative_runs, nil)
+}
+
 pipeline test_lower_run_id_later_failed_rerun_revokes_direct_and_deferred_proof() {
   const good = producer(
     run(20, "push"),
