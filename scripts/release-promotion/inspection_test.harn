@@ -1,0 +1,81 @@
+import { assert_error_contains } from "std/testing"
+import { live_github } from "./live.harn"
+import { ReleasePlan, inspect_publication } from "./publication.harn"
+
+const API = "https://api.github.com/repos/acme/release"
+
+const SOURCE = "a".repeat(40)
+
+fn plan() -> ReleasePlan {
+  return {
+    repository: "acme/release",
+    sha: SOURCE,
+    tag: "v1.0.0",
+    prerelease: false,
+    latest: true,
+    notes_file: "notes.md",
+    body: "original notes\n",
+    files: [{name: "candidate.zip", path: "candidate.zip", sha256: "b".repeat(64)}],
+  }
+}
+
+fn reads(harness: Harness, visible: bool, conflict: bool = false) {
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("GET", API + "/git/ref/tags/v1.0.0", {status: 404, body: "{}"})
+  harness.testing.http_mock("GET", API + "/releases/tags/v1.0.0", {status: 404, body: "{}"})
+  const draft = {
+    id: 423822379,
+    tag_name: "v1.0.0",
+    target_commitish: SOURCE,
+    name: "v1.0.0",
+    body: conflict ? "other notes" : "original notes\n",
+    draft: true,
+    prerelease: false,
+    html_url: "https://github.com/acme/release/releases/tag/untagged-fixture",
+    assets: [],
+    author: {login: "release-app[bot]"},
+  }
+  harness.testing.http_mock(
+    "GET",
+    API + "/releases?per_page=100",
+    {status: 200, body: json_stringify(visible ? [draft] : [])},
+  )
+  harness.testing.http_mock(
+    "GET",
+    API + "/releases/423822379/assets?per_page=100&page=1",
+    {status: 200, body: "[]"},
+  )
+}
+
+pipeline test_actual_http_reader_reports_missing_then_visible_draft_without_writes(
+  harness: Harness,
+) {
+  const github = live_github(
+    harness.net,
+    harness.tools,
+    harness.fs,
+    "fixture-token",
+    "acme/release",
+    harness.fs.mkdtemp_in_workspace("inspection-http-"),
+  )
+  reads(harness, false)
+  const missing = inspect_publication({json: github.json}, plan())
+  assert_eq(missing.release_id, nil)
+  assert_eq(missing.pending_asset_count, 1)
+  assert_eq(len(harness.testing.http_mock_calls()), 3)
+  reads(harness, true)
+  const visible = inspect_publication({json: github.json}, plan())
+  assert_eq(visible.release_id, 423822379)
+  assert_eq(visible.draft, true)
+  assert_eq(visible.notes_sha256, sha256("original notes\n"))
+  assert_eq(visible.pending_asset_names, ["candidate.zip"])
+  const calls = harness.testing.http_mock_calls()
+  assert_eq(len(calls), 4)
+  for call in calls {
+    assert_eq(call.method, "GET")
+    assert_eq(call.headers.authorization, "Bearer fixture-token")
+  }
+  reads(harness, true, true)
+  assert_error_contains(fn() { inspect_publication({json: github.json}, plan()) }, "conflicts")
+  assert_eq(len(harness.testing.http_mock_calls()), 3)
+}

@@ -70,6 +70,11 @@ on:
         required: false
         default: false
         type: boolean
+      inspect-only:
+        description: Inspect an existing verified publication through the release App without publishing or uploading.
+        required: false
+        default: false
+        type: boolean
     secrets:
       RELEASE_APP_CLIENT_ID:
         description: GitHub App client id with contents write on the calling repository.
@@ -212,12 +217,12 @@ jobs:
           permission-contents: write
           permission-workflows: write
 
-      - name: Publish the verified files
+      - name: Inspect or publish the verified files
         id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
-          PROMOTE_MODE: publish
+          PROMOTE_MODE: ${{ inputs.inspect-only && 'inspect' || 'publish' }}
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}

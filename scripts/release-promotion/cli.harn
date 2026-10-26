@@ -1,7 +1,13 @@
 import { gha_write_output } from "std/gha"
 import { parse_authorization, verify_authorization } from "./authorization.harn"
 import { live_consumer_recovery, live_github } from "./live.harn"
-import { parse_request, publish_candidate, verify_candidate, verify_run } from "./promotion.harn"
+import {
+  inspect_candidate,
+  parse_request,
+  publish_candidate,
+  verify_candidate,
+  verify_run,
+} from "./promotion.harn"
 import { standalone_completion } from "./standalone.harn"
 
 fn required_env(env: HarnessEnv, name: string) -> string {
@@ -80,6 +86,21 @@ fn main(harness: Harness) {
         + to_string(len(candidate.files))
         + " files match their manifest digests and attestations.",
     )
+    return
+  }
+  if mode == "inspect" {
+    const inspection = inspect_candidate(
+      github,
+      harness.fs,
+      request,
+      verify_run(github, request, authorize_completion),
+      directory,
+    )
+    harness.stdio.println(json_stringify(inspection))
+    require inspection.publication.release_id != nil,
+      "publication inspection found no matching release: missing_release=1"
+    require inspection.publication.notes_sha256 == inspection.publication.expected_notes_sha256,
+      "publication inspection found a changed release body"
     return
   }
   if mode == "publish" {
