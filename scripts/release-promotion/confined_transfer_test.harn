@@ -1,0 +1,100 @@
+import { command_run } from "std/command"
+import { with_temp_dir } from "std/testing"
+
+fn capture_path(stdout: string) -> string {
+  const rows = stdout.split("\n").filter({ line -> line.starts_with("capture_path=") }).to_list()
+  require len(rows) == 1, "the real capture path was not observed"
+  return rows[0]!.split("capture_path=")[1]!
+}
+
+pipeline test_production_launcher_allocates_binary_captures_inside_its_existing_scope(
+  harness: Harness,
+) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+      const real = trim(command_run(harness.tools, ["which", "harn"]).stdout)
+      require real.starts_with("/"), "the installed pinned Harn must be identified"
+      const version = command_run(harness.tools, [real, "version", "--json"])
+      require version.success && json_parse(version.stdout).data.version == "0.10.133",
+        "the restricted-launcher regression requires the production-pinned runtime"
+      const outside_result = command_run(
+        harness.tools,
+        ["mktemp", "-d", "/tmp/harn-capture-control.XXXXXXXX"],
+      )
+      require outside_result.success, "could not create isolated control output"
+      const outside = trim(outside_result.stdout)
+      require outside.starts_with("/tmp/harn-capture-control."), "invalid control directory"
+      harness.fs.mkdir(path_join(work, "input"), true)
+      harness.fs.mkdir(path_join(work, "bin"), true)
+      harness.fs.mkdir(path_join(work, "outputs"), true)
+      harness.fs.mkdir(path_join(work, ".harn/promote-release"), true)
+      const input = path_join(work, "input/candidate-manifest.json")
+      const archive = path_join(work, "fixture.zip")
+      harness.fs.write_text(input, "{\"fixture\":\"binary archive transfer\"}\n")
+      require command_run(harness.tools, ["zip", "-j", archive, input]).success,
+        "fixture ZIP failed"
+      const expected = sha256(harness.fs.read_bytes(archive))
+      const wrapper = path_join(work, "bin/harn")
+      harness.fs.write_text(
+        wrapper,
+        "#!/usr/bin/env bash\nset -euo pipefail\nargs=(\"$@\")\nargs[$#-1]=\"$FIXTURE_ENTRY\"\nexec \"$FIXTURE_HARN\" \"$"
+          + "{args[@]}\"\n",
+      )
+      require command_run(harness.tools, ["chmod", "+x", wrapper]).success, "fixture wrapper failed"
+      const bootstrap = harness.fs.read_text("run.sh")
+      const allocation =
+        "# Host command captures must be allocated inside the existing workspace scope.\n"
+        + "readonly capture_root=\"$(mktemp -d \"$workspace/.harn/promote-release/capture.XXXXXXXX\")\"\n"
+        + "export TMPDIR=\"$capture_root\" TMP=\"$capture_root\" TEMP=\"$capture_root\"\n"
+      require bootstrap.contains(allocation),
+        "the allocation control no longer matches the launcher"
+      const baseline = path_join(work, "baseline.sh")
+      const old = bootstrap.replace(allocation, "").replace(
+        "readonly package_root=\"$(cd \"$(dirname \"$" + "{BASH_SOURCE[0]}\")/../..\" && pwd)\"",
+        "readonly package_root=\"$FIXTURE_PACKAGE_ROOT\"",
+      )
+      harness.fs.write_text(baseline, old)
+      const env = {
+        PATH: path_join(work, "bin") + ":" + unwrap(harness.env.get("PATH")),
+        FIXTURE_HARN: real,
+        FIXTURE_ENTRY: path_join(root, "scripts/release-promotion/fixtures/confined-transfer.harn"),
+        FIXTURE_PACKAGE_ROOT: root,
+        GITHUB_WORKSPACE: work,
+        GITHUB_OUTPUT: path_join(work, "outputs/step"),
+        GH_TOKEN: "fixture-token",
+        PROMOTE_MODE: "verify",
+        PROMOTE_REPOSITORY: "acme/fixture",
+        PROMOTE_SHA: "a".repeat(40),
+        PROMOTE_RUN_ID: "100",
+        PROMOTE_TAG: "v1.0.0",
+        PROMOTE_DIRECTORY: path_join(work, "candidate"),
+        TMPDIR: outside,
+        TMP: outside,
+        TEMP: outside,
+      }
+      const refused = command_run(harness.tools, ["bash", baseline], {env: env, timeout_ms: 60000})
+      require !refused.success
+        && refused.stderr.contains("captured manifest archive is unavailable"),
+        "the system-temp baseline did not reproduce the real visibility failure"
+      const old_path = capture_path(refused.stdout)
+      require old_path.starts_with(outside + "/") && harness.fs.exists(old_path),
+        "the refused capture must still exist outside the admitted workspace"
+      require sha256(harness.fs.read_bytes(old_path)) == expected,
+        "baseline captured different bytes"
+      const passed = command_run(
+        harness.tools,
+        ["bash", path_join(root, "scripts/release-promotion/run.sh")],
+        {env: env, timeout_ms: 60000},
+      )
+      require passed.success && passed.stdout.contains("confined-binary-transfer=pass"),
+        "the production launcher did not transfer the binary capture under its unchanged policy"
+      const new_path = capture_path(passed.stdout)
+      require new_path.starts_with(path_join(work, ".harn/promote-release/capture.")),
+        "the new capture escaped its existing workspace authority"
+      require sha256(harness.fs.read_bytes(new_path)) == expected, "new capture changed ZIP bytes"
+      require command_run(harness.tools, ["rm", "-rf", outside]).success, "control cleanup failed"
+    },
+  )
+}
