@@ -1,10 +1,14 @@
+import { ObservedRun, checkpoint_history } from "./checkpoint_history.harn"
 import {
   Admission,
   Artifact,
+  CONSUMER_EVENTS,
+  CheckpointEnrollment,
   IDENTITY_SCHEMA,
   Job,
   JobIdentity,
   ProducerPolicy,
+  ProofUniverse,
   Provenance,
   RegisteredArtifact,
   Registration,
@@ -46,6 +50,8 @@ type Pull = {number: int, head: {sha: string, repo: {full_name: string}?}}
 pub const READ_BUDGET = 40
 
 pub const RUN_BUDGET = 8
+
+const CHECKPOINT_READ_BUDGET = 128
 
 pub fn repository(value: string) -> string {
   if !regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", value) {
@@ -286,16 +292,19 @@ pub type Discovery = {
   reads: int,
   budget: int,
   reason: string,
+  blocked: list<string>,
+  negative_runs: int?,
+  negative_probed: int?,
 }
 
 type BudgetSource = {source: ProofSource, reads: fn() -> int, exhausted: fn() -> bool}
 
-fn bounded_source(source: ProofSource, now: fn() -> int) -> BudgetSource {
+fn bounded_source(source: ProofSource, now: fn() -> int, limit: int = READ_BUDGET) -> BudgetSource {
   let reads = 0
   let memo = {}
   const expires_at = now() + 45000
   const take = fn() {
-    if reads >= READ_BUDGET || now() >= expires_at {
+    if reads >= limit || now() >= expires_at {
       throw "proof discovery budget exhausted"
     }
     reads = reads + 1
@@ -317,7 +326,7 @@ fn bounded_source(source: ProofSource, now: fn() -> int) -> BudgetSource {
       },
     },
     reads: fn() { return reads },
-    exhausted: fn() { return reads >= READ_BUDGET || now() >= expires_at },
+    exhausted: fn() { return reads >= limit || now() >= expires_at },
   }
 }
 
@@ -347,6 +356,14 @@ fn candidates(source: ProofSource, current: RunContext, pull: int?) -> list<Run>
   if current.event == "push" {
     return runs(source, current, "event=merge_group&head_sha=" + sha(current.commit)) + pushes
   }
+  if current.event == "workflow_dispatch" {
+    return (runs(source, current, "event=push&head_sha=" + sha(current.commit))
+      + runs(source, current, "event=merge_group&head_sha=" + sha(current.commit))
+      + pushes)
+      .filter({ run -> run.id < current.runId })
+      .to_list()
+      .sorted_by({ run -> [-run.id, -run.run_attempt] })
+  }
   if pull == nil {
     return pushes.slice(0, 1)
   }
@@ -359,12 +376,13 @@ fn candidates(source: ProofSource, current: RunContext, pull: int?) -> list<Run>
     + pushes.slice(0, 1)
 }
 
-pub fn discover(
+fn discover_positive(
   source: ProofSource,
   current: RunContext,
   wanted: list<JobIdentity>,
   pull: int?,
   now: fn() -> int,
+  checkpoint: bool = false,
 ) -> Discovery {
   const bounded = bounded_source(source, now)
   const result = fn(admitted, probed, reason) { return {
@@ -373,8 +391,12 @@ pub fn discover(
     reads: bounded.reads(),
     budget: READ_BUDGET,
     reason: reason,
+    blocked: [],
+    negative_runs: nil,
+    negative_probed: nil,
   } }
-  if !["push", "merge_group"].contains(current.event) {
+  if !CONSUMER_EVENTS.contains(current.event)
+    && !(checkpoint && current.event == "workflow_dispatch") {
     return result([], 0, "unsupported_event")
   }
   const listed = try {
@@ -426,12 +448,170 @@ pub fn discover(
     )
       .to_list()
     const outcome = try {
-      read_run(bounded.source, current, unwrap(run), open)
+      inspect_run(bounded.source, current, unwrap(run), open)
     }
     if is_ok(outcome) {
-      admitted = admitted + unwrap(outcome).admitted
-      queue = queue + unwrap(outcome).deferred.map({ deferral -> deferral.provenance }).to_list()
+      const measured = unwrap(outcome)
+      admitted = admitted + measured.admission.admitted
+      queue = queue + measured.admission.deferred.map({ deferral -> deferral.provenance }).to_list()
     }
   }
   return result(admitted, probed, len(admitted) > 0 ? "qualified" : "no_qualified_registration")
+}
+
+type NegativeAudit = {blocked: list<string>, runs: int, probed: int}
+
+fn negative_audit(
+  source: ProofSource,
+  current: RunContext,
+  wanted: list<JobIdentity>,
+  enrolled: CheckpointEnrollment,
+  provisional: list<Admission>,
+  universe: ProofUniverse,
+  through_ms: int,
+) -> NegativeAudit {
+  let passed_at = {}
+  for proof in provisional {
+    const producer = schema_expect(
+      source.json(
+        "/repos/${current.repository}/actions/runs/${proof.provenance.runId}/attempts/${proof.provenance.attempt}",
+      ),
+      schema_of(Run),
+    )
+    const measured = inspect_run(
+      source,
+      current,
+      producer,
+      wanted.filter({ identity -> identity.id == proof.id }).to_list(),
+    )
+    require measured.admission.admitted.any({ actual -> actual == proof }),
+      "provisional proof changed"
+    const completed = measured.census.jobs.filter({ job -> proof.jobIds.contains(job.id) }).map(
+      { job -> date_parse(job.completed_at) },
+    )
+      .to_list()
+      .sorted()
+    require len(completed) == len(proof.jobIds) && len(completed) > 0,
+      "proof chronology is unmeasured"
+    passed_at = passed_at + {[proof.id]: completed[len(completed) - 1]}
+  }
+  const oldest = passed_at.values().to_list().sorted()[0]
+  require oldest != nil && through_ms / 1000 >= oldest, "checkpoint chronology is unmeasured"
+  const inventory = checkpoint_history(source, current, enrolled, universe, through_ms)
+  let blocked: list<string> = []
+  let probed = 0
+  for latest in inventory.filter({ run -> date_parse(run.updated_at) >= oldest }) {
+    for attempt in range(1, latest.run_attempt + 1) {
+      if latest.id == current.runId && attempt >= current.attempt {
+        continue
+      }
+      const observed = attempt == latest.run_attempt ? latest : schema_expect(
+        source.json("/repos/${current.repository}/actions/runs/${latest.id}/attempts/${attempt}"),
+        schema_of(ObservedRun),
+      )
+      require observed.id == latest.id && observed.run_attempt == attempt,
+        "negative attempt identity changed"
+      if date_parse(observed.updated_at) < oldest {
+        continue
+      }
+      require observed.status == "completed", "negative attempt has not settled"
+      require probed < RUN_BUDGET, "negative attempt inspection budget exhausted"
+      probed = probed + 1
+      const census = job_census(source, current.repository, observed)
+      if census.jobs.all({ job -> ["success", "skipped", "neutral"].contains(job.conclusion) }) {
+        continue
+      }
+      const measured = inspect_original_run(
+        source,
+        {
+          repository: current.repository,
+          workflow: current.workflow,
+          events: ["push", "workflow_dispatch", "schedule"],
+          registrarJob: current.registrarJob,
+          registrarStep: current.registrarStep,
+        },
+        observed,
+        wanted,
+      )
+      for identity in wanted.filter({ identity -> passed_at[identity.id] != nil }) {
+        const matching = measured.registered.registration.jobs.filter(
+          { claim ->
+            claim.id == identity.id && claim.digest == identity.digest
+              && claim.names == identity.names
+          },
+        )
+          .to_list()
+        if len(matching) != 1 {
+          continue
+        }
+        for job in measured.census.jobs.filter({ job -> leg_of(identity.names, job.name) }) {
+          if !["success", "skipped", "neutral"].contains(job.conclusion)
+            && (job.completed_at == nil || date_parse(job.completed_at) >= passed_at[identity.id]) {
+            blocked = (blocked + [identity.id]).unique()
+          }
+        }
+      }
+    }
+  }
+  return {blocked: blocked.sorted(), runs: len(inventory), probed: probed}
+}
+
+/**
+ * Positive proof is provisional until complete checkpoint/main history rules out newer job failures.
+ */
+pub fn discover(
+  source: ProofSource,
+  current: RunContext,
+  wanted: list<JobIdentity>,
+  pull: int?,
+  now: fn() -> int,
+  checkpoint: CheckpointEnrollment? = nil,
+  universe: ProofUniverse? = nil,
+) -> Discovery {
+  if checkpoint == nil {
+    return discover_positive(source, current, wanted, pull, now)
+  }
+  const through = now()
+  const bounded = bounded_source(source, now, CHECKPOINT_READ_BUDGET)
+  const provisional = discover_positive(bounded.source, current, wanted, pull, now, true)
+  if universe == nil {
+    return provisional + {admitted: [], reason: "negative_scope_unmeasured"}
+  }
+  if len(provisional.admitted) == 0 {
+    return provisional + {reads: bounded.reads(), budget: CHECKPOINT_READ_BUDGET}
+  }
+  const audit = try {
+    negative_audit(
+      bounded.source,
+      current,
+      wanted,
+      checkpoint,
+      provisional.admitted,
+      universe,
+      through,
+    )
+  }
+  if is_err(audit) || bounded.exhausted() {
+    return provisional
+      + {
+        admitted: [],
+        blocked: provisional.admitted.map({ proof -> proof.id }),
+        reads: bounded.reads(),
+        budget: CHECKPOINT_READ_BUDGET,
+        reason: "negative_history_unmeasured",
+      }
+  }
+  const measured = unwrap(audit)
+  const retained = provisional.admitted.filter({ proof -> !measured.blocked.contains(proof.id) })
+    .to_list()
+  return provisional
+    + {
+      admitted: retained,
+      reason: len(retained) > 0 ? "qualified" : "newer_job_failure",
+      blocked: measured.blocked,
+      negative_runs: measured.runs,
+      negative_probed: measured.probed,
+      reads: bounded.reads(),
+      budget: CHECKPOINT_READ_BUDGET,
+    }
 }

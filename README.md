@@ -80,13 +80,37 @@ main push. A run that reused a job records the run where that job actually
 executed, and the next run proves the job there. It never accepts a pointer
 alone.
 
+A canonical full checkpoint can supply `checkpoint-enrollment`: JSON containing
+`actorId`, `actorLogin` and `headBranch` from its trusted admission policy.
+The resolver verifies that identity against the actual workflow run, requires
+the clean tested commit to match, and checks that main contains it. Every
+unmatched job runs. The resolver inventories main runs and canonical checkpoints,
+then compares matching job failures by execution time, including old runs rerun
+later and earlier attempts of the current checkpoint. A passing job remains
+reusable when an unrelated sibling fails. Unreadable failure attribution or
+incomplete history or an unsettled relevant attempt prevents reuse.
+Without enrollment, dispatches only register original evidence. Scheduled
+backstops remain fresh.
+
+Checkpoint callers also supply `proof-universe`: JSON containing a `generation`
+name and UTC `notBefore` timestamp. The resolver includes both values in every
+job digest and refuses registration when the authenticated original API run was
+created before that timestamp. An old run cannot publish this generation's proofs
+by checking out newer source during a rerun. The negative inventory covers the
+complete creation range for this generation, including later reruns within it.
+Changing either value invalidates prior proofs. Ordinary callers can omit it.
+
 A job counts as passed only when every leg GitHub reports for it succeeded in
 one complete attempt, after that run registered its digests. An unrelated
 failed or cancelled job does not discard the others. The producer must be this
 repository's workflow, completed, with a registration archive whose digest
 matches. Unknown, partial, or unreadable producers prove nothing, so the job
-runs. Lookup reads at most eight runs, with a 40-read budget and a 45-second
-deadline. See the [typed proof owner](scripts/ci-job-proof/contract.harn).
+runs. Ordinary lookup reads at most eight runs, with a 40-read budget and a
+45-second deadline. Checkpoints share that deadline across positive proof and
+negative history, with a 128-read budget and at most eight recent negative
+attempt inspections. Creation-range partitioning defeats GitHub's result cap;
+it keeps every rerun within the generation. Exhaustion returns no reused jobs.
+See the [typed proof owner](scripts/ci-job-proof/contract.harn).
 The [record reference](docs/ci-job-proof-records.md) defines the actual tested
 checkout, the API run head, and the original-run inspection interface.
 

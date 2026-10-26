@@ -1,9 +1,62 @@
-import { Artifact, Registration, Run, RunContext, closed, sha } from "./contract.harn"
+import {
+  Artifact,
+  CheckpointEnrollment,
+  ProofUniverse,
+  Registration,
+  Run,
+  RunContext,
+  TestedSource,
+  closed,
+  qualify_universe_run,
+  sha,
+} from "./contract.harn"
 import { ProofSource, repository, workflow } from "./reader.harn"
 
 const API_ROOT = "https://api.github.com"
 
 const MAX_REGISTRATION_BYTES = 1048576
+
+type CheckpointRun = Run & {head_branch: string, actor: {id: int, login: string}}
+
+type MainComparison = {status: string}
+
+/** Reauthenticate the caller's enrolled full checkpoint and its actual clean checkout on main. */
+pub fn checkpoint_enrollment(
+  source: ProofSource,
+  current: RunContext,
+  tested: TestedSource,
+  raw: string,
+) -> CheckpointEnrollment? {
+  if raw == "" || current.event != "workflow_dispatch" {
+    return nil
+  }
+  const expected = schema_expect(json_parse(raw), closed(schema_of(CheckpointEnrollment)))
+  require expected.actorId > 0 && expected.actorLogin != "" && expected.headBranch != "",
+    "checkpoint enrollment is incomplete"
+  const run = schema_expect(
+    source.json(
+      "/repos/${current.repository}/actions/runs/${current.runId}/attempts/${current.attempt}",
+    ),
+    schema_of(CheckpointRun),
+  )
+  if tested.commit != current.commit || run.id != current.runId
+    || run.run_attempt != current.attempt
+    || run.head_sha != current.commit
+    || run.event != current.event
+    || run.repository.full_name != current.repository
+    || run.head_repository.full_name != current.repository
+    || run.path != ".github/workflows/${current.workflow}"
+    || run.actor.id != expected.actorId
+    || run.actor.login != expected.actorLogin
+    || run.head_branch != expected.headBranch {
+    return nil
+  }
+  const comparison = schema_expect(
+    source.json("/repos/${current.repository}/compare/${sha(current.commit)}...main"),
+    schema_of(MainComparison),
+  )
+  return ["ahead", "identical"].contains(comparison.status) ? expected : nil
+}
 
 fn required(env: HarnessEnv, name: string) -> string {
   const value = env.get(name) ?? ""
@@ -11,37 +64,61 @@ fn required(env: HarnessEnv, name: string) -> string {
   return value
 }
 
-/** Authenticate the current API run without inventing checkout facts for read-only callers. */
-pub fn current_run(env: HarnessEnv, source: ProofSource) -> RunContext {
-  const repo = repository(required(env, "CI_JOB_PROOF_REPOSITORY"))
-  const file = workflow(required(env, "CI_JOB_PROOF_WORKFLOW"))
-  const run_id = to_int(required(env, "CI_JOB_PROOF_RUN_ID"))
-  const attempt = to_int(required(env, "CI_JOB_PROOF_ATTEMPT"))
-  require run_id > 0 && attempt > 0, "invalid current run or attempt"
-  const run = schema_expect(
-    source.json(
-      "/repos/" + repo + "/actions/runs/" + to_string(run_id) + "/attempts/" + to_string(attempt),
-    ),
-    schema_of(Run),
+/** One authentication boundary owns API identity and proof-generation admission. */
+pub fn authenticate_run(
+  source: ProofSource,
+  current: RunContext,
+  universe: ProofUniverse? = nil,
+) -> RunContext {
+  const repo = repository(current.repository)
+  const file = workflow(current.workflow)
+  const commit = sha(current.commit)
+  require current.runId > 0 && current.attempt > 0, "invalid current run or attempt"
+  const raw = source.json(
+    "/repos/${repo}/actions/runs/${current.runId}/attempts/${current.attempt}",
   )
-  const commit = sha(required(env, "CI_JOB_PROOF_COMMIT"))
-  const event = required(env, "CI_JOB_PROOF_EVENT")
-  require run.id == run_id && run.run_attempt == attempt && run.head_sha == commit
-    && run.event == event
+  const run = schema_expect(raw, schema_of(Run))
+  require run.id == current.runId && run.run_attempt == current.attempt && run.head_sha == commit
+    && run.event == current.event
     && run.repository.full_name == repo
     && run.head_repository.full_name == repo
     && run.path == ".github/workflows/" + file,
     "current workflow context differs from the authenticated run"
-  return {
-    repository: repo,
-    workflow: file,
-    event: event,
-    commit: commit,
-    runId: run_id,
-    attempt: attempt,
-    registrarJob: required(env, "CI_JOB_PROOF_REGISTRAR_JOB"),
-    registrarStep: required(env, "CI_JOB_PROOF_REGISTRAR_STEP"),
+  if universe != nil {
+    const original_raw = source.json("/repos/${repo}/actions/runs/${current.runId}")
+    const original = schema_expect(original_raw, schema_of(Run))
+    require original.id == run.id && original.run_attempt == run.run_attempt
+      && original.head_sha == run.head_sha
+      && original.event == run.event
+      && original.path == run.path
+      && original.repository.full_name == run.repository.full_name
+      && original.head_repository.full_name == run.head_repository.full_name,
+      "original run identity changed during proof admission"
+    qualify_universe_run(original_raw, universe)
   }
+  return current
+}
+
+/** Authenticate the current API run without inventing checkout facts for read-only callers. */
+pub fn current_run(
+  env: HarnessEnv,
+  source: ProofSource,
+  universe: ProofUniverse? = nil,
+) -> RunContext {
+  return authenticate_run(
+    source,
+    {
+      repository: required(env, "CI_JOB_PROOF_REPOSITORY"),
+      workflow: required(env, "CI_JOB_PROOF_WORKFLOW"),
+      event: required(env, "CI_JOB_PROOF_EVENT"),
+      commit: required(env, "CI_JOB_PROOF_COMMIT"),
+      runId: to_int(required(env, "CI_JOB_PROOF_RUN_ID")),
+      attempt: to_int(required(env, "CI_JOB_PROOF_ATTEMPT")),
+      registrarJob: required(env, "CI_JOB_PROOF_REGISTRAR_JOB"),
+      registrarStep: required(env, "CI_JOB_PROOF_REGISTRAR_STEP"),
+    },
+    universe,
+  )
 }
 
 fn options(token: string, limit: int) -> dict {

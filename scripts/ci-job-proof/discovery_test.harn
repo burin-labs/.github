@@ -5,12 +5,21 @@ import {
   Registration,
   Run,
   registration,
+  universe_identities,
 } from "./contract.harn"
-import { ProofSource, discover } from "./reader.harn"
+import { ProofSource, READ_BUDGET, discover } from "./reader.harn"
 
 const DIGEST = "a".repeat(64)
 
 const COMMIT = "c".repeat(40)
+
+const CHECKPOINT = {actorId: 42, actorLogin: "release[bot]", headBranch: "main"}
+
+const UNIVERSE = {generation: "fixture-v1", notBefore: "2026-10-09T00:00:00Z"}
+
+fn checkpoint_now() -> int {
+  return to_int(date_parse("2026-10-09T12:00:00Z") * 1000)
+}
 
 pipeline test_dispatch_registers_original_jobs_without_searching_or_reusing_history() {
   const context = current() + {event: "workflow_dispatch"}
@@ -69,6 +78,10 @@ fn run(id: int, event: string) -> Run {
     conclusion: "success",
     repository: {full_name: "acme/product"},
     head_repository: {full_name: "acme/product"},
+    created_at: "2026-10-09T09:00:00Z",
+    updated_at: "2026-10-09T11:00:00Z",
+    head_branch: "main",
+    actor: {id: 42, login: "release[bot]"},
   }
 }
 
@@ -124,11 +137,41 @@ fn source(producers: list, calls: fn(string) -> nil) -> ProofSource {
   return {
     json: fn(endpoint) {
       calls(endpoint)
+      if endpoint.contains("per_page=100&created=") {
+        let latest = {}
+        for item in producers {
+          const selected = endpoint.contains("event=workflow_dispatch") ? item.run.event
+            == "workflow_dispatch" : ["push", "workflow_dispatch", "schedule"].contains(
+            item.run.event,
+          )
+          if selected
+            && (latest[to_string(item.run.id)] == nil
+              || latest[to_string(item.run.id)].run_attempt < item.run.run_attempt) {
+            latest = latest + {[to_string(item.run.id)]: item.run}
+          }
+        }
+        return {total_count: len(latest), workflow_runs: latest.values().to_list()}
+      }
       if endpoint.contains("event=push&branch=main") {
-        return {total_count: 1, workflow_runs: [run(25, "push")]}
+        let latest = {}
+        for item in producers.filter({ item -> item.run.event == "push" }) {
+          const key = to_string(item.run.id)
+          if latest[key] == nil || latest[key].run_attempt < item.run.run_attempt {
+            latest = latest + {[key]: item.run}
+          }
+        }
+        const rows = latest.values().to_list().sorted_by({ item -> -item.id })
+        return {total_count: len(rows), workflow_runs: rows.slice(0, 5)}
+      }
+      if endpoint.contains("event=push&head_sha=" + COMMIT) {
+        return {total_count: 0, workflow_runs: []}
       }
       if endpoint.contains("event=merge_group&head_sha=" + COMMIT) {
-        return {total_count: 1, workflow_runs: [run(20, "merge_group")]}
+        const rows = producers.filter({ item -> item.run.event == "merge_group" }).map(
+          { item -> item.run },
+        )
+          .to_list()
+        return {total_count: len(rows), workflow_runs: rows.slice(0, 5)}
       }
       const found = regex_captures("/actions/runs/([0-9]+)/", endpoint)
       const id = to_int(found[0].groups[0])
@@ -163,6 +206,409 @@ fn source(producers: list, calls: fn(string) -> nil) -> ProofSource {
     registration:
       fn(_repo, artifact) { return at(artifact.id / 10, artifact.id % 10).registration },
   }
+}
+
+fn failing(item: dict, names: list<string>, completed: string = "2026-10-09T11:00:00Z") -> dict {
+  return item
+    + {
+      run: item.run + {conclusion: "failure"},
+      jobs: item.jobs.map(
+        { job ->
+          names.contains(job.name) ? job + {conclusion: "failure", completed_at: completed} : job
+        },
+      )
+        .to_list(),
+    }
+}
+
+pipeline test_enrolled_checkpoint_reuses_only_qualified_inputs_and_keeps_failed_inputs_fresh() {
+  const context = current() + {event: "workflow_dispatch"}
+  const older = producer(
+    run(20, "merge_group"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const latest = producer(run(25, "push"), {lint: {digest: DIGEST}}, ["Lint"])
+  const accepted = discover(
+    source([latest, older], fn(_endpoint) { return nil }),
+    context,
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(
+    accepted.admitted.map({ proof -> [proof.id, proof.provenance.runId] }),
+    [["lint", 25], ["suite", 20]],
+  )
+  assert_eq(accepted.blocked, [])
+  assert(accepted.reads > 0 && accepted.reads <= READ_BUDGET)
+  const failed = failing(latest, ["Lint"])
+  const refused = discover(
+    source([failed, older], fn(_endpoint) { return nil }),
+    context,
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(refused.blocked, ["lint"])
+  assert_eq(refused.admitted.map({ proof -> proof.id }), ["suite"])
+  const complete = source([failed, older], fn(_endpoint) { return nil })
+  const unreadable: ProofSource = {
+    json: complete.json,
+    registration: fn(repo, artifact) {
+      if artifact.workflow_run.id == 25 {
+        throw "failed producer registration is unreadable"
+      }
+      return complete.registration(repo, artifact)
+    },
+  }
+  const unknown = discover(unreadable, context, wanted(), nil, checkpoint_now, CHECKPOINT, UNIVERSE)
+  assert_eq(unknown.blocked, ["lint", "suite"])
+  assert_eq(unknown.admitted, [])
+  const changed = discover(
+    source([latest, older], fn(_endpoint) { return nil }),
+    context,
+    [{id: "lint", names: ["Lint"], digest: "b".repeat(64)}],
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(changed.admitted, [])
+}
+
+pipeline test_checkpoint_checks_newer_failed_attempt_before_old_success_of_the_same_run() {
+  const earlier = producer(
+    run(25, "push"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const later = failing(
+    producer(
+      run(25, "push") + {run_attempt: 2, conclusion: "failure"},
+      {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+      ["Lint", "Suite"],
+    ),
+    ["Lint", "Suite"],
+  )
+  const complete = source([earlier, later], fn(_endpoint) { return nil })
+  const changing: ProofSource = {
+    json: fn(endpoint) {
+      if endpoint.contains("per_page=100&created=") {
+        return complete.json(endpoint)
+      }
+      if endpoint.contains("event=push&head_sha=" + COMMIT) {
+        return {total_count: 1, workflow_runs: [earlier.run]}
+      }
+      if endpoint.contains("event=push&branch=main") {
+        return {total_count: 1, workflow_runs: [later.run]}
+      }
+      return complete.json(endpoint)
+    },
+    registration: complete.registration,
+  }
+  const result = discover(
+    changing,
+    current() + {event: "workflow_dispatch"},
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(result.blocked, ["lint", "suite"])
+  assert_eq(result.admitted, [])
+}
+
+pipeline test_later_failed_checkpoint_is_negative_evidence_but_never_positive_proof() {
+  const good = producer(
+    run(20, "merge_group"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const bad = failing(
+    producer(
+      run(25, "workflow_dispatch"),
+      {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+      ["Lint", "Suite"],
+    ),
+    ["Lint"],
+  )
+  const observed = discover(
+    source([good, bad], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(observed.blocked, ["lint"])
+  assert_eq(observed.admitted.map({ proof -> [proof.id, proof.provenance.runId] }), [["suite", 20]])
+  const only_dispatch = discover(
+    source(
+      [producer(run(25, "workflow_dispatch"), {lint: {digest: DIGEST}}, ["Lint"])],
+      fn(_endpoint) { return nil },
+    ),
+    current() + {event: "workflow_dispatch"},
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(only_dispatch.admitted, [])
+}
+
+pipeline test_active_checkpoint_with_finished_failure_cannot_hide_behind_old_success() {
+  const good = producer(run(20, "merge_group"), {lint: {digest: DIGEST}}, ["Lint"])
+  const bad = failing(
+    producer(run(25, "workflow_dispatch"), {lint: {digest: DIGEST}}, ["Lint"]),
+    ["Lint"],
+  )
+  const active = bad + {run: bad.run + {status: "in_progress", conclusion: nil}}
+  const result = discover(
+    source([good, active], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    [wanted()[0]],
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(result.admitted, [])
+  assert_eq(result.reason, "negative_history_unmeasured")
+  assert_eq(result.negative_runs, nil)
+}
+
+pipeline test_lower_run_id_later_failed_rerun_revokes_direct_and_deferred_proof() {
+  const good = producer(
+    run(20, "push"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const earlier = producer(
+    run(10, "push"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const bad = failing(
+    producer(
+      run(10, "push") + {run_attempt: 2},
+      {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+      ["Lint", "Suite"],
+    ),
+    ["Lint"],
+  )
+  const observed = discover(
+    source([good, earlier, bad], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(observed.blocked, ["lint"])
+  assert_eq(observed.admitted.map({ proof -> proof.id }), ["suite"])
+  const pointer = producer(
+    run(20, "merge_group"),
+    {lint: {digest: DIGEST, provenance: {runId: 7, attempt: 1}}},
+    [],
+  )
+  const original = producer(run(7, "push"), {lint: {digest: DIGEST}}, ["Lint"])
+  const deferred = discover(
+    source([pointer, original, earlier, bad], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    [wanted()[0]],
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(deferred.admitted, [])
+  assert_eq(deferred.blocked, ["lint"])
+}
+
+pipeline test_current_checkpoint_previous_failed_attempt_cannot_reuse_old_success() {
+  const good = producer(
+    run(20, "merge_group"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const bad = failing(
+    producer(
+      run(30, "workflow_dispatch"),
+      {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+      ["Lint", "Suite"],
+    ),
+    ["Lint"],
+  )
+  const active = producer(
+    run(30, "workflow_dispatch") + {run_attempt: 2, status: "in_progress", conclusion: nil},
+    {},
+    [],
+  )
+  const observed = discover(
+    source([good, bad, active], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch", attempt: 2},
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(observed.blocked, ["lint"])
+  assert_eq(observed.admitted.map({ proof -> proof.id }), ["suite"])
+}
+
+pipeline test_unrelated_job_failure_and_changed_input_do_not_discard_passing_job() {
+  const good = producer(
+    run(20, "merge_group"),
+    {lint: {digest: DIGEST}, suite: {digest: DIGEST}},
+    ["Lint", "Suite"],
+  )
+  const mixed = failing(
+    producer(run(25, "push"), {lint: {digest: DIGEST}, suite: {digest: DIGEST}}, ["Lint", "Suite"]),
+    ["Suite"],
+  )
+  const observed = discover(
+    source([good, mixed], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    wanted(),
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(observed.blocked, ["suite"])
+  assert_eq(observed.admitted.map({ proof -> proof.id }), ["lint"])
+  const changed = failing(
+    producer(run(25, "push"), {lint: {digest: "b".repeat(64)}}, ["Lint"]),
+    ["Lint"],
+  )
+  const unchanged = discover(
+    source([good, changed], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    [wanted()[0]],
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(unchanged.blocked, [])
+  assert_eq(unchanged.admitted.map({ proof -> proof.id }), ["lint"])
+}
+
+pipeline test_one_failed_matrix_leg_blocks_that_logical_job() {
+  const matrix = {id: "suite", names: ["^Suite \\([a-z]+\\)$"], digest: DIGEST}
+  const decorate = fn(item) { return item
+    + {
+      registration: item.registration
+        + {
+          jobs: item.registration.jobs.map(
+            { claim -> claim.id == "suite" ? claim + {names: matrix.names} : claim },
+          )
+            .to_list(),
+        },
+    } }
+  const good = decorate(
+    producer(run(20, "merge_group"), {suite: {digest: DIGEST}}, ["Suite (a)", "Suite (long)"]),
+  )
+  const bad = failing(
+    decorate(producer(run(25, "push"), {suite: {digest: DIGEST}}, ["Suite (a)", "Suite (long)"])),
+    ["Suite (long)"],
+  )
+  const result = discover(
+    source([good, bad], fn(_endpoint) { return nil }),
+    current() + {event: "workflow_dispatch"},
+    [matrix],
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(result.blocked, ["suite"])
+  assert_eq(result.admitted, [])
+}
+
+pipeline test_advancing_floor_with_same_generation_cannot_retain_old_matching_positive() {
+  const original_wanted = universe_identities([wanted()[0]], UNIVERSE)
+  const advanced = UNIVERSE + {notBefore: "2026-10-09T10:30:00Z"}
+  const next_wanted = universe_identities([wanted()[0]], advanced)
+  const good = producer(
+    run(20, "merge_group"),
+    {lint: {digest: original_wanted[0].digest}},
+    ["Lint"],
+  )
+  const bad = failing(
+    producer(run(25, "workflow_dispatch"), {lint: {digest: original_wanted[0].digest}}, ["Lint"]),
+    ["Lint"],
+  )
+  const complete = source([good, bad], fn(_endpoint) { return nil })
+  const original = discover(
+    complete,
+    current() + {event: "workflow_dispatch"},
+    original_wanted,
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(original.blocked, ["lint"])
+  let excluded_reads = 0
+  const excluded: ProofSource = {
+    json: fn(endpoint) {
+      if endpoint.contains("per_page=100&created=") {
+        excluded_reads = excluded_reads + 1
+        return {total_count: 0, workflow_runs: []}
+      }
+      return complete.json(endpoint)
+    },
+    registration: complete.registration,
+  }
+  const next = discover(
+    excluded,
+    current() + {event: "workflow_dispatch"},
+    next_wanted,
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    advanced,
+  )
+  assert_eq(next.admitted, [])
+  assert_eq(next.reason, "no_qualified_registration")
+  assert_eq(excluded_reads, 0)
+}
+
+pipeline test_incomplete_negative_inventory_cannot_return_provisional_success() {
+  const good = producer(run(20, "merge_group"), {lint: {digest: DIGEST}}, ["Lint"])
+  const complete = source([good], fn(_endpoint) { return nil })
+  const partial: ProofSource = {
+    json: fn(endpoint) {
+      if endpoint.contains("per_page=100&created=") {
+        return {total_count: 1, workflow_runs: []}
+      }
+      return complete.json(endpoint)
+    },
+    registration: complete.registration,
+  }
+  const result = discover(
+    partial,
+    current() + {event: "workflow_dispatch"},
+    [wanted()[0]],
+    nil,
+    checkpoint_now,
+    CHECKPOINT,
+    UNIVERSE,
+  )
+  assert_eq(result.admitted, [])
+  assert_eq(result.reason, "negative_history_unmeasured")
+  assert_eq(result.negative_runs, nil)
 }
 
 pipeline test_a_reused_job_is_proven_at_the_run_that_executed_it() {

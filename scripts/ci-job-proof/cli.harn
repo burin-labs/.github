@@ -2,14 +2,17 @@ import { write_json } from "std/fs"
 import { gha_write_output } from "std/gha"
 import {
   JobIdentity,
+  ProofUniverse,
   RECEIPT_SCHEMA,
   REGISTRATION_EVENTS,
   Registration,
   identities,
+  proof_universe,
   registration,
   registration_artifact_name,
+  universe_identities,
 } from "./contract.harn"
-import { current_run, live_source } from "./live.harn"
+import { checkpoint_enrollment, current_run, live_source } from "./live.harn"
 import { READ_BUDGET, discover, merge_group_pull } from "./reader.harn"
 import { tested_source } from "./source.harn"
 
@@ -39,9 +42,9 @@ fn register(harness: Harness, published: Registration) {
   )
 }
 
-fn resolve(harness: Harness, wanted: list<JobIdentity>) {
+fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?) {
   const source = live_source(harness.net, harness.fs, required(harness.env, "GH_TOKEN"))
-  const current = current_run(harness.env, source)
+  const current = current_run(harness.env, source, universe)
   if !REGISTRATION_EVENTS.contains(current.event) {
     harness.stdio.println(
       "This event neither registers nor reuses job proofs; every selected job runs.",
@@ -50,6 +53,12 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
   }
   const workspace = required(harness.env, "GITHUB_WORKSPACE")
   const actual_source = tested_source(harness.process, workspace)
+  const checkpoint = checkpoint_enrollment(
+    source,
+    current,
+    actual_source,
+    harness.env.get("CI_JOB_PROOF_CHECKPOINT_ENROLLMENT") ?? "",
+  )
   const discovery = try {
     discover(
       source,
@@ -57,6 +66,8 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
       wanted,
       merge_group_pull(harness.env.get("CI_JOB_PROOF_MERGE_GROUP_HEAD_REF") ?? ""),
       fn() { return harness.clock.now_ms() },
+      checkpoint,
+      universe,
     )
   }
   const found = is_ok(discovery) ? unwrap(discovery) : {
@@ -65,8 +76,20 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>) {
     reads: nil,
     budget: READ_BUDGET,
     reason: "discovery_failed",
+    blocked: [],
+    negative_runs: nil,
+    negative_probed: nil,
   }
-  output(harness, "discovery", json_stringify(pick(found, ["probed", "reads", "budget", "reason"])))
+  output(
+    harness,
+    "discovery",
+    json_stringify(
+      pick(
+        found,
+        ["probed", "reads", "budget", "reason", "blocked", "negative_runs", "negative_probed"],
+      ),
+    ),
+  )
   // Registration records where each reused job actually ran, so a later run
   // proves it there instead of trusting this run's pointer.
   require tested_source(harness.process, workspace) == actual_source,
@@ -110,9 +133,24 @@ fn main(harness: Harness) {
     return
   }
   try {
-    resolve(harness, identities(json_parse(raw)))
+    const universe = proof_universe(harness.env.get("CI_JOB_PROOF_UNIVERSE") ?? "")
+    resolve(harness, universe_identities(identities(json_parse(raw)), universe), universe)
   } catch (_error) {
     // Diagnostics never expose API responses, tokens, or caller-provided plan values.
+    output(
+      harness,
+      "discovery",
+      json_stringify(
+        {
+          reason: "registration_unqualified",
+          probed: nil,
+          reads: nil,
+          budget: READ_BUDGET,
+          negative_runs: nil,
+          negative_probed: nil,
+        },
+      ),
+    )
     harness.stdio.println("Job proofs could not be qualified; selected jobs will run.")
   }
 }
