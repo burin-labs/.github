@@ -1,0 +1,109 @@
+import { command_run } from "std/command"
+import { complete_command_result } from "../captured-command.harn"
+import { ManifestIdentity } from "./authorization.harn"
+import { CompletionAuthorization, PromotionRequest } from "./promotion.harn"
+
+type ArchiveProof = {
+  schema: string,
+  stage: string,
+  source_sha: string,
+  producer_run: string,
+  producer_attempt: int,
+  verdict: string,
+  pending: int,
+  failed_jobs: list<string>,
+  observed_jobs: int,
+  proven_artifacts: int,
+  manifest: ManifestIdentity,
+}
+
+pub fn standalone_manifest(
+  raw: unknown,
+  request: PromotionRequest,
+  attempt: int,
+) -> ManifestIdentity {
+  const proof = schema_expect(raw, schema_of(ArchiveProof))
+  require request.repository == "burin-labs/harn"
+    && proof.schema == "harn.release.producer_readiness.v1"
+    && proof.stage == "candidate-archives"
+    && proof.source_sha == request.sha
+    && proof.producer_run == to_string(request.run_id)
+    && proof.producer_attempt == attempt
+    && proof.verdict == "pass"
+    && proof.pending == 0
+    && len(proof.failed_jobs) == 0
+    && proof.observed_jobs > 0
+    && proof.proven_artifacts > 0
+    && proof.manifest.id > 0
+    && regex_match("^sha256:[0-9a-f]{64}$", proof.manifest.digest) != nil,
+    "standalone archive qualification does not bind this producer"
+  return proof.manifest
+}
+
+pub fn require_source_proof(output: string, source: string) -> nil {
+  let main_proofs = 0
+  let native_proofs = 0
+  for line in output.split("\n") {
+    if !trim(line).starts_with("{") {
+      continue
+    }
+    const proof = json_parse(line)
+    if proof?.kind == "harn.release.full_suite.v1" && proof?.verdict == "success" {
+      require proof?.source_sha == source && proof?.pending_count == 0 && proof?.failed_count == 0
+        && proof?.missing_jobs == [],
+        "standalone main CI proof is mismatched"
+      main_proofs += 1
+    }
+    if proof?.kind == "harn.release.native_qualification" {
+      require proof?.source == source && proof?.status == "complete"
+        && proof?.pending_count == 0
+        && proof?.failed_count == 0
+        && proof?.observed_jobs > 0
+        && proof?.required_steps > 0,
+        "standalone native qualification is incomplete"
+      native_proofs += 1
+    }
+  }
+  require main_proofs == 1 && native_proofs > 0,
+    "standalone publication requires measured main CI and native qualification"
+  return nil
+}
+
+/** Existing immutable Harn readers own the complete source and archive policy. */
+pub fn standalone_completion(
+  tools: HarnessTools,
+  config: {token: string, reader_root: string},
+  request: PromotionRequest,
+) -> CompletionAuthorization {
+  require request.repository == "burin-labs/harn", "standalone qualification is Harn-owned"
+  return fn(attempt: int) {
+    const env = {
+      GH_TOKEN: config.token,
+      GITHUB_REPOSITORY: request.repository,
+      GH_REPO: request.repository,
+      EXPECTED_SOURCE_SHA: request.sha,
+      SOURCE_SHA: request.sha,
+      CANDIDATE_RUN_ID: to_string(request.run_id),
+      CANDIDATE_RUN_ATTEMPT: to_string(attempt),
+      WAIT_FOR_FULL_SUITE: "false",
+    }
+    const source = complete_command_result(
+      command_run(
+        tools,
+        ["bash", path_join(config.reader_root, "scripts/ci/require_full_suite.sh")],
+        {env: env, timeout_ms: 180000, capture: {max_inline_bytes: 65536}},
+      ),
+    )
+    require source.success, "standalone source qualification refused"
+    require_source_proof(source.stdout, request.sha)
+    const archives = complete_command_result(
+      command_run(
+        tools,
+        ["node", path_join(config.reader_root, "scripts/ci/qualify-release-producer.mjs")],
+        {env: env, timeout_ms: 180000, capture: {max_inline_bytes: 16384}},
+      ),
+    )
+    require archives.success, "standalone archive qualification refused"
+    return standalone_manifest(json_parse(archives.stdout), request, attempt)
+  }
+}

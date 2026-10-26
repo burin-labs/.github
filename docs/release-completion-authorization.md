@@ -1,9 +1,33 @@
 # Release completion authorization
 
+`inspect-only: true` runs the existing publisher's `inspect` mode after archive
+verification and normal release-App token minting. It validates the same sealed
+candidate and publication intent, then passes only the production JSON reader
+to release discovery and asset census. It cannot create a draft, upload files,
+create a tag or publish. Its JSON reports source, tag state, draft ID, notes
+hashes, intent/manifest hashes and pending asset names/counts. A missing release
+or changed notes fails inspection. It does not report publication outputs;
+callers must skip downstream publication jobs. A successful inspection proves
+only observed state, and a later ordinary publication rechecks every guard.
+
 Ordinary promotion requires a completed successful producer at the requested
 source. Harn may also provide `original-consumer-context` when its original
 consumer observer reached its deadline and the exact admitted child later
 completed successfully with a reached product pass.
+
+An explicit `standalone-harn` call qualifies Harn publication separately from
+downstream adoption. It runs the immutable Harn source-CI/native reader and
+archive-producer reader, requiring measured complete source proof and every
+required build, smoke, audit and archive handoff. The archive reader binds the
+original producing attempt and exact manifest ID/digest. Publication repeats
+these reads before writing and retains all manifest, file, signature,
+attestation and ancestry checks. A failed or absent Harn-owned check refuses;
+empty output or a zero exit code without measured proof also refuses.
+
+This mode is restricted to Harn, defaults off, and cannot be combined with
+either consumer completion selector. It does not qualify a consumer, claim a
+successful rehearsal, or rewrite the original failed producer result. Consumer
+compatibility and adoption remain separately measured obligations.
 
 Harn owns which producer failures are eligible and which downstream product
 steps and receipts prove completion. One immutable reader authenticates the
@@ -35,6 +59,13 @@ candidate through original deadline recovery. Repair uses its distinct typed
 decision and binds the original producer and manifest instead. The two modes
 are mutually exclusive. Failed, empty, malformed or truncated reader output
 refuses.
+
+The host filesystem retains command-owned output bytes before archive
+inspection through the existing scoped read/write APIs. ZIP size, digest and
+sole-member checks remain mandatory before the extracted manifest is installed.
+The launcher allocates new command captures in a private temporary directory
+inside its existing writable workspace. It does not grant access to captures
+from an earlier invocation outside that scope.
 
 This authorization changes only the producer-success prerequisite. Manifest,
 archive digests, attestations, source ancestry, signing and publication checks

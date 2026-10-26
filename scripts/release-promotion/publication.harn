@@ -19,6 +19,22 @@ pub type PublicationGitHub = {
   publish_draft: fn(int, bool) -> unknown,
 }
 
+pub type PublicationReader = {json: fn(string) -> unknown}
+
+pub type PublicationInspection = {
+  tag: string,
+  source_commit: string,
+  tag_commit: string?,
+  release_id: int?,
+  draft: bool?,
+  notes_sha256: string?,
+  expected_notes_sha256: string,
+  expected_asset_count: int,
+  existing_asset_count: int,
+  pending_asset_names: list<string>,
+  pending_asset_count: int,
+}
+
 type Release = {
   id: int,
   tag_name: string,
@@ -52,7 +68,7 @@ fn release_record(raw: unknown, plan: ReleasePlan) -> Release {
   return release
 }
 
-fn release_for(github: PublicationGitHub, plan: ReleasePlan) -> Release? {
+fn release_for(github: PublicationReader, plan: ReleasePlan) -> Release? {
   const published = github.json("${prefix(plan)}/releases/tags/${url_encode(plan.tag)}")
   let found = published == nil ? nil : release_record(published, plan)
   for page in range(1, 11) {
@@ -76,7 +92,7 @@ fn release_for(github: PublicationGitHub, plan: ReleasePlan) -> Release? {
   throw "release census is incomplete after 1000 records"
 }
 
-fn tag_commit(github: PublicationGitHub, plan: ReleasePlan) -> string? {
+fn tag_commit(github: PublicationReader, plan: ReleasePlan) -> string? {
   const ref = github.json("${prefix(plan)}/git/ref/tags/${url_encode(plan.tag)}")
   if ref == nil {
     return nil
@@ -90,7 +106,7 @@ fn tag_commit(github: PublicationGitHub, plan: ReleasePlan) -> string? {
   return to_string(annotated?.object?.sha)
 }
 
-fn assets_for(github: PublicationGitHub, plan: ReleasePlan, release: Release) -> list<Asset> {
+fn assets_for(github: PublicationReader, plan: ReleasePlan, release: Release) -> list<Asset> {
   let assets = []
   for page in range(1, 11) {
     const records = schema_expect(
@@ -107,7 +123,7 @@ fn assets_for(github: PublicationGitHub, plan: ReleasePlan, release: Release) ->
 }
 
 fn missing_files(
-  github: PublicationGitHub,
+  github: PublicationReader,
   plan: ReleasePlan,
   release: Release,
 ) -> list<ReleaseFile> {
@@ -131,6 +147,27 @@ fn require_complete(github: PublicationGitHub, plan: ReleasePlan, release: Relea
   require tag_commit(github, plan) == plan.sha,
     "published ${plan.tag} but the tag does not point at ${plan.sha}"
   return nil
+}
+
+/** Inspect the same identity and asset census with no mutation capability. */
+pub fn inspect_publication(github: PublicationReader, plan: ReleasePlan) -> PublicationInspection {
+  const tagged = tag_commit(github, plan)
+  require tagged == nil || tagged == plan.sha, "inspection found a conflicting release tag"
+  const release = release_for(github, plan)
+  const missing = release == nil ? plan.files : missing_files(github, plan, release)
+  return {
+    tag: plan.tag,
+    source_commit: plan.sha,
+    tag_commit: tagged,
+    release_id: release?.id,
+    draft: release?.draft,
+    notes_sha256: release == nil ? nil : sha256(release.body),
+    expected_notes_sha256: sha256(plan.body),
+    expected_asset_count: len(plan.files),
+    existing_asset_count: len(plan.files) - len(missing),
+    pending_asset_names: missing.map({ file -> file.name }),
+    pending_asset_count: len(missing),
+  }
 }
 
 pub fn reconcile_publication(

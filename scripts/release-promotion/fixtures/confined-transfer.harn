@@ -1,0 +1,40 @@
+import { command_run } from "std/command"
+import { download_bound_manifest } from "../bound-manifest.harn"
+
+fn main(harness: Harness) {
+  const output = unwrap(harness.env.get("PROMOTE_DIRECTORY"))
+  const work = dirname(output)
+  const archive = path_join(work, "fixture.zip")
+  const bytes = harness.fs.read_bytes(archive)
+  const identity = {id: 9, digest: "sha256:" + sha256(bytes)}
+  const metadata = {
+    id: 9,
+    name: "candidate-manifest-fixture",
+    digest: identity.digest,
+    expired: false,
+    size_in_bytes: len(bytes),
+    workflow_run: {id: 100},
+  }
+  const run = fn(argv: list<string>, options: dict) {
+    const result = command_run(harness.tools, argv[0] == "gh" ? ["cat", archive] : argv, options)
+    if argv[0] == "gh" {
+      harness.stdio.println("capture_path=" + result.stdout_path)
+    }
+    return result
+  }
+  download_bound_manifest(
+    harness.fs,
+    run,
+    fn(_endpoint: string) { return metadata },
+    {},
+    "acme/fixture",
+    100,
+    "candidate-manifest-fixture",
+    identity,
+    output,
+  )
+  require harness.fs.read_text(path_join(output, "candidate-manifest.json"))
+    == harness.fs.read_text(path_join(work, "input/candidate-manifest.json")),
+    "confined manifest bytes changed"
+  harness.stdio.println("confined-binary-transfer=pass")
+}

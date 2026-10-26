@@ -31,6 +31,7 @@ pipeline test_bound_manifest_download_authenticates_exact_zip_bytes_before_extra
       let commands = []
       const run = fn(argv: list<string>, options: dict) {
         commands = commands + [argv]
+        assert(argv[0] != "cp", "owned capture artifacts must not require a child filesystem grant")
         if argv[0] == "gh" {
           assert_eq(argv, ["gh", "api", "/repos/acme/producer/actions/artifacts/9/zip"])
           assert_eq(options.env.GH_TOKEN, "fixture-token")
@@ -58,6 +59,36 @@ pipeline test_bound_manifest_download_authenticates_exact_zip_bytes_before_extra
       )
       assert_eq(reads, 1)
       assert_eq(harness.fs.read_text(path_join(output, CANDIDATE_MANIFEST_FILE)), source)
+      for failure in ["archive-missing", "manifest-missing", "manifest-length"] {
+        const broken_run = fn(argv: list<string>, options: dict) {
+          const result = run(argv, options)
+          if (failure == "archive-missing" && argv[0] == "gh")
+            || (failure == "manifest-missing" && argv[0] == "unzip" && argv[1] == "-p") {
+            return result + {stdout_path: path_join(work, "missing-capture")}
+          }
+          if failure == "manifest-length" && argv[0] == "unzip" && argv[1] == "-p" {
+            return result + {byte_count: result.byte_count + 1}
+          }
+          return result
+        }
+        assert(
+          is_err(
+            try {
+              download_bound_manifest(
+                harness.fs,
+                broken_run,
+                read,
+                {GH_TOKEN: "fixture-token"},
+                "acme/producer",
+                100,
+                NAME,
+                identity,
+                output,
+              )
+            },
+          ),
+        )
+      }
       const changed = identity + {digest: "sha256:" + sha256("different ZIP")}
       commands = []
       assert_error_contains(

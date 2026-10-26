@@ -1,0 +1,107 @@
+import { CheckpointEnrollment, ProofUniverse, Run, RunContext } from "./contract.harn"
+
+pub type ObservedRun = Run \
+  & {created_at: string, updated_at: string, head_branch: string, actor: {id: int, login: string}}
+
+type Page = {total_count: int, workflow_runs: list<ObservedRun>}
+
+pub type HistorySource = {json: fn(string) -> unknown}
+
+fn stamp(seconds: int) -> string {
+  return date_format(seconds, "%Y-%m-%dT%H:%M:%SZ")
+}
+
+/**
+ * Partition creation ranges to defeat GitHub's cap without omitting reruns inside the generation.
+ */
+fn census(
+  source: HistorySource,
+  prefix: string,
+  query: string,
+  start: int,
+  through: int,
+) -> list<ObservedRun> {
+  const endpoint = "${prefix}/runs?${query}&per_page=100&created=${stamp(start)}..${stamp(through)}"
+  const first = schema_expect(source.json("${endpoint}&page=1"), schema_of(Page))
+  require first.total_count >= 0 && len(first.workflow_runs) <= 100
+    && len(first.workflow_runs) <= first.total_count,
+    "negative run census is malformed"
+  if first.total_count >= 1000 {
+    require len(first.workflow_runs) > 0, "negative run census is partial"
+    const pivot = to_int(
+      first.workflow_runs.map({ run -> date_parse(run.created_at) }).to_list().sorted()[0],
+    )
+    require pivot > start && pivot <= through, "negative run census cannot be partitioned"
+    const divided = census(source, prefix, query, start, pivot - 1)
+      + census(source, prefix, query, pivot, through)
+    require len(divided) >= first.total_count
+      && len(divided.map({ run -> run.id }).unique()) == len(divided),
+      "partitioned negative census is incomplete or duplicated"
+    return divided
+  }
+  let rows = first.workflow_runs
+  for page in range(2, 11) {
+    if len(rows) == first.total_count {
+      break
+    }
+    const next = schema_expect(source.json("${endpoint}&page=${page}"), schema_of(Page))
+    require next.total_count == first.total_count && len(next.workflow_runs) > 0
+      && len(next.workflow_runs) <= 100,
+      "negative run census is partial or changing"
+    rows = rows + next.workflow_runs
+  }
+  require len(rows) == first.total_count && len(rows.map({ run -> run.id }).unique()) == len(rows),
+    "negative run census is incomplete or duplicated"
+  for run in rows {
+    const created = date_parse(run.created_at)
+    require created >= start && created <= through && date_parse(run.updated_at) >= created,
+      "negative run census chronology is unmeasured"
+  }
+  return rows
+}
+
+/** A complete metadata inventory includes old runs whose reruns executed recently. */
+pub fn checkpoint_history(
+  source: HistorySource,
+  current: RunContext,
+  enrolled: CheckpointEnrollment,
+  universe: ProofUniverse,
+  through_ms: int,
+) -> list<ObservedRun> {
+  const prefix = "/repos/${current.repository}/actions/workflows/${current.workflow}"
+  const start = to_int(date_parse(universe.notBefore))
+  const main = census(source, prefix, "branch=main", start, to_int(through_ms / 1000))
+  const checkpoints = census(
+    source,
+    prefix,
+    "event=workflow_dispatch&actor=${url_encode(enrolled.actorLogin)}",
+    start,
+    to_int(through_ms / 1000),
+  )
+  for run in main + checkpoints {
+    require run.id > 0 && run.run_attempt > 0
+      && (run.status != "completed" || run.conclusion != nil)
+      && run.repository.full_name == current.repository
+      && run.head_repository.full_name == current.repository
+      && run.path == ".github/workflows/${current.workflow}"
+      && ((["push", "schedule", "workflow_dispatch"].contains(run.event)
+          && run.head_branch == "main")
+        || (run.event == "workflow_dispatch" && run.actor.id == enrolled.actorId
+          && run.actor.login == enrolled.actorLogin)),
+      "negative run census identity mismatch"
+  }
+  let unique = {}
+  for run in main + checkpoints {
+    const key = to_string(run.id)
+    const previous = unique[key]
+    if previous != nil {
+      require previous.run_attempt == run.run_attempt && previous.updated_at == run.updated_at
+        && previous.head_sha == run.head_sha
+        && previous.status == run.status
+        && previous.conclusion == run.conclusion,
+        "negative run inventory changed between reads"
+    }
+    unique = unique + {[key]: run}
+  }
+  return unique.values().to_list()
+}

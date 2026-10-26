@@ -10,13 +10,27 @@ fn promote(fs: HarnessFs) -> dict {
   return yaml_parse(read(fs, ".github/workflows/promote-release.yml"))
 }
 
+fn named_step(steps: list, name: string) -> dict {
+  const matches = steps.filter({ step -> step.name == name }).to_list()
+  assert_eq(len(matches), 1, name)
+  return matches[0]!
+}
+
 pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harness) {
   const workflow = promote(harness.fs)
   assert_eq(keys(workflow.on), ["workflow_call"])
   const call = workflow.on.workflow_call
   assert_eq(
     keys(call.inputs).sorted(),
-    ["consumer-repair", "original-consumer-context", "run-id", "sha", "tag"],
+    [
+      "consumer-repair",
+      "inspect-only",
+      "original-consumer-context",
+      "run-id",
+      "sha",
+      "standalone-harn",
+      "tag",
+    ],
   )
   for name in ["run-id", "sha", "tag"] {
     assert_eq(call.inputs[name].required, true)
@@ -30,7 +44,20 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
   for name in ["RELEASE_APP_CLIENT_ID", "RELEASE_APP_PRIVATE_KEY"] {
     assert_eq(call.secrets[name].required, true)
   }
+  assert_eq(
+    call.inputs["standalone-harn"],
+    {
+      description:
+        "Qualify Harn's own source and immutable archives independently of downstream adoption.",
+      required: false,
+      default: false,
+      type: "boolean",
+    },
+  )
   assert_eq(call.secrets.CONSUMER_CANARY_REPOSITORY.required, false)
+  assert_eq(call.inputs["inspect-only"].type, "boolean")
+  assert_eq(call.inputs["inspect-only"].default, false)
+  assert_eq(call.inputs["inspect-only"].required, false)
   assert_eq(call.outputs.tag.value, expression("jobs.promote.outputs.tag"))
   assert_eq(call.outputs["release-url"].value, expression("jobs.promote.outputs.release-url"))
   assert_eq(workflow.permissions, {contents: "read"})
@@ -46,6 +73,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   assert_eq(
     job.steps.map({ step -> step.name }),
     [
+      "Require standalone inspection scope",
       "Require called-workflow identity",
       "Check out workflow implementation",
       "Set up exact Harn release",
@@ -55,10 +83,15 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "Verify the run and its files",
       "Preserve the verified publication intent",
       "Mint the release token",
-      "Publish the verified files",
+      "Inspect or publish the verified files",
     ],
   )
-  const implementation = job.steps[1]
+  assert_eq(
+    named_step(job.steps, "Require standalone inspection scope").if,
+    "inputs.inspect-only && (!inputs.standalone-harn || github.repository != 'burin-labs/harn')",
+  )
+  assert(named_step(job.steps, "Require standalone inspection scope").run.contains("exit 2"))
+  const implementation = named_step(job.steps, "Check out workflow implementation")
   assert_eq(
     implementation["with"],
     {
@@ -68,13 +101,13 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "persist-credentials": false,
     },
   )
-  const reader = job.steps[3]
-  const runtime = job.steps[4]
-  const reader_token = job.steps[5]
-  const verify = job.steps[6]
-  const checkpoint = job.steps[7]
-  const token = job.steps[8]
-  const publish = job.steps[9]
+  const reader = named_step(job.steps, "Check out the immutable consumer reader")
+  const runtime = named_step(job.steps, "Set up the consumer reader runtime")
+  const reader_token = named_step(job.steps, "Mint consumer read authority")
+  const verify = named_step(job.steps, "Verify the run and its files")
+  const checkpoint = named_step(job.steps, "Preserve the verified publication intent")
+  const token = named_step(job.steps, "Mint the release token")
+  const publish = named_step(job.steps, "Inspect or publish the verified files")
   assert_eq(
     job.concurrency,
     {
@@ -88,12 +121,16 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   assert_eq(checkpoint.with["if-no-files-found"], "error")
   assert_eq(checkpoint.with["include-hidden-files"], true)
   assert_eq(checkpoint.with["retention-days"], 30)
-  for step in [reader, runtime, reader_token] {
+  for step in [reader, runtime] {
     assert_eq(
       step.if,
-      "(inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'",
+      "(inputs.original-consumer-context != '' || inputs.consumer-repair != '' || inputs.standalone-harn) && github.repository == 'burin-labs/harn'",
     )
   }
+  assert_eq(
+    reader_token.if,
+    "(inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'",
+  )
   assert_eq(reader.uses, implementation.uses)
   assert_eq(
     reader.with,
@@ -125,7 +162,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   assert_eq(publish.run, entry)
   assert_eq(verify.env.PROMOTE_MODE, "verify")
   assert_eq(verify.env.GH_TOKEN, expression("github.token"))
-  assert_eq(publish.env.PROMOTE_MODE, "publish")
+  assert_eq(publish.env.PROMOTE_MODE, expression("inputs.inspect-only && 'inspect' || 'publish'"))
   assert_eq(publish.env.GH_TOKEN, expression("steps.token.outputs.token"))
   for name in [
     "PROMOTE_REPOSITORY",
@@ -133,6 +170,9 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     "PROMOTE_RUN_ID",
     "PROMOTE_ORIGINAL_CONSUMER_CONTEXT",
     "PROMOTE_CONSUMER_REPAIR",
+    "PROMOTE_STANDALONE_HARN",
+    "PROMOTE_QUALIFICATION_TOKEN",
+    "PROMOTE_HARN_READER_ROOT",
     "PROMOTE_CONSUMER_TOKEN",
     "PROMOTE_CONSUMER_REPOSITORY",
     "PROMOTE_CONSUMER_WORKFLOW",
@@ -189,6 +229,9 @@ pipeline test_promotion_bootstrap_only_dispatches_harn(harness: Harness) {
     "PROMOTE_CONSUMER_REPOSITORY",
     "PROMOTE_CONSUMER_WORKFLOW",
     "PROMOTE_CONSUMER_READER",
+    "PROMOTE_STANDALONE_HARN",
+    "PROMOTE_QUALIFICATION_TOKEN",
+    "PROMOTE_HARN_READER_ROOT",
     "PROMOTE_TAG",
     "PROMOTE_DIRECTORY",
     "GITHUB_OUTPUT",

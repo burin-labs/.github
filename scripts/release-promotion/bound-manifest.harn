@@ -60,21 +60,20 @@ pub fn download_bound_manifest(
   const captured = capture_file(run, env, ["gh", "api", endpoint + "/zip"])
   const scratch = fs.mkdtemp_in_workspace("release-manifest-")
   const archive = path_join(scratch, "manifest.zip")
-  const copied = run(["cp", captured.stdout_path, archive], {timeout_ms: 10000})
-  require copied.success, "authenticated manifest archive could not be retained"
-  const bytes = fs.read_bytes(archive)
+  require fs.exists(captured.stdout_path), "captured manifest archive is unavailable"
+  const bytes = fs.read_bytes(captured.stdout_path)
   require len(bytes) == metadata.size_in_bytes && "sha256:" + sha256(bytes) == identity.digest,
     "authenticated manifest archive digest does not match the downloaded bytes"
+  fs.write_bytes(archive, bytes)
   const listing = complete_command_result(
     run(["unzip", "-Z1", archive], {capture: {max_inline_bytes: 16384}, timeout_ms: 10000}),
   )
   require listing.success && trim(listing.stdout) == CANDIDATE_MANIFEST_FILE,
     "authenticated manifest archive must contain exactly the candidate manifest"
   const extracted = capture_file(run, {}, ["unzip", "-p", archive, CANDIDATE_MANIFEST_FILE])
+  require fs.exists(extracted.stdout_path), "captured candidate manifest is unavailable"
+  const manifest_bytes = fs.read_bytes(extracted.stdout_path)
+  require len(manifest_bytes) == extracted.byte_count, "extracted manifest byte count changed"
   fs.mkdir(directory, true)
-  const installed = run(
-    ["cp", extracted.stdout_path, path_join(directory, CANDIDATE_MANIFEST_FILE)],
-    {timeout_ms: 10000},
-  )
-  require installed.success, "authenticated manifest could not be installed"
+  fs.write_bytes(path_join(directory, CANDIDATE_MANIFEST_FILE), manifest_bytes)
 }
