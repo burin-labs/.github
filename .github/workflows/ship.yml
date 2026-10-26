@@ -30,7 +30,7 @@ permissions:
 jobs:
   ship:
     # The shared runner decides which events wake the shepherd.
-    uses: burin-labs/.github/.github/workflows/smart-ship.yml@main
+    uses: burin-labs/.github/.github/workflows/smart-ship.yml@ef1906f805d8a763008c9bbd580144aadeeb9a82
     with:
       # .github/smart-ship.toml limits repair to merge conflicts.
       repair: true

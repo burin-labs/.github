@@ -293,6 +293,16 @@ pipeline test_repository_caller_forwards_the_optional_repair_key(harness: Harnes
   )
 }
 
+pipeline test_repository_caller_pins_the_shared_runner_to_an_immutable_revision(harness: Harness) {
+  const caller = read_yaml(harness.fs, "../../.github/workflows/ship.yml")
+  const uses = to_string(caller.jobs.ship.uses ?? "")
+  const pin = regex_captures(
+    "^burin-labs/\\.github/\\.github/workflows/smart-ship\\.yml@[0-9a-f]{40}$",
+    uses,
+  )
+  assert_eq(len(pin), 1, uses)
+}
+
 pipeline test_repair_evidence_survives_a_failed_attempt_without_uploading_checkouts(
   harness: Harness,
 ) {
