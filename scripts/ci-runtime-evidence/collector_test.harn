@@ -344,7 +344,7 @@ pipeline test_rerun_reused_jobs_do_not_report_copied_timing() {
   const measured = report.runs[0].jobs[0]
   assert_eq(measured.wallMs, nil)
   assert_eq(measured.queueMs, nil)
-  assert(measured.steps.every(fn(step) { step.wallMs == nil }))
+  assert(measured.steps.all(fn(step) { step.wallMs == nil }))
 }
 
 pipeline test_cancelled_unassigned_jobs_do_not_report_clock_skew_as_execution() {

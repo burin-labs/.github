@@ -74,6 +74,12 @@ jobs:
           harn test scripts/harn-required-review
           harn test scripts/review-dispatch
           bash .github/actions/local-workflow-checks/run_test.sh
+      - name: Set up the runtime evidence consumer's Harn version
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        with:
+          version: "0.10.177"
+      - name: Test runtime evidence on the consumer runtime
+        run: harn test scripts/ci-runtime-evidence
       - name: Set up the CI job proof runtime
         uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
         with:

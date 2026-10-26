@@ -245,7 +245,7 @@ fn runner_class(raw: dict) -> string {
     || labels.any(fn(label) { starts_with(label, "blacksmith-") }) {
     return "blacksmith"
   }
-  if labels.includes("self-hosted") {
+  if labels.contains("self-hosted") {
     return "self-hosted"
   }
   if starts_with(runner_name, "GitHub Actions ")
