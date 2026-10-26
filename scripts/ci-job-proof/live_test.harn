@@ -1,8 +1,59 @@
 import { read_yaml } from "std/fs"
 import { assert_error_contains } from "std/testing"
 import { RunContext } from "./contract.harn"
-import { checkpoint_enrolled, registration_from_archive } from "./live.harn"
+import { authenticate_run, checkpoint_enrollment, registration_from_archive } from "./live.harn"
 import { ProofSource } from "./reader.harn"
+
+fn checkpoint_enrolled(
+  source: ProofSource,
+  current: RunContext,
+  tested: {commit: string, tree: string},
+  raw: string,
+) -> bool {
+  return checkpoint_enrollment(source, current, tested, raw) != nil
+}
+
+pipeline test_registrar_refuses_old_run_even_when_rerun_uses_new_generation_source() {
+  const context: RunContext = {
+    repository: "acme/product",
+    workflow: "ci.yml",
+    event: "push",
+    commit: "a".repeat(40),
+    runId: 30,
+    attempt: 2,
+    registrarJob: "Changes",
+    registrarStep: "Register",
+  }
+  const run = {
+    id: 30,
+    run_attempt: 2,
+    head_sha: context.commit,
+    event: "push",
+    path: ".github/workflows/ci.yml",
+    status: "in_progress",
+    conclusion: nil,
+    repository: {full_name: context.repository},
+    head_repository: {full_name: context.repository},
+    created_at: "2026-10-08T23:59:59Z",
+  }
+  const source = fn(value) -> ProofSource { return {
+    json: fn(endpoint) { return endpoint.contains("/attempts/") ? value
+      + {created_at: "2026-10-09T01:00:00Z"} : value },
+    registration: fn(_repo, _artifact) {
+      throw "no artifact before admission"
+    },
+  } }
+  const universe = {generation: "fixture-v1", notBefore: "2026-10-09T00:00:00Z"}
+  assert_error_contains(
+    fn() { authenticate_run(source(run), context, universe) },
+    "predates the proof generation",
+  )
+  assert_eq(
+    authenticate_run(source(run + {created_at: "2026-10-09T00:00:00Z"}), context, universe),
+    context,
+  )
+  assert_eq(authenticate_run(source(run), context), context)
+}
 
 pipeline test_checkpoint_enrollment_authenticates_actual_run_checkout_and_main_ancestry() {
   const commit = "a".repeat(40)

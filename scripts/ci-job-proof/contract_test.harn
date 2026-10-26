@@ -5,13 +5,32 @@ import {
   Run,
   admit_jobs,
   identities,
+  proof_universe,
   registration,
   trusted_producer,
+  universe_identities,
 } from "./contract.harn"
 
 const DIGEST_A = "a".repeat(64)
 
 const DIGEST_B = "b".repeat(64)
+
+pipeline test_proof_generation_namespaces_every_job_digest() {
+  const first = proof_universe(
+    json_stringify({generation: "fixture-v1", notBefore: "2026-10-09T00:00:00Z"}),
+  )
+  const scoped = universe_identities(wanted(), first)
+  assert(scoped.all({ job -> job.digest != DIGEST_A && len(job.digest) == 64 }))
+  assert_eq(universe_identities(wanted(), nil), wanted())
+  assert_eq(universe_identities(wanted(), proof_universe("")), wanted())
+  assert(
+    universe_identities(wanted(), first + {generation: "fixture-v2"})[0].digest != scoped[0].digest,
+  )
+  assert(
+    universe_identities(wanted(), first + {notBefore: "2026-10-10T00:00:00Z"})[0].digest
+      != scoped[0].digest,
+  )
+}
 
 fn wanted() -> list<JobIdentity> {
   return [

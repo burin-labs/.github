@@ -29,8 +29,58 @@ pub type RunContext = {
 /** Expected canonical checkpoint identity, emitted by the caller's trusted admission policy. */
 pub type CheckpointEnrollment = {actorId: int, actorLogin: string, headBranch: string}
 
+/** An authenticated run-creation floor bounds every digest in this proof generation. */
+pub type ProofUniverse = {generation: string, notBefore: string}
+
+type CreatedRun = {created_at: string}
+
+pub fn proof_universe(raw: string) -> ProofUniverse? {
+  if raw == "" {
+    return nil
+  }
+  const parsed = json_parse(raw)
+  schema_expect(parsed, closed(schema_of(ProofUniverse)))
+  const value = schema_expect(parsed, schema_of(ProofUniverse))
+  require value.generation.trim() != "" && len(value.generation) <= 128
+    && date_format(date_parse(value.notBefore), "%Y-%m-%dT%H:%M:%SZ") == value.notBefore,
+    "proof generation is malformed"
+  return value
+}
+
+pub fn universe_identities(
+  wanted: list<JobIdentity>,
+  universe: ProofUniverse?,
+) -> list<JobIdentity> {
+  if universe == nil {
+    return wanted
+  }
+  return wanted.map(
+    { identity ->
+      identity
+        + {
+          digest: sha256(
+            json_stringify([universe.generation, universe.notBefore, identity.digest]),
+          ),
+        }
+    },
+  )
+    .to_list()
+}
+
+/**
+ * Old runs cannot publish new-generation digests, even after checking out newer source on a rerun.
+ */
+pub fn qualify_universe_run(raw: unknown, universe: ProofUniverse?) {
+  if universe == nil {
+    return
+  }
+  const run = schema_expect(raw, schema_of(CreatedRun))
+  require date_parse(run.created_at) >= date_parse(universe.notBefore),
+    "run predates the proof generation"
+}
+
 /** Implemented producer events; dispatch observation requires explicit enrollment. */
-pub type ProducerEvent = "pull_request" | "merge_group" | "push" | "workflow_dispatch"
+pub type ProducerEvent = "pull_request" | "merge_group" | "push" | "workflow_dispatch" | "schedule"
 
 /** Trusted producer selection is independent of the workflow running an observer. */
 pub type ProducerPolicy = {

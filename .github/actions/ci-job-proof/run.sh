@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export CI_JOB_PROOF_CHECKPOINT_ENROLLMENT="${CI_JOB_PROOF_CHECKPOINT_ENROLLMENT:-}"
+export CI_JOB_PROOF_UNIVERSE="${CI_JOB_PROOF_UNIVERSE:-}"
 
 package_root="$(cd "${GITHUB_ACTION_PATH:?GITHUB_ACTION_PATH is required}/../../.." && pwd)"
 readonly package_root
@@ -20,6 +21,7 @@ GITHUB_OUTPUT="$staged_output" harn run \
   --grant token=env:GH_TOKEN,expose=GH_TOKEN \
   --grant event=env:CI_JOB_PROOF_EVENT,expose=CI_JOB_PROOF_EVENT \
   --grant checkpoint_enrollment=env:CI_JOB_PROOF_CHECKPOINT_ENROLLMENT,expose=CI_JOB_PROOF_CHECKPOINT_ENROLLMENT \
+  --grant proof_universe=env:CI_JOB_PROOF_UNIVERSE,expose=CI_JOB_PROOF_UNIVERSE \
   --grant commit=env:CI_JOB_PROOF_COMMIT,expose=CI_JOB_PROOF_COMMIT \
   --grant repository=env:CI_JOB_PROOF_REPOSITORY,expose=CI_JOB_PROOF_REPOSITORY \
   --grant workflow=env:CI_JOB_PROOF_WORKFLOW,expose=CI_JOB_PROOF_WORKFLOW \
