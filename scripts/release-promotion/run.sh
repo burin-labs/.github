@@ -9,7 +9,8 @@ readonly workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 # is outside the workspace. Harn admits write roots as directories only.
 readonly outputs="$(dirname "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}")"
 # Host command captures must be allocated inside the existing workspace scope.
-readonly capture_root="$(mktemp -d "$workspace/.harn/promote-release/capture.XXXXXXXX")"
+capture_root="$(mktemp -d "$workspace/.harn/promote-release/capture.XXXXXXXX")"
+readonly capture_root
 export TMPDIR="$capture_root" TMP="$capture_root" TEMP="$capture_root"
 export PROMOTE_ORIGINAL_CONSUMER_CONTEXT="${PROMOTE_ORIGINAL_CONSUMER_CONTEXT:-}"
 export PROMOTE_CONSUMER_REPAIR="${PROMOTE_CONSUMER_REPAIR:-}"
