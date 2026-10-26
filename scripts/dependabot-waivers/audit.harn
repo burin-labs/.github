@@ -1,0 +1,184 @@
+import { GitHub, OptionalRead } from "../merge-override/github.harn"
+import {
+  Alert,
+  AuditResult,
+  Blocker,
+  BlockerState,
+  Document,
+  Report,
+  reconcile,
+  summarize,
+  unwaived,
+  validate,
+} from "./policy.harn"
+import { BlockerObservation, FixObservation } from "./registries.harn"
+
+pub type Source = {
+  github: GitHub,
+  contents: fn(string) -> OptionalRead,
+  fix_installable: fn(string, string, string?) -> FixObservation,
+  blocker_state: fn(Blocker) -> BlockerObservation,
+}
+
+type RepositoryMetadata = {private: bool}
+
+type Contents = {type: string, encoding: string, content: string}
+
+type Repositories = list<{full_name: string, archived: bool}>
+
+type Alerts = list<Alert>
+
+/** A partial alert cannot prove either a waiver or a reason to reopen it. */
+pub fn decode_alerts(value: unknown) -> Alerts {
+  const alerts = schema_expect(value, schema_of(Alerts))
+  for alert in alerts {
+    require alert.number > 0
+      && ["dismissed", "auto_dismissed", "open", "fixed"].contains(alert.state),
+      "invalid live alert identity or state"
+    require regex_match(
+      "^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$",
+      alert.security_advisory.ghsa_id,
+    )
+      != nil
+      && trim(alert.security_vulnerability.package.name) != "",
+      "invalid live advisory or package identity"
+    const patch = alert.security_vulnerability.first_patched_version
+    require patch == nil || trim(patch.identifier) != "", "invalid live patch identifier"
+  }
+  return alerts
+}
+
+/** Reports contain private dependency details, so execution must be private. */
+pub fn require_private_execution(github: GitHub, repository: string) {
+  const metadata = schema_expect(github.read("repos/${repository}"), schema_of(RepositoryMetadata))
+  require metadata.private == true,
+    "Dependabot waiver audit requires a measured private execution repository"
+}
+
+pub fn decode_contents(value: unknown, repository: string) -> Document {
+  const blob = schema_expect(value, schema_of(Contents))
+  require blob.type == "file" && blob.encoding == "base64",
+    "waiver Contents response must be a base64 file"
+  const decoded = bytes_to_string(bytes_from_base64(blob.content.replace("\n", "")))
+  return validate(json_parse(decoded), repository)
+}
+
+fn rows(pages: list) -> list {
+  let result: list = []
+  for page in pages {
+    require type_of(page) == "list", "GitHub pagination must return arrays of rows"
+    result = result + page
+  }
+  return result
+}
+
+/** One org inventory, one opt-in registry per repository, no private central registry. */
+pub fn audit(
+  source: Source,
+  execution_repository: string,
+  org: string,
+  today: string,
+  apply: bool,
+) -> Report {
+  require_private_execution(source.github, execution_repository)
+  const repositories = schema_expect(
+    rows(source.github.pages("orgs/${org}/repos?per_page=100&type=all")),
+    schema_of(Repositories),
+  )
+    .filter(fn(repo) { return !repo.archived })
+    .map(fn(repo) { return repo.full_name })
+    .to_list()
+    .sorted()
+  require len(repositories) > 0, "organization inventory returned zero active repositories"
+  let results: list<AuditResult> = []
+  let registries = 0
+  let dismissed_alerts = 0
+  let skipped: list<string> = []
+  for repository in repositories {
+    const response = source.contents("repos/${repository}/contents/.github/dependabot-waivers.json")
+    if response.state == "missing" {
+      skipped.push(repository)
+      continue
+    }
+    const document = decode_contents(response.value, repository)
+    registries = registries + 1
+    const alerts = decode_alerts(
+      rows(
+        source.github.pages("repos/${repository}/dependabot/alerts?state=dismissed&per_page=100"),
+      ),
+    )
+    dismissed_alerts = dismissed_alerts + len(alerts)
+    for alert in unwaived(alerts, document.waivers) {
+      results.push(
+        {
+          repository: repository,
+          alert_number: alert.number,
+          ghsa_id: alert.security_advisory.ghsa_id,
+          package: alert.security_vulnerability.package.name,
+          verdict: "unwaived",
+          detail:
+            "dismissed as ${alert.dismissed_reason ?? ""} with no waiver recording why or when to revisit",
+          reopened: false,
+        },
+      )
+    }
+    for waiver in document.waivers {
+      const alert = alerts.find(fn(item) { return item.number == waiver.alert_number })
+      const preliminary = reconcile(waiver, alert, false, today, nil)
+      const needs_registry = !["stale", "reopen"].contains(preliminary.verdict)
+      const fix = !needs_registry ? {state: "known", installable: false} : source.fix_installable(
+        waiver.ecosystem,
+        waiver.package,
+        alert?.security_vulnerability?.first_patched_version?.identifier,
+      )
+      const installable = fix.state == "known" ? fix.installable : false
+      let pending: list<string> = []
+      if fix.state == "pending" {
+        pending.push(fix.detail)
+      }
+      const blocker = waiver.observed.blocked_by
+      let current: BlockerState? = nil
+      if blocker != nil && needs_registry {
+        const observation = source.blocker_state(blocker)
+        if observation.state == "known" {
+          current = observation.value
+        } else {
+          pending.push(observation.detail)
+        }
+      }
+      const decision = reconcile(waiver, alert, installable, today, current)
+      const reopened = decision.verdict == "reopen" && apply
+      if reopened {
+        source.github.send(
+          "PATCH",
+          "repos/${repository}/dependabot/alerts/${waiver.alert_number}",
+          {state: "open"},
+        )
+      }
+      results.push(
+        {
+          repository: repository,
+          alert_number: waiver.alert_number,
+          ghsa_id: waiver.ghsa_id,
+          package: waiver.package,
+          verdict: decision.verdict == "ok" && len(pending) > 0 ? "pending" : decision.verdict,
+          detail: len(pending) == 0 ? decision
+            .detail : (decision.verdict == "ok" ? "waiver could not be rechecked" : decision.detail)
+            + "; unmeasured: "
+            + join(pending, "; "),
+          reopened: reopened,
+          pending_details: pending,
+        },
+      )
+    }
+  }
+  return summarize(
+    results,
+    {
+      repositories: len(repositories),
+      registries: registries,
+      dismissed_alerts: dismissed_alerts,
+      skipped_repositories: skipped,
+    },
+  )
+}

@@ -1,0 +1,77 @@
+import { Alert, Blocker, Document, Waiver } from "./policy.harn"
+
+pub fn waiver(overrides: dict = {}) -> Waiver {
+  return schema_expect(
+    {
+      alert_number: 2,
+      ghsa_id: "GHSA-test-test-test",
+      package: "example/package",
+      ecosystem: "go",
+      dismissed_reason: "not_used",
+      why: "The affected server operation is absent from this client application.",
+      review_by: "2026-11-15",
+      observed: {severity: "high", fix_available: false, first_patched_version: "2.0.0"},
+    }
+      + overrides,
+    schema_of(Waiver),
+  )
+}
+
+pub fn document(waivers: list<Waiver> = [waiver()]) -> Document {
+  return {schema_version: 1, repository: "acme/project", waivers: waivers}
+}
+
+pub fn alert(overrides: dict = {}) -> Alert {
+  return schema_expect(
+    {
+      number: 2,
+      state: "dismissed",
+      security_advisory: {ghsa_id: "GHSA-test-test-test", severity: "high"},
+      security_vulnerability: {
+        package: {name: "example/package"},
+        first_patched_version: {identifier: "2.0.0"},
+      },
+    }
+      + overrides,
+    schema_of(Alert),
+  )
+}
+
+pub fn blocker(overrides: dict = {}) -> Blocker {
+  return schema_expect(
+    {
+      package: "parent",
+      ecosystem: "cargo",
+      version: "1.0.0",
+      requirement: "^1",
+      constrains: "child",
+      override_rejected:
+        "Forcing a new incompatible API breaks the parent package at compile time.",
+    }
+      + overrides,
+    schema_of(Blocker),
+  )
+}
+
+pub fn blocked(overrides: dict = {}) -> Waiver {
+  return waiver(
+    {
+      dismissed_reason: "tolerable_risk",
+      observed: {
+        severity: "high",
+        fix_available: true,
+        first_patched_version: "2.0.0",
+        blocked_by: blocker(overrides),
+      },
+    },
+  )
+}
+
+pub fn contents(value: unknown) -> dict {
+  const encoded = base64_encode(json_stringify(value))
+  return {
+    type: "file",
+    encoding: "base64",
+    content: encoded[0:20] + "\n" + encoded[20:len(encoded)] + "\n",
+  }
+}

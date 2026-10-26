@@ -1,0 +1,30 @@
+import { blocker } from "./fixtures.harn"
+import { Registry, blocker_state, fix_installable } from "./registries.harn"
+
+pipeline test_unknown_fix_lookup_is_pending(harness: Harness) {
+  const registry: Registry = {
+    json: fn(_) {
+      throw "registry timeout"
+    },
+    available: fn(_, _) {
+      throw "registry timeout"
+    },
+  }
+  const observation = fix_installable(registry, "npm", "package", "2")
+  assert_eq(observation.state, "pending")
+  assert((observation.detail ?? "").contains("registry timeout"))
+}
+
+pipeline test_unknown_blocker_lookup_is_pending(harness: Harness) {
+  const registry: Registry = {
+    json: fn(_) {
+      throw "registry timeout"
+    },
+    available: fn(_, _) {
+      throw "registry timeout"
+    },
+  }
+  const observation = blocker_state(registry, blocker())
+  assert_eq(observation.state, "pending")
+  assert((observation.detail ?? "").contains("registry timeout"))
+}
