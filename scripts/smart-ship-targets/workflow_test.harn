@@ -64,7 +64,7 @@ pipeline test_each_repair_releases_its_pr_however_it_ends(harness: Harness) {
   assert_eq(
     jobs.repair.strategy.matrix.pr,
     "$"
-      + "{{ github.event.inputs.main_red != '' && fromJSON('[\"main-red\"]') || fromJSON(needs.ship.outputs.deferred_json) }}",
+      + "{{ inputs.main-red != '' && fromJSON('[\"main-red\"]') || fromJSON(needs.ship.outputs.deferred_json) }}",
   )
   const steps = jobs.repair.steps
   const repair = named(steps, "Repair deferred pull requests")
@@ -90,14 +90,25 @@ pipeline test_each_repair_releases_its_pr_however_it_ends(harness: Harness) {
 }
 
 pipeline test_a_main_red_dispatch_repairs_main_one_at_a_time_and_starts_no_sweep(harness: Harness) {
-  const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
-  assert(jobs.availability["if"].contains("github.event.inputs.main_red == ''"))
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  const jobs = workflow.jobs
+  const input = workflow.on.workflow_call.inputs
+  assert(input.has("main-red"), "the reusable workflow must type the main-red request")
+  assert_eq(input["main-red"].type, "string")
+  assert_eq(input["main-red"].required, false)
+  assert_eq(input["main-red"].default, "")
+  assert(jobs.availability["if"].contains("inputs.main-red == ''"))
   assert(
-    jobs.ship["if"].contains(
-      "github.event_name == 'workflow_dispatch' && github.event.inputs.main_red == ''",
-    ),
+    jobs.ship["if"].contains("github.event_name == 'workflow_dispatch' && inputs.main-red == ''"),
   )
-  assert(jobs.repair["if"].contains("github.event.inputs.main_red != ''"))
+  assert(jobs.repair["if"].contains("inputs.main-red != ''"))
+  const caller = read_yaml(harness.fs, "../../.github/workflows/ship.yml")
+  const dispatch = caller.on.workflow_dispatch
+  assert(dispatch != nil, "the Smart Ship caller must declare workflow_dispatch inputs")
+  assert(dispatch.inputs.main_red != nil, "the caller must expose main_red for manual dispatch")
+  assert_eq(dispatch.inputs.main_red.type, "string")
+  assert_eq(dispatch.inputs.main_red.default, "")
+  assert_eq(caller.jobs.ship.with["main-red"], "$" + "{{ inputs.main_red }}")
   assert(
     jobs.repair.concurrency.group.contains("format('smart-ship-main-red-{0}', github.repository)"),
   )
