@@ -50,6 +50,10 @@ decision and binds the original producer and manifest instead. The two modes
 are mutually exclusive. Failed, empty, malformed or truncated reader output
 refuses.
 
+The host filesystem retains command-owned output bytes before archive
+inspection through the existing scoped read/write APIs. ZIP size, digest and
+sole-member checks remain mandatory before the extracted manifest is installed.
+
 This authorization changes only the producer-success prerequisite. Manifest,
 archive digests, attestations, source ancestry, signing and publication checks
 remain required. It neither rebuilds archives nor treats an equal Git tree as
