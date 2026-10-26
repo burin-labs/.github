@@ -16,7 +16,15 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
   const call = workflow.on.workflow_call
   assert_eq(
     keys(call.inputs).sorted(),
-    ["consumer-repair", "original-consumer-context", "run-id", "sha", "standalone-harn", "tag"],
+    [
+      "consumer-repair",
+      "inspect-only",
+      "original-consumer-context",
+      "run-id",
+      "sha",
+      "standalone-harn",
+      "tag",
+    ],
   )
   for name in ["run-id", "sha", "tag"] {
     assert_eq(call.inputs[name].required, true)
@@ -41,6 +49,8 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
     },
   )
   assert_eq(call.secrets.CONSUMER_CANARY_REPOSITORY.required, false)
+  assert_eq(call.inputs["inspect-only"].type, "boolean")
+  assert_eq(call.inputs["inspect-only"].default, false)
   assert_eq(call.outputs.tag.value, expression("jobs.promote.outputs.tag"))
   assert_eq(call.outputs["release-url"].value, expression("jobs.promote.outputs.release-url"))
   assert_eq(workflow.permissions, {contents: "read"})
@@ -56,6 +66,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   assert_eq(
     job.steps.map({ step -> step.name }),
     [
+      "Require standalone inspection scope",
       "Require called-workflow identity",
       "Check out workflow implementation",
       "Set up exact Harn release",
@@ -65,10 +76,14 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "Verify the run and its files",
       "Preserve the verified publication intent",
       "Mint the release token",
-      "Publish the verified files",
+      "Inspect or publish the verified files",
     ],
   )
-  const implementation = job.steps[1]
+  assert_eq(
+    job.steps[0].if,
+    "inputs.inspect-only && (!inputs.standalone-harn || github.repository != 'burin-labs/harn')",
+  )
+  const implementation = job.steps[2]
   assert_eq(
     implementation["with"],
     {
@@ -78,13 +93,13 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "persist-credentials": false,
     },
   )
-  const reader = job.steps[3]
-  const runtime = job.steps[4]
-  const reader_token = job.steps[5]
-  const verify = job.steps[6]
-  const checkpoint = job.steps[7]
-  const token = job.steps[8]
-  const publish = job.steps[9]
+  const reader = job.steps[4]
+  const runtime = job.steps[5]
+  const reader_token = job.steps[6]
+  const verify = job.steps[7]
+  const checkpoint = job.steps[8]
+  const token = job.steps[9]
+  const publish = job.steps[10]
   assert_eq(
     job.concurrency,
     {
@@ -139,7 +154,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   assert_eq(publish.run, entry)
   assert_eq(verify.env.PROMOTE_MODE, "verify")
   assert_eq(verify.env.GH_TOKEN, expression("github.token"))
-  assert_eq(publish.env.PROMOTE_MODE, "publish")
+  assert_eq(publish.env.PROMOTE_MODE, expression("inputs.inspect-only && 'inspect' || 'publish'"))
   assert_eq(publish.env.GH_TOKEN, expression("steps.token.outputs.token"))
   for name in [
     "PROMOTE_REPOSITORY",
