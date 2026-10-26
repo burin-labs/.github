@@ -123,7 +123,7 @@ pub fn logs_from_archive(
   )
   const entries = complete_stdout(tools, listing).split("\n").filter(fn(entry) { entry != "" })
   const unsafe = entries.filter(
-    fn(entry) { return starts_with(entry, "/") || entry.split("/").includes("..") },
+    fn(entry) { return starts_with(entry, "/") || entry.split("/").contains("..") },
   )
   if len(unsafe) > 0 {
     throw "run " + to_string(run_id) + " log archive contains an unsafe path"
