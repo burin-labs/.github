@@ -1,0 +1,176 @@
+import { assert_error_contains } from "std/testing"
+import { alert, blocked, blocker, document, waiver } from "./fixtures.harn"
+import { reconcile, summarize, unwaived, validate } from "./policy.harn"
+
+pipeline test_existing_v1_schema_and_template(harness: Harness) {
+  assert_eq(validate(document(), "acme/project").waivers[0]?.alert_number, 2)
+  validate(document([blocked()]), nil)
+  validate(
+    document(
+      [
+        waiver(
+          {
+            dismissed_reason: "fix_started",
+            observed: {severity: "high", fix_available: true, first_patched_version: "2"},
+          },
+        ),
+      ],
+    ),
+    nil,
+  )
+  validate(
+    json_parse(
+      harness.fs.read_text(path_join(harness.fs.cwd(), "../../templates/dependabot-waivers.json")),
+    ),
+    nil,
+  )
+}
+
+pipeline test_invalid_v1_documents_are_refused(harness: Harness) {
+  for value in [
+    nil,
+    [],
+    {},
+    document() + {schema_version: 99},
+    document() + {repository: ""},
+    document([waiver(), waiver()]),
+    document() + {waivers: "invalid"},
+  ] {
+    assert_error_contains(fn() { validate(value, nil) }, "")
+  }
+  assert_error_contains(fn() { validate(document(), "acme/other") }, "does not match")
+}
+
+pipeline test_invalid_waiver_fields_and_missing_observation_are_refused(harness: Harness) {
+  for overrides in [
+    {alert_number: 0},
+    {alert_number: 1.5},
+    {ghsa_id: "invalid"},
+    {package: ""},
+    {ecosystem: ""},
+    {dismissed_reason: "no_patch"},
+    {why: "no patch"},
+    {review_by: "tomorrow"},
+    {observed: {}},
+    {observed: {severity: "invalid", fix_available: false, first_patched_version: nil}},
+    {observed: {severity: "high", fix_available: "false", first_patched_version: nil}},
+    {observed: {severity: "high", fix_available: false}},
+    {observed: {severity: "high", fix_available: true, first_patched_version: "2"}},
+    {
+      observed: {
+        severity: "high",
+        fix_available: false,
+        first_patched_version: nil,
+        blocked_by: blocker(),
+      },
+    },
+  ] {
+    assert_error_contains(
+      fn() { validate(document() + {waivers: [waiver() + overrides]}, nil) },
+      "",
+    )
+  }
+}
+
+pipeline test_blocker_requires_the_real_edge_and_rejected_override(harness: Harness) {
+  for overrides in [
+    {package: ""},
+    {ecosystem: "conda"},
+    {version: ""},
+    {requirement: ""},
+    {constrains: ""},
+    {override_rejected: "unsafe"},
+  ] {
+    assert_error_contains(fn() { validate(document([blocked(overrides)]), nil) }, "")
+  }
+}
+
+pipeline test_reconciliation_preserves_v1_order_and_outcomes(harness: Harness) {
+  for case in [
+    {live: alert(), installable: false, today: "2026-08-15", verdict: "ok"},
+    {live: alert(), installable: true, today: "2026-08-15", verdict: "reopen"},
+    {
+      live: alert({security_advisory: {ghsa_id: "GHSA-test-test-test", severity: "critical"}}),
+      installable: false,
+      today: "2026-08-15",
+      verdict: "reopen",
+    },
+    {
+      live: alert({security_advisory: {ghsa_id: "GHSA-test-test-test", severity: "medium"}}),
+      installable: false,
+      today: "2026-08-15",
+      verdict: "ok",
+    },
+    {
+      live: alert({security_advisory: {ghsa_id: "GHSA-other", severity: "high"}}),
+      installable: false,
+      today: "2026-08-15",
+      verdict: "reopen",
+    },
+    {live: nil, installable: true, today: "2026-11-16", verdict: "stale"},
+    {live: alert({state: "open"}), installable: true, today: "2026-11-16", verdict: "stale"},
+    {live: alert({state: "fixed"}), installable: true, today: "2026-08-15", verdict: "stale"},
+    {
+      live: alert({state: "auto_dismissed"}),
+      installable: false,
+      today: "2026-08-15",
+      verdict: "ok",
+    },
+    {live: alert(), installable: false, today: "2026-11-16", verdict: "overdue"},
+    {live: alert(), installable: true, today: "2026-11-16", verdict: "reopen"},
+  ] {
+    assert_eq(
+      reconcile(waiver(), case.live, case.installable, case.today, nil).verdict,
+      case.verdict,
+    )
+  }
+}
+
+pipeline test_capped_fix_tracks_cap_movement_and_outage_still_expires(harness: Harness) {
+  for case in [
+    {state: {version: "1.0.0", requirement: "^1"}, today: "2026-08-15", verdict: "ok"},
+    {state: {version: "1.1.0", requirement: "^1"}, today: "2026-08-15", verdict: "reopen"},
+    {state: {version: "1.0.0", requirement: "^2"}, today: "2026-08-15", verdict: "reopen"},
+    {state: nil, today: "2026-08-15", verdict: "ok"},
+    {state: nil, today: "2026-11-16", verdict: "overdue"},
+  ] {
+    assert_eq(reconcile(blocked(), alert(), true, case.today, case.state).verdict, case.verdict)
+  }
+}
+
+pipeline test_report_preserves_counts_and_names_failures(harness: Harness) {
+  const results = ["ok", "reopen", "stale", "overdue", "unwaived"].map(
+    fn(verdict) { return {
+      repository: "acme/project",
+      alert_number: 2,
+      ghsa_id: nil,
+      package: nil,
+      verdict: verdict,
+      detail: "fixture",
+      reopened: verdict == "reopen",
+    } },
+  )
+    .to_list()
+  const report = summarize(
+    results,
+    {repositories: 1, registries: 1, dismissed_alerts: 5, skipped_repositories: []},
+  )
+  assert_eq(
+    [report.checked, report.ok, report.reopened, report.stale, report.overdue, report.unwaived],
+    [5, 1, 1, 1, 1, 1],
+  )
+  assert_eq(
+    report.failing_names,
+    ["acme/project#2:stale", "acme/project#2:overdue", "acme/project#2:unwaived"],
+  )
+  assert_eq(report.pending, 0)
+  assert_eq(
+    unwaived([alert({number: 9}), alert(), alert({number: 7})], [waiver()]).map(
+      fn(a) { return a.number },
+    )
+      .to_list(),
+    [7, 9],
+  )
+  assert_eq(unwaived([alert()], [waiver()]), [])
+  assert_eq(unwaived([], [waiver()]), [])
+}

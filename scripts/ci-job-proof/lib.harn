@@ -1,6 +1,7 @@
 pub import {
   ProducerEvent,
   ProducerPolicy,
+  ProofUniverse,
   Registration,
   Run,
   RunContext,

@@ -1,11 +1,25 @@
 name: Reuse CI job proofs by input digest
 description: >-
   Registers a digest of each reusable job's own inputs for this run, and on a
-  merge group or main push reuses each job whose digest a qualified earlier run
-  recorded and whose legs all passed there. Unknown or unreadable proof runs
-  the job.
+  merge group, main push or enrolled full checkpoint reuses each job whose
+  digest a qualified earlier run recorded and whose legs all passed there.
+  Unknown or unreadable proof runs the job.
 
 inputs:
+  proof-universe:
+    description: >-
+      Optional closed JSON generation and UTC notBefore. The resolver namespaces
+      every digest and refuses registration from API runs created before this
+      floor. Required for checkpoint reuse; ordinary legacy callers may omit it.
+    required: false
+    default: ""
+  checkpoint-enrollment:
+    description: >-
+      Closed JSON actorId, actorLogin and headBranch emitted only by the caller's
+      canonical full-checkpoint policy. The resolver reauthenticates this identity,
+      clean checkout and main ancestry. Empty leaves dispatches outside reuse.
+    required: false
+    default: ""
   workflow-file:
     description: Workflow filename under .github/workflows (for example ci.yml).
     required: true
@@ -68,6 +82,8 @@ runs:
       shell: bash
       env:
         CI_JOB_PROOF_EVENT: ${{ inputs.event-name }}
+        CI_JOB_PROOF_CHECKPOINT_ENROLLMENT: ${{ inputs.checkpoint-enrollment }}
+        CI_JOB_PROOF_UNIVERSE: ${{ inputs.proof-universe }}
         CI_JOB_PROOF_COMMIT: ${{ inputs.commit-sha }}
         CI_JOB_PROOF_REPOSITORY: ${{ inputs.repository }}
         CI_JOB_PROOF_WORKFLOW: ${{ inputs.workflow-file }}

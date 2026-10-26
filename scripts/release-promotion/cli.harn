@@ -31,6 +31,7 @@ fn main(harness: Harness) {
   const github = live_github(
     harness.net,
     harness.tools,
+    harness.fs,
     required_env(harness.env, "GH_TOKEN"),
     request.repository,
     harness.fs.mkdtemp_in_workspace("promote-release-gh-"),
@@ -38,8 +39,10 @@ fn main(harness: Harness) {
   const mode = required_env(harness.env, "PROMOTE_MODE")
   const authorization = parse_authorization(
     harness.env.get("PROMOTE_ORIGINAL_CONSUMER_CONTEXT") ?? "",
+    harness.env.get("PROMOTE_CONSUMER_REPAIR") ?? "",
   )
-  const authorize_completion = authorization == nil ? nil : fn(attempt: int) { verify_authorization(
+  const authorize_completion =
+    authorization == nil ? nil : fn(attempt: int) { return verify_authorization(
     live_consumer_recovery(
       harness.tools,
       {
@@ -48,6 +51,7 @@ fn main(harness: Harness) {
         workflow: required_env(harness.env, "PROMOTE_CONSUMER_WORKFLOW"),
         reader: required_env(harness.env, "PROMOTE_CONSUMER_READER"),
       },
+      authorization.mode == "repair" ? "--repair" : "--recover",
     ),
     request.repository,
     request.sha,

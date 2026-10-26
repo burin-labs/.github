@@ -1,0 +1,80 @@
+import { complete_command_result } from "../captured-command.harn"
+import { ManifestIdentity } from "./authorization.harn"
+import { CANDIDATE_MANIFEST_FILE } from "./manifest.harn"
+
+type ArtifactMetadata = {
+  id: int,
+  name: string,
+  digest: string,
+  expired: bool,
+  size_in_bytes: int,
+  workflow_run: {id: int},
+}
+
+const MAX_MANIFEST_BYTES = 1048576
+
+pub type ArtifactCommand = fn(list<string>, dict) -> dict
+
+pub fn require_bound_manifest(
+  raw: unknown,
+  run_id: int,
+  name: string,
+  identity: ManifestIdentity,
+) -> ArtifactMetadata {
+  const metadata = schema_expect(raw, schema_of(ArtifactMetadata))
+  require metadata.id == identity.id && metadata.digest == identity.digest
+    && metadata.name == name
+    && metadata.workflow_run.id == run_id
+    && !metadata.expired
+    && metadata.size_in_bytes > 0
+    && metadata.size_in_bytes <= MAX_MANIFEST_BYTES,
+    "authenticated manifest artifact identity is unavailable or changed"
+  return metadata
+}
+
+fn capture_file(run: ArtifactCommand, env: dict, argv: list<string>) -> dict {
+  const result = run(
+    argv,
+    {env: env, capture: {transport: "file", max_inline_bytes: 0}, timeout_ms: 120000},
+  )
+  require result.success && !result.timed_out && result.stdout_path != nil
+    && result.byte_count > 0
+    && result.byte_count <= MAX_MANIFEST_BYTES,
+    "authenticated manifest download is incomplete or exceeds its bound"
+  return result
+}
+
+pub fn download_bound_manifest(
+  fs: HarnessFs,
+  run: ArtifactCommand,
+  read_json: fn(string) -> unknown,
+  env: dict,
+  repository: string,
+  run_id: int,
+  name: string,
+  identity: ManifestIdentity,
+  directory: string,
+) -> nil {
+  const endpoint = "/repos/${repository}/actions/artifacts/${identity.id}"
+  const metadata = require_bound_manifest(read_json(endpoint), run_id, name, identity)
+  const captured = capture_file(run, env, ["gh", "api", endpoint + "/zip"])
+  const scratch = fs.mkdtemp_in_workspace("release-manifest-")
+  const archive = path_join(scratch, "manifest.zip")
+  const copied = run(["cp", captured.stdout_path, archive], {timeout_ms: 10000})
+  require copied.success, "authenticated manifest archive could not be retained"
+  const bytes = fs.read_bytes(archive)
+  require len(bytes) == metadata.size_in_bytes && "sha256:" + sha256(bytes) == identity.digest,
+    "authenticated manifest archive digest does not match the downloaded bytes"
+  const listing = complete_command_result(
+    run(["unzip", "-Z1", archive], {capture: {max_inline_bytes: 16384}, timeout_ms: 10000}),
+  )
+  require listing.success && trim(listing.stdout) == CANDIDATE_MANIFEST_FILE,
+    "authenticated manifest archive must contain exactly the candidate manifest"
+  const extracted = capture_file(run, {}, ["unzip", "-p", archive, CANDIDATE_MANIFEST_FILE])
+  fs.mkdir(directory, true)
+  const installed = run(
+    ["cp", extracted.stdout_path, path_join(directory, CANDIDATE_MANIFEST_FILE)],
+    {timeout_ms: 10000},
+  )
+  require installed.success, "authenticated manifest could not be installed"
+}

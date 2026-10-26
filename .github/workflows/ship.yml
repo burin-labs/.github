@@ -16,11 +16,16 @@ on:
     types: [completed]
   schedule:
     - cron: "7,22,37,52 * * * *"
+  # The review-thread relay (services/smart-ship-relay) dispatches with `pr`.
   workflow_dispatch:
     inputs:
       main_red:
         description: Optional fix-forward request for a red default branch.
         required: false
+        type: string
+        default: ""
+      pr:
+        description: Pull request number to look at; empty runs a sweep.
         type: string
         default: ""
 

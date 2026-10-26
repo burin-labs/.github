@@ -24,6 +24,34 @@ const TAG = "v0.10.142"
 
 const TAG_OBJECT = "5b1d0c3e9f2a4b6c8d7e0f1a2b3c4d5e6f708192"
 
+fn visible_release(release: dict, published: bool) -> dict {
+  return release
+    + {
+      draft: !published,
+      html_url: published ? "https://github.com/" + REPO + "/releases/tag/"
+        + release.tag_name : release.html_url,
+    }
+}
+
+fn stored_asset(fs: HarnessFs, path: string, overrides: dict) -> dict {
+  const name = basename(path)
+  return {
+    name: name,
+    digest: (overrides[name] ?? "sha256:") + sha256(fs.read_bytes(path)),
+    state: "uploaded",
+  }
+}
+
+fn release_listing(options: dict, drafts: list<dict>, published: bool, second: bool) -> list<dict> {
+  if !second && options?.full_release_page != nil {
+    return options.full_release_page
+  }
+  if second && options?.full_release_page == nil {
+    return []
+  }
+  return drafts.map({ release -> visible_release(release, published) }).to_list()
+}
+
 fn real_manifest(fs: HarnessFs) -> dict {
   return json_parse(fs.read_text("fixtures/harn-candidate-manifest.json"))
 }
@@ -99,14 +127,29 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
     tag: nil,
     tagged_first: nil,
     requests: [],
+    bound_downloads: 0,
+    creates: 0,
+    publishes: 0,
+    tags: 0,
+    fault_fired: false,
   }
   const forged = options?.forged ?? []
   const stored_override = options?.stored ?? {}
   const github = {
     json: fn(endpoint) {
       state.requests = state.requests + [endpoint]
-      if endpoint == "/repos/" + REPO + "/releases?per_page=100" {
-        return state.drafts
+      if endpoint.starts_with("/repos/" + REPO + "/releases?per_page=100") {
+        return release_listing(options, state.drafts, state.published, endpoint.contains("&page="))
+      }
+      if endpoint.starts_with("/repos/" + REPO + "/releases/7/assets?") {
+        return options?.asset_census ?? state.drafts[0].assets
+      }
+      if endpoint.starts_with("/repos/" + REPO + "/releases/tags/") && state.published {
+        return state.drafts[0]
+          + {
+            draft: false,
+            html_url: "https://github.com/" + REPO + "/releases/tag/" + state.drafts[0].tag_name,
+          }
       }
       if endpoint.starts_with("/repos/" + REPO + "/git/ref/tags/") && state.tag != nil {
         return {object: {type: "tag", sha: TAG_OBJECT}}
@@ -135,6 +178,19 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
       }
       return nil
     },
+    download_bound: fn(run_id, name, identity, directory) {
+      state.bound_downloads = state.bound_downloads + 1
+      require state.bound_downloads <= (options?.bound_limit ?? 100),
+        "bound manifest became unavailable"
+      assert_eq(to_string(run_id), RUN_ID)
+      assert_eq(name, "candidate-manifest-" + SHA)
+      assert_eq(
+        identity,
+        options?.manifest_identity ?? {id: 9, digest: "sha256:" + sha256("manifest archive")},
+      )
+      fs.write_text(path_join(directory, CANDIDATE_MANIFEST_FILE), json_stringify(manifest))
+      return nil
+    },
     attest: fn(path, expect) {
       assert_eq(expect.repository, REPO)
       assert_eq(expect.source_digest, SHA)
@@ -146,41 +202,237 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
       return nil
     },
     create_draft: fn(release) {
-      let assets = []
-      for path in release.files {
-        const name = basename(path)
-        const digest = (stored_override[name] ?? "sha256:") + sha256(fs.read_bytes(path))
-        assets = assets + [{name: name, digest: digest}]
-      }
+      state.creates = state.creates + 1
+      const assets =
+        release.files.map({ path -> stored_asset(fs, path, stored_override) }).to_list()
       state.uploaded = release.files.map({ path -> basename(path) })
       state.drafts = [
         {
           id: 7,
+          target_commitish: release.sha,
+          name: release.title,
           tag_name: release.tag,
           draft: true,
           prerelease: release.prerelease,
           body: options?.body ?? fs.read_text(release.notes_file),
           html_url: "https://github.com/" + REPO + "/releases/tag/untagged-7",
           assets: assets,
-        },
+        }
+          + (options?.release_fields ?? {}),
       ]
+      if options?.fault == "after-draft" && !state.fault_fired {
+        state.fault_fired = true
+        throw "connection lost after draft creation"
+      }
+      return nil
+    },
+    upload_assets: fn(tag, paths) {
+      assert_eq(tag, state.drafts[0].tag_name)
+      let assets = state.drafts[0].assets
+      for path in paths {
+        const name = basename(path)
+        require !state.uploaded.contains(name), "an accepted asset was uploaded again"
+        assets = assets + [stored_asset(fs, path, stored_override)]
+        state.uploaded = state.uploaded + [name]
+        state.drafts = [state.drafts[0] + {assets: assets}]
+        if options?.fault == "after-upload" && !state.fault_fired {
+          state.fault_fired = true
+          throw "connection lost after asset upload"
+        }
+      }
+      state.drafts = [state.drafts[0] + {assets: assets}]
       return nil
     },
     create_tag: fn(tag, sha, message) {
+      state.tags = state.tags + 1
       state.tag = {name: tag, sha: sha, message: message}
       state.tagged_first = !state.published
+      if options?.fault == "after-tag" && !state.fault_fired {
+        state.fault_fired = true
+        throw "connection lost after tag creation"
+      }
       return nil
     },
     publish_draft: fn(id, latest) {
       assert_eq(id, 7)
+      state.publishes = state.publishes + 1
       state.published = true
       state.latest = latest
+      if options?.fault == "after-publish" && !state.fault_fired {
+        state.fault_fired = true
+        throw "connection lost after publication"
+      }
       return {html_url: "https://github.com/" + REPO + "/releases/tag/" + state.drafts[0].tag_name}
     },
   }
   // Closures share the captured state; the fixture record holds a copy, so
   // tests read release state through this getter.
   return {github: github, state: fn() { return state }}
+}
+
+pipeline test_resume_preserves_every_accepted_publication_effect(harness: Harness) {
+  for fault in ["after-draft", "after-upload", "after-tag", "after-publish"] {
+    const directory = harness.fs.mkdtemp_in_workspace("publication-resume-")
+    const world = fixture(harness.fs, {fault: fault})
+    verify_candidate(world.github, harness.fs, request(), directory)
+    const run = verify_run(world.github, request())
+    assert_error_contains(
+      fn() { publish_candidate(world.github, harness.fs, request(), run, directory) },
+      "connection lost after",
+    )
+    assert_eq(world.state().creates, 1)
+    const release = publish_candidate(world.github, harness.fs, request(), run, directory)
+    assert_eq(release.tag, TAG)
+    assert_eq(world.state().creates, 1)
+    assert_eq(world.state().publishes, 1)
+    assert_eq(world.state().tags, 1)
+    assert(world.state().published)
+    const uploaded = world.state().uploaded
+    publish_candidate(world.github, harness.fs, request(), run, directory)
+    assert_eq(world.state().uploaded, uploaded)
+    assert_eq(world.state().creates, 1)
+    assert_eq(world.state().publishes, 1)
+    assert_eq(world.state().tags, 1)
+  }
+}
+
+pipeline test_publication_intent_is_required_and_bound_before_external_writes(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("publication-intent-")
+  const world = fixture(harness.fs)
+  verify_candidate(world.github, harness.fs, request(), directory)
+  const path = path_join(directory, "publication-intent.json")
+  const intent = json_parse(harness.fs.read_text(path))
+  assert_eq(intent.sourceCommit, SHA)
+  assert_eq(intent.runId, RUN_ID)
+  assert_eq(intent.runAttempt, "1")
+  assert_eq(len(intent.assets), 8)
+  harness.fs.write_text(path, json_stringify(intent + {sourceCommit: OTHER_SHA}))
+  assert_error_contains(
+    fn() { publish_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      verify_run(world.github, request()),
+      directory,
+    ) },
+    "publication intent no longer matches",
+  )
+  assert_eq(world.state().creates, 0)
+  assert_eq(world.state().uploaded, [])
+  assert_eq(world.state().tags, 0)
+  assert_eq(world.state().publishes, 0)
+}
+
+pipeline test_release_identity_conflicts_refuse_before_asset_upload(harness: Harness) {
+  for fields in [
+    {target_commitish: OTHER_SHA},
+    {name: "another release"},
+    {prerelease: true},
+    {body: "different notes"},
+    {html_url: "https://example.test/release"},
+  ] {
+    const directory = harness.fs.mkdtemp_in_workspace("publication-conflict-")
+    const world = fixture(harness.fs, {release_fields: fields})
+    verify_candidate(world.github, harness.fs, request(), directory)
+    assert_error_contains(
+      fn() { publish_candidate(
+        world.github,
+        harness.fs,
+        request(),
+        verify_run(world.github, request()),
+        directory,
+      ) },
+      "existing release identity or body conflicts",
+    )
+    assert_eq(world.state().uploaded, [])
+    assert_eq(world.state().tags, 0)
+    assert_eq(world.state().publishes, 0)
+  }
+}
+
+pipeline test_an_empty_asset_read_cannot_authorize_publication(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("publication-empty-read-")
+  const world = fixture(harness.fs, {asset_census: []})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  assert_error_contains(
+    fn() { publish_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      verify_run(world.github, request()),
+      directory,
+    ) },
+    "8 pending assets",
+  )
+  assert_eq(len(world.state().uploaded), 8)
+  assert_eq(world.state().tags, 0)
+  assert_eq(world.state().publishes, 0)
+}
+
+pipeline test_duplicate_or_foreign_assets_are_never_overwritten(harness: Harness) {
+  const name = "harn-aarch64-apple-darwin.tar.gz"
+  const digest = "sha256:" + sha256("archive for aarch64-apple-darwin\n")
+  const asset = {name: name, digest: digest, state: "uploaded"}
+  for case in [
+    {assets: [asset, asset], message: "duplicate asset"},
+    {assets: [asset + {name: "foreign.zip"}], message: "not a candidate file"},
+    {assets: [asset + {digest: nil, state: "starter"}], message: "stored as nil"},
+  ] {
+    const directory = harness.fs.mkdtemp_in_workspace("publication-asset-conflict-")
+    const world = fixture(harness.fs, {asset_census: case.assets})
+    verify_candidate(world.github, harness.fs, request(), directory)
+    assert_error_contains(
+      fn() { publish_candidate(
+        world.github,
+        harness.fs,
+        request(),
+        verify_run(world.github, request()),
+        directory,
+      ) },
+      case.message,
+    )
+    assert_eq(world.state().uploaded, [])
+    assert_eq(world.state().tags, 0)
+    assert_eq(world.state().publishes, 0)
+  }
+}
+
+pipeline test_releases_beyond_the_first_page_are_adopted(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("publication-pages-")
+  const old = range(0, 100).map({ index -> {tag_name: "older-${index}"} }).to_list()
+  const world = fixture(harness.fs, {full_release_page: old, fault: "after-draft"})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  const run = verify_run(world.github, request())
+  assert_error_contains(
+    fn() { publish_candidate(world.github, harness.fs, request(), run, directory) },
+    "connection lost after draft creation",
+  )
+  publish_candidate(world.github, harness.fs, request(), run, directory)
+  assert_eq(world.state().creates, 1)
+  assert_eq(world.state().publishes, 1)
+  assert(world.state().requests.contains("/repos/${REPO}/releases?per_page=100&page=2"))
+}
+
+pipeline test_a_full_asset_census_cannot_be_mistaken_for_a_complete_read(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("publication-full-page-")
+  const page = range(0, 100).map(
+    { index -> {name: "asset-${index}", digest: nil, state: "starter"} },
+  )
+    .to_list()
+  const world = fixture(harness.fs, {asset_census: page})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  assert_error_contains(
+    fn() { publish_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      verify_run(world.github, request()),
+      directory,
+    ) },
+    "release asset census is incomplete after 1000 records",
+  )
+  assert_eq(world.state().uploaded, [])
+  assert_eq(world.state().publishes, 0)
 }
 
 fn verify(fs: HarnessFs, options: dict = {}) {
@@ -440,7 +692,7 @@ pipeline test_leaves_a_draft_unpublished_when_its_body_is_not_the_notes(harness:
       verify_run(world.github, request()),
       directory,
     ) },
-    "the release body is not release-notes.md",
+    "existing release identity or body conflicts",
   )
   assert(!world.state().published)
 }
@@ -461,6 +713,95 @@ pipeline test_refuses_a_run_that_did_not_succeed(harness: Harness) {
     fn() { verify(harness.fs, {run: {status: "in_progress", conclusion: nil}}) },
     "did not succeed: status in_progress",
   )
+}
+
+pipeline test_incomplete_producer_requires_an_authenticated_completion_reader(harness: Harness) {
+  for record in [
+    {status: "completed", conclusion: "failure"},
+    {status: "in_progress", conclusion: nil},
+  ] {
+    const world = fixture(harness.fs, {run: record})
+    let measured = 0
+    verify_run(
+      world.github,
+      request(),
+      fn(attempt: int) {
+        assert_eq(attempt, 1)
+        measured = measured + 1
+      },
+    )
+    assert_eq(measured, 1)
+    assert_error_contains(
+      fn() { verify_run(
+        world.github,
+        request(),
+        fn(_attempt: int) {
+          throw "consumer product remains unproven"
+        },
+      ) },
+      "consumer product remains unproven",
+    )
+  }
+  for conclusion in ["cancelled", "timed_out", "skipped", nil] {
+    const world = fixture(harness.fs, {run: {status: "completed", conclusion: conclusion}})
+    let measured = 0
+    assert_error_contains(
+      fn() { verify_run(world.github, request(), fn(_attempt: int) { measured = measured + 1 }) },
+      "did not succeed",
+    )
+    assert_eq(measured, 0)
+  }
+}
+
+pipeline test_explicit_repair_remains_required_after_the_producer_succeeds(harness: Harness) {
+  const world = fixture(harness.fs)
+  assert_error_contains(
+    fn() { verify_run(
+      world.github,
+      request(),
+      fn(_attempt: int) {
+        throw "fresh repair remains unproven"
+      },
+    ) },
+    "fresh repair remains unproven",
+  )
+}
+
+pipeline test_repair_manifest_cannot_come_from_an_earlier_attempt(harness: Harness) {
+  const world = fixture(harness.fs, {run: {run_attempt: 2}})
+  const directory = harness.fs.mkdtemp_in_workspace("repair-attempt-")
+  assert_error_contains(
+    fn() { verify_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      directory,
+      fn(_attempt: int) { return {id: 9, digest: "sha256:" + sha256("manifest archive")} },
+    ) },
+    "authenticated producing attempt",
+  )
+}
+
+pipeline test_repair_manifest_is_reauthenticated_before_publication_writes(harness: Harness) {
+  const world = fixture(harness.fs, {bound_limit: 1})
+  const directory = harness.fs.mkdtemp_in_workspace("repair-publication-")
+  const authorize =
+    fn(_attempt: int) { return {id: 9, digest: "sha256:" + sha256("manifest archive")} }
+  verify_candidate(world.github, harness.fs, request(), directory, authorize)
+  assert_eq(world.state().bound_downloads, 1)
+  assert_error_contains(
+    fn() { publish_candidate(
+      world.github,
+      harness.fs,
+      request(),
+      verify_run(world.github, request(), authorize),
+      directory,
+    ) },
+    "bound manifest became unavailable",
+  )
+  assert_eq(world.state().bound_downloads, 2)
+  assert_eq(world.state().drafts, [])
+  assert_eq(world.state().tagged_first, nil)
 }
 
 pipeline test_refuses_a_file_whose_digest_differs(harness: Harness) {
@@ -590,7 +931,7 @@ pipeline test_refuses_to_overwrite_a_release_or_move_a_tag(harness: Harness) {
   for case in [
     {
       responses: {[releases]: {html_url: "https://example.test/release"}},
-      message: "release " + TAG + " already exists",
+      message: "\"id\" is a required property",
     },
     {
       responses: {[ref]: {object: {type: "commit", sha: OTHER_SHA}}},

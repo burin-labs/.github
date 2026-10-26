@@ -14,12 +14,15 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
   const workflow = promote(harness.fs)
   assert_eq(keys(workflow.on), ["workflow_call"])
   const call = workflow.on.workflow_call
-  assert_eq(keys(call.inputs).sorted(), ["original-consumer-context", "run-id", "sha", "tag"])
+  assert_eq(
+    keys(call.inputs).sorted(),
+    ["consumer-repair", "original-consumer-context", "run-id", "sha", "tag"],
+  )
   for name in ["run-id", "sha", "tag"] {
     assert_eq(call.inputs[name].required, true)
     assert_eq(call.inputs[name].type, "string")
   }
-  for name in ["original-consumer-context"] {
+  for name in ["original-consumer-context", "consumer-repair"] {
     assert_eq(call.inputs[name].required, false)
     assert_eq(call.inputs[name].type, "string")
     assert_eq(call.inputs[name].default, "")
@@ -48,8 +51,9 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       "Set up exact Harn release",
       "Check out the immutable consumer reader",
       "Set up the consumer reader runtime",
-      "Mint original consumer read authority",
+      "Mint consumer read authority",
       "Verify the run and its files",
+      "Preserve the verified publication intent",
       "Mint the release token",
       "Publish the verified files",
     ],
@@ -68,12 +72,26 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
   const runtime = job.steps[4]
   const reader_token = job.steps[5]
   const verify = job.steps[6]
-  const token = job.steps[7]
-  const publish = job.steps[8]
+  const checkpoint = job.steps[7]
+  const token = job.steps[8]
+  const publish = job.steps[9]
+  assert_eq(
+    job.concurrency,
+    {
+      group: "publish-tested-files-" + expression("github.repository") + "-"
+        + expression("inputs.tag"),
+      "cancel-in-progress": false,
+    },
+  )
+  assert_eq(checkpoint.uses, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+  assert_eq(checkpoint.with.path, ".harn/promote-release/candidate/publication-intent.json")
+  assert_eq(checkpoint.with["if-no-files-found"], "error")
+  assert_eq(checkpoint.with["include-hidden-files"], true)
+  assert_eq(checkpoint.with["retention-days"], 30)
   for step in [reader, runtime, reader_token] {
     assert_eq(
       step.if,
-      "inputs.original-consumer-context != '' && github.repository == 'burin-labs/harn'",
+      "(inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'",
     )
   }
   assert_eq(reader.uses, implementation.uses)
@@ -81,7 +99,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     reader.with,
     {
       repository: "burin-labs/harn",
-      ref: "d1b11367b22acd8b9b03ff3db66d43c89a7d0be9",
+      ref: "98395fd57845149560e7854947f029adf1b1a615",
       path: ".harn/promote-release/consumer-reader",
       "persist-credentials": false,
     },
@@ -99,6 +117,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
       repositories: "harn\n" + expression("secrets.CONSUMER_CANARY_REPOSITORY") + "\n",
       "permission-actions": "read",
       "permission-contents": "read",
+      "permission-pull-requests": "read",
     },
   )
   const entry = "bash .harn/promote-release/implementation/scripts/release-promotion/run.sh"
@@ -113,6 +132,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
     "PROMOTE_ORIGINAL_CONSUMER_CONTEXT",
+    "PROMOTE_CONSUMER_REPAIR",
     "PROMOTE_CONSUMER_TOKEN",
     "PROMOTE_CONSUMER_REPOSITORY",
     "PROMOTE_CONSUMER_WORKFLOW",
@@ -128,6 +148,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     expression("inputs.original-consumer-context"),
   )
   assert_eq(verify.env.PROMOTE_CONSUMER_TOKEN, expression("steps.consumer-token.outputs.token"))
+  assert_eq(verify.env.PROMOTE_CONSUMER_REPAIR, expression("inputs.consumer-repair"))
   assert_eq(
     verify.env.PROMOTE_CONSUMER_REPOSITORY,
     expression("github.repository_owner") + "/" + expression("secrets.CONSUMER_CANARY_REPOSITORY"),
@@ -163,6 +184,7 @@ pipeline test_promotion_bootstrap_only_dispatches_harn(harness: Harness) {
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
     "PROMOTE_ORIGINAL_CONSUMER_CONTEXT",
+    "PROMOTE_CONSUMER_REPAIR",
     "PROMOTE_CONSUMER_TOKEN",
     "PROMOTE_CONSUMER_REPOSITORY",
     "PROMOTE_CONSUMER_WORKFLOW",

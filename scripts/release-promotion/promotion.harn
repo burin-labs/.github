@@ -1,3 +1,4 @@
+import { ManifestIdentity } from "./authorization.harn"
 import {
   CANDIDATE_MANIFEST_FILE,
   CandidateManifest,
@@ -5,6 +6,7 @@ import {
   expect_manifest_identity,
   validate_candidate_manifest,
 } from "./manifest.harn"
+import { ReleasePlan, reconcile_publication } from "./publication.harn"
 
 /**
  * Everything promotion asks of GitHub. The live adapter implements it with
@@ -13,8 +15,10 @@ import {
 pub type GitHub = {
   json: fn(string) -> unknown,
   download: fn(int, string, string) -> nil,
+  download_bound: fn(int, string, ManifestIdentity, string) -> nil,
   attest: fn(string, dict) -> string?,
   create_draft: fn(dict) -> nil,
+  upload_assets: fn(string, list<string>) -> nil,
   create_tag: fn(string, string, string) -> nil,
   publish_draft: fn(int, bool) -> unknown,
 }
@@ -33,10 +37,10 @@ pub type PromotionRequest = {
 }
 
 /** The run facts promotion relies on after it has checked them. */
-pub type VerifiedRun = {url: string, attempt: int}
+pub type VerifiedRun = {url: string, attempt: int, manifest_identity?: ManifestIdentity?}
 
 /** Internal authenticated completion reader, never a caller-provided verdict. */
-pub type CompletionAuthorization = fn(int) -> nil
+pub type CompletionAuthorization = fn(int) -> ManifestIdentity?
 
 /** A candidate whose manifest and file digests have been checked on disk. */
 pub type Candidate = {
@@ -120,9 +124,11 @@ pub fn verify_run(
     throw run_label(request) + " built a commit from " + to_string(head_owner) + ", not "
       + request.repository
   }
-  if run?.status != "completed"
-    || (run?.conclusion != "success"
-      && (run?.conclusion != "failure" || authorize_completion == nil)) {
+  const succeeded = run?.status == "completed" && run?.conclusion == "success"
+  const recoverable = (run?.status == "completed" && run?.conclusion == "failure")
+    || (["queued", "requested", "waiting", "pending", "in_progress"].contains(run?.status)
+      && run?.conclusion == nil)
+  if !succeeded && (!recoverable || authorize_completion == nil) {
     throw run_label(request) + " did not succeed: status " + to_string(run?.status)
       + ", conclusion "
       + to_string(run?.conclusion)
@@ -149,10 +155,23 @@ pub fn verify_run(
   if type_of(attempt) != "int" || attempt < 1 {
     throw run_label(request) + " reported no run attempt"
   }
-  if run?.conclusion == "failure" {
-    authorize_completion(attempt)
+  const identity = authorize_completion == nil ? nil : authorize_completion(attempt)
+  return {url: to_string(run?.html_url), attempt: attempt, manifest_identity: identity}
+}
+
+fn download_manifest(
+  github: GitHub,
+  request: PromotionRequest,
+  run: VerifiedRun,
+  directory: string,
+) -> nil {
+  const name = candidate_manifest_artifact(request.sha)
+  const destination = path_join(directory, "manifest")
+  if run.manifest_identity != nil {
+    github.download_bound(request.run_id, name, run.manifest_identity, destination)
+  } else {
+    github.download(request.run_id, name, destination)
   }
-  return {url: to_string(run?.html_url), attempt: attempt}
 }
 
 /** Where a verification directory keeps each downloaded file. */
@@ -192,6 +211,9 @@ fn load_manifest(
   if to_int(manifest.runAttempt) > run.attempt {
     throw "manifest runAttempt " + manifest.runAttempt + " is later than the run's attempt "
       + to_string(run.attempt)
+  }
+  if run.manifest_identity != nil && to_int(manifest.runAttempt) != run.attempt {
+    throw "consumer repair manifest must name the authenticated producing attempt"
   }
   return manifest
 }
@@ -242,11 +264,7 @@ pub fn verify_candidate(
   authorize_completion: CompletionAuthorization? = nil,
 ) -> Candidate {
   const run = verify_run(github, request, authorize_completion)
-  github.download(
-    request.run_id,
-    candidate_manifest_artifact(request.sha),
-    path_join(directory, "manifest"),
-  )
+  download_manifest(github, request, run, directory)
   const manifest = load_manifest(fs, request, run, directory)
   let artifacts = []
   for item in manifest.artifacts {
@@ -275,40 +293,70 @@ pub fn verify_candidate(
   if len(refused) > 0 {
     throw "build attestation did not verify for " + join(refused, "; ")
   }
+  fs.write_text(
+    path_join(directory, "publication-intent.json"),
+    json_stringify(publication_intent(fs, request, candidate)),
+  )
   return candidate
 }
 
-fn tag_commit(github: GitHub, request: PromotionRequest) -> string? {
-  const ref = github.json(
-    "/repos/" + request.repository + "/git/ref/tags/" + url_encode(request.tag),
-  )
-  if ref == nil {
-    return nil
+fn publication_plan(fs: HarnessFs, request: PromotionRequest, candidate: Candidate) -> ReleasePlan {
+  const notes = candidate.files.find({ file -> file.kind == "notes" })
+  require notes != nil, "the candidate has no notes file for the release body"
+  const assets = candidate.files.filter({ file -> file.kind != "notes" }).to_list()
+  return {
+    repository: request.repository,
+    sha: request.sha,
+    tag: request.tag,
+    prerelease: request.prerelease,
+    latest: request.namespace == nil && !request.prerelease,
+    notes_file: notes.path,
+    body: fs.read_text(notes.path),
+    files: assets.map({ file -> {name: file.name, path: file.path, sha256: file.sha256} })
+      + [
+        {
+          name: CANDIDATE_MANIFEST_FILE,
+          path: candidate.manifest_path,
+          sha256: sha256(fs.read_bytes(candidate.manifest_path)),
+        },
+      ],
   }
-  if ref?.object?.type == "commit" {
-    return to_string(ref.object.sha)
-  }
-  const annotated = github.json(
-    "/repos/" + request.repository + "/git/tags/" + to_string(ref?.object?.sha),
-  )
-  return to_string(annotated?.object?.sha)
 }
 
-fn draft_for(github: GitHub, request: PromotionRequest) -> dict? {
-  const releases = github.json("/repos/" + request.repository + "/releases?per_page=100")
-  for release in to_list(releases ?? []) {
-    if release?.tag_name == request.tag && release?.draft == true {
-      return release
-    }
-  }
-  return nil
+type PublicationIntent = {
+  schemaVersion: string,
+  repository: string,
+  sourceCommit: string,
+  runId: string,
+  runAttempt: string,
+  tag: string,
+  prerelease: bool,
+  manifestSha256: string,
+  notesSha256: string,
+  assets: list<{file: string, sha256: string}>,
 }
 
-/**
- * Publish a checked candidate: create a draft release at the commit holding
- * exactly the candidate files and the manifest, confirm GitHub stored those
- * exact digests, then publish it, which creates the tag. Returns the release.
- */
+fn publication_intent(
+  fs: HarnessFs,
+  request: PromotionRequest,
+  candidate: Candidate,
+) -> PublicationIntent {
+  const plan = publication_plan(fs, request, candidate)
+  return {
+    schemaVersion: "burin-labs.release_publication_intent.v1",
+    repository: request.repository,
+    sourceCommit: request.sha,
+    runId: to_string(request.run_id),
+    runAttempt: candidate.manifest.runAttempt,
+    tag: request.tag,
+    prerelease: request.prerelease,
+    manifestSha256: sha256(fs.read_bytes(candidate.manifest_path)),
+    notesSha256: sha256(plan.body),
+    assets: plan.files.map({ file -> {file: file.name, sha256: file.sha256} }),
+  }
+}
+
+/** Recheck the sealed candidate, then reconcile only matching publication state. */
 pub fn publish_candidate(
   github: GitHub,
   fs: HarnessFs,
@@ -316,90 +364,15 @@ pub fn publish_candidate(
   run: VerifiedRun,
   directory: string,
 ) -> {tag: string, url: string} {
+  if run.manifest_identity != nil {
+    download_manifest(github, request, run, directory)
+  }
   const candidate = check_candidate(fs, request, run, directory)
-  const existing = github.json(
-    "/repos/" + request.repository + "/releases/tags/" + url_encode(request.tag),
+  const intent = schema_expect(
+    json_parse(fs.read_text(path_join(directory, "publication-intent.json"))),
+    schema_of(PublicationIntent),
   )
-  if existing != nil {
-    throw "release " + request.tag + " already exists: " + to_string(existing?.html_url)
-  }
-  const tagged = tag_commit(github, request)
-  if tagged != nil && tagged != request.sha {
-    throw "tag " + request.tag + " already points at " + tagged + ", not " + request.sha
-  }
-  const stale = draft_for(github, request)
-  if stale != nil {
-    throw "a draft release for " + request.tag + " already exists: " + to_string(stale?.html_url)
-  }
-  // The notes file is the release body, byte for byte as the run built it;
-  // every other candidate file, and the manifest, is an asset.
-  const notes = candidate.files.find({ file -> file.kind == "notes" })
-  if notes == nil {
-    throw "the candidate has no notes file for the release body"
-  }
-  const assets = candidate.files.filter({ file -> file.kind != "notes" }).to_list()
-  let expected: dict<string, string> = {
-    [CANDIDATE_MANIFEST_FILE]: sha256(fs.read_bytes(candidate.manifest_path)),
-  }
-  for file in assets {
-    expected = expected + {[file.name]: file.sha256}
-  }
-  github.create_draft(
-    {
-      tag: request.tag,
-      sha: request.sha,
-      title: request.tag,
-      notes_file: notes.path,
-      prerelease: request.prerelease,
-      files: assets.map({ file -> file.path }) + [candidate.manifest_path],
-    },
-  )
-  const draft = draft_for(github, request)
-  if draft == nil {
-    throw "the draft release for " + request.tag + " did not appear"
-  }
-  let stored = {}
-  for asset in to_list(draft?.assets ?? []) {
-    stored = stored + {[to_string(asset?.name)]: to_string(asset?.digest)}
-  }
-  let differences = []
-  for name in keys(expected).sorted() {
-    const digest = "sha256:" + (expected[name] ?? "")
-    if stored[name] != digest {
-      differences = differences
-        + [name + " stored as " + to_string(stored[name]) + ", expected " + digest]
-    }
-  }
-  for name in keys(stored).sorted() {
-    if expected[name] == nil {
-      differences = differences + [name + " is not a candidate file"]
-    }
-  }
-  // GitHub does not report a digest for the body, so compare the text. Only
-  // surrounding whitespace is allowed to differ.
-  if trim(to_string(draft?.body ?? "")) != trim(fs.read_text(notes.path)) {
-    differences = differences + ["the release body is not " + notes.name]
-  }
-  if draft?.prerelease != request.prerelease {
-    differences = differences + ["prerelease is " + to_string(draft?.prerelease)]
-  }
-  if len(differences) > 0 {
-    throw "draft release " + to_string(draft?.html_url) + " does not hold the candidate: "
-      + join(differences, "; ")
-      + ". It was left unpublished."
-  }
-  // Tag the commit with an annotated tag before publishing, so the release
-  // adopts it. Publishing alone would create a lightweight tag, which carries
-  // no tagger or message and which tag verifiers written for every earlier
-  // release refuse. A rerun after a partial publish finds the tag in place.
-  if tagged == nil {
-    github.create_tag(request.tag, request.sha, "Release " + request.tag)
-  }
-  const published = github.publish_draft(draft.id, request.namespace == nil && !request.prerelease)
-  const landed = tag_commit(github, request)
-  if landed != request.sha {
-    throw "published " + request.tag + " but the tag points at " + to_string(landed) + ", not "
-      + request.sha
-  }
-  return {tag: request.tag, url: to_string(published?.html_url)}
+  require intent == publication_intent(fs, request, candidate),
+    "publication intent no longer matches the verified candidate"
+  return reconcile_publication(github, publication_plan(fs, request, candidate))
 }

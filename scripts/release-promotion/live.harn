@@ -1,6 +1,7 @@
 import { command_output_tail, command_run } from "std/command"
 import { complete_command_result } from "../captured-command.harn"
 import { ReadRecovery } from "./authorization.harn"
+import { download_bound_manifest } from "./bound-manifest.harn"
 import { GitHub } from "./promotion.harn"
 
 pub type ConsumerRecoveryConfig = {
@@ -14,11 +15,18 @@ pub type ConsumerRecoveryConfig = {
  * Invoke the immutable shared reader. Its closed output contains public
  * context/counts only; arbitrary subprocess diagnostics never reach logs.
  */
-pub fn live_consumer_recovery(tools: HarnessTools, config: ConsumerRecoveryConfig) -> ReadRecovery {
+pub fn live_consumer_recovery(
+  tools: HarnessTools,
+  config: ConsumerRecoveryConfig,
+  operation: string = "--recover",
+) -> ReadRecovery {
+  if !["--recover", "--repair"].contains(operation) {
+    throw "unknown consumer recovery operation"
+  }
   return fn(context: string, source: string) {
     const result = command_run(
       tools,
-      ["node", config.reader, "--recover"],
+      ["node", config.reader, operation],
       {
         capture: {max_inline_bytes: 16384},
         timeout_ms: 1200000,
@@ -28,7 +36,7 @@ pub fn live_consumer_recovery(tools: HarnessTools, config: ConsumerRecoveryConfi
           CANARY_WORKFLOW: config.workflow,
           OBSERVER_CONTEXT: context,
           SOURCE_REVISION: source,
-          REQUIRE_CURRENT_DEFAULT: "true",
+          REQUIRE_CURRENT_DEFAULT: operation == "--repair" ? "false" : "true",
         },
       },
     )
@@ -127,6 +135,7 @@ fn api_json(net: HarnessNet, token: string, endpoint: string) -> unknown {
 pub fn live_github(
   net: HarnessNet,
   tools: HarnessTools,
+  fs: HarnessFs,
   token: string,
   repository: string,
   scratch: string,
@@ -143,6 +152,20 @@ pub fn live_github(
   }
   return {
     json: fn(endpoint) { return api_json(net, token, endpoint) },
+    download_bound: fn(run_id, name, identity, directory) {
+      download_bound_manifest(
+        fs,
+        fn(argv: list<string>, options: dict) { return command_run(tools, argv, options) },
+        fn(endpoint: string) { return api_json(net, token, endpoint) },
+        env,
+        repository,
+        run_id,
+        name,
+        identity,
+        directory,
+      )
+      return nil
+    },
     download: fn(run_id, name, directory) {
       gh_ok(
         tools,
@@ -215,6 +238,15 @@ pub fn live_github(
           + (release.prerelease ? ["--prerelease"] : [])
           + release.files,
         "creating the draft release",
+      )
+      return nil
+    },
+    upload_assets: fn(tag, paths) {
+      gh_ok(
+        tools,
+        env,
+        ["release", "upload", tag, "--repo", repository] + paths,
+        "uploading missing release assets",
       )
       return nil
     },

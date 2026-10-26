@@ -2,8 +2,8 @@
  * Merge override policy: which attached label acts, who may apply it, what it
  * does, and the audit record every attempt leaves.
  *
- * An override is an admin's decision. The policy refuses only what is unsafe
- * whoever asks: a non-admin actor, a fork head, a head that moved after the
+ * An override is an admin's decision, or the fleet control App's. The policy
+ * refuses only what is unsafe whoever asks: a non-admin actor, a fork head, a head that moved after the
  * label, a pull request that is no longer open, missing required approval
  * (except `force-merge`), and `bypass-merge-queue` on a head whose `CI status`
  * is not green, because that label promises CI passed and `force-merge` is the
@@ -477,8 +477,17 @@ fn incident_refusal(label: string, incident: Incident?) -> string? {
     + "). It lands outside the merge queue only when main is red, this is a release-train pull request, the queue is wedged, or the automated reviewer failed to finish on this head."
 }
 
+/**
+ * The fleet control App. GitHub reports an App's membership and repository
+ * permission as `none`, so the admin read refuses it by construction; it is
+ * named instead. The `[bot]` suffix is reserved, so no person holds this login.
+ */
+pub const CONTROL_APP_LOGIN = "burin-control[bot]"
+
 fn is_admin(actor: Actor) -> bool {
-  return actor.membership_role == "admin" || actor.repository_permission == "admin"
+  return actor.login == CONTROL_APP_LOGIN
+    || actor.membership_role == "admin"
+    || actor.repository_permission == "admin"
 }
 
 /** Apply the policy. Refusals are the hard checks; warnings only reach the record. */

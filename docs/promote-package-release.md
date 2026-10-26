@@ -51,6 +51,21 @@ same files. A stable package release is a normal release with `latest: false`.
 A package prerelease also remains outside latest. Root stable releases still
 update latest; root prereleases do not.
 
+## Resume an interrupted promotion
+
+Rerun promotion with the same source SHA, producer run ID and tag. Keep the
+original candidate artifacts; do not rebuild them to repair an upload failure.
+The workflow re-verifies the candidate and retains its publication intent for
+30 days before obtaining write authority.
+
+The promoter adopts a matching draft, checks every stored asset digest, and
+uploads only missing files. If publication already succeeded, it checks the
+published release and exact tag target and returns that release. It refuses a
+different source, body, prerelease setting, unexpected asset, duplicate asset,
+incomplete upload or changed digest. Preserve the draft and retained proof when
+it refuses; diagnose the named conflict before another attempt. Same-tag
+promotions serialize without cancelling the active publisher.
+
 ## Register the package
 
 After publication, register the immutable archive URL and checksum with the

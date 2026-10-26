@@ -1,0 +1,40 @@
+name: Dependabot waiver audit
+description: Reconcile repository-owned waivers in a private execution repository
+
+inputs:
+  token:
+    description: Organization installation token with Contents read and Dependabot alerts write
+    required: true
+  organization:
+    description: Organization whose repository-owned waivers are reconciled
+    required: true
+  apply:
+    description: Reopen alerts whose waiver no longer holds
+    default: "false"
+  harn-version:
+    description: Published runtime used by the audit
+    default: "0.10.170"
+
+runs:
+  using: composite
+  steps:
+    - name: Install audit runtime
+      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+      with:
+        version: ${{ inputs.harn-version }}
+    - name: Reconcile waivers against live alerts
+      id: audit
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        DEPENDABOT_WAIVER_ORGANIZATION: ${{ inputs.organization }}
+        DEPENDABOT_WAIVER_APPLY: ${{ inputs.apply }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"
+    - name: Upload waiver audit report
+      if: ${{ always() && steps.audit.outputs.report != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: dependabot-waiver-audit
+        path: ${{ steps.audit.outputs.report }}
+        if-no-files-found: error
+        retention-days: 30

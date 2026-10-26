@@ -19,12 +19,7 @@ fn diagnostic(tools: HarnessTools, result: dict) -> string {
   return text == "" ? "exit " + to_string(result?.exit_code) : text
 }
 
-/** gh keeps its config and caches under scratch, inside the sandbox's write roots. */
-pub fn live_github(
-  host: {fs: HarnessFs, tools: HarnessTools},
-  token: string,
-  scratch: string,
-) -> GitHub {
+fn command_options(token: string, scratch: string) -> dict {
   const env = {
     GH_TOKEN: token,
     GH_CONFIG_DIR: path_join(scratch, "config"),
@@ -35,7 +30,60 @@ pub fn live_github(
     GH_NO_UPDATE_NOTIFIER: "1",
     NO_COLOR: "1",
   }
-  const options = {capture: {max_inline_bytes: 20000000}, env: env, timeout_ms: 120000}
+  return {capture: {max_inline_bytes: 20000000}, env: env, timeout_ms: 120000}
+}
+
+pub type OptionalRead = {state: "present" | "missing", value: unknown}
+
+type MissingResponse = {status: string, message: string}
+
+/** Only an actual HTTP 404 means absent. Permission and transport errors throw. */
+pub fn optional_response(success: bool, stdout: string) -> OptionalRead {
+  const normalized = stdout.replace("\r\n", "\n")
+  const boundary = normalized.index_of("\n\n")
+  require boundary != nil, "GitHub optional read returned no HTTP headers"
+  const offset = boundary ?? 0
+  const headers = normalized[0:offset]
+  const status_line = headers.split("\n")[0]
+  require regex_match("^HTTP/[0-9.]+ [0-9]{3}( |$)", status_line) != nil,
+    "GitHub optional read returned no HTTP status"
+  const status = to_int(status_line.split(" ")[1])
+  const body = normalized[offset + 2:len(normalized)]
+  if status == 404 && !success {
+    const error = schema_expect(json_parse(body), schema_of(MissingResponse))
+    require error.status == "404", "GitHub 404 body did not confirm the status"
+    return {state: "missing", value: nil}
+  }
+  require success && status >= 200 && status < 300,
+    "GitHub optional read failed with HTTP ${status}"
+  return {state: "present", value: json_parse(body)}
+}
+
+pub fn optional_read(
+  host: {tools: HarnessTools},
+  token: string,
+  scratch: string,
+  path: string,
+) -> OptionalRead {
+  const result = command_run(
+    host.tools,
+    ["gh", "api", "--include", path],
+    command_options(token, scratch),
+  )
+  try {
+    return optional_response(result.success, result.stdout)
+  } catch (error) {
+    throw "GET ${path}: ${to_string(error)}"
+  }
+}
+
+/** gh keeps its config and caches under scratch, inside the sandbox's write roots. */
+pub fn live_github(
+  host: {fs: HarnessFs, tools: HarnessTools},
+  token: string,
+  scratch: string,
+) -> GitHub {
+  const options = command_options(token, scratch)
   const tools = host.tools
   const run = fn(argv, what) {
     const result = command_run(tools, argv, options)

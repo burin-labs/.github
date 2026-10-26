@@ -80,13 +80,37 @@ main push. A run that reused a job records the run where that job actually
 executed, and the next run proves the job there. It never accepts a pointer
 alone.
 
+A canonical full checkpoint can supply `checkpoint-enrollment`: JSON containing
+`actorId`, `actorLogin` and `headBranch` from its trusted admission policy.
+The resolver verifies that identity against the actual workflow run, requires
+the clean tested commit to match, and checks that main contains it. Every
+unmatched job runs. The resolver inventories main runs and canonical checkpoints,
+then compares matching job failures by execution time, including old runs rerun
+later and earlier attempts of the current checkpoint. A passing job remains
+reusable when an unrelated sibling fails. Unreadable failure attribution or
+incomplete history or an unsettled relevant attempt prevents reuse.
+Without enrollment, dispatches only register original evidence. Scheduled
+backstops remain fresh.
+
+Checkpoint callers also supply `proof-universe`: JSON containing a `generation`
+name and UTC `notBefore` timestamp. The resolver includes both values in every
+job digest and refuses registration when the authenticated original API run was
+created before that timestamp. An old run cannot publish this generation's proofs
+by checking out newer source during a rerun. The negative inventory covers the
+complete creation range for this generation, including later reruns within it.
+Changing either value invalidates prior proofs. Ordinary callers can omit it.
+
 A job counts as passed only when every leg GitHub reports for it succeeded in
 one complete attempt, after that run registered its digests. An unrelated
 failed or cancelled job does not discard the others. The producer must be this
 repository's workflow, completed, with a registration archive whose digest
 matches. Unknown, partial, or unreadable producers prove nothing, so the job
-runs. Lookup reads at most eight runs, with a 40-read budget and a 45-second
-deadline. See the [typed proof owner](scripts/ci-job-proof/contract.harn).
+runs. Ordinary lookup reads at most eight runs, with a 40-read budget and a
+45-second deadline. Checkpoints share that deadline across positive proof and
+negative history, with a 128-read budget and at most eight recent negative
+attempt inspections. Creation-range partitioning defeats GitHub's result cap;
+it keeps every rerun within the generation. Exhaustion returns no reused jobs.
+See the [typed proof owner](scripts/ci-job-proof/contract.harn).
 The [record reference](docs/ci-job-proof-records.md) defines the actual tested
 checkout, the API run head, and the original-run inspection interface.
 
@@ -228,8 +252,9 @@ dismissed by a human or through `PATCH /repos/{owner}/{repo}/dependabot/alerts/
 {alert_number}` is never resurfaced — including on the day upstream finally
 ships the fix. Nothing in a dismissal expires by itself.
 
-`scripts/dependabot_waivers.rb` closes that gap. The weekly
-`Dependabot waiver audit` workflow reads every repository's waiver file,
+`scripts/dependabot-waivers/cli.harn` closes that gap. Its
+`.github/actions/dependabot-waiver-audit` composite action requires a private
+caller pinned to a reviewed commit. It reads every repository's waiver file,
 compares it against the live alert, and **reopens** the alert when the waiver
 stops being true: an installable fix appeared, the severity rose, or the alert
 now points at a different advisory. It fails the job when a waiver has gone
@@ -279,7 +304,8 @@ Copy `templates/dependabot-waivers.json` into the affected repository at
 `.github/dependabot-waivers.json` and check it with:
 
 ```console
-ruby scripts/dependabot_waivers.rb verify .github/dependabot-waivers.json owner/repo
+harn run scripts/dependabot-waivers/cli.harn -- verify \
+  .github/dependabot-waivers.json owner/repo
 ```
 
 The registry deliberately lives in the repository it describes, not here: this
@@ -290,21 +316,53 @@ GitHub has no dismissal reason meaning "upstream shipped no patch" — the
 checker rejects a waiver that omits it, and rejects one whose own recorded
 evidence admits an available fix.
 
+The implementation is public; its execution and reports are private. Before
+reading any alert or waiver, the audit reads the execution repository's GitHub
+metadata and requires `private: true`. Missing metadata or a public repository
+fails closed. Host the single schedule and token minting in the private caller;
+the action retains its report in that private run. Do not restore a public
+scheduled caller: logs, summaries and artifacts can reveal private dependency
+and advisory details.
+
+The Contents reader decodes the full JSON response before its base64 content.
+Only a structured HTTP 404 skips a missing registry; permission and transport
+errors fail the run. Organization and alert inventories use slurped API pages.
+Reports include repository, registry and dismissed-alert counts, skipped
+repositories, pending count and failing names. A zero active-repository
+inventory fails instead of reporting a vacuous clean audit.
+
+A registry timeout, permission error, server error or malformed response is
+unmeasured evidence. The audit keeps the alert dismissed, names the pending
+waiver and fails the run. A published-version lookup returning HTTP 404 means
+the version is absent; it is distinct from an unreadable registry. Known
+reopening and expiry decisions still take precedence, and an overdue waiver
+also reports any pending evidence.
+
 ### Arming the audit
 
-The workflow is gated on the `DEPENDABOT_WAIVER_AUDIT` variable and stays
-skipped until two things a workflow cannot do for itself are done by hand:
+The private caller is gated on the `DEPENDABOT_WAIVER_AUDIT` variable and stays
+skipped until setup and its permission check are complete:
 
 1. Grant the `harn-release-bot` GitHub App the **Dependabot alerts:
    read and write** repository permission (App settings → Permissions), and
    accept the permission change on the organization installation. Reopening an
    alert is a write; nothing less will do.
-2. Set the repository or organization variable `DEPENDABOT_WAIVER_AUDIT` to
-   `enabled`.
+2. Confirm the installation can read a nonempty private waiver file and its
+   dismissed alerts. A token declaration does not prove the App has the grant.
+3. Set `DEPENDABOT_WAIVER_AUDIT` to `enabled` in the measured private caller's
+   repository. Check the effective value, including inherited variables.
 
 Until then the job reports as skipped rather than running red every week, since
 a permanently failing alarm is the failure mode this whole mechanism exists to
 prevent.
+
+When moving a dependency to another repository, enable its dependency graph and
+alerts, then match the live advisory, package, ecosystem and manifest path in
+that repository. Alert numbers belong to one repository, so never copy the old
+number or invent a placeholder. Keep the existing review date and evidence
+unless the new dependency graph warrants a reviewed change. Repositories are
+discovered from the organization; the fleet's Dependabot configuration projection
+does not register waiver files or grant alert permissions.
 
 ## Eval fixture repositories
 

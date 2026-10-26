@@ -1,0 +1,107 @@
+import { assert_error_contains } from "std/testing"
+import { checkpoint_history } from "./checkpoint_history.harn"
+import { CheckpointEnrollment, RunContext } from "./contract.harn"
+
+const ENROLLED: CheckpointEnrollment = {actorId: 42, actorLogin: "release[bot]", headBranch: "main"}
+
+const UNIVERSE = {generation: "fixture-v1", notBefore: "2026-10-08T00:00:00Z"}
+
+fn current() -> RunContext {
+  return {
+    repository: "acme/product",
+    workflow: "ci.yml",
+    event: "workflow_dispatch",
+    commit: "a".repeat(40),
+    runId: 2000,
+    attempt: 1,
+    registrarJob: "Changes",
+    registrarStep: "Register",
+  }
+}
+
+fn row(id: int, created: string) -> dict {
+  return {
+    id: id,
+    run_attempt: 1,
+    head_sha: "a".repeat(40),
+    event: "push",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: "success",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+    head_branch: "main",
+    actor: {id: 42, login: "release[bot]"},
+    created_at: created,
+    updated_at: "2026-10-09T11:00:00Z",
+  }
+}
+
+pipeline test_negative_inventory_partitions_capped_history_without_dropping_old_reruns() {
+  const rows = range(1, 1003).map(
+    { id -> row(id, id <= 902 ? "2026-10-08T09:00:00Z" : "2026-10-09T09:00:00Z") },
+  )
+    .to_list()
+  let reads = 0
+  const read = fn(endpoint) {
+    reads = reads + 1
+    if endpoint.contains("event=workflow_dispatch") {
+      return {total_count: 0, workflow_runs: []}
+    }
+    const bounds = regex_captures("created=([^&]+)\\.\\.([^&]+)&page=([0-9]+)$", endpoint)[0].groups
+    const start = date_parse(bounds[0])
+    const through = date_parse(bounds[1])
+    const page = to_int(bounds[2])
+    const selected = rows.filter(
+      { run -> date_parse(run.created_at) >= start && date_parse(run.created_at) <= through },
+    )
+      .to_list()
+      .sorted_by({ run -> -run.id })
+    return {
+      total_count: min(len(selected), 1000),
+      workflow_runs: selected.slice((page - 1) * 100, page * 100),
+    }
+  }
+  const result = checkpoint_history(
+    {json: read},
+    current(),
+    ENROLLED,
+    UNIVERSE,
+    to_int(date_parse("2026-10-09T12:00:00Z") * 1000),
+  )
+  assert_eq(len(result), 1002)
+  assert(result.any({ run -> run.id == 1 }))
+  assert(reads > 2 && reads < 20)
+}
+
+pipeline test_partial_or_unpartitionable_history_refuses_instead_of_measuring_zero() {
+  const through = to_int(date_parse("2026-10-09T12:00:00Z") * 1000)
+  assert_error_contains(
+    fn() { checkpoint_history(
+      {
+        json:
+          fn(_endpoint) { return {total_count: 2, workflow_runs: [row(1, "2026-10-09T09:00:00Z")]} },
+      },
+      current(),
+      ENROLLED,
+      UNIVERSE,
+      through,
+    ) },
+    "incomplete or duplicated",
+  )
+  assert_error_contains(
+    fn() { checkpoint_history(
+      {
+        json: fn(_endpoint) { return {
+          total_count: 1000,
+          workflow_runs: [row(1, "2026-10-09T09:00:00Z")],
+        } },
+      },
+      current(),
+      ENROLLED,
+      UNIVERSE,
+      through,
+    ) },
+    "cannot be partitioned",
+  )
+}
