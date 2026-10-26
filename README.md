@@ -94,9 +94,9 @@ backstops remain fresh.
 
 Checkpoint callers also supply `proof-universe`: JSON containing a `generation`
 name and UTC `notBefore` timestamp. The resolver includes both values in every
-job digest and refuses registration when the authenticated original API run was created
-before that timestamp. An old run cannot publish this generation's proofs by
-checking out newer source during a rerun. The negative inventory covers the
+job digest and refuses registration when the authenticated original API run was
+created before that timestamp. An old run cannot publish this generation's proofs
+by checking out newer source during a rerun. The negative inventory covers the
 complete creation range for this generation, including later reruns within it.
 Changing either value invalidates prior proofs. Ordinary callers can omit it.
 
