@@ -32,7 +32,10 @@ pub type Alert = {
   state: string,
   dismissed_reason?: string?,
   security_advisory: {ghsa_id: string, severity: "low" | "medium" | "high" | "critical"},
-  security_vulnerability: {package: {name: string}, first_patched_version: {identifier: string}?},
+  security_vulnerability: {
+    package: {name: string, ecosystem: string},
+    first_patched_version: {identifier: string}?,
+  },
 }
 
 pub type BlockerState = {version: string, requirement: string}

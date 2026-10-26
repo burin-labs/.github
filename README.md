@@ -314,6 +314,11 @@ the version is absent; it is distinct from an unreadable registry. Known
 reopening and expiry decisions still take precedence, and an overdue waiver
 also reports any pending evidence.
 
+The live package name and ecosystem must match the waiver before any registry
+lookup or reopening. A mismatch is named pending work. The action permits only
+GitHub and the registry destinations declared by the registry adapter; Go proxy
+paths preserve module and version case through the protocol's escape encoding.
+
 ### Arming the audit
 
 The private caller is gated on the `DEPENDABOT_WAIVER_AUDIT` variable and stays

@@ -102,11 +102,7 @@ pipeline test_real_cli_transport_reads_pages_and_enforces_private_execution(harn
     harness.fs.write_text(
       blob,
       json_stringify(
-        contents(
-          document(
-            scenario == "pending" ? [waiver({ecosystem: "npm", package: "bad\npackage"})] : [],
-          ),
-        ),
+        contents(document(scenario == "pending" ? [waiver({package: "mistyped/package"})] : [])),
       ),
     )
     const output_path = path_join(root, "outputs-${scenario}")
@@ -156,6 +152,7 @@ pipeline test_real_cli_transport_reads_pages_and_enforces_private_execution(harn
       assert_eq(report.pending_names, ["acme/project#2"])
       assert_eq(report.ok, 0)
       assert_eq(report.reopened, 0)
+      assert(to_string(report.results[0]?.detail).contains("waiver names go:mistyped/package"))
       assert_eq(report.failing_names, ["acme/project#2:pending"])
       const output = trim(harness.fs.read_text(output_path)).split("\n")
       assert_eq(len(output), 3)

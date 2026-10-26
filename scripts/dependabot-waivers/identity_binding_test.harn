@@ -1,0 +1,64 @@
+import { Source, audit } from "./audit.harn"
+import { alert, contents, document, waiver } from "./fixtures.harn"
+
+pipeline test_only_the_live_package_and_ecosystem_can_reach_a_registry_or_write(harness: Harness) {
+  for row in [
+    {package: "example/package", ecosystem: "go", live_ecosystem: "go", matched: true},
+    {package: "mistyped/package", ecosystem: "go", live_ecosystem: "go", matched: false},
+    {package: "example/package", ecosystem: "pip", live_ecosystem: "go", matched: false},
+    {package: "example/package", ecosystem: "rust", live_ecosystem: "rust", matched: true},
+  ] {
+    let probes = 0
+    let writes = 0
+    const live = alert(
+      {
+        security_vulnerability: {
+          package: {name: "example/package", ecosystem: row.live_ecosystem},
+          first_patched_version: {identifier: "2.0.0"},
+        },
+      },
+    )
+    const source: Source = {
+      github: {
+        read: fn(_) { return {private: true} },
+        pages: fn(path) { return path.starts_with("orgs/") ? [
+          [{full_name: "acme/project", archived: false}],
+        ] : [[live]] },
+        send: fn(method, path, body) {
+          assert_eq(method, "PATCH")
+          assert_eq(path, "repos/acme/project/dependabot/alerts/2")
+          assert_eq(body, {state: "open"})
+          writes = writes + 1
+          return {}
+        },
+        graphql: fn(_, _) {
+          throw "not used"
+        },
+      },
+      contents: fn(_) { return {
+        state: "present",
+        value: contents(document([waiver(pick(row, ["package", "ecosystem"]))])),
+      } },
+      fix_installable: fn(ecosystem, package, version) {
+        assert_eq(ecosystem, row.ecosystem)
+        assert_eq(version, "2.0.0")
+        probes = probes + 1
+        return {state: "known", installable: package == "example/package"}
+      },
+      blocker_state: fn(_) {
+        probes = probes + 1
+        throw "no blocker"
+      },
+    }
+    const report = audit(source, "acme/audit", "acme", "2026-08-15", true)
+    assert_eq(report.ok, 0)
+    assert_eq(report.reopened, row.matched ? 1 : 0)
+    assert_eq(report.pending, row.matched ? 0 : 1)
+    assert_eq(probes, row.matched ? 1 : 0)
+    assert_eq(writes, row.matched ? 1 : 0)
+    if !row.matched {
+      assert_eq(report.pending_names, ["acme/project#2"])
+      assert_eq(report.failing_names, ["acme/project#2:pending"])
+    }
+  }
+}

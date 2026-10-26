@@ -27,8 +27,8 @@ pipeline test_patch_claim_requires_a_real_go_or_npm_version(harness: Harness) {
   assert_eq(
     paths,
     [
-      "https://proxy.golang.org/example/package/@v/v2.0.0.info",
-      "https://proxy.golang.org/example/package/@v/v2.0.0+incompatible.info",
+      "https://proxy.golang.org/!example/!package/@v/v2.0.0.info",
+      "https://proxy.golang.org/!example/!package/@v/v2.0.0+incompatible.info",
     ],
   )
   assert_eq(
