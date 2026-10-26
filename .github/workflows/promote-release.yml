@@ -65,6 +65,11 @@ on:
         required: false
         default: ''
         type: string
+      standalone-harn:
+        description: Qualify Harn's own source and immutable archives independently of downstream adoption.
+        required: false
+        default: false
+        type: boolean
     secrets:
       RELEASE_APP_CLIENT_ID:
         description: GitHub App client id with contents write on the calling repository.
@@ -128,7 +133,7 @@ jobs:
           version: 0.10.133
 
       - name: Check out the immutable consumer reader
-        if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'
+        if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '' || inputs.standalone-harn) && github.repository == 'burin-labs/harn'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: burin-labs/harn
@@ -137,7 +142,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up the consumer reader runtime
-        if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'
+        if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '' || inputs.standalone-harn) && github.repository == 'burin-labs/harn'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
@@ -167,6 +172,9 @@ jobs:
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
           PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
           PROMOTE_CONSUMER_REPAIR: ${{ inputs.consumer-repair }}
+          PROMOTE_STANDALONE_HARN: ${{ inputs.standalone-harn && 'true' || 'false' }}
+          PROMOTE_QUALIFICATION_TOKEN: ${{ github.token }}
+          PROMOTE_HARN_READER_ROOT: ${{ github.workspace }}/.harn/promote-release/consumer-reader
           PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
           PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
           PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}
@@ -215,6 +223,9 @@ jobs:
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
           PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
           PROMOTE_CONSUMER_REPAIR: ${{ inputs.consumer-repair }}
+          PROMOTE_STANDALONE_HARN: ${{ inputs.standalone-harn && 'true' || 'false' }}
+          PROMOTE_QUALIFICATION_TOKEN: ${{ github.token }}
+          PROMOTE_HARN_READER_ROOT: ${{ github.workspace }}/.harn/promote-release/consumer-reader
           PROMOTE_CONSUMER_TOKEN: ${{ steps.consumer-token.outputs.token }}
           PROMOTE_CONSUMER_REPOSITORY: ${{ github.repository_owner }}/${{ secrets.CONSUMER_CANARY_REPOSITORY }}
           PROMOTE_CONSUMER_WORKFLOW: ${{ vars.CONSUMER_CANARY_WORKFLOW }}

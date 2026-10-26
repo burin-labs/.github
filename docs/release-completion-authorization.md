@@ -5,6 +5,20 @@ source. Harn may also provide `original-consumer-context` when its original
 consumer observer reached its deadline and the exact admitted child later
 completed successfully with a reached product pass.
 
+An explicit `standalone-harn` call qualifies Harn publication separately from
+downstream adoption. It runs the immutable Harn source-CI/native reader and
+archive-producer reader, requiring measured complete source proof and every
+required build, smoke, audit and archive handoff. The archive reader binds the
+original producing attempt and exact manifest ID/digest. Publication repeats
+these reads before writing and retains all manifest, file, signature,
+attestation and ancestry checks. A failed or absent Harn-owned check refuses;
+empty output or a zero exit code without measured proof also refuses.
+
+This mode is restricted to Harn, defaults off, and cannot be combined with
+either consumer completion selector. It does not qualify a consumer, claim a
+successful rehearsal, or rewrite the original failed producer result. Consumer
+compatibility and adoption remain separately measured obligations.
+
 Harn owns which producer failures are eligible and which downstream product
 steps and receipts prove completion. One immutable reader authenticates the
 original issued context, reached deadline, complete producer and child

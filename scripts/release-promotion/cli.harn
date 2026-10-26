@@ -2,6 +2,7 @@ import { gha_write_output } from "std/gha"
 import { parse_authorization, verify_authorization } from "./authorization.harn"
 import { live_consumer_recovery, live_github } from "./live.harn"
 import { parse_request, publish_candidate, verify_candidate, verify_run } from "./promotion.harn"
+import { standalone_completion } from "./standalone.harn"
 
 fn required_env(env: HarnessEnv, name: string) -> string {
   const value = env.get(name)
@@ -41,8 +42,18 @@ fn main(harness: Harness) {
     harness.env.get("PROMOTE_ORIGINAL_CONSUMER_CONTEXT") ?? "",
     harness.env.get("PROMOTE_CONSUMER_REPAIR") ?? "",
   )
-  const authorize_completion =
-    authorization == nil ? nil : fn(attempt: int) { return verify_authorization(
+  const standalone = harness.env.get("PROMOTE_STANDALONE_HARN") ?? "false"
+  require ["true", "false"].contains(standalone), "standalone qualification choice is unreported"
+  require standalone != "true" || authorization == nil,
+    "standalone publication cannot claim consumer completion"
+  const authorize_completion = standalone == "true" ? standalone_completion(
+    harness.tools,
+    {
+      token: required_env(harness.env, "PROMOTE_QUALIFICATION_TOKEN"),
+      reader_root: required_env(harness.env, "PROMOTE_HARN_READER_ROOT"),
+    },
+    request,
+  ) : authorization == nil ? nil : fn(attempt: int) { return verify_authorization(
     live_consumer_recovery(
       harness.tools,
       {

@@ -1,0 +1,196 @@
+import { with_temp_dir } from "std/testing"
+import { parse_request } from "./promotion.harn"
+import { require_source_proof, standalone_completion, standalone_manifest } from "./standalone.harn"
+
+const SOURCE = "89512fd930c0af99f13f9295d8b236407ad07244"
+
+fn request() -> dict {
+  return parse_request(
+    {repository: "burin-labs/harn", sha: SOURCE, run_id: "100", tag: "v0.10.180"},
+  )
+}
+
+fn archives() -> dict {
+  return {
+    schema: "harn.release.producer_readiness.v1",
+    stage: "candidate-archives",
+    source_sha: SOURCE,
+    producer_run: "100",
+    producer_attempt: 1,
+    verdict: "pass",
+    pending: 0,
+    failed_jobs: [],
+    observed_jobs: 19,
+    proven_artifacts: 7,
+    manifest: {id: 9, digest: "sha256:" + "a".repeat(64)},
+  }
+}
+
+fn main_proof() -> dict {
+  return {
+    kind: "harn.release.full_suite.v1",
+    source_sha: SOURCE,
+    verdict: "success",
+    pending_count: 0,
+    failed_count: 0,
+    missing_jobs: [],
+  }
+}
+
+fn native_proof() -> dict {
+  return {
+    kind: "harn.release.native_qualification",
+    source: SOURCE,
+    status: "complete",
+    pending_count: 0,
+    failed_count: 0,
+    observed_jobs: 1,
+    required_steps: 8,
+  }
+}
+
+pipeline test_standalone_binds_actual_archive_proof_without_a_consumer_verdict() {
+  assert_eq(standalone_manifest(archives(), request(), 1), archives().manifest)
+  for change in [
+    {source_sha: "other"},
+    {producer_run: "101"},
+    {producer_attempt: 2},
+    {verdict: "pending"},
+    {pending: 1},
+    {failed_jobs: ["smoke"]},
+    {observed_jobs: 0},
+    {proven_artifacts: 0},
+    {stage: "consumer"},
+    {manifest: {id: 0, digest: archives().manifest.digest}},
+    {manifest: {id: 9, digest: "unmeasured"}},
+  ] {
+    assert(
+      is_err(
+        try {
+          standalone_manifest(archives() + change, request(), 1)
+        },
+      ),
+    )
+  }
+  assert(
+    is_err(
+      try {
+        standalone_manifest(archives(), request() + {repository: "acme/other"}, 1)
+      },
+    ),
+  )
+}
+
+pipeline test_standalone_requires_nonempty_matching_source_and_native_measurement() {
+  const good = json_stringify(main_proof()) + "\n" + json_stringify(native_proof())
+  require_source_proof(good, SOURCE)
+  for bad in [
+    "",
+    "exit zero without measurement",
+    json_stringify(main_proof()),
+    json_stringify(native_proof()),
+    good + "\n" + json_stringify(main_proof()),
+  ] {
+    assert(
+      is_err(
+        try {
+          require_source_proof(bad, SOURCE)
+        },
+      ),
+    )
+  }
+  for change in [
+    {source: "other"},
+    {status: "missing"},
+    {pending_count: 1},
+    {failed_count: 1},
+    {observed_jobs: 0},
+    {required_steps: 0},
+  ] {
+    assert(
+      is_err(
+        try {
+          require_source_proof(
+            json_stringify(main_proof()) + "\n" + json_stringify(native_proof() + change),
+            SOURCE,
+          )
+        },
+      ),
+    )
+  }
+  for change in [
+    {source_sha: "other"},
+    {verdict: "failure"},
+    {pending_count: 1},
+    {failed_count: 1},
+    {missing_jobs: ["test"]},
+  ] {
+    assert(
+      is_err(
+        try {
+          require_source_proof(
+            json_stringify(main_proof() + change) + "\n" + json_stringify(native_proof()),
+            SOURCE,
+          )
+        },
+      ),
+    )
+  }
+}
+
+pipeline test_standalone_reaches_both_owning_readers_and_refuses_child_failure(harness: Harness) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const ci = path_join(work, "scripts/ci")
+      harness.fs.mkdir(ci, true)
+      const source = path_join(ci, "require_full_suite.sh")
+      const archive = path_join(ci, "qualify-release-producer.mjs")
+      const config = {token: "fixture-read-only-token", reader_root: work}
+      harness.fs.write_text(
+        source,
+        "set -eu\n"
+          + "test \"$GH_TOKEN\" = fixture-read-only-token\n"
+          + "test \"$GH_REPO\" = burin-labs/harn\n"
+          + "test \"$SOURCE_SHA\" = "
+          + SOURCE
+          + "\n"
+          + "test \"$WAIT_FOR_FULL_SUITE\" = false\n"
+          + "printf '%s\\n' '"
+          + json_stringify(main_proof())
+          + "' '"
+          + json_stringify(native_proof())
+          + "'\n",
+      )
+      harness.fs.write_text(
+        archive,
+        "if (process.env.GH_TOKEN !== 'fixture-read-only-token' || process.argv.length !== 2"
+          + " || process.env.GITHUB_REPOSITORY !== 'burin-labs/harn'"
+          + " || process.env.EXPECTED_SOURCE_SHA !== '"
+          + SOURCE
+          + "'"
+          + " || process.env.CANDIDATE_RUN_ID !== '100' || process.env.CANDIDATE_RUN_ATTEMPT !== '1') process.exit(73);\n"
+          + "process.stdout.write("
+          + json_stringify(json_stringify(archives()))
+          + ");\n",
+      )
+      assert_eq(standalone_completion(harness.tools, config, request())(1), archives().manifest)
+      harness.fs.write_text(archive, "process.exit(14);\n")
+      assert(
+        is_err(
+          try {
+            standalone_completion(harness.tools, config, request())(1)
+          },
+        ),
+      )
+      harness.fs.write_text(source, "exit 13\n")
+      assert(
+        is_err(
+          try {
+            standalone_completion(harness.tools, config, request())(1)
+          },
+        ),
+      )
+    },
+  )
+}
