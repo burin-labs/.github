@@ -47,9 +47,7 @@ fn read_page(
     + (cursor == "" ? [] : ["-f", "cursor=${cursor}"])
   const result = command_run(tools, args)
   require result.success && !(result?.stdout_truncated ?? false), "sweep census page is unreadable"
-  const decoded = json_decode(result.stdout, schema_of(Response))
-  require is_ok(decoded), "sweep census page is malformed"
-  const response: Response = unwrap(decoded)
+  const response: Response = schema_expect(json_parse(result.stdout), schema_of(Response))
   require response.errors == nil || len(response.errors) == 0,
     "sweep census returned GraphQL errors"
   const page = response.data?.repository?.pullRequests
