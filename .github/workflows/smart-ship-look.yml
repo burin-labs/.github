@@ -105,7 +105,7 @@ jobs:
 
       - name: Hold the selected sweep look for the handoff canary
         if: ${{ !inputs.direct && matrix.pr == 62 }}
-        run: sleep 120
+        run: sleep 300
 
       - name: Check out the look result contract
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
