@@ -32,7 +32,10 @@ pub type Alert = {
   state: string,
   dismissed_reason?: string?,
   security_advisory: {ghsa_id: string, severity: "low" | "medium" | "high" | "critical"},
-  security_vulnerability: {package: {name: string}, first_patched_version: {identifier: string}?},
+  security_vulnerability: {
+    package: {name: string, ecosystem: string},
+    first_patched_version: {identifier: string}?,
+  },
 }
 
 pub type BlockerState = {version: string, requirement: string}
@@ -132,6 +135,13 @@ fn severity_rank(value: string) -> int {
   return -1
 }
 
+pub fn overdue_review(waiver: Waiver, today: string) -> Decision? {
+  if waiver.review_by < today {
+    return {verdict: "overdue", detail: "review_by ${waiver.review_by} has passed"}
+  }
+  return nil
+}
+
 /** Reopening takes precedence over expiry, as in the v1 audit. */
 pub fn reconcile(
   waiver: Waiver,
@@ -192,10 +202,8 @@ pub fn reconcile(
       }
     }
   }
-  if waiver.review_by < today {
-    return {verdict: "overdue", detail: "review_by ${waiver.review_by} has passed"}
-  }
-  return {verdict: "ok", detail: "no installable fix; severity unchanged at ${severity}"}
+  return overdue_review(waiver, today)
+    ?? {verdict: "ok", detail: "no installable fix; severity unchanged at ${severity}"}
 }
 
 pub fn unwaived(alerts: list<Alert>, waivers: list<Waiver>) -> list<Alert> {

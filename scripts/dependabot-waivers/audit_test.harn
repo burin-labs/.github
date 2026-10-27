@@ -5,7 +5,12 @@ import { alert, blocked, contents, document, waiver } from "./fixtures.harn"
 pipeline test_partial_live_alerts_fail_before_registry_probes_or_mutation(harness: Harness) {
   const good = alert()
   const no_patch = good
-    + {security_vulnerability: {package: {name: "example/package"}, first_patched_version: nil}}
+    + {
+      security_vulnerability: {
+        package: {name: "example/package", ecosystem: "go"},
+        first_patched_version: nil,
+      },
+    }
   assert_eq(decode_alerts([no_patch])[0]?.security_vulnerability?.first_patched_version, nil)
   for malformed in [
     {number: 2, state: "dismissed"},
@@ -14,12 +19,38 @@ pipeline test_partial_live_alerts_fail_before_registry_probes_or_mutation(harnes
     good + {security_advisory: {ghsa_id: "GHSA-test-test-test", severity: "unknown"}},
     good + {security_advisory: {ghsa_id: nil, severity: "high"}},
     good + {security_advisory: {ghsa_id: "GHSA-", severity: "high"}},
-    good + {security_vulnerability: {package: {name: "example/package"}}},
+    good + {security_vulnerability: {package: {name: "example/package", ecosystem: "go"}}},
     good
-      + {security_vulnerability: {package: {name: "example/package"}, first_patched_version: {}}},
-    good + {security_vulnerability: {package: {}, first_patched_version: nil}},
+      + {
+        security_vulnerability: {
+          package: {name: "example/package", ecosystem: "go"},
+          first_patched_version: {},
+        },
+      },
+    good + {security_vulnerability: {package: {ecosystem: "go"}, first_patched_version: nil}},
     good
-      + {security_vulnerability: {package: {name: "example/package"}, first_patched_version: "2"}},
+      + {
+        security_vulnerability: {
+          package: {name: "example/package", ecosystem: "go"},
+          first_patched_version: "2",
+        },
+      },
+    good
+      + {security_vulnerability: {package: {name: "example/package"}, first_patched_version: nil}},
+    good
+      + {
+        security_vulnerability: {
+          package: {name: "example/package", ecosystem: 17},
+          first_patched_version: nil,
+        },
+      },
+    good
+      + {
+        security_vulnerability: {
+          package: {name: "example/package", ecosystem: " "},
+          first_patched_version: nil,
+        },
+      },
     good + {state: "unknown"},
   ] {
     let writes = 0
@@ -98,6 +129,72 @@ pipeline test_unknown_evidence_is_named_pending_without_reopening_or_certifying(
           blocked_fix ? "blocker lookup timeout" : "fix lookup timeout",
         ),
       )
+    }
+  }
+}
+
+pipeline test_identity_mismatch_preserves_expiry_without_probes_or_mutation() {
+  for package in [
+    {name: "wrong/package", ecosystem: "go"},
+    {name: "example/package", ecosystem: "cargo"},
+  ] {
+    for changed_advisory in [false, true] {
+      for today in ["2026-11-14", "2026-11-15", "2026-11-16"] {
+        for apply in [false, true] {
+          let probes = 0
+          let writes = 0
+          const live = alert(
+            {
+              security_advisory: {
+                ghsa_id: changed_advisory ? "GHSA-othr-test-test" : "GHSA-test-test-test",
+                severity: changed_advisory ? "critical" : "high",
+              },
+              security_vulnerability: {
+                package: package,
+                first_patched_version: {identifier: "2.0.0"},
+              },
+            },
+          )
+          const source: Source = {
+            github: {
+              read: fn(_) { return {private: true} },
+              pages: fn(path) { return path.starts_with("orgs/") ? [
+                [{full_name: "acme/project", archived: false}],
+              ] : [[live]] },
+              send: fn(_, _, _) {
+                writes = writes + 1
+                return {}
+              },
+              graphql: fn(_, _) {
+                throw "not used"
+              },
+            },
+            contents: fn(_) { return {state: "present", value: contents(document([blocked()]))} },
+            fix_installable: fn(_, _, _) {
+              probes = probes + 1
+              return {state: "known", installable: true}
+            },
+            blocker_state: fn(_) {
+              probes = probes + 1
+              return {state: "known", value: {version: "2.0.0", requirement: "^2"}}
+            },
+          }
+          const report = audit(source, "acme/audit", "acme", today, apply)
+          const expired = today == "2026-11-16"
+          const verdict = expired ? "overdue" : "pending"
+          assert_eq(report.checked, 1)
+          assert_eq([probes, writes, report.ok, report.reopened], [0, 0, 0, 0])
+          assert_eq(report.overdue, expired ? 1 : 0)
+          assert_eq(report.pending, 1)
+          assert_eq(report.pending_names, ["acme/project#2"])
+          assert_eq(report.failing_names, ["acme/project#2:${verdict}"])
+          assert_eq(report.results[0]?.verdict, verdict)
+          assert((report.results[0]?.detail ?? "").contains("waiver names go:example/package"))
+          if expired {
+            assert((report.results[0]?.detail ?? "").contains("review_by 2026-11-15 has passed"))
+          }
+        }
+      }
     }
   }
 }

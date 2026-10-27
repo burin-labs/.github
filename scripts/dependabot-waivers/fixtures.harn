@@ -28,7 +28,7 @@ pub fn alert(overrides: dict = {}) -> Alert {
       state: "dismissed",
       security_advisory: {ghsa_id: "GHSA-test-test-test", severity: "high"},
       security_vulnerability: {
-        package: {name: "example/package"},
+        package: {name: "example/package", ecosystem: "go"},
         first_patched_version: {identifier: "2.0.0"},
       },
     }

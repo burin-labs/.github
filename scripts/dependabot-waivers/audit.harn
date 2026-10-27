@@ -6,6 +6,7 @@ import {
   BlockerState,
   Document,
   Report,
+  overdue_review,
   reconcile,
   summarize,
   unwaived,
@@ -40,7 +41,8 @@ pub fn decode_alerts(value: unknown) -> Alerts {
       alert.security_advisory.ghsa_id,
     )
       != nil
-      && trim(alert.security_vulnerability.package.name) != "",
+      && trim(alert.security_vulnerability.package.name) != ""
+      && trim(alert.security_vulnerability.package.ecosystem) != "",
       "invalid live advisory or package identity"
     const patch = alert.security_vulnerability.first_patched_version
     require patch == nil || trim(patch.identifier) != "", "invalid live patch identifier"
@@ -124,8 +126,16 @@ pub fn audit(
     }
     for waiver in document.waivers {
       const alert = alerts.find(fn(item) { return item.number == waiver.alert_number })
+      let identity_problem: string? = nil
+      if alert != nil {
+        const package = alert.security_vulnerability.package
+        if waiver.package != package.name || waiver.ecosystem != package.ecosystem {
+          identity_problem = "waiver names ${waiver.ecosystem}:${waiver.package}; live alert names ${package.ecosystem}:${package.name}"
+        }
+      }
       const preliminary = reconcile(waiver, alert, false, today, nil)
-      const needs_registry = !["stale", "reopen"].contains(preliminary.verdict)
+      const needs_registry = identity_problem == nil
+        && !["stale", "reopen"].contains(preliminary.verdict)
       const fix = !needs_registry ? {state: "known", installable: false} : source.fix_installable(
         waiver.ecosystem,
         waiver.package,
@@ -133,6 +143,9 @@ pub fn audit(
       )
       const installable = fix.state == "known" ? fix.installable : false
       let pending: list<string> = []
+      if identity_problem != nil {
+        pending.push(identity_problem)
+      }
       if fix.state == "pending" {
         pending.push(fix.detail)
       }
@@ -146,7 +159,14 @@ pub fn audit(
           pending.push(observation.detail)
         }
       }
-      const decision = reconcile(waiver, alert, installable, today, current)
+      const decision = identity_problem == nil ? reconcile(
+        waiver,
+        alert,
+        installable,
+        today,
+        current,
+      ) : overdue_review(waiver, today)
+        ?? {verdict: "pending", detail: "waiver identity does not match the live alert"}
       const reopened = decision.verdict == "reopen" && apply
       if reopened {
         source.github.send(

@@ -1,0 +1,28 @@
+import { fix_installable, registry_transport } from "./registries.harn"
+
+pipeline test_go_proxy_encodes_module_and_version_capitals_without_changing_identity(
+  harness: Harness,
+) {
+  for row in [
+    {module: "example/package", version: "2.0.0-rc1", escaped: "example/package/@v/v2.0.0-rc1"},
+    {module: "Example/Package", version: "2.0.0", escaped: "!example/!package/@v/v2.0.0"},
+    {module: "example/package", version: "2.0.0-RC1", escaped: "example/package/@v/v2.0.0-!r!c1"},
+  ] {
+    let paths: list<string> = []
+    const registry = registry_transport(
+      fn(url) {
+        paths.push(url)
+        return url == "https://proxy.golang.org/${row.escaped}.info" ? {
+          status: 200,
+          ok: true,
+          body: json_stringify({Version: "v${row.version}"}),
+        } : {status: 404, ok: false, body: "not found"}
+      },
+    )
+    assert_eq(
+      fix_installable(registry, "go", row.module, row.version),
+      {state: "known", installable: true},
+    )
+    assert_eq(paths, ["https://proxy.golang.org/${row.escaped}.info"])
+  }
+}
