@@ -89,6 +89,10 @@ jobs:
           ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn --
           "$REPO" "$DEFAULT_BRANCH" "$RUNNER_TEMP/ship.toml"
 
+      - name: Hold the selected sweep look for the handoff canary
+        if: ${{ !inputs.direct && matrix.pr == 62 }}
+        run: sleep 120
+
       - name: Look at the pull request
         id: look
         env:
