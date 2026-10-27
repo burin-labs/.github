@@ -89,10 +89,6 @@ jobs:
           ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn --
           "$REPO" "$DEFAULT_BRANCH" "$RUNNER_TEMP/ship.toml"
 
-      - name: Hold the selected sweep look for the handoff canary
-        if: ${{ !inputs.direct && matrix.pr == 62 }}
-        run: sleep 120
-
       - name: Look at the pull request
         id: look
         env:
@@ -106,6 +102,10 @@ jobs:
           POLICY: ${{ runner.temp }}/ship.toml
           SHIP_ROOT: ${{ runner.temp }}/ship
         run: ./scripts/harnw run --no-sandbox scripts/smart-ship-look.harn
+
+      - name: Hold the selected sweep look for the handoff canary
+        if: ${{ !inputs.direct && matrix.pr == 62 }}
+        run: sleep 120
 
       - name: Check out the look result contract
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
