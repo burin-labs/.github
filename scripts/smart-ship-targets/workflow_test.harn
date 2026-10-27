@@ -38,7 +38,7 @@ pipeline test_the_exact_selection_is_finalized_before_any_shepherd(harness: Harn
   const discovery = named(ship, "Find the pull requests to look at")
   const notices = named(ship, "Check out the complete Ship sweep census")
   assert_eq(notices["with"].repository, "burin-labs/.github")
-  assert_eq(notices["with"].ref, "4c0781b112f8034ca2f16f61c4fb4e366319fb41")
+  assert_eq(notices["with"].ref, "d6e448b7f5af749cb437e04174f477299f72045c")
   assert_eq(notices["with"]["persist-credentials"], false)
   assert(discovery.run.contains(".smart-ship-census/scripts/smart-ship-targets/sweep-census.harn"))
   assert(ship.index_of(notices) < ship.index_of(discovery))
