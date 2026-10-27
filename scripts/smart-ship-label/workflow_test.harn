@@ -29,6 +29,13 @@ pipeline test_repair_job_leaves_time_for_setup_and_transcript_upload(harness: Ha
     repair_job_fits(workflow.jobs.repair["timeout-minutes"]),
     "repair job must leave time after setup and the bounded agent",
   )
+  const step = named(workflow.jobs.repair.steps, "Repair deferred pull requests")
+  const bounded = "timeout --signal=TERM --kill-after=20s 47m ./scripts/harnw run"
+  assert(step.run.contains("exec " + bounded + " --no-sandbox scripts/smart-ship.harn"))
+  assert(
+    step.run.contains(bounded + " --no-sandbox --approve-risky git.push scripts/smart-ship.harn"),
+  )
+  assert(workflow.jobs.repair["timeout-minutes"] > 47, "job must outlast its repair deadline")
 }
 
 pipeline test_repair_bootstrap_provisions_the_declared_package_manager(harness: Harness) {
