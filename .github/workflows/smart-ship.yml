@@ -355,9 +355,7 @@ jobs:
             merged_numbers="$(./scripts/harnw run --no-sandbox \
               .smart-ship-census/scripts/smart-ship-targets/sweep-census.harn -- \
               --repo "$REPO" --label "$LABEL" --state MERGED --since "$since" | tail -n 1)"
-            notice_numbers="$(./scripts/harnw run --no-sandbox \
-              .smart-ship-census/scripts/smart-ship-targets/sweep-census.harn -- \
-              --repo "$REPO" --label ship-needs-you --state OPEN | tail -n 1)"
+            notice_numbers=""
             numbers="$(printf '%s\n' "$open_numbers" "$merged_numbers" "$notice_numbers" | tr ' ' '\n' | sort -u)"
           fi
           echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
