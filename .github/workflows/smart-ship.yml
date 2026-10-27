@@ -378,6 +378,10 @@ jobs:
           .smart-ship-targets/scripts/smart-ship-targets/cli.harn --
           --output "$RUNNER_TEMP/ship-targets/targets.json"
 
+      - name: Hold the sweep before publishing its selection for the handoff canary
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '' }}
+        run: sleep 300
+
       - name: Publish the selected pull requests
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
