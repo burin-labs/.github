@@ -80,15 +80,6 @@ jobs:
           path: .smart-ship-runner
           persist-credentials: false
 
-      - name: Check out the look result contract
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: burin-labs/.github
-          ref: d0a9e0a
-          path: .smart-ship-results
-          sparse-checkout: scripts/smart-ship-targets
-          persist-credentials: false
-
       - name: Read the default-branch shipping policy
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -111,6 +102,15 @@ jobs:
           POLICY: ${{ runner.temp }}/ship.toml
           SHIP_ROOT: ${{ runner.temp }}/ship
         run: ./scripts/harnw run --no-sandbox scripts/smart-ship-look.harn
+
+      - name: Check out the look result contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 1eaf45133ff4fecbe9dac844c3f25d02f3995eeb
+          path: .smart-ship-results
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
 
       - name: Record the finished look
         env:

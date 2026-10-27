@@ -392,7 +392,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: burin-labs/.github
-          ref: 54c2f11
+          ref: 1eaf45133ff4fecbe9dac844c3f25d02f3995eeb
           path: .smart-ship-results
           sparse-checkout: scripts/smart-ship-targets
           persist-credentials: false
@@ -459,7 +459,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: burin-labs/.github
-          ref: 54c2f11
+          ref: 1eaf45133ff4fecbe9dac844c3f25d02f3995eeb
           path: .smart-ship-results
           sparse-checkout: scripts/smart-ship-targets
           persist-credentials: false

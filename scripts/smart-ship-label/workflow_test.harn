@@ -1,4 +1,10 @@
 import { read_yaml } from "std/fs"
+import { selected_targets } from "../smart-ship-targets/lib.harn"
+import {
+  LookArtifact,
+  deferred_looks,
+  look_result_name,
+} from "../smart-ship-targets/look-results.harn"
 import { CONTROL_POLICY_SOURCE, control_policy_source, ship_label } from "./policy.harn"
 
 fn expression(value: string) -> string {
@@ -151,9 +157,9 @@ pipeline test_only_private_callers_can_hand_in_an_owned_runner(harness: Harness)
 /**
  * Runs the look step, then the repair step it hands off to, against a fake shepherd; returns its calls in order.
  */
-fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
+fn run_shepherd_steps(harness: Harness, defer_pr: string, fail_pr: string = "") -> list<string> {
   const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
-  const steps = jobs.ship.steps
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship-look.yml").jobs.look.steps
   const workspace = harness.fs.mkdtemp_in_workspace("smart-ship-sweep")
   const calls = path_join(workspace, "calls")
   const output = path_join(workspace, "github-output")
@@ -163,15 +169,18 @@ fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
   harness.fs.mkdir(path_join(workspace, "home"), true)
   harness.fs.write_text(calls, "")
   harness.fs.write_text(output, "")
-  // The fake shepherd defers the one PR whose next action is a repair.
+  // Execute the actual worker and repair step commands against one fake controller.
   const harnw = path_join(workspace, "scripts/harnw")
   harness.fs.write_text(
     harnw,
     "#!/usr/bin/env bash\n"
+      + "if [ \"$3\" = scripts/smart-ship-look.harn ]; then\n"
+      + "  echo \"$LOOK_PR look\" >> \"$CALLS\"\n"
+      + "  if [ \"$LOOK_PR\" = \"$FAIL_PR\" ]; then exit 1; fi\n"
+      + "  if [ \"$LOOK_PR\" = \"$DEFER_PR\" ]; then echo outcome=deferred >> \"$GITHUB_OUTPUT\"; else echo outcome=complete >> \"$GITHUB_OUTPUT\"; fi\n"
+      + "  exit 0\nfi\n"
       + "if [ \"$3\" = .smart-ship-runner/scripts/smart-ship-policy/cli.harn ]; then : > \"$7\"; exit 0; fi\n"
-      + "echo \"$*\" >> \"$CALLS\"\npr=\"\"; defer=0\n"
-      + "while [ $# -gt 0 ]; do case \"$1\" in --pr) pr=\"$2\"; shift ;; --defer-repair) defer=1 ;; esac; shift; done\n"
-      + "if [ \"$defer\" = 1 ] && [ \"$pr\" = \"$DEFER_PR\" ]; then exit 3; fi\nexit 0\n",
+      + "echo \"$DEFERRED run\" >> \"$CALLS\"\n",
   )
   // This fixture isolates look/repair ordering; the policy tests execute the reader.
   harness.fs.write_text(path_join(bin, "gh"), "#!/usr/bin/env bash\nexit 19\n")
@@ -184,18 +193,60 @@ fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
     HOME: path_join(workspace, "home"),
     CALLS: calls,
     DEFER_PR: defer_pr,
+    FAIL_PR: fail_pr,
     GITHUB_OUTPUT: output,
     GITHUB_WORKSPACE: workspace,
     REPO: "o/r",
     LABEL: "ship",
-    NUMBERS: "1 2 3",
     REPAIR: "true",
     DEFAULT_BRANCH: "main",
     RUNNER_TEMP: workspace,
   }
-  const look = run_step(harness, named(steps, "Shepherd").run, workspace, env)
-  assert(look.success, "Shepherd step failed: " + look.stdout + look.stderr)
-  const deferred = step_outputs(harness.fs.read_text(output)).get("deferred") ?? ""
+  const selection = selected_targets(
+    {
+      repository: "o/r",
+      workflow_ref: "o/r/.github/workflows/ship.yml@main",
+      run_id: 100,
+      attempt: 1,
+      numbers: "1 2 3",
+    },
+  )
+  let artifacts: list<LookArtifact> = []
+  for pr in selection.prs {
+    harness.fs.write_text(output, "")
+    const look = run_step(
+      harness,
+      named(steps, "Look at the pull request").run,
+      workspace,
+      env + {LOOK_PR: to_string(pr)},
+    )
+    if look.success {
+      artifacts = artifacts
+        + [
+          {
+            name: look_result_name(selection, pr),
+            result: {
+              schema: 1,
+              repository: "o/r",
+              workflow: "ship.yml",
+              run_id: 100,
+              attempt: 1,
+              pr: pr,
+              outcome: step_outputs(harness.fs.read_text(output)).get("outcome") ?? "",
+            },
+          },
+        ]
+    }
+  }
+  const reduced = try {
+    deferred_looks(selection, artifacts)
+  }
+  if fail_pr != "" {
+    assert(is_err(reduced), "a missing look must refuse every repair")
+    return harness.fs.read_text(calls).split("\n").filter({ line -> line != "" }).to_list()
+  }
+  assert(is_ok(reduced), "the complete look census must reduce")
+  const deferred = join(unwrap(reduced).map({ pr -> to_string(pr) }).to_list(), " ")
   if deferred != "" {
     const read = run_step(
       harness,
@@ -213,17 +264,7 @@ fn run_shepherd_steps(harness: Harness, defer_pr: string) -> list<string> {
     )
     assert(repair.success, "Repair step failed: " + repair.stdout + repair.stderr)
   }
-  return harness.fs.read_text(calls).split("\n").filter({ line -> line != "" }).map(
-    { line ->
-      regex_captures("--pr o/r#([0-9]+)", line)[0].groups[0]
-        + if line.contains("--defer-repair") {
-          " look"
-        } else {
-          " run"
-        }
-    },
-  )
-    .to_list()
+  return harness.fs.read_text(calls).split("\n").filter({ line -> line != "" }).to_list()
 }
 
 fn run_step(harness: Harness, script: string, workspace: string, env: dict) {
@@ -256,8 +297,9 @@ fn step_outputs(text: string) -> dict<string, string> {
  * before any repair runs, and only a deferred PR is repaired.
  */
 pipeline test_a_sweep_looks_at_every_pr_before_it_repairs_any(harness: Harness) {
-  assert_eq(run_shepherd_steps(harness, "o/r#2"), ["1 look", "2 look", "3 look", "2 run"])
+  assert_eq(run_shepherd_steps(harness, "2"), ["1 look", "2 look", "3 look", "2 run"])
   assert_eq(run_shepherd_steps(harness, ""), ["1 look", "2 look", "3 look"])
+  assert_eq(run_shepherd_steps(harness, "2", "3"), ["1 look", "2 look", "3 look"])
 }
 
 /**
@@ -268,18 +310,22 @@ pipeline test_a_sweep_looks_at_every_pr_before_it_repairs_any(harness: Harness) 
  */
 pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Harness) {
   const jobs = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs
-  assert_eq(jobs.ship.outputs.deferred, expression("steps.shepherd.outputs.deferred"))
+  const look = named(
+    read_yaml(harness.fs, "../../.github/workflows/smart-ship-look.yml").jobs.look.steps,
+    "Look at the pull request",
+  )
+  assert_eq(jobs.reduce_looks.outputs.deferred, expression("steps.reduce.outputs.deferred"))
   assert_eq(
     jobs.repair["if"],
     expression(
-      "!cancelled() && (needs.ship.outputs.deferred != '' || (github.event_name == 'workflow_dispatch' && inputs.main-red != '')) && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))",
+      "!cancelled() && (needs.reduce_looks.outputs.deferred != '' || (github.event_name == 'workflow_dispatch' && inputs.main-red != '')) && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))",
     ),
   )
-  assert(jobs.repair.needs.contains("ship"))
+  assert(jobs.repair.needs.contains("reduce_looks"))
   assert_eq(jobs.repair.environment, expression("inputs.repair-environment"))
   assert_eq(jobs.repair["runs-on"], jobs.ship["runs-on"])
-  assert_eq(named(jobs.ship.steps, "Shepherd").env?.OPENAI_API_KEY, nil)
-  assert_eq(named(jobs.ship.steps, "Shepherd").env?.ANTHROPIC_API_KEY, nil)
+  assert_eq(look.env?.OPENAI_API_KEY, nil)
+  assert_eq(look.env?.ANTHROPIC_API_KEY, nil)
   assert_eq(
     named(jobs.repair.steps, "Repair deferred pull requests").env.OPENAI_API_KEY,
     expression("secrets.OPENAI_API_KEY"),
@@ -290,7 +336,7 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
     repair.run.contains("--approve-risky git.push"),
     "the repair controller can publish a leased rebase",
   )
-  assert(!named(jobs.ship.steps, "Shepherd").run.contains("--approve-risky"))
+  assert(!look.run.contains("--approve-risky"))
   for name in [
     "Download the PR agent",
     "Set up Node",

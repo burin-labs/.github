@@ -4,15 +4,18 @@ import { READ_CASES, policy_fixture } from "./fixture.harn"
 
 pipeline test_actual_workflow_refuses_before_any_shepherd_when_policy_read_fails(harness: Harness) {
   const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
-  const consumers = steps.filter(
-    fn(step) { return ["Reconcile the Smart Ship control label", "Shepherd"].contains(step?.name) },
+  const reconcile_step = steps.find(
+    { step -> step?.name == "Reconcile the Smart Ship control label" },
   )
-    .to_list()
-  assert_eq(len(consumers), 2)
-  assert_eq(consumers[0].name, "Reconcile the Smart Ship control label")
-  assert_eq(consumers[1].name, "Shepherd")
-  const reconcile = consumers[0].run.replace("$" + "{{ inputs.ship-label }}", "ship")
-  const step = consumers[1]
+  const worker_steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship-look.yml").jobs
+    .look.steps
+  const step = worker_steps.find(
+    { entry -> entry?.name == "Read the default-branch shipping policy" },
+  )
+  const look = worker_steps.find({ entry -> entry?.name == "Look at the pull request" })
+  assert(reconcile_step != nil && step != nil && look != nil)
+  assert(worker_steps.index_of(step) < worker_steps.index_of(look))
+  const reconcile = reconcile_step.run.replace("$" + "{{ inputs.ship-label }}", "ship")
   assert_eq(step.env.DEFAULT_BRANCH, "$" + "{{ github.event.repository.default_branch }}")
   with_temp_dir(
     harness.fs,
@@ -23,9 +26,7 @@ pipeline test_actual_workflow_refuses_before_any_shepherd_when_policy_read_fails
         + "if [ \"$3\" = .smart-ship-runner/scripts/smart-ship-policy/cli.harn ]; then\n"
         + "  printf '%s\\n' \"$5\" \"$6\" \"$7\" > \"$ACQUIRED\"\n"
         + "  exec \"$HARN_BINARY\" \"$@\"\nfi\n"
-        + "if [ -e .smart-ship-runner ]; then echo 'control checkout survived into a worker' >&2; exit 89; fi\n"
-        + "printf '%s\\n' \"$*\" >> \"$SHEPHERD_CALLS\"\n"
-        + "case \"$*\" in *'example/consumer#2'*) exit 3;; esac\nexit 0\n"
+        + "printf '%s\\n' \"$LOOK_PR\" >> \"$SHEPHERD_CALLS\"\nexit 0\n"
       let measured = 0
       for scenario in READ_CASES + ["missing-helper"] {
         const workspace = path_join(temp, scenario)
@@ -57,7 +58,14 @@ pipeline test_actual_workflow_refuses_before_any_shepherd_when_policy_read_fails
         const result = harness.process.run(
           {
             program: "/usr/bin/env",
-            args: ["bash", "-e", "-o", "pipefail", "-c", reconcile + "\n" + step.run],
+            args: [
+              "bash",
+              "-e",
+              "-o",
+              "pipefail",
+              "-c",
+              reconcile + "\n" + step.run + "\n" + look.run,
+            ],
             cwd: workspace,
             env: fixture.prepare(scenario == "missing-helper" ? "present" : scenario)
               + {
@@ -73,6 +81,7 @@ pipeline test_actual_workflow_refuses_before_any_shepherd_when_policy_read_fails
                 LABEL: "ship",
                 NUMBERS: "1 2 3",
                 REPAIR: "false",
+                LOOK_PR: "2",
               },
             timeout_ms: 30000,
           },
@@ -112,15 +121,13 @@ pipeline test_actual_workflow_refuses_before_any_shepherd_when_policy_read_fails
           fn(line) { return line != "" },
         )
           .to_list()
-        assert_eq(len(children), expected ? 3 : 0, scenario)
+        assert_eq(len(children), expected ? 1 : 0, scenario)
         if expected {
           assert_eq(
             harness.fs.read_text(fixture.output),
             scenario == "present" ? fixture.content : "",
           )
-          for number in [1, 2, 3] {
-            assert(children[number - 1].contains("--pr example/consumer#" + to_string(number)))
-          }
+          assert_eq(children, ["2"])
         } else {
           assert_eq(harness.fs.read_text(fixture.output), "previous measured policy\n", scenario)
           assert_eq(harness.fs.read_text(output), "", scenario)
