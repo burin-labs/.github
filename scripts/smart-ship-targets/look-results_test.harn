@@ -1,0 +1,66 @@
+import { assert_error_contains } from "std/testing"
+import { selected_targets } from "./lib.harn"
+import { LookArtifact, deferred_looks, look_groups, look_result_name } from "./look-results.harn"
+
+const INPUT = {
+  repository: "o/r",
+  workflow_ref: "o/r/.github/workflows/ship.yml@refs/heads/main",
+  run_id: 150,
+  attempt: 2,
+  numbers: "7 8 9",
+}
+
+pipeline test_every_selected_look_is_accounted_for_before_repairs() {
+  const selection = selected_targets(INPUT)
+  const artifacts: list<LookArtifact> = selection.prs.map(
+    { pr ->
+      {
+        name: look_result_name(selection, pr),
+        result: {
+          schema: 1,
+          repository: selection.repository,
+          workflow: selection.workflow,
+          run_id: selection.run_id,
+          attempt: selection.attempt,
+          pr: pr,
+          outcome: pr == 8 ? "deferred" : "complete",
+        },
+      }
+    },
+  )
+    .to_list()
+  assert_eq(deferred_looks(selection, artifacts), [8])
+  assert_eq(deferred_looks(selected_targets(INPUT + {numbers: ""}), []), [])
+  const first = unwrap(artifacts[0])
+  const second = unwrap(artifacts[1])
+  const third = unwrap(artifacts[2])
+  const invalid_cases: list<{rows: list<LookArtifact>, error: string}> = [
+    {rows: artifacts[0:2], error: "census is incomplete"},
+    {rows: [first, first, third], error: "duplicate"},
+    {rows: [first + {name: "other"}, second, third], error: "foreign PR"},
+    {
+      rows: [first + {result: first.result + {attempt: 1}}, second, third],
+      error: "foreign run identity",
+    },
+    {
+      rows: [first + {result: first.result + {repository: "foreign/r"}}, second, third],
+      error: "foreign run identity",
+    },
+    {
+      rows: [first + {result: first.result + {outcome: "failed"}}, second, third],
+      error: "did not finish successfully",
+    },
+  ]
+  for invalid in invalid_cases {
+    assert_error_contains(fn() { deferred_looks(selection, invalid.rows) }, invalid.error)
+  }
+}
+
+pipeline test_matrix_groups_keep_every_pr_within_githubs_limit() {
+  const numbers = range(1, 1001).map({ number -> to_string(number) }).to_list()
+  const groups = look_groups(selected_targets(INPUT + {numbers: join(numbers, " ")}))
+  assert_eq(groups.map({ group -> len(group) }).to_list(), [250, 250, 250, 250])
+  assert_eq(unwrap(groups[0])[0], 1)
+  assert_eq(unwrap(groups[3])[249], 1000)
+  assert_eq(look_groups(selected_targets(INPUT + {numbers: "7 8 9"})), [[7, 8, 9], [], [], []])
+}
