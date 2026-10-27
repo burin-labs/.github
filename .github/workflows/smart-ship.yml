@@ -308,7 +308,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: burin-labs/.github
-          ref: 4c0781b112f8034ca2f16f61c4fb4e366319fb41
+          ref: cf149645a4da0a24890733b2ea7362580fff96e0
           path: .smart-ship-census
           sparse-checkout: scripts/smart-ship-targets
           persist-credentials: false
