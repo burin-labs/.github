@@ -303,6 +303,15 @@ jobs:
         with:
           token: ${{ steps.app.outputs.token }}
 
+      - name: Check out the pending Ship notice census
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 35bfea2e649cd5f43774bf0fa009f634eb030e6d
+          path: .smart-ship-notices
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
+
       - name: Find the pull requests to look at
         id: prs
         env:
@@ -342,7 +351,9 @@ jobs:
             open_numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number')"
             merged_numbers="$(gh pr list -R "$REPO" --label "$LABEL" --state merged --search "merged:>=$since" \
               --json number --jq '.[].number')"
-            numbers="$(printf '%s\n' "$open_numbers" "$merged_numbers" | sort -u)"
+            notice_numbers="$(./scripts/harnw run --no-sandbox \
+              .smart-ship-notices/scripts/smart-ship-targets/pending-notices.harn -- --repo "$REPO" | tail -n 1)"
+            numbers="$(printf '%s\n' "$open_numbers" "$merged_numbers" "$notice_numbers" | tr ' ' '\n' | sort -u)"
           fi
           echo "numbers=$(printf '%s\n' "$numbers" | xargs)" >> "$GITHUB_OUTPUT"
           echo "Looking at: ${numbers:-none}"

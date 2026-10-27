@@ -10,13 +10,14 @@ pipeline test_target_collection_requires_every_census_before_publishing(harness:
   for row in [
     {mode: "open-failed", calls: 1, success: false, output: ""},
     {mode: "merged-failed", calls: 2, success: false, output: ""},
-    {mode: "success", calls: 2, success: true, output: "numbers=7 9"},
+    {mode: "success", calls: 2, success: true, output: "numbers=15 7 9"},
+    {mode: "notice-failed", calls: 2, success: false, output: ""},
     {mode: "empty", calls: 2, success: true, output: "numbers="},
     {mode: "direct", calls: 0, success: true, output: "numbers=11"},
     // A finished run on main looks only at the PRs the lister says wait on main.
     {mode: "main-waiting", calls: 0, success: true, output: "numbers=4 5"},
     {mode: "main-none", calls: 0, success: true, output: "numbers="},
-    {mode: "main-unreadable", calls: 2, success: true, output: "numbers=7 9"},
+    {mode: "main-unreadable", calls: 2, success: true, output: "numbers=15 7 9"},
     {mode: "main-failed", calls: 0, success: false, output: ""},
   ] {
     with_temp_dir(
@@ -47,6 +48,12 @@ pipeline test_target_collection_requires_every_census_before_publishing(harness:
           """
 #!/bin/sh
 case "$*" in
+  *".smart-ship-notices/scripts/smart-ship-targets/pending-notices.harn -- --repo example/repo")
+    printf '%s\n' notice >> "$FIXTURE_NOTICE_CALLS"
+    if [ "$FIXTURE_MODE" = notice-failed ]; then exit 96; fi
+    if [ "$FIXTURE_MODE" != empty ]; then echo "7 15"; fi
+    exit 0
+    ;;
   *"scripts/smart-ship-waiting.harn -- --repo example/repo --label ship") ;;
   *) exit 94 ;;
 esac
@@ -98,6 +105,7 @@ esac
               "LABEL=ship",
               "FIXTURE_MODE=" + row.mode,
               "FIXTURE_CALLS=" + calls,
+              "FIXTURE_NOTICE_CALLS=" + root + "/notice-calls",
               "/bin/bash",
               source,
             ],
@@ -115,6 +123,9 @@ esac
         }
         if row.calls == 2 {
           assert(observed.contains("--state merged"), "both censuses must be reached")
+          if row.mode != "merged-failed" {
+            assert(harness.fs.exists(root + "/notice-calls"), "the notice census must be reached")
+          }
         }
       },
     )
