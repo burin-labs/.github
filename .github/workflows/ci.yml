@@ -132,6 +132,14 @@ jobs:
           test "$COMPARISON_BASE" = "$GITHUB_SHA"
           test "$COMPARISON_TIP" = "$GITHUB_SHA"
           harn test .github/actions/ci-comparison/cli_test.harn
+      - name: Validate a candidate with an xz-distributed Harn release
+        uses: ./.github/actions/validate-candidate-manifest
+        with:
+          harn-version: 0.10.180
+          manifest: scripts/release-promotion/fixtures/harn-candidate-manifest.json
+          repository: burin-labs/harn
+          source-commit: 0e926289a777480b70c5fe9b29c6b67585559030
+          run-id: "35858262708"
 
   package-smoke:
     name: Reusable Harn package smoke (${{ matrix.strict && 'strict' || 'default' }})

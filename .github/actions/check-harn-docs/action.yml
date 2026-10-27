@@ -26,7 +26,7 @@ runs:
   steps:
     - name: Set up the checker runtime
       id: runtime
-      uses: burin-labs/harn/.github/actions/setup-harn@a776aba61473102efdad448e6ae464c944e44af0
+      uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808
       with:
         version: ${{ inputs.version }}
         version-file: ${{ inputs.version-file }}

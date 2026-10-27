@@ -34,7 +34,7 @@ runs:
   steps:
     - name: Set up exact Harn release
       if: ${{ inputs.skip-harn-setup != 'true' }}
-      uses: burin-labs/harn/.github/actions/setup-harn@6f1796501c9870074644c47c50200b05f4548e03
+      uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808
       with:
         version: ${{ inputs.harn-version }}
     - name: Capture comparison

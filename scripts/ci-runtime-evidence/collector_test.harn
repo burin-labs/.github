@@ -429,10 +429,7 @@ pipeline test_action_passes_token_only_through_environment(harness: Harness) {
   const action = read_yaml(harness.fs, "../../.github/actions/ci-runtime-evidence/action.yml", nil)
   const setup = action.runs.steps[0]
   const collect_step = action.runs.steps[1]
-  assert_eq(
-    setup.uses,
-    "burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f",
-  )
+  assert(regex_match(r"^burin-labs/harn/\.github/actions/setup-harn@[0-9a-f]{40}$", setup.uses))
   assert_eq(collect_step.env.GH_TOKEN, "$" + "{{ inputs.github-token }}")
   assert(!collect_step.run.contains("github-token"))
   assert(collect_step.run.contains("run.sh"))

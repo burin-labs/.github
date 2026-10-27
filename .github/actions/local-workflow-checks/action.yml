@@ -41,7 +41,7 @@ runs:
   steps:
     - name: Set up exact Harn release
       id: setup
-      uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f # bounded release-asset retries
+      uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808 # supports compressed release archives
       with:
         version: ${{ inputs.harn-version }}
         version-file: ${{ inputs.harn-version-file }}
