@@ -11,6 +11,20 @@ fn named(steps: list, name: string) -> dict {
   return matches[0] ?? {}
 }
 
+/** The current repair policy has a bounded setup, agent and shutdown allowance. */
+fn repair_job_fits(minutes: int) -> bool {
+  return minutes * 60 >= 900 + 1500 + 300 + 600
+}
+
+pipeline test_repair_job_leaves_time_for_setup_and_transcript_upload(harness: Harness) {
+  const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
+  assert(!repair_job_fits(40), "the former job limit must fail the budget check")
+  assert(
+    repair_job_fits(workflow.jobs.repair["timeout-minutes"]),
+    "repair job must leave time after setup and the bounded agent",
+  )
+}
+
 pipeline test_repair_bootstrap_provisions_the_declared_package_manager(harness: Harness) {
   const workflow = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml")
   const steps = workflow.jobs.repair.steps
