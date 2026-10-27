@@ -286,7 +286,10 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
   )
   const repair = named(jobs.repair.steps, "Repair deferred pull requests")
   assert_eq(repair.env.ANTHROPIC_API_KEY, expression("secrets.ANTHROPIC_API_KEY"))
-  assert(repair.run.contains("--approve-risky git.push"), "the repair controller can publish a leased rebase")
+  assert(
+    repair.run.contains("--approve-risky git.push"),
+    "the repair controller can publish a leased rebase",
+  )
   assert(!named(jobs.ship.steps, "Shepherd").run.contains("--approve-risky"))
   for name in [
     "Download the PR agent",
@@ -301,10 +304,7 @@ pipeline test_repair_tooling_runs_only_when_a_look_deferred_a_repair(harness: Ha
 
 pipeline test_repository_caller_forwards_the_optional_repair_key(harness: Harness) {
   const caller = read_yaml(harness.fs, "../../.github/workflows/ship.yml")
-  assert_eq(
-    caller.jobs.ship.secrets.ANTHROPIC_API_KEY,
-    expression("secrets.ANTHROPIC_API_KEY"),
-  )
+  assert_eq(caller.jobs.ship.secrets.ANTHROPIC_API_KEY, expression("secrets.ANTHROPIC_API_KEY"))
 }
 
 pipeline test_repair_evidence_survives_a_failed_attempt_without_uploading_checkouts(
@@ -374,7 +374,7 @@ pipeline test_a_main_run_wakes_only_the_prs_waiting_on_main(harness: Harness) {
   const lister = run.index_of("scripts/smart-ship-waiting.harn")
   assert(lister > 0, run)
   assert(run.index_of("exit 0") > lister, run)
-  assert(run.index_of("exit 0") < run.index_of("gh pr list"), run)
+  assert(run.index_of("exit 0") < run.index_of("sweep-census.harn"), run)
   assert(run.contains("if [ \"$numbers\" != \"--all\" ]"), run)
 }
 
