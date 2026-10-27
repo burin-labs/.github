@@ -16,7 +16,15 @@ pub type LookArtifact = {name: string, result: LookResult}
 /** GitHub's matrix limit is 256, so split the complete selection into four bounded groups. */
 pub fn look_groups(selection: TargetSelection) -> list<list<int>> {
   require len(selection.prs) <= 1000, "look selection exceeds its population bound"
-  return range(0, 4).map({ group -> selection.prs[group * 250:(group + 1) * 250] }).to_list()
+  return range(0, 4).map(
+    { group ->
+      range(0, len(selection.prs)).filter({ index -> index % 4 == group }).map(
+        { index -> unwrap(selection.prs[index]) },
+      )
+        .to_list()
+    },
+  )
+    .to_list()
 }
 
 /** The artifact name and payload both belong to the original run and attempt. */

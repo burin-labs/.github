@@ -62,5 +62,10 @@ pipeline test_matrix_groups_keep_every_pr_within_githubs_limit() {
   assert_eq(groups.map({ group -> len(group) }).to_list(), [250, 250, 250, 250])
   assert_eq(unwrap(groups[0])[0], 1)
   assert_eq(unwrap(groups[3])[249], 1000)
-  assert_eq(look_groups(selected_targets(INPUT + {numbers: "7 8 9"})), [[7, 8, 9], [], [], []])
+  const twenty_five = numbers[0:25]
+  const measured = look_groups(selected_targets(INPUT + {numbers: join(twenty_five, " ")}))
+  assert_eq(measured.map({ group -> len(group) }).to_list(), [7, 6, 6, 6])
+  assert_eq(measured[0], [1, 5, 9, 13, 17, 21, 25])
+  assert_eq(measured[3], [4, 8, 12, 16, 20, 24])
+  assert_eq(look_groups(selected_targets(INPUT + {numbers: "7 8 9"})), [[7], [8], [9], []])
 }
