@@ -465,7 +465,9 @@ jobs:
       - name: Download every finished look
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          pattern: smart-ship-look-result-${{ github.run_id }}-${{ github.run_attempt }}-*
+          # The download action flattens a single matching artifact. Include
+          # the original targets to keep every result in its named directory.
+          pattern: '{smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }},smart-ship-look-result-${{ github.run_id }}-${{ github.run_attempt }}-*}'
           path: ${{ runner.temp }}/ship-look-results
       - name: Verify the complete look census
         id: reduce
