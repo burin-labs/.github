@@ -29,10 +29,11 @@ fn main(harness: Harness) {
   if argv == ["groups"] {
     const selected = selection(harness.env, harness.env.get("NUMBERS"))
     const groups = look_groups(selected)
-    let output = ""
-    for index in range(0, 4) {
-      output = output + "group_" + to_string(index) + "=" + json_stringify(groups[index]) + "\n"
-    }
+    const output = "groups_json="
+      + json_stringify(
+        groups.filter({ group -> len(group) > 0 }).map({ group -> {prs: group} }).to_list(),
+      )
+      + "\n"
     harness.fs.append(required(harness.env, "GITHUB_OUTPUT"), output)
     harness.stdio.println("look selection: selected=${to_string(len(selected.prs))}, pending=0")
     return
