@@ -39,10 +39,18 @@ pipeline test_real_look_result_cli_requires_the_complete_same_attempt_census(har
         },
       )
       assert(groups.success, groups.stderr)
-      assert_eq(
-        harness.fs.read_text(output),
-        "group_0=[7,8,9]\ngroup_1=[]\ngroup_2=[]\ngroup_3=[]\n",
+      assert_eq(harness.fs.read_text(output), "groups_json=[[7,8,9]]\n")
+      harness.fs.write_text(output, "")
+      const empty_groups = harness.process.run(
+        {
+          program: "harn",
+          args: ["run", "--no-sandbox", cli, "--", "groups"],
+          env: env + {NUMBERS: ""},
+          timeout_ms: 30000,
+        },
       )
+      assert(empty_groups.success, empty_groups.stderr)
+      assert_eq(harness.fs.read_text(output), "groups_json=[]\n")
       harness.fs.write_text(output, "")
       for pr in [7, 8] {
         const path = path_join(root, look_result_name(selected, pr), "result.json")
