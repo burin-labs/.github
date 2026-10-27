@@ -249,6 +249,7 @@ jobs:
           persist-credentials: false
 
       - name: Reconcile the Smart Ship control label
+        if: ${{ inputs.ship-label != 'ship-parallel-canary' }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
@@ -268,7 +269,7 @@ jobs:
       # whose jobs has started or done work is cancelled; on 2026-10-24 a
       # sweep cancelled the previous sweep's seven running repairs.
       - name: Cancel stale queued Smart Ship runs
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '') }}
+        if: ${{ inputs.ship-label != 'ship-parallel-canary' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '')) }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
