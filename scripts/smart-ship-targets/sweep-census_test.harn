@@ -35,7 +35,7 @@ fn read(harness: Harness, input: SweepInput, responses: list<dict>) -> list<int>
     harness.testing,
     responses.map({ response -> {capability: "tools", method: "run_command", result: response} })
       .to_list(),
-    { -> sweep_census(harness.tools, input) },
+    { -> sweep_census(harness.tools, input, "fixture-token") },
   )
 }
 
@@ -54,7 +54,7 @@ pipeline test_sweep_census_reads_over_30_and_a_measured_empty_population(harness
     )
       .to_list(),
     { ->
-      const found = sweep_census(harness.tools, input)
+      const found = sweep_census(harness.tools, input, "fixture-token")
       return {
         found: found,
         calls: harness.testing.calls().map({ call -> json_stringify(call.args) }).to_list(),
@@ -63,6 +63,10 @@ pipeline test_sweep_census_reads_over_30_and_a_measured_empty_population(harness
   )
   assert_eq(measured.found, numbers(1, 102))
   assert_eq(len(measured.calls), 3)
+  assert(
+    measured.calls.all({ call -> call.contains("fixture-token") }),
+    "every page needs the app token",
+  )
   assert(measured.calls[1].contains("cursor=next"), "second page must use the returned cursor")
   assert(!measured.calls[2].contains("cursor=next"), "stability read must revisit the first page")
 }
@@ -131,4 +135,20 @@ pipeline test_sweep_census_refuses_partial_changed_and_duplicate_evidence(harnes
     }
     assert(is_err(attempt), "incomplete or changing evidence must refuse")
   }
+}
+
+pipeline test_sweep_census_refuses_missing_app_token_before_reading(harness: Harness) {
+  const input: SweepInput = {repo: "o/r", label: "ship", state: "OPEN", since: ""}
+  const measured = with_capability_fixtures(
+    harness.testing,
+    [],
+    { ->
+      const attempted = try {
+        sweep_census(harness.tools, input, "")
+      }
+      return {failed: is_err(attempted), calls: harness.testing.calls()}
+    },
+  )
+  assert(measured.failed, "a missing token must not become an empty census")
+  assert_eq(len(measured.calls), 0, "a missing token must refuse before a GitHub read")
 }
