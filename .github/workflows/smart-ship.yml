@@ -211,8 +211,8 @@ jobs:
     runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     timeout-minutes: 40
     outputs:
-      deferred: ${{ steps.shepherd.outputs.deferred }}
-      deferred_json: ${{ steps.shepherd.outputs.deferred_json }}
+      numbers: ${{ steps.prs.outputs.numbers }}
+      groups_json: ${{ steps.look_groups.outputs.groups_json }}
     steps:
       - name: Mint the release app token
         id: app
@@ -388,70 +388,104 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-      - name: Shepherd
-        id: shepherd
-        if: steps.prs.outputs.numbers != ''
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
-          # The bot the token acts as. GitHub reports the shepherd's own queue
-          # removals as `manual`, like a person's; the actor tells them apart.
-          BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
-          REPO: ${{ github.repository }}
-          LABEL: ${{ inputs.ship-label }}
-          NUMBERS: ${{ steps.prs.outputs.numbers }}
-          REPAIR: ${{ inputs.repair }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -uo pipefail
-          # The calling repository's checked-in policy, read from its default
-          # branch so a pull request cannot rewrite the rules it is judged by.
-          policy="$RUNNER_TEMP/ship.toml"
-          ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn -- \
-            "$REPO" "$DEFAULT_BRANCH" "$policy" || exit $?
-          rm -rf -- "$GITHUB_WORKSPACE/.smart-ship-runner"
-          extra=()
-          if [ "$REPAIR" != "true" ]; then
-            extra+=(--no-repair)
-          fi
-          # Every PR gets its look first. With --defer-repair the shepherd
-          # changes nothing and exits 3 when its next action is a repair; those
-          # PRs are repaired after every look, by the repair job. A sweep that
-          # repaired inline never reached the PRs after it, and the repair
-          # tooling costs about 40 seconds that a look never needs.
-          status=0
-          deferred=()
-          for n in $NUMBERS; do
-            echo "::group::$REPO#$n"
-            rc=0
-            ./scripts/harnw run --no-sandbox scripts/smart-ship.harn -- \
-              --pr "$REPO#$n" --state github --ship-label "$LABEL" \
-              --policy "$policy" --ship-root "$RUNNER_TEMP/ship" "${extra[@]}" --defer-repair || rc=$?
-            echo "::endgroup::"
-            if [ "$rc" -eq 3 ]; then
-              deferred+=("$n")
-            elif [ "$rc" -ne 0 ]; then
-              status=1
-            fi
-          done
-          echo "deferred=${deferred[*]}" >> "$GITHUB_OUTPUT"
-          echo "deferred_json=[$(IFS=,; echo "${deferred[*]}")]" >> "$GITHUB_OUTPUT"
-          exit $status
+      - name: Check out the look result contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 1eaf45133ff4fecbe9dac844c3f25d02f3995eeb
+          path: .smart-ship-results
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
 
-      # Once every look is done this run acts only on the PRs its repair job
-      # takes. Publishing that subset lets other runs act on the rest instead
-      # of deferring to this run until its repairs finish.
-      - name: Record the pull requests left for repair
-        if: ${{ !cancelled() && steps.prs.outputs.numbers != '' }}
+      - name: Group the selected pull requests
+        id: look_groups
         env:
-          NUMBERS: ${{ steps.shepherd.outputs.deferred }}
+          NUMBERS: ${{ steps.prs.outputs.numbers }}
         run: >-
           ./scripts/harnw run --no-sandbox
-          .smart-ship-targets/scripts/smart-ship-targets/cli.harn --
-          --output "$RUNNER_TEMP/ship-repair-targets/targets.json"
+          .smart-ship-results/scripts/smart-ship-targets/look-results-cli.harn -- groups
 
+  # Each group contains at most 250 PRs. One look per group runs at once, so
+  # the four groups bound concurrency while retaining the complete selection.
+  looks:
+    needs: [availability, ship]
+    if: ${{ !cancelled() && needs.ship.result == 'success' && needs.ship.outputs.numbers != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.ship.outputs.groups_json) }}
+    uses: ./.github/workflows/smart-ship-look.yml
+    with:
+      prs: ${{ toJSON(matrix.group.prs) }}
+      burin-ref: ${{ inputs.burin-ref }}
+      ship-label: ${{ inputs.ship-label }}
+      repair: ${{ inputs.repair }}
+      owned-runner-tag: ${{ inputs.owned-runner-tag }}
+      use-owned: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) }}
+      direct: ${{ (github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr) && true || false }}
+    secrets:
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+  reduce_looks:
+    needs: [availability, ship, looks]
+    if: ${{ !cancelled() && needs.ship.result == 'success' && needs.looks.result == 'success' }}
+    runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
+    outputs:
+      deferred: ${{ steps.reduce.outputs.deferred }}
+      deferred_json: ${{ steps.reduce.outputs.deferred_json }}
+    steps:
+      - name: Mint the release app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }},burin-code
+      - name: Check out Smart Ship
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/burin-code
+          ref: ${{ inputs.burin-ref }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+      - name: Fetch Harn
+        uses: ./.github/actions/fetch-harn
+        with:
+          github-token: ${{ github.token }}
+          precompile: "false"
+      - name: Check out the look result contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 1eaf45133ff4fecbe9dac844c3f25d02f3995eeb
+          path: .smart-ship-results
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
+      - name: Download every finished look
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          # The download action flattens a single matching artifact. Include
+          # the original targets to keep every result in its named directory.
+          pattern: '{smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }},smart-ship-look-result-${{ github.run_id }}-${{ github.run_attempt }}-*}'
+          path: ${{ runner.temp }}/ship-look-results
+      - name: Verify the complete look census
+        id: reduce
+        env:
+          NUMBERS: ${{ needs.ship.outputs.numbers }}
+          LOOK_RESULTS_ROOT: ${{ runner.temp }}/ship-look-results
+        run: >-
+          ./scripts/harnw run --no-sandbox
+          .smart-ship-results/scripts/smart-ship-targets/look-results-cli.harn -- reduce
+      - name: Record the pull requests left for repair
+        env:
+          NUMBERS: ${{ steps.reduce.outputs.deferred }}
+        run: >-
+          ./scripts/harnw run --no-sandbox
+          .smart-ship-results/scripts/smart-ship-targets/cli.harn --
+          --output "$RUNNER_TEMP/ship-repair-targets/targets.json"
       - name: Publish the pull requests left for repair
-        if: ${{ !cancelled() && steps.prs.outputs.numbers != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}-repair
@@ -468,10 +502,10 @@ jobs:
   # One leg per PR: serial repairs held every PR until the slowest ended, and
   # the job timeout cancelled the PRs still waiting their turn.
   repair:
-    needs: [availability, ship]
+    needs: [availability, reduce_looks]
     # A `main_red` dispatch (burin-code scripts/ci/main-red-response.ts) is one
     # fix-forward repair of the default branch, not a PR look.
-    if: ${{ !cancelled() && (needs.ship.outputs.deferred != '' || (github.event_name == 'workflow_dispatch' && inputs.main-red != '')) && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+    if: ${{ !cancelled() && (needs.reduce_looks.outputs.deferred != '' || (github.event_name == 'workflow_dispatch' && inputs.main-red != '')) && (inputs.repair-environment == '' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
     environment: ${{ inputs.repair-environment }}
     runs-on: ${{ inputs.owned-runner-tag != '' && contains(fromJSON('["burin-labs/burin-code", "burin-labs/harn-cloud"]'), github.repository) && contains(fromJSON('["", "none", "false"]'), vars.CI_SELFHOSTED_DISABLED) && (needs.availability.result == 'skipped' || (needs.availability.result == 'success' && needs.availability.outputs.probe_state == 'measured' && fromJSON(needs.availability.outputs.capacity).linux_probe.online > 0)) && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
     # The controller allows 15 minutes for setup, 25 for the configured agent,
@@ -487,7 +521,7 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        pr: ${{ inputs.main-red != '' && fromJSON('["main-red"]') || fromJSON(needs.ship.outputs.deferred_json) }}
+        pr: ${{ inputs.main-red != '' && fromJSON('["main-red"]') || fromJSON(needs.reduce_looks.outputs.deferred_json) }}
     steps:
       - name: Mint the release app token
         id: app

@@ -1,0 +1,141 @@
+name: Smart Ship look group
+
+on:
+  workflow_call:
+    inputs:
+      prs:
+        type: string
+        required: true
+      burin-ref:
+        type: string
+        required: true
+      ship-label:
+        type: string
+        required: true
+      repair:
+        type: boolean
+        required: true
+      owned-runner-tag:
+        type: string
+        required: true
+      use-owned:
+        type: boolean
+        required: true
+      direct:
+        type: boolean
+        required: true
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  look:
+    if: ${{ inputs.prs != '[]' }}
+    runs-on: ${{ inputs.use-owned && fromJSON(format('["self-hosted", "Linux", "X64", "{0}"]', inputs.owned-runner-tag)) || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    concurrency:
+      group: >-
+        smart-ship-look-${{ github.repository }}-${{ inputs.direct && format('direct-{0}', matrix.pr)
+        || format('sweep-{0}-{1}', github.run_id, matrix.pr) }}
+      cancel-in-progress: ${{ inputs.direct }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        pr: ${{ fromJSON(inputs.prs) }}
+    steps:
+      - name: Mint the release app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }},burin-code
+
+      - name: Check out Smart Ship
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/burin-code
+          ref: ${{ inputs.burin-ref }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+
+      - name: Fetch Harn
+        uses: ./.github/actions/fetch-harn
+        with:
+          github-token: ${{ github.token }}
+          precompile: "false"
+
+      - name: Check out the Smart Ship control policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: df9c75308b05be787532b0d2a827e0ae8a61c095
+          path: .smart-ship-runner
+          persist-credentials: false
+
+      - name: Read the default-branch shipping policy
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: >-
+          ./scripts/harnw run --no-sandbox .smart-ship-runner/scripts/smart-ship-policy/cli.harn --
+          "$REPO" "$DEFAULT_BRANCH" "$RUNNER_TEMP/ship.toml"
+
+      - name: Look at the pull request
+        id: look
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          BURIN_SHIP_BOT_LOGIN: ${{ steps.app.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ inputs.ship-label }}
+          LOOK_PR: ${{ matrix.pr }}
+          REPAIR: ${{ inputs.repair }}
+          POLICY: ${{ runner.temp }}/ship.toml
+          SHIP_ROOT: ${{ runner.temp }}/ship
+        run: ./scripts/harnw run --no-sandbox scripts/smart-ship-look.harn
+
+      - name: Check out the look result contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: burin-labs/.github
+          ref: 1eaf45133ff4fecbe9dac844c3f25d02f3995eeb
+          path: .smart-ship-results
+          sparse-checkout: scripts/smart-ship-targets
+          persist-credentials: false
+
+      - name: Record the finished look
+        env:
+          LOOK_PR: ${{ matrix.pr }}
+          LOOK_OUTCOME: ${{ steps.look.outputs.outcome }}
+          LOOK_RESULT_PATH: ${{ runner.temp }}/ship-look/result.json
+        run: >-
+          ./scripts/harnw run --no-sandbox
+          .smart-ship-results/scripts/smart-ship-targets/look-results-cli.harn -- result
+
+      - name: Publish the finished look
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-look-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
+          path: ${{ runner.temp }}/ship-look/result.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Release the completed look
+        if: ${{ steps.look.outputs.outcome == 'complete' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}-looked-${{ matrix.pr }}
+          path: ${{ runner.temp }}/ship-look/result.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
