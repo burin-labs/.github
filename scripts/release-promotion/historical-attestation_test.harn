@@ -1,0 +1,143 @@
+import { historical_attestation_matches } from "./historical-attestation.harn"
+import { attestation_args } from "./live.harn"
+
+const SOURCE = "0e926289a777480b70c5fe9b29c6b67585559030"
+
+const POLICY = "69d95851b5bbf43a076cb557716f3308c980ba6c"
+
+const REPO = "burin-labs/harn"
+
+fn expected() -> dict {
+  return {
+    repository: REPO,
+    source: SOURCE,
+    policy: POLICY,
+    run: "42",
+    attempt: "1",
+    file: "harn-x86_64-unknown-linux-gnu.tar.xz",
+    digest: "b".repeat(64),
+    kind: "archive",
+    target: "x86_64-unknown-linux-gnu",
+  }
+}
+
+fn record() -> dict {
+  return {
+    verificationResult: {
+      signature: {
+        certificate: {
+          sourceRepositoryURI: "https://github.com/" + REPO,
+          sourceRepositoryDigest: POLICY,
+          sourceRepositoryRef: "refs/heads/main",
+          buildSignerDigest: POLICY,
+          buildTrigger: "workflow_dispatch",
+          buildConfigURI: "https://github.com/" + REPO
+            + "/.github/workflows/build-release-binaries.yml@refs/heads/main",
+          runInvocationURI: "https://github.com/" + REPO + "/actions/runs/42/attempts/1",
+        },
+      },
+      statement: {
+        predicate: {
+          schemaVersion: "harn.release_archive_provenance.v1",
+          repository: REPO,
+          phase: "candidate",
+          sourceCommit: SOURCE,
+          archive: expected().file,
+          sha256: expected().digest,
+          target: expected().target,
+          buildPolicy: {
+            workflow: ".github/workflows/build-release-binaries.yml",
+            ref: REPO + "/.github/workflows/build-release-binaries.yml@refs/heads/main",
+            revision: POLICY,
+          },
+          workflow: {runId: "42", runAttempt: "1"},
+        },
+      },
+    },
+  }
+}
+
+pipeline test_historical_attestation_binds_every_identity(_harness: Harness) {
+  const good = record()
+  assert_eq(historical_attestation_matches([good], expected()), true)
+  const cert = good.verificationResult.signature.certificate
+  const predicate = good.verificationResult.statement.predicate
+  for changed in [
+    {sourceRepositoryDigest: SOURCE},
+    {buildSignerDigest: SOURCE},
+    {sourceRepositoryRef: "refs/heads/topic"},
+    {buildTrigger: "schedule"},
+    {runInvocationURI: "https://github.com/" + REPO + "/actions/runs/42/attempts/2"},
+    {buildConfigURI: "https://github.com/" + REPO + "/.github/workflows/other.yml@refs/heads/main"},
+  ] {
+    assert_eq(
+      historical_attestation_matches(
+        [
+          good
+            + {
+              verificationResult: good.verificationResult
+                + {signature: {certificate: cert + changed}},
+            },
+        ],
+        expected(),
+      ),
+      false,
+    )
+  }
+  for changed in [
+    {sourceCommit: POLICY},
+    {sha256: "c".repeat(64)},
+    {archive: "other.tar.xz"},
+    {buildPolicy: predicate.buildPolicy + {revision: SOURCE}},
+    {workflow: {runId: "42", runAttempt: "2"}},
+  ] {
+    assert_eq(
+      historical_attestation_matches(
+        [
+          good
+            + {
+              verificationResult: good.verificationResult
+                + {statement: {predicate: predicate + changed}},
+            },
+        ],
+        expected(),
+      ),
+      false,
+    )
+  }
+  assert_eq(historical_attestation_matches([], expected()), false)
+}
+
+pipeline test_attestation_selects_one_signer_flag(_harness: Harness) {
+  const options = {repository: REPO, predicate_type: "fixture-predicate", source_digest: POLICY}
+  const normal = attestation_args("artifact", options)
+  const historical = attestation_args("artifact", options + {historical: expected()})
+  assert(normal.contains("--signer-repo"))
+  assert(!normal.contains("--signer-workflow"))
+  assert(historical.contains("--signer-workflow"))
+  assert(!historical.contains("--signer-repo"))
+}
+
+pipeline test_historical_release_files_bind_their_producing_attempt(_harness: Harness) {
+  const archive = record()
+  const predicate = archive.verificationResult.statement.predicate
+  const files = archive
+    + {
+      verificationResult: archive.verificationResult
+        + {statement: {predicate: predicate + {schemaVersion: "harn.release_files_provenance.v1"}}},
+    }
+  const file_expected = expected() + {kind: "notes", file: "release-notes.md"}
+  assert_eq(historical_attestation_matches([files], file_expected), true)
+  const wrong = files
+    + {
+      verificationResult: files.verificationResult
+        + {
+          statement: {
+            predicate: files.verificationResult.statement.predicate
+              + {workflow: {runId: "43", runAttempt: "1"}},
+          },
+        },
+    }
+  assert_eq(historical_attestation_matches([wrong], file_expected), false)
+  assert_eq(historical_attestation_matches([archive], file_expected), false)
+}

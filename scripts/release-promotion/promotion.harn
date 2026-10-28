@@ -42,7 +42,12 @@ pub type PromotionRequest = {
 }
 
 /** The run facts promotion relies on after it has checked them. */
-pub type VerifiedRun = {url: string, attempt: int, manifest_identity?: ManifestIdentity?}
+pub type VerifiedRun = {
+  url: string,
+  attempt: int,
+  manifest_identity?: ManifestIdentity?,
+  policy_sha?: string?,
+}
 
 /** Internal authenticated completion reader, never a caller-provided verdict. */
 pub type CompletionAuthorization = fn(int) -> ManifestIdentity?
@@ -138,7 +143,15 @@ pub fn verify_run(
       + ", conclusion "
       + to_string(run?.conclusion)
   }
-  if run?.head_sha != request.sha {
+  const historical = run?.head_sha != request.sha
+  if historical
+    && (request.repository != "burin-labs/harn" || !succeeded
+      || authorize_completion == nil
+      || run?.event != "workflow_dispatch"
+      || run?.head_branch != "main"
+      || run?.path != ".github/workflows/build-release-binaries.yml"
+      || type_of(run?.head_sha) != "string"
+      || regex_match("^[0-9a-f]{40}$", run.head_sha) == nil) {
     throw run_label(request) + " tested " + to_string(run?.head_sha) + ", not the requested "
       + request.sha
   }
@@ -161,7 +174,23 @@ pub fn verify_run(
     throw run_label(request) + " reported no run attempt"
   }
   const identity = authorize_completion == nil ? nil : authorize_completion(attempt)
-  return {url: to_string(run?.html_url), attempt: attempt, manifest_identity: identity}
+  if historical {
+    if identity == nil {
+      throw "historical source requires an authenticated repair manifest"
+    }
+    const lineage = github.json(
+      "/repos/" + request.repository + "/compare/" + request.sha + "..." + run.head_sha,
+    )
+    if lineage?.status != "ahead" || lineage?.merge_base_commit?.sha != request.sha {
+      throw "historical source is not an ancestor of its main workflow policy"
+    }
+  }
+  return {
+    url: to_string(run?.html_url),
+    attempt: attempt,
+    manifest_identity: identity,
+    policy_sha: historical ? run.head_sha : nil,
+  }
 }
 
 fn download_manifest(
@@ -283,13 +312,27 @@ pub fn verify_candidate(
   const candidate = check_candidate(fs, request, run, directory)
   let refused = []
   for item in candidate.manifest.artifacts {
+    const identity = run.policy_sha == nil ? {} : {
+      historical: {
+        repository: request.repository,
+        source: request.sha,
+        policy: run.policy_sha,
+        run: to_string(request.run_id),
+        attempt: to_string(run.attempt),
+        file: item.file,
+        digest: item.sha256,
+        kind: item.kind,
+        target: item.target ?? "",
+      },
+    }
     const diagnostic = github.attest(
       file_path(directory, item.artifact, item.file),
       {
         repository: request.repository,
         predicate_type: item.attestationPredicateType,
-        source_digest: request.sha,
-      },
+        source_digest: run.policy_sha ?? request.sha,
+      }
+        + identity,
     )
     if diagnostic != nil {
       refused = refused + [item.file + ": " + diagnostic]
