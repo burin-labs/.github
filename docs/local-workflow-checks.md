@@ -26,6 +26,11 @@ not forwarded, so a credential reaches a check only when its contract declares
 it. The runner supplies absolute `GITHUB_WORKSPACE` and `RUNNER_TEMP` values
 from its normalized root and private run directory.
 
+When the caller requests offline package checks, the runner also forwards
+`npm_config_offline=true`, `npm_config_manage_package_manager_versions=false`,
+`npm_config_package_manager_strict_version=true`, and
+`BURIN_HARN_SOURCE_OFFLINE=1`. Other values for those names are not forwarded.
+
 An authored check that launches another fixed repository check can call
 `repository_check_environment(harness.env)` once and add the returned map to
 that child's explicit environment. It projects only the existing outer host
