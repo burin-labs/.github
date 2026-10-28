@@ -3,8 +3,97 @@ import {
   capture_outer_execution_context,
   report,
   repository_check_environment,
+  repository_runtime_environment,
   run_checks,
 } from "./run.harn"
+
+pipeline test_offline_runtime_projection_keeps_only_restrictive_settings() {
+  const safe = {
+    PATH: "/bin",
+    npm_config_manage_package_manager_versions: "false",
+    npm_config_package_manager_strict_version: "true",
+    npm_config_offline: "true",
+    BURIN_HARN_SOURCE_OFFLINE: "1",
+    UNRELATED_PRIVATE_VALUE: "not-projected",
+  }
+  const projected = repository_runtime_environment(fn(name) { safe[name] })
+  assert_eq(projected.PATH, "/bin")
+  assert_eq(projected.npm_config_manage_package_manager_versions, "false")
+  assert_eq(projected.npm_config_package_manager_strict_version, "true")
+  assert_eq(projected.npm_config_offline, "true")
+  assert_eq(projected.BURIN_HARN_SOURCE_OFFLINE, "1")
+  assert(!json_stringify(projected).contains("not-projected"))
+  const relaxed = {
+    npm_config_manage_package_manager_versions: "true",
+    npm_config_package_manager_strict_version: "false",
+    npm_config_offline: "false",
+    BURIN_HARN_SOURCE_OFFLINE: "0",
+  }
+  assert_eq(repository_runtime_environment(fn(name) { relaxed[name] }), {})
+}
+
+pipeline test_cli_forwards_offline_settings_without_ambient_secrets(harness: Harness) {
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const fixture = harness.fs.mkdtemp_in_workspace("offline-child-")
+  harness.fs.write_text(
+    path_join(fixture, "workflow.yml"),
+    """jobs:
+  probe:
+    steps:
+      - name: Offline child
+        run: test "$npm_config_offline" = true && test "$npm_config_manage_package_manager_versions" = false && test "$npm_config_package_manager_strict_version" = true && test "$BURIN_HARN_SOURCE_OFFLINE" = 1 && test -z "$UNRELATED_PRIVATE_VALUE" && printf reached > reached.txt
+""",
+  )
+  harness.fs.write_text(
+    path_join(fixture, "policy.json"),
+    "{\"version\":1,\"jobs\":{\"probe\":{}},\"actions\":{},\"environment\":{}}",
+  )
+  const args = [
+    "run",
+    path_join(root, "scripts/local-checks/cli.harn"),
+    "--",
+    "--workflow",
+    "workflow.yml",
+    "--policy",
+    "policy.json",
+    "--root",
+    fixture,
+  ]
+  const environment = {
+    PATH: to_string(harness.env.get("PATH") ?? ""),
+    HOME: to_string(harness.env.get("HOME") ?? ""),
+    npm_config_offline: "true",
+    npm_config_manage_package_manager_versions: "false",
+    npm_config_package_manager_strict_version: "true",
+    BURIN_HARN_SOURCE_OFFLINE: "1",
+    UNRELATED_PRIVATE_VALUE: "fixture-sentinel",
+  }
+  const positive = harness.process.run(
+    {
+      program: "harn",
+      args: args,
+      cwd: root,
+      env_mode: "replace",
+      env: environment,
+      timeout_ms: 30000,
+    },
+  )
+  assert(positive.success, positive.stderr)
+  assert(positive.stdout.contains("PASSED probe / Offline child"), positive.stdout)
+  assert_eq(harness.fs.read_text(path_join(fixture, "reached.txt")), "reached")
+  const negative = harness.process.run(
+    {
+      program: "harn",
+      args: args,
+      cwd: root,
+      env_mode: "replace",
+      env: environment + {npm_config_offline: "false"},
+      timeout_ms: 30000,
+    },
+  )
+  assert(!negative.success, "a relaxed offline setting must not reach the child")
+  assert(negative.stdout.contains("FAILED probe / Offline child"), negative.stdout)
+}
 
 pipeline test_repository_check_environment_projects_only_the_existing_address(harness: Harness) {
   const captured = capture_outer_execution_context(fn(name) { harness.env.get(name) })
