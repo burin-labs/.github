@@ -78,8 +78,16 @@ fn main(harness: Harness) {
     attempt,
     authorization,
   ) }
+  const historical_repair = standalone != "true" && authorization?.mode == "repair"
   if mode == "verify" {
-    const candidate = verify_candidate(github, harness.fs, request, directory, authorize_completion)
+    const candidate = verify_candidate(
+      github,
+      harness.fs,
+      request,
+      directory,
+      authorize_completion,
+      historical_repair,
+    )
     for file in candidate.files {
       harness.stdio.println("verified " + file.name + " sha256 " + file.sha256)
     }
@@ -95,7 +103,7 @@ fn main(harness: Harness) {
       github,
       harness.fs,
       request,
-      verify_run(github, request, authorize_completion),
+      verify_run(github, request, authorize_completion, historical_repair),
       directory,
     )
     harness.stdio.println(json_stringify(inspection))
@@ -110,7 +118,7 @@ fn main(harness: Harness) {
       github,
       harness.fs,
       request,
-      verify_run(github, request, authorize_completion),
+      verify_run(github, request, authorize_completion, historical_repair),
       directory,
     )
     write_output(harness, "tag", release.tag)

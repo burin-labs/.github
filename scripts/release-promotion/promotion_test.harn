@@ -827,7 +827,8 @@ pipeline test_historical_source_requires_authenticated_repair_and_main_policy(ha
   const authorize =
     fn(_attempt: int) { return {id: 9, digest: "sha256:" + sha256("manifest archive")} }
   assert_error_contains(fn() { verify_run(world.github, request()) }, "tested")
-  assert_eq(verify_run(world.github, request(), authorize).policy_sha, OTHER_SHA)
+  assert_error_contains(fn() { verify_run(world.github, request(), authorize) }, "tested")
+  assert_eq(verify_run(world.github, request(), authorize, true).policy_sha, OTHER_SHA)
   for invalid in [
     {head_branch: "topic"},
     {event: "schedule"},
@@ -841,7 +842,7 @@ pipeline test_historical_source_requires_authenticated_repair_and_main_policy(ha
         responses: {[comparison]: {status: "ahead", merge_base_commit: {sha: SHA}}},
       },
     )
-    assert_error_contains(fn() { verify_run(changed.github, request(), authorize) }, "tested")
+    assert_error_contains(fn() { verify_run(changed.github, request(), authorize, true) }, "tested")
   }
   const unrelated = fixture(
     harness.fs,
@@ -850,7 +851,10 @@ pipeline test_historical_source_requires_authenticated_repair_and_main_policy(ha
       responses: {[comparison]: {status: "diverged", merge_base_commit: {sha: OTHER_SHA}}},
     },
   )
-  assert_error_contains(fn() { verify_run(unrelated.github, request(), authorize) }, "ancestor")
+  assert_error_contains(
+    fn() { verify_run(unrelated.github, request(), authorize, true) },
+    "ancestor",
+  )
 }
 
 pipeline test_historical_candidate_carries_source_policy_and_run_to_attestation(harness: Harness) {
@@ -868,7 +872,7 @@ pipeline test_historical_candidate_carries_source_policy_and_run_to_attestation(
   const authorize =
     fn(_attempt: int) { return {id: 9, digest: "sha256:" + sha256("manifest archive")} }
   const directory = harness.fs.mkdtemp_in_workspace("historical-candidate-")
-  const checked = verify_candidate(world.github, harness.fs, request(), directory, authorize)
+  const checked = verify_candidate(world.github, harness.fs, request(), directory, authorize, true)
   assert_eq(len(world.state().attested), len(checked.manifest.artifacts))
   for measured in world.state().attested {
     assert_eq(measured.source_digest, OTHER_SHA)

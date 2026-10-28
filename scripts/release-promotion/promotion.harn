@@ -118,6 +118,7 @@ pub fn verify_run(
   github: GitHub,
   request: PromotionRequest,
   authorize_completion: CompletionAuthorization? = nil,
+  historical_repair: bool = false,
 ) -> VerifiedRun {
   const run = github.json(
     "/repos/" + request.repository + "/actions/runs/" + to_string(request.run_id),
@@ -147,6 +148,7 @@ pub fn verify_run(
   if historical
     && (request.repository != "burin-labs/harn" || !succeeded
       || authorize_completion == nil
+      || !historical_repair
       || run?.event != "workflow_dispatch"
       || run?.head_branch != "main"
       || run?.path != ".github/workflows/build-release-binaries.yml"
@@ -296,8 +298,9 @@ pub fn verify_candidate(
   request: PromotionRequest,
   directory: string,
   authorize_completion: CompletionAuthorization? = nil,
+  historical_repair: bool = false,
 ) -> Candidate {
-  const run = verify_run(github, request, authorize_completion)
+  const run = verify_run(github, request, authorize_completion, historical_repair)
   download_manifest(github, request, run, directory)
   const manifest = load_manifest(fs, request, run, directory)
   let artifacts = []
