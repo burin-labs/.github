@@ -3,6 +3,7 @@ import {
   capture_outer_execution_context,
   report,
   repository_check_environment,
+  repository_offline_environment,
   repository_runtime_environment,
   run_checks,
 } from "./run.harn"
@@ -16,8 +17,8 @@ pipeline test_offline_runtime_projection_keeps_only_restrictive_settings() {
     BURIN_HARN_SOURCE_OFFLINE: "1",
     UNRELATED_PRIVATE_VALUE: "not-projected",
   }
-  const projected = repository_runtime_environment(fn(name) { safe[name] })
-  assert_eq(projected.PATH, "/bin")
+  const projected = repository_offline_environment(fn(name) { safe[name] })
+  assert_eq(repository_runtime_environment(fn(name) { safe[name] }).PATH, "/bin")
   assert_eq(projected.npm_config_manage_package_manager_versions, "false")
   assert_eq(projected.npm_config_package_manager_strict_version, "true")
   assert_eq(projected.npm_config_offline, "true")
@@ -29,7 +30,7 @@ pipeline test_offline_runtime_projection_keeps_only_restrictive_settings() {
     npm_config_offline: "false",
     BURIN_HARN_SOURCE_OFFLINE: "0",
   }
-  assert_eq(repository_runtime_environment(fn(name) { relaxed[name] }), {})
+  assert_eq(repository_offline_environment(fn(name) { relaxed[name] }), {})
 }
 
 pipeline test_cli_forwards_offline_settings_without_ambient_secrets(harness: Harness) {
@@ -46,7 +47,7 @@ pipeline test_cli_forwards_offline_settings_without_ambient_secrets(harness: Har
   )
   harness.fs.write_text(
     path_join(fixture, "policy.json"),
-    "{\"version\":1,\"jobs\":{\"probe\":{}},\"actions\":{},\"environment\":{}}",
+    "{\"version\":1,\"jobs\":{\"probe\":{}},\"actions\":{},\"environment\":{\"npm_config_offline\":\"false\"}}",
   )
   const args = [
     "run",

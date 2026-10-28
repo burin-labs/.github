@@ -69,6 +69,11 @@ pub fn repository_runtime_environment(get: fn(string) -> string?) -> dict<string
       result = result + {[name]: value ?? ""}
     }
   }
+  return result
+}
+
+pub fn repository_offline_environment(get: fn(string) -> string?) -> dict<string, string> {
+  let result: dict<string, string> = {}
   // These values only narrow package and source acquisition. Never forward
   // arbitrary npm configuration or an ambient value that relaxes them.
   for entry in [
@@ -198,7 +203,8 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
                   GIT_CONFIG_GLOBAL: global_config,
                   GIT_CONFIG_NOSYSTEM: "1",
                   CI: "true",
-                },
+                }
+                + repository_offline_environment(fn(env_name) { harness.env.get(env_name) }),
               timeout_ms: check.timeout_ms,
             },
           )
