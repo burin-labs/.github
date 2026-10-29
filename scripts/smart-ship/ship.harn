@@ -697,6 +697,17 @@ fn main(harness: Harness) {
   const number = to_int(harness.env.get("PR") ?? "") ?? 0
   const token = harness.env.get("GH_TOKEN") ?? ""
   const work = harness.env.get("SHIP_WORK") ?? ""
+  // Actions masks only the token's literal value; mask the derived git header before any use.
+  const header = base64_encode("x-access-token:" + token)
+  harness.stdio.println("::add-mask::" + header)
+  // Digests let a log audit look for the token, the header and a printed canary without holding them.
+  const canary = "smartship-canary-"
+    + substring(sha256((harness.env.get("GITHUB_RUN_ID") ?? "") + repo + to_string(number)), 0, 16)
+  const digest = { s -> substring(sha256(s), 0, 16) }
+  harness.stdio.println("smart-ship log canary: ${canary} ${base64_encode(canary)}")
+  harness.stdio.println(
+    "smart-ship digests: token=${digest(token)} header=${digest(header)} canary=${digest(canary)} canary64=${digest(base64_encode(canary))}",
+  )
   const opts: GithubClientOptions = {installation_token: token}
   const r = read(harness, opts, repo, number)
   const pr = r.pullRequest
