@@ -38,8 +38,8 @@ jobs:
     uses: burin-labs/.github/.github/workflows/smart-ship.yml@main
     with:
       main-red: ${{ inputs.main_red }}
-      # .github/smart-ship.toml limits repair to merge conflicts.
-      repair: true
+      # Re-enable after the private replay lands at least three of five repairs.
+      repair: false
     secrets:
       RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
       RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
