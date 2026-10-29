@@ -59,18 +59,28 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   const own = {
     name: "ship / ship (9)",
     status: "IN_PROGRESS",
-    checkSuite: {workflowRun: {workflow: {name: "Smart Ship"}}},
+    checkSuite: {workflowRun: {workflow: {id: "W_ship", name: "Smart Ship"}}},
   }
   const looking = {mergeStateStatus: "UNSTABLE"} + checks([GREEN, own])
   assert_eq(
-    decide(pr(looking), "clear", false, "Smart Ship").action,
+    decide(pr(looking), "clear", false, "W_ship").action,
     "merge",
     "a look never waits on itself",
   )
   assert_eq(
-    decide(pr(looking), "clear", false, "Other").action,
+    decide(pr(looking), "clear", false, "W_other").action,
     "stop",
     "another workflow still pends",
+  )
+  assert_eq(
+    decide(pr(looking), "clear", false, "Smart Ship").action,
+    "stop",
+    "a display name never names the look",
+  )
+  assert_eq(
+    decide(pr(looking), "clear", false, "").action,
+    "stop",
+    "an unresolved look counts its own checks",
   )
   const refusals = [
     {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
@@ -157,11 +167,30 @@ pipeline test_only_the_newest_attempt_of_a_check_counts(harness: Harness) {
   )
   const old_look = checks([run("Smart Ship", "ship / looks (9) / look (9)", "FAILURE", 12), GREEN])
   assert_eq(
-    decide(pr(old_look), "clear", false, "Smart Ship").action,
+    decide(pr(old_look), "clear", false, "W_Smart Ship").action,
     "merge",
     "an old look of its own never blocks",
   )
-  assert_eq(decide(pr(old_look), "clear", false, "Other").action, "stop", "another workflow's does")
+  assert_eq(
+    decide(pr(old_look), "clear", false, "W_other").action,
+    "stop",
+    "another workflow's does",
+  )
+  const namesake = {
+    name: "security",
+    status: "COMPLETED",
+    conclusion: "FAILURE",
+    databaseId: 10,
+    checkSuite: {
+      app: {id: "other-app"},
+      workflowRun: {workflow: {id: "W_namesake", name: "Smart Ship"}},
+    },
+  }
+  assert_eq(
+    decide(pr(checks([namesake, GREEN])), "clear", false, "W_Smart Ship").action,
+    "stop",
+    "another workflow named Smart Ship cannot hide a failure",
+  )
 }
 
 /** Display names are not identity: only a known producer's newer attempt clears its own failure. */
