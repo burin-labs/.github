@@ -8,11 +8,18 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 
 const action = dirname(fileURLToPath(import.meta.url));
-const steps = JSON.parse(execFileSync("ruby", ["-ryaml", "-rjson", "-e",
-  "puts JSON.generate(YAML.safe_load(File.read(ARGV[0]))['runs']['steps'])", join(action, "action.yml")], { encoding: "utf8" })).filter(step => typeof step.run === "string");
+const definition = JSON.parse(execFileSync("ruby", ["-ryaml", "-rjson", "-e",
+  "puts JSON.generate(YAML.safe_load(File.read(ARGV[0])))", join(action, "action.yml")], { encoding: "utf8" }));
+const steps = definition.runs.steps.filter(step => typeof step.run === "string");
 const reader = steps.find(step => step.name === "Read the immutable CI latency baseline");
 const checker = steps.find(step => step.name === "Validate declared CI latency contract");
 const originReader = steps.find(step => step.name === "Verify signed historical origin");
+
+test("ordinary callers do not invoke the optional check-run reader", () => {
+  assert.equal(definition.inputs["origin-receipt-sha"].required, false);
+  assert.equal(definition.inputs["origin-receipt-sha"].default, "");
+  assert.equal(originReader.if, "${{ inputs.origin-receipt-sha != '' }}");
+});
 const sha = "a".repeat(40);
 const policy = {
   schema_version: 1, repository: "burin-labs/example", workflow: "ci.yml", event: "merge_group",
