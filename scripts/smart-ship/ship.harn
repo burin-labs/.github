@@ -358,10 +358,20 @@ fn prepare(
   const continuing = wip != "" && len(conflicted) == 0
     && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/base") == pr.headRefOid
   if continuing {
+    // The trusted clone holds the credential that lazily fetches the saved blobs.
     sh(
       harness.tools,
-      ["git", "restore", "--source=" + wip, "--worktree", "--", ":/"],
-      {},
+      [
+        "git",
+        "--git-dir=" + work + "/base/.git",
+        "--work-tree=" + work + "/pr",
+        "restore",
+        "--source=" + wip,
+        "--worktree",
+        "--",
+        ":/",
+      ],
+      env,
       work + "/pr",
     )
   } else if wip != "" {
