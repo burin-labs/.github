@@ -1,0 +1,510 @@
+/** Smart Ship: land one pull request labeled `ship`, or hand what blocks it to one repair agent. */
+import { agent_edit_tools, agent_host_tools } from "std/agent/host_tools"
+import { agent_loop } from "std/agent/loop"
+import { agent_options } from "std/agent/options"
+import { command_run } from "std/command"
+import { github_commit_worktree } from "harn-github-connector/worktree"
+
+const HOLDS = ["hold", "do-not-merge"]
+
+pub const MAX_ATTEMPTS = 3
+
+const RED = ["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"]
+
+const MARK = "<!-- smart-ship head="
+
+const QUERY = """
+query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
+  defaultBranchRef { name } mergeQueue { id }
+  pullRequest(number: $number) { id title state isDraft isCrossRepository isInMergeQueue
+    headRefName headRefOid baseRefName mergeStateStatus reviewDecision
+    labels(first: 50) { nodes { name } } latestOpinionatedReviews(first: 20) { nodes { state } }
+    comments(last: 100) { nodes { body } }
+    reviewThreads(first: 100) { nodes { isResolved path comments(first: 10) { nodes { databaseId body } } } }
+    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+      ... on CheckRun { name status conclusion databaseId } ... on StatusContext { name: context state } } } } } } } } } }
+"""
+
+pub type Check = {
+  name: string,
+  status?: string?,
+  conclusion?: string?,
+  state?: string?,
+  databaseId?: int?,
+}
+
+type Thread = {
+  isResolved: bool,
+  path: string?,
+  comments: {nodes: list<{databaseId: int, body: string}>},
+}
+
+type Rollup = {contexts: {nodes: list<Check>}}
+
+pub type Pull = {
+  id: string,
+  title: string,
+  state: string,
+  isDraft: bool,
+  isCrossRepository: bool,
+  isInMergeQueue: bool,
+  headRefName: string,
+  headRefOid: string,
+  baseRefName: string,
+  mergeStateStatus: string,
+  reviewDecision: string?,
+  labels: {nodes: list<{name: string}>},
+  latestOpinionatedReviews: {nodes: list<{state: string}>},
+  comments: {nodes: list<{body: string}>},
+  reviewThreads: {nodes: list<Thread>},
+  commits: {nodes: list<{commit: {statusCheckRollup: Rollup?}}>},
+}
+
+pub type Repo = {defaultBranchRef: {name: string}, mergeQueue: {id: string}?, pullRequest: Pull}
+
+type Response = {data: {repository: Repo}}
+
+pub type Facts = {
+  head: string,
+  conflict: bool,
+  approved: bool,
+  failing: list<Check>,
+  pending: list<string>,
+  threads: list<{id: int, path: string, body: string}>,
+  marks: int,
+  answered: bool,
+}
+
+/** What the pull request's head shows, read once from GitHub's answer. */
+pub fn observe(pr: Pull) -> Facts {
+  const checks = pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []
+  const reviews = pr.latestOpinionatedReviews.nodes.map({ v -> v.state })
+  const marks = pr.comments.nodes.filter({ c -> contains(c.body, MARK) })
+  return {
+    head: pr.headRefOid,
+    conflict: pr.mergeStateStatus == "DIRTY",
+    approved: pr.reviewDecision == "APPROVED"
+      || (pr.reviewDecision == nil && reviews.contains("APPROVED")
+        && !reviews.contains("CHANGES_REQUESTED")),
+    failing: checks.filter({ c -> RED.contains(c.conclusion ?? c.state ?? "") }),
+    pending: checks.filter(
+      { c ->
+        (c.status ?? "COMPLETED") != "COMPLETED" || ["PENDING", "EXPECTED"].contains(c.state ?? "")
+      },
+    )
+      .map({ c -> c.name }),
+    threads: pr.reviewThreads.nodes.filter({ t -> !t.isResolved && len(t.comments.nodes) > 0 })
+      .map(
+        { t ->
+          {
+            id: t.comments.nodes[0]?.databaseId ?? 0,
+            path: t.path ?? "the pull request",
+            body: t.comments.nodes.map({ c -> c.body }).join("\n---\n"),
+          }
+        },
+      ),
+    marks: len(marks),
+    answered: marks.any({ c -> contains(c.body, MARK + pr.headRefOid) }),
+  }
+}
+
+/**
+ * Every landing rule, deterministic and never delegated to a model: `merge`, `update`, `repair`, or `stop`.
+ */
+pub fn decide(repo: Repo, has_key: bool) -> {action: string, reason: string, facts: Facts} {
+  const pr = repo.pullRequest
+  const labels = pr.labels.nodes.map({ l -> l.name })
+  const f = observe(pr)
+  const stop = { why -> {action: "stop", reason: why, facts: f} }
+  const blocked = f.conflict || len(f.failing) > 0 || len(f.threads) > 0
+  if pr.state != "OPEN" || !labels.contains("ship") {
+    return stop("not an open pull request labeled ship")
+  }
+  if labels.any({ l -> HOLDS.contains(l) }) {
+    return stop("held by a label")
+  }
+  if pr.isCrossRepository || pr.isDraft || pr.baseRefName != repo.defaultBranchRef.name {
+    return stop("not shepherded: a fork, a draft, or a non-default base")
+  }
+  if pr.isInMergeQueue {
+    return stop("already in the merge queue")
+  }
+  if !f.conflict && len(f.pending) > 0 {
+    return stop("waiting on " + join(f.pending, ", "))
+  }
+  if f.approved && pr.mergeStateStatus == "CLEAN" && !blocked {
+    return {action: "merge", reason: "approved and green", facts: f}
+  }
+  if pr.mergeStateStatus == "BEHIND" && !blocked {
+    return {action: "update", reason: "behind its base", facts: f}
+  }
+  if !blocked {
+    return stop("green; waiting for an approving review")
+  }
+  if f.answered {
+    return stop("already answered at this head")
+  }
+  if f.marks >= MAX_ATTEMPTS {
+    return stop("repair attempts used up; a person needs to take it")
+  }
+  if !has_key {
+    return stop("blocked, and no repair model key reaches this run")
+  }
+  return {action: "repair", reason: "blocked", facts: f}
+}
+
+fn run(
+  harness: Harness,
+  argv: list<string>,
+  env: dict,
+  cwd: string = ".",
+) -> {ok: bool, out: string} {
+  const r = command_run(
+    harness.tools,
+    {argv: argv, cwd: cwd, env_mode: "patch", env: env},
+    {timeout_ms: 600000},
+  )
+  if !r.success {
+    harness.stdio.eprintln(join(argv[0:3], " ") + ": " + trim(r.stderr))
+  }
+  return {ok: r.success, out: trim(r.stdout)}
+}
+
+fn gh(harness: Harness, token: string, args: list<string>) -> {ok: bool, out: string} {
+  return run(harness, ["gh"] + args, {GH_TOKEN: token})
+}
+
+/**
+ * The token reaches git through the environment only, never argv; the agent's own commands never see it.
+ */
+fn git(
+  harness: Harness,
+  token: string,
+  dir: string,
+  args: list<string>,
+) -> {ok: bool, out: string} {
+  const who = "Smart Ship"
+  const mail = "smart-ship@users.noreply.github.com"
+  return run(
+    harness,
+    ["git"] + args,
+    {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+      GIT_CONFIG_VALUE_0: "AUTHORIZATION: basic " + base64_encode("x-access-token:" + token),
+      GIT_AUTHOR_NAME: who,
+      GIT_AUTHOR_EMAIL: mail,
+      GIT_COMMITTER_NAME: who,
+      GIT_COMMITTER_EMAIL: mail,
+    },
+    dir,
+  )
+}
+
+fn read(harness: Harness, token: string, repo: string, number: int) -> Repo {
+  const [owner, name] = split(repo, "/")
+  const r = gh(
+    harness,
+    token,
+    [
+      "api",
+      "graphql",
+      "-f",
+      "query=${QUERY}",
+      "-f",
+      "owner=${owner}",
+      "-f",
+      "name=${name}",
+      "-F",
+      "number=${number}",
+    ],
+  )
+  require r.ok, "could not read ${repo}#${number}"
+  const body: Response = schema_expect(json_parse(r.out), schema_of(Response))
+  return body.data.repository
+}
+
+/**
+ * Publish the staged tree of `dir` onto `branch` as one GitHub-signed commit; a moved branch refuses.
+ */
+fn publish(
+  harness: Harness,
+  token: string,
+  repo: string,
+  branch: string,
+  dir: string,
+  headline: string,
+) -> string {
+  const [owner, name] = split(repo, "/")
+  const sent = github_commit_worktree(
+    harness,
+    {
+      owner: owner,
+      repo: name,
+      branch: branch,
+      headline: headline,
+      repo_dir: dir,
+      source: "index",
+      options: {installation_token: token},
+    },
+  )
+  require is_ok(sent), "signed publication failed: " + to_string(unwrap_err(sent)?.message)
+  return unwrap(sent).commit_oid
+}
+
+/**
+ * Agent commands run in the checkout without credentials; these words are refused outright as well.
+ */
+fn tools_for(harness: Harness, dir: string, done_path: string) {
+  const scope = {
+    root: dir,
+    cwd: dir,
+    command_policy: { req, _ ->
+      const line = join(req?.argv ?? [], " ") + " " + (req?.command ?? "")
+      return regex_match("\\b(push|gh|curl|wget)\\b|--admin", line) == nil
+        || "Smart Ship publishes for you; pushing, merging and GitHub calls are not available"
+    },
+  }
+  const tools = agent_edit_tools(
+    harness.fs,
+    harness.tools,
+    agent_host_tools(harness, nil, scope),
+    scope,
+  )
+  return tool_define(
+    tools,
+    "finish",
+    "Report the outcome once, at the end.",
+    {
+      parameters: {
+        outcome: {type: "string", enum: ["fixed", "unrelated", "stuck"]},
+        summary: {type: "string"},
+        replies: {
+          type: "array",
+          items: {type: "object", properties: {id: {type: "integer"}, body: {type: "string"}}},
+        },
+      },
+      handler: { args ->
+        harness.fs.write_text(done_path, json_stringify(args))
+        return "recorded"
+      },
+    },
+  )
+}
+
+/**
+ * Clone, let one bounded agent work, publish its tree as a signed commit, and answer the threads.
+ */
+fn repair(
+  harness: Harness,
+  token: string,
+  repo: string,
+  number: int,
+  pr: Pull,
+  f: Facts,
+) -> string {
+  const dir = harness.fs.mkdtemp_in_workspace("ship-")
+  require git(harness, token, ".", ["clone", "--quiet", "https://github.com/${repo}.git", dir]).ok,
+    "clone failed"
+  git(harness, token, dir, ["checkout", "--quiet", "--detach", pr.headRefOid])
+  const base = "origin/" + pr.baseRefName
+  let conflicted = []
+  if f.conflict {
+    git(harness, token, dir, ["merge", "--no-commit", "--no-ff", base])
+    conflicted = split(
+      git(harness, token, dir, ["diff", "--name-only", "--diff-filter=U"]).out,
+      "\n",
+    )
+      .filter({ p -> p != "" })
+  }
+  const failing = f.failing.map(
+    { c ->
+      {
+        name: c.name,
+        log: c.databaseId == nil ? "" : join(
+          split(
+            gh(
+              harness,
+              token,
+              ["run", "view", "-R", repo, "--job", to_string(c.databaseId), "--log-failed"],
+            ).out,
+            "\n",
+          )
+            .slice(-120),
+          "\n",
+        ),
+      }
+    },
+  )
+  const done_path = path_join(dir, ".git", "ship-finish.json")
+  const task = harness.fs.render_prompt(
+    "repair.harn.prompt",
+    {
+      repo: repo,
+      number: number,
+      title: pr.title,
+      head: pr.headRefOid,
+      base: pr.baseRefName,
+      conflicted: join(conflicted, ", "),
+      failing: failing,
+      threads: f.threads,
+      attempt: f.marks + 1,
+      max_attempts: MAX_ATTEMPTS,
+    },
+  )
+  agent_loop(
+    harness,
+    task,
+    nil,
+    agent_options(
+      {
+        provider: "anthropic",
+        model: "claude-sonnet-5-5",
+        tools: tools_for(harness, dir, done_path),
+        loop_until_done: true,
+        max_iterations: 60,
+        budget: {total_budget_usd: 2.0},
+        stop_after_successful_tools: ["finish"],
+      },
+    ),
+  )
+  require harness.fs.exists(done_path), "the repair agent stopped without reporting"
+  const done = json_parse(harness.fs.read_text(done_path))
+  let note = to_string(done?.summary ?? "")
+  if done?.outcome == "fixed" {
+    git(harness, token, dir, ["add", "-A"])
+    require git(harness, token, dir, ["diff", "--cached", "--check"]).ok,
+      "the repair left conflict markers"
+    if len(conflicted) > 0 {
+      // GitHub merges only a conflict-free branch: first match the base in the conflicted files, merge, then restore the resolution.
+      const bridge = harness.fs.mkdtemp_in_workspace("ship-bridge-")
+      git(harness, token, dir, ["worktree", "add", "--quiet", "--detach", bridge, pr.headRefOid])
+      for p in conflicted {
+        if !git(harness, token, bridge, ["checkout", base, "--", p]).ok {
+          git(harness, token, bridge, ["rm", "--quiet", p])
+        }
+      }
+      git(harness, token, bridge, ["add", "-A"])
+      const bridged = publish(
+        harness,
+        token,
+        repo,
+        pr.headRefName,
+        bridge,
+        "Take ${pr.baseRefName}'s side of the conflicted files",
+      )
+      require gh(
+        harness,
+        token,
+        [
+          "api",
+          "-X",
+          "PUT",
+          "repos/${repo}/pulls/${number}/update-branch",
+          "-f",
+          "expected_head_sha=${bridged}",
+        ],
+      ).ok,
+        "update-branch refused the bridge"
+      for _ in range(0, 20) {
+        if read(harness, token, repo, number).pullRequest.headRefOid != bridged {
+          break
+        }
+        harness.clock.sleep_ms(3000)
+      }
+      git(harness, token, dir, ["merge", "--quit"])
+      git(harness, token, dir, ["fetch", "--quiet", "origin", pr.headRefName])
+    }
+    git(
+      harness,
+      token,
+      dir,
+      ["reset", "--soft", len(conflicted) > 0 ? "FETCH_HEAD" : pr.headRefOid],
+    )
+    note = "Pushed "
+      + publish(harness, token, repo, pr.headRefName, dir, "Smart Ship repair for #${number}")
+      + ". "
+      + note
+  }
+  for reply in done?.replies ?? [] {
+    gh(
+      harness,
+      token,
+      [
+        "api",
+        "repos/${repo}/pulls/${number}/comments/${reply?.id}/replies",
+        "-f",
+        "body=${reply?.body}",
+      ],
+    )
+  }
+  return note
+}
+
+fn main(harness: Harness) {
+  const repo = harness.env.get("REPO") ?? ""
+  const number = to_int(harness.env.get("PR") ?? "") ?? 0
+  const token = harness.env.get("GH_TOKEN") ?? ""
+  const r = read(harness, token, repo, number)
+  const pr = r.pullRequest
+  const d = decide(r, (harness.env.get("ANTHROPIC_API_KEY") ?? "") != "")
+  let note = d.reason
+  if d.action == "merge" {
+    // expectedHeadOid is --match-head-commit: GitHub refuses if the head moved since it was judged.
+    const verb =
+      r.mergeQueue != nil ? "enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head})" : "mergePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head, mergeMethod: SQUASH})"
+    const sent = gh(
+      harness,
+      token,
+      [
+        "api",
+        "graphql",
+        "-f",
+        "query=mutation($id: ID!, $head: GitObjectID!) { ${verb} { clientMutationId } }",
+        "-f",
+        "id=${pr.id}",
+        "-f",
+        "head=${pr.headRefOid}",
+      ],
+    )
+    const after = read(harness, token, repo, number).pullRequest
+    note = "${sent.ok ? "landing" : "merge refused"} at ${pr.headRefOid}: ${after.state}, queued=${after.isInMergeQueue}"
+  }
+  if d.action == "update" {
+    gh(
+      harness,
+      token,
+      [
+        "api",
+        "-X",
+        "PUT",
+        "repos/${repo}/pulls/${number}/update-branch",
+        "-f",
+        "expected_head_sha=${pr.headRefOid}",
+      ],
+    )
+  }
+  if d.action == "repair" {
+    note = try {
+      repair(harness, token, repo, number, pr, d.facts)
+    } catch (e) {
+      "Repair failed: " + to_string(e)
+    }
+    const last =
+      d.facts.marks + 1 >= MAX_ATTEMPTS ? "\n\nThat was the last automatic attempt; a person needs to take it from here." : ""
+    gh(
+      harness,
+      token,
+      [
+        "pr",
+        "comment",
+        to_string(number),
+        "-R",
+        repo,
+        "--body",
+        "**Smart Ship:** ${note}${last}\n\n${MARK}${pr.headRefOid} -->",
+      ],
+    )
+  }
+  harness.stdio.println("${repo}#${number}: ${d.action}: ${note}")
+}

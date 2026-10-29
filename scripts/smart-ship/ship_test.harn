@@ -1,0 +1,113 @@
+/** The landing gate is the one place a wrong answer merges unreviewed or red code. */
+import { Repo, decide } from "./ship.harn"
+
+fn pr(over: dict = {}) -> Repo {
+  const pull = {
+    id: "PR_1",
+    title: "t",
+    state: "OPEN",
+    isDraft: false,
+    isCrossRepository: false,
+    isInMergeQueue: false,
+    headRefName: "b",
+    headRefOid: "abc",
+    baseRefName: "main",
+    mergeStateStatus: "CLEAN",
+    reviewDecision: "APPROVED",
+    labels: {nodes: [{name: "ship"}]},
+    latestOpinionatedReviews: {nodes: [{state: "APPROVED"}]},
+    comments: {nodes: []},
+    reviewThreads: {nodes: []},
+    commits: {
+      nodes: [
+        {
+          commit: {
+            statusCheckRollup: {
+              contexts: {nodes: [{name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}]},
+            },
+          },
+        },
+      ],
+    },
+  }
+  return {defaultBranchRef: {name: "main"}, mergeQueue: nil, pullRequest: pull + over}
+}
+
+const RED = {
+  commits: {
+    nodes: [
+      {
+        commit: {
+          statusCheckRollup: {
+            contexts: {
+              nodes: [
+                {name: "CI status", status: "COMPLETED", conclusion: "FAILURE", databaseId: 7},
+              ],
+            },
+          },
+        },
+      },
+    ],
+  },
+}
+
+pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) {
+  assert_eq(decide(pr(), false).action, "merge")
+  const refusals = [
+    {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
+    {
+      reviewDecision: nil,
+      latestOpinionatedReviews: {nodes: [{state: "APPROVED"}, {state: "CHANGES_REQUESTED"}]},
+    },
+    {labels: {nodes: [{name: "ship"}, {name: "hold"}]}},
+    {labels: {nodes: []}},
+    {isCrossRepository: true},
+    {isDraft: true},
+    {baseRefName: "release"},
+    {mergeStateStatus: "UNSTABLE"},
+    {
+      commits: {
+        nodes: [
+          {
+            commit: {
+              statusCheckRollup: {contexts: {nodes: [{name: "CI status", status: "IN_PROGRESS"}]}},
+            },
+          },
+        ],
+      },
+    },
+    {
+      reviewThreads: {
+        nodes: [
+          {isResolved: false, path: "a.rs", comments: {nodes: [{databaseId: 3, body: "why?"}]}},
+        ],
+      },
+    },
+  ]
+  for over in refusals {
+    assert(decide(pr(over), true).action != "merge", to_string(over))
+  }
+}
+
+pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
+  assert_eq(decide(pr(RED), true).action, "repair")
+  assert_eq(decide(pr(RED), false).action, "stop", "no model key, no repair")
+  assert_eq(decide(pr(RED + {reviewDecision: "REVIEW_REQUIRED"}), true).action, "repair")
+  assert_eq(
+    decide(pr({reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"}), true).action,
+    "stop",
+    "green waits for review",
+  )
+  const answered = {comments: {nodes: [{body: "x <!-- smart-ship head=abc -->"}]}}
+  assert_eq(decide(pr(RED + answered), true).reason, "already answered at this head")
+  const spent = {
+    comments: {
+      nodes: [
+        {body: "<!-- smart-ship head=a -->"},
+        {body: "<!-- smart-ship head=b -->"},
+        {body: "<!-- smart-ship head=c -->"},
+      ],
+    },
+  }
+  assert_eq(decide(pr(RED + spent), true).action, "stop")
+}
