@@ -6,8 +6,18 @@ fn page(nodes: list) {
 }
 
 fn checks(nodes: list, total: int = -1) {
-  const rollup = {contexts: {totalCount: total < 0 ? len(nodes) : total, nodes: nodes}}
-  return {commits: {nodes: [{commit: {signature: {isValid: true}, statusCheckRollup: rollup}}]}}
+  const rollup = {
+    contexts: {
+      totalCount: total < 0 ? len(nodes) : total,
+      pageInfo: {hasNextPage: false},
+      nodes: nodes,
+    },
+  }
+  return {
+    commits: {
+      nodes: [{commit: {oid: "abc", signature: {isValid: true}, statusCheckRollup: rollup}}],
+    },
+  }
 }
 
 const GREEN = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
@@ -88,11 +98,17 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
     {
       commits: {
         nodes: [
-          {commit: {signature: {isValid: false}, statusCheckRollup: {contexts: page([GREEN])}}},
+          {
+            commit: {
+              oid: "abc",
+              signature: {isValid: false},
+              statusCheckRollup: {contexts: {...page([GREEN]), pageInfo: {hasNextPage: false}}},
+            },
+          },
         ],
       },
     },
-    {reviewThreads: page([{isResolved: false, path: "a.rs", comments: {nodes: []}}])},
+    {reviewThreads: page([{isResolved: false, path: "a.rs", comments: page([])}])},
   ]
   for over in refusals {
     assert(decide(pr(over), "clear", true).action != "merge", to_string(over))
@@ -157,6 +173,16 @@ pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
       .action,
     "stop",
     "the repair opt-out holds",
+  )
+  const long_thread = {
+    reviewThreads: page(
+      [{isResolved: false, path: "a.rs", comments: {totalCount: 101, nodes: []}}],
+    ),
+  }
+  assert_eq(
+    decide(pr(red() + long_thread), "clear", true).reason,
+    "a review thread is too long to read whole; a person needs to take it",
+    "the agent never repairs from a partial thread",
   )
   const ours = { body -> {body: body, viewerDidAuthor: true} }
   const answered = {comments: page([ours("x <!-- smart-ship head=abc -->")])}
