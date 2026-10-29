@@ -4,6 +4,7 @@ import { Repo, decide } from "./ship.harn"
 fn pr(over: dict = {}) -> Repo {
   const pull = {
     id: "PR_1",
+    number: 9,
     title: "t",
     state: "OPEN",
     isDraft: false,
@@ -52,7 +53,7 @@ const RED = {
 }
 
 pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) {
-  assert_eq(decide(pr(), false).action, "merge")
+  assert_eq(decide(pr(), "clear", false).action, "merge")
   const refusals = [
     {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
     {
@@ -85,21 +86,32 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
     },
   ]
   for over in refusals {
-    assert(decide(pr(over), true).action != "merge", to_string(over))
+    assert(decide(pr(over), "clear", true).action != "merge", to_string(over))
   }
 }
 
+pipeline test_a_release_lease_holds_every_other_merge(harness: Harness) {
+  const held =
+    "release-merge-lease v2 repo=o/r base=main base_oid=${"1" * 40} candidate_pr=4 candidate_head=${"2" * 40} generation=g tag=v1 merge_method=squash "
+  assert_eq(decide(pr(), held, false).action, "stop")
+  assert_eq(decide(pr(), "unreadable", false).action, "stop", "an unreadable lease fails closed")
+  const mine =
+    "release-merge-lease v2 repo=o/r base=main base_oid=${"1" * 40} candidate_pr=9 candidate_head=abc generation=g tag=v1 merge_method=squash "
+  assert_eq(decide(pr(), mine, false).action, "merge", "the named candidate may land")
+}
+
 pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
-  assert_eq(decide(pr(RED), true).action, "repair")
-  assert_eq(decide(pr(RED), false).action, "stop", "no model key, no repair")
-  assert_eq(decide(pr(RED + {reviewDecision: "REVIEW_REQUIRED"}), true).action, "repair")
+  assert_eq(decide(pr(RED), "clear", true).action, "repair")
+  assert_eq(decide(pr(RED), "clear", false).action, "stop", "no model key, no repair")
+  assert_eq(decide(pr(RED + {reviewDecision: "REVIEW_REQUIRED"}), "clear", true).action, "repair")
   assert_eq(
-    decide(pr({reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"}), true).action,
+    decide(pr({reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"}), "clear", true)
+      .action,
     "stop",
     "green waits for review",
   )
   const answered = {comments: {nodes: [{body: "x <!-- smart-ship head=abc -->"}]}}
-  assert_eq(decide(pr(RED + answered), true).reason, "already answered at this head")
+  assert_eq(decide(pr(RED + answered), "clear", true).reason, "already answered at this head")
   const spent = {
     comments: {
       nodes: [
@@ -109,5 +121,5 @@ pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
       ],
     },
   }
-  assert_eq(decide(pr(RED + spent), true).action, "stop")
+  assert_eq(decide(pr(RED + spent), "clear", true).action, "stop")
 }

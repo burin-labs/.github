@@ -15,7 +15,7 @@ on:
         default: '"ubuntu-24.04"'
       repair-environment:
         description: >-
-          GitHub environment whose secret ANTHROPIC_API_KEY reaches the repair
+          GitHub environment whose secret OPENAI_API_KEY reaches the repair
           agent. Callers that use one pass `secrets: inherit`. A review event
           runs outside it, so it can land a head but never repairs one.
         type: string
@@ -25,7 +25,7 @@ on:
         required: true
       RELEASE_APP_PRIVATE_KEY:
         required: true
-      ANTHROPIC_API_KEY:
+      OPENAI_API_KEY:
         required: false
 
 permissions:
@@ -103,7 +103,7 @@ jobs:
         working-directory: .smart-ship/scripts/smart-ship
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REPO: ${{ github.repository }}
           PR: ${{ matrix.pr }}
         run: |

@@ -16,7 +16,7 @@ const MARK = "<!-- smart-ship head="
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
   defaultBranchRef { name } mergeQueue { id }
-  pullRequest(number: $number) { id title state isDraft isCrossRepository isInMergeQueue
+  pullRequest(number: $number) { id number title state isDraft isCrossRepository isInMergeQueue
     headRefName headRefOid baseRefName mergeStateStatus reviewDecision
     labels(first: 50) { nodes { name } } latestOpinionatedReviews(first: 20) { nodes { state } }
     comments(last: 100) { nodes { body } }
@@ -43,6 +43,7 @@ type Rollup = {contexts: {nodes: list<Check>}}
 
 pub type Pull = {
   id: string,
+  number: int,
   title: string,
   state: string,
   isDraft: bool,
@@ -111,7 +112,11 @@ pub fn observe(pr: Pull) -> Facts {
 /**
  * Every landing rule, deterministic and never delegated to a model: `merge`, `update`, `repair`, or `stop`.
  */
-pub fn decide(repo: Repo, has_key: bool) -> {action: string, reason: string, facts: Facts} {
+pub fn decide(
+  repo: Repo,
+  lease: string,
+  has_key: bool,
+) -> {action: string, reason: string, facts: Facts} {
   const pr = repo.pullRequest
   const labels = pr.labels.nodes.map({ l -> l.name })
   const f = observe(pr)
@@ -133,6 +138,11 @@ pub fn decide(repo: Repo, has_key: bool) -> {action: string, reason: string, fac
     return stop("waiting on " + join(f.pending, ", "))
   }
   if f.approved && pr.mergeStateStatus == "CLEAN" && !blocked {
+    // A release cut holds main through this lease; only the exact candidate it names may land.
+    const candidate = "candidate_pr=${pr.number} candidate_head=${lowercase(pr.headRefOid)} "
+    if lease != "clear" && !contains(lease, candidate) {
+      return stop("a release merge lease holds ${pr.baseRefName}: ${lease}")
+    }
     return {action: "merge", reason: "approved and green", facts: f}
   }
   if pr.mergeStateStatus == "BEHIND" && !blocked {
@@ -199,6 +209,35 @@ fn git(
     },
     dir,
   )
+}
+
+/**
+ * `clear`, `unreadable`, or the lease commit's headline; anything but `clear` blocks other merges.
+ */
+fn release_lease(harness: Harness, token: string, repo: string, base: string) -> string {
+  const ref = "refs/release-merge-lease/" + base
+  const found = gh(
+    harness,
+    token,
+    [
+      "api",
+      "repos/${repo}/git/matching-refs/release-merge-lease/${base}",
+      "--jq",
+      "[.[] | select(.ref == \"${ref}\") | .object.sha][0] // \"\"",
+    ],
+  )
+  if !found.ok {
+    return "unreadable"
+  }
+  if found.out == "" {
+    return "clear"
+  }
+  const commit = gh(
+    harness,
+    token,
+    ["api", "repos/${repo}/git/commits/${found.out}", "--jq", ".message"],
+  )
+  return commit.ok && commit.out != "" ? split(commit.out, "\n")[0] + " " : "unreadable"
 }
 
 fn read(harness: Harness, token: string, repo: string, number: int) -> Repo {
@@ -358,8 +397,8 @@ fn repair(
     nil,
     agent_options(
       {
-        provider: "anthropic",
-        model: "claude-sonnet-5-5",
+        provider: "openai",
+        model: "gpt-6-luna",
         tools: tools_for(harness, dir, done_path),
         loop_until_done: true,
         max_iterations: 60,
@@ -447,7 +486,8 @@ fn main(harness: Harness) {
   const token = harness.env.get("GH_TOKEN") ?? ""
   const r = read(harness, token, repo, number)
   const pr = r.pullRequest
-  const d = decide(r, (harness.env.get("ANTHROPIC_API_KEY") ?? "") != "")
+  const lease = release_lease(harness, token, repo, pr.baseRefName)
+  const d = decide(r, lease, (harness.env.get("OPENAI_API_KEY") ?? "") != "")
   let note = d.reason
   if d.action == "merge" {
     // expectedHeadOid is --match-head-commit: GitHub refuses if the head moved since it was judged.
