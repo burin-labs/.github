@@ -878,7 +878,7 @@ fn merge_now(harness: Harness, opts: GithubClientOptions, pr: Pull) -> string {
 
 /**
  * The node id of the workflow running this look, which its checks carry. On any failure it is "",
- * which excludes nothing: the look then counts its own checks and cannot land, rather than guess.
+ * which excludes nothing, so every check counts, including Smart Ship's own.
  */
 fn own_workflow(harness: Harness, opts: GithubClientOptions, repo: string) -> string {
   const unresolved = { why ->
