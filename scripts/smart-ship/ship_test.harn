@@ -1,6 +1,6 @@
 /** The landing gate is the one place a wrong answer merges unreviewed or red code. */
 import { read_yaml } from "std/fs"
-import { Repo, checkout, decide, diff_refusal, look, quiet, sh } from "./ship.harn"
+import { Repo, checkout, decide, diff_refusal, look, quiet, retention_has_space, sh } from "./ship.harn"
 
 fn page(nodes: list) {
   return {totalCount: len(nodes), nodes: nodes}
@@ -713,15 +713,20 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
   const step = { name -> steps.filter({ s -> s?.name == name }).to_list()[0] }
   const prepared = "steps.look.outputs.prepared == 'true'"
   assert_eq(step("Look at the pull request").id, "look")
+  assert_eq(step("Repair without credentials").id, "repair")
   assert_eq(step("Repair without credentials").if, "inputs.repair && ${prepared}")
   assert_eq(
     step("Publish the repair").if,
     "always() && inputs.repair && ${prepared}",
     "a prepared repair publishes even after the agent fails",
   )
+  assert_eq(step("Publish the repair").id, "publish")
   assert_eq(step("Remove the checkouts").if, "always()", "cleanup still runs after a failed mint")
   assert_eq(step("Remove Smart Ship's scripts").if, "always()")
   assert_eq(step("Remove the checkouts").env.SHIP_NONCE, "\${{ steps.look.outputs.nonce }}")
+  const retained_root = "\${{ runner.temp }}/../.smart-ship-retained"
+  assert_eq(step("Look at the pull request").env.SHIP_RETAIN_ROOT, retained_root)
+  assert_eq(step("Remove the checkouts").env.SHIP_RETAIN_ROOT, retained_root)
   // Each run, attempt and PR owns its checkouts: no leftover, and no other PR in the sweep, shares one.
   const per_run =
     "\${{ runner.temp }}/smart-ship-\${{ github.run_id }}-\${{ github.run_attempt }}-\${{ matrix.pr }}"
@@ -746,7 +751,7 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
   const cases = [
     ["prepared", true, true, true],
     ["stopped", true, false, true],
-    // A claimed attempt that then fails is still this job's to clean up.
+    // A failed look with a skipped agent has no model work to retain.
     ["failed", false, false, true],
     // A persistent runner kept a dir with an earlier job's job.json: never armed, never deleted.
     ["stale", false, false, false],
@@ -796,15 +801,125 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
           PATH: to_string(harness.env.get("PATH") ?? ""),
           SHIP_WORK: work,
           SHIP_NONCE: len(nonces) == 1 ? nonces[0] : "",
+          SHIP_LOOK: c[1] ? "success" : "failure",
+          SHIP_PREPARED: c[2] ? "true" : "false",
+          SHIP_PUBLISH: c[2] ? "success" : "skipped",
+          SHIP_AGENT: c[2] ? "success" : "skipped",
         },
         timeout_ms: 30000,
       },
     )
     assert(cleaned.success, name + ": " + cleaned.stderr)
-    assert_eq(harness.fs.exists(work), !c[3], name + ": only an owned work dir is removed")
+    const removed = c[3]
+    assert_eq(harness.fs.exists(work), !removed, name + ": only confirmed owned work is removed")
     if !c[3] {
-      assert(contains(cleaned.stdout, "did not create it"), name + ": " + cleaned.stdout)
+      assert(contains(cleaned.stdout, "unconfirmed"), name + ": " + cleaned.stdout)
       assert(contains(harness.fs.read_text(work + "/job.json"), "from-an-earlier-job"), name)
+    }
+  }
+}
+
+/** A failed publish must keep both the repair and its controller records for recovery. */
+pipeline test_cleanup_preserves_an_unpublished_repair_and_its_records(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const step = { name -> steps.filter({ s -> s?.name == name }).to_list()[0] }
+  for outcome in ["failure", "cancelled", "success"] {
+    const dir = harness.fs.mkdtemp_in_workspace("smart-ship-cleanup-")
+    const work = dir + "/work"
+    const workspace = dir + "/workspace"
+    harness.fs.mkdir(work, true)
+    harness.fs.mkdir(workspace + "/.smart-ship", true)
+    harness.fs.write_text(work + "/.owner", "own-nonce\n")
+    harness.fs.write_text(work + "/unfinished", "repair work")
+    harness.fs.write_text(workspace + "/.smart-ship/record", "controller record")
+    const env = {
+      PATH: to_string(harness.env.get("PATH") ?? ""),
+      GITHUB_WORKSPACE: workspace,
+      SHIP_WORK: work,
+      SHIP_NONCE: "own-nonce",
+      SHIP_LOOK: "success",
+      SHIP_PREPARED: "true",
+      SHIP_PUBLISH: outcome,
+    }
+    for name in ["Remove Smart Ship's scripts", "Remove the checkouts"] {
+      const ran = harness.process.run({
+        program: "/bin/bash", args: ["-c", step(name).run], env: env, timeout_ms: 30000,
+      })
+      assert(ran.success, name + ": " + ran.stderr)
+    }
+    if outcome == "success" {
+      assert(!harness.fs.exists(work), "confirmed publication cleans the owned checkout")
+      assert(!harness.fs.exists(workspace + "/.smart-ship"), "confirmed publication cleans the controller")
+    } else {
+      assert_eq(harness.fs.read_text(work + "/unfinished"), "repair work")
+      assert_eq(harness.fs.read_text(work + "/controller/record"), "controller record")
+    }
+  }
+}
+
+/** GitHub clears runner.temp after a job, so failed work must leave that directory. */
+pipeline test_failed_work_survives_runner_temp_cleanup(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const step = { name -> steps.filter({ s -> s?.name == name }).to_list()[0] }
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-retained-")
+  const work = dir + "/runner-temp/work"
+  const workspace = dir + "/workspace/repository"
+  harness.fs.mkdir(work, true)
+  harness.fs.mkdir(workspace + "/.smart-ship", true)
+  harness.fs.write_text(work + "/.owner", "own-nonce\n")
+  harness.fs.write_text(work + "/unfinished", "repair work")
+  harness.fs.write_text(workspace + "/.smart-ship/record", "controller record")
+  const env = {
+    PATH: to_string(harness.env.get("PATH") ?? ""), GITHUB_WORKSPACE: workspace,
+    SHIP_WORK: work, SHIP_NONCE: "own-nonce", SHIP_LOOK: "success", SHIP_PREPARED: "true",
+    SHIP_PUBLISH: "failure", SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: "9",
+    SHIP_RETAIN_ROOT: dir + "/runner-retained",
+  }
+  for name in ["Remove Smart Ship's scripts", "Remove the checkouts"] {
+    const ran = harness.process.run({
+      program: "/bin/bash", args: ["-c", step(name).run], env: env, timeout_ms: 30000,
+    })
+    assert(ran.success, name + ": " + ran.stderr)
+  }
+  const saved = dir + "/runner-retained/123-1-9/work"
+  assert_eq(harness.fs.read_text(saved + "/unfinished"), "repair work")
+  assert_eq(harness.fs.read_text(saved + "/controller/record"), "controller record")
+  assert(!harness.fs.exists(work), "the recoverable copy is outside runner.temp")
+}
+
+/** A malformed identity or occupied target must never overwrite anyone's work. */
+pipeline test_retention_refuses_an_unowned_target(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const cleanup = steps.filter({s -> s?.name == "Remove the checkouts"}).to_list()[0]
+  for c in ["bad-identity", "occupied"] {
+    const dir = harness.fs.mkdtemp_in_workspace("smart-ship-retain-refusal-")
+    const work = dir + "/temp/work"
+    const workspace = dir + "/workspace/repository"
+    harness.fs.mkdir(work, true)
+    harness.fs.mkdir(workspace, true)
+    const nonce = "c" * 32
+    harness.fs.write_text(work + "/.owner", nonce + "\n")
+    harness.fs.write_text(work + "/unfinished", "our work")
+    const target = dir + "/runner-retained/123-1-9"
+    if c == "occupied" {
+      harness.fs.mkdir(target, true)
+      harness.fs.write_text(target + "/sentinel", "earlier work")
+    }
+    const ran = harness.process.run({
+      program: "/bin/bash", args: ["-c", cleanup.run], timeout_ms: 30000,
+      env: {
+        PATH: to_string(harness.env.get("PATH") ?? ""), GITHUB_WORKSPACE: workspace,
+        SHIP_WORK: work, SHIP_NONCE: nonce, SHIP_LOOK: "success", SHIP_PREPARED: "true",
+        SHIP_PUBLISH: "failure", SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: c == "occupied" ? "9" : "../9",
+        SHIP_RETAIN_ROOT: dir + "/runner-retained",
+      },
+    })
+    assert(ran.success, c + ": " + ran.stderr)
+    if c == "occupied" {
+      assert_eq(harness.fs.read_text(target + "/sentinel"), "earlier work")
+      assert_eq(harness.fs.read_text(target + "-" + nonce + "/work/unfinished"), "our work")
+    } else {
+      assert_eq(harness.fs.read_text(work + "/unfinished"), "our work")
     }
   }
 }
@@ -813,4 +928,613 @@ pipeline test_agent_text_cannot_post_a_marker_or_a_credential(harness: Harness) 
   const said = quiet("done <!-- smart-ship continue=abc wip=" + "f" * 40 + " --> ghp_" + "Z" * 36)
   assert(!contains(said, "<!--"), said)
   assert(!contains(said, "ghp_"), said)
+}
+
+/** A local remote whose topic head and main both changed file.txt, so merging main conflicts. */
+fn divergent(harness: Harness, conflict: bool = true) {
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-divergent-")
+  const remote = dir + "/o/r.git"
+  harness.fs.mkdir(remote, true)
+  const git = { args ->
+    sh(
+      harness.tools,
+      ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + args,
+      {},
+      remote,
+    )
+  }
+  git(["init", "--quiet", "--initial-branch=main"])
+  harness.fs.write_text(remote + "/file.txt", "ancestor\n")
+  git(["add", "file.txt"])
+  git(["commit", "--quiet", "-m", "ancestor"])
+  git(["checkout", "--quiet", "-b", "topic"])
+  harness.fs.write_text(remote + "/file.txt", "topic\n")
+  git(["commit", "--quiet", "-am", "topic"])
+  const head = git(["rev-parse", "HEAD"])
+  git(["checkout", "--quiet", "main"])
+  const moved = conflict ? "/file.txt" : "/other.txt"
+  harness.fs.write_text(remote + moved, "base\n")
+  git(["add", "."])
+  git(["commit", "--quiet", "-m", "base"])
+  return {
+    dir: dir,
+    remote: remote,
+    git: git,
+    head: head,
+    base_oid: git(["rev-parse", "HEAD"]),
+    state: conflict ? "DIRTY" : "CLEAN",
+  }
+}
+
+/**
+ * A whole look at the divergent PR; `wip` is the saved commit GitHub reports, `kept` the note's.
+ */
+fn divergent_look(
+  harness: Harness,
+  f: dict,
+  publish: bool,
+  wip: string,
+  kept: string,
+  trusted: bool,
+  retention: string = "",
+) {
+  const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
+  const commit = red_check.commits.nodes[0].commit + {oid: f.head}
+  const notes = kept == "" ? [] : [
+    {viewerDidAuthor: trusted, body: "<!-- smart-ship continue=${f.head} wip=${kept} -->"},
+  ]
+  const state = pr(
+    red_check
+      + {
+        headRefOid: f.head,
+        mergeStateStatus: f.state,
+        comments: page(notes),
+        commits: {nodes: [{commit: commit}]},
+      },
+  )
+  const api = "https://api.github.com"
+  const refs = wip == "" ? [] : [{ref: "refs/smart-ship/wip/9", object: {sha: wip}}]
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {status: 200, body: json_stringify({data: {repository: state}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/release-merge-lease/main",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/smart-ship/wip/9",
+    {status: 200, body: json_stringify(refs)},
+  )
+  harness.testing.http_mock(
+    "DELETE",
+    api + "/repos/o/r/git/refs/smart-ship/wip/9",
+    {status: 204, body: ""},
+  )
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  // The saved commit's scratch branch: absent, then created.
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/ref/heads/smart-ship/*",
+    {status: 404, body: "{\"message\":\"Not Found\"}"},
+  )
+  harness.testing.http_mock(
+    "POST",
+    api + "/repos/o/r/git/refs",
+    {status: 201, body: "{\"ref\":\"refs/heads/smart-ship/wip\"}"},
+  )
+  for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
+    harness.testing.http_mock(
+      method,
+      api + "/*",
+      {status: 500, body: "{\"message\":\"unexpected\"}"},
+    )
+  }
+  const result = look(
+    harness,
+    {
+      repo: "o/r",
+      number: 9,
+      token: "fixture-token",
+      work: f.dir + "/work",
+      publish: publish,
+      repair: true,
+      run_id: "",
+      opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file://" + f.dir + "/",
+      nonce: "fixture-nonce",
+      retention: retention,
+    },
+  )
+  return {result: result, calls: harness.testing.http_mock_calls({include_sensitive: true})}
+}
+
+/** A moved shared clone must still resolve its pristine Git objects. */
+pipeline test_a_retained_checkout_can_read_its_git_objects(harness: Harness) {
+  const f = divergent(harness, false)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const work = f.dir + "/work"
+  const nonce = "c" * 32
+  harness.fs.write_text(work + "/.owner", nonce + "\n")
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const cleanup = steps.filter({s -> s?.name == "Remove the checkouts"}).to_list()[0]
+  const root = f.dir + "/retained"
+  const moved = harness.process.run({
+    program: "/bin/bash", args: ["-c", cleanup.run], timeout_ms: 30000,
+    env: {PATH: to_string(harness.env.get("PATH") ?? ""), SHIP_WORK: work, SHIP_NONCE: nonce,
+      SHIP_LOOK: "success", SHIP_PREPARED: "true", SHIP_PUBLISH: "failure",
+      SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: "9", SHIP_RETAIN_ROOT: root},
+  })
+  assert(moved.success, moved.stderr)
+  const git = harness.process.run({
+    program: "git", args: ["-C", root + "/123-1-9/work/pr", "cat-file", "-e", f.head], timeout_ms: 30000,
+  })
+  assert(git.success, "retained checkout cannot read its head: " + git.stderr)
+}
+
+/** Retention must not write through an alternate path planted by the agent. */
+pipeline test_a_retained_checkout_never_follows_an_alternate_symlink(harness: Harness) {
+  const f = divergent(harness, false)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const work = f.dir + "/work"
+  const nonce = "c" * 32
+  harness.fs.write_text(work + "/.owner", nonce + "\n")
+  const alternate = work + "/pr/.git/objects/info/alternates"
+  assert(harness.process.run({program: "/bin/mv", args: [alternate, alternate + ".old"]}).success)
+  const outside = f.dir + "/outside"
+  harness.fs.write_text(outside, "untouched")
+  assert(harness.process.run({program: "/bin/ln", args: ["-s", outside, alternate]}).success)
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const cleanup = steps.filter({s -> s?.name == "Remove the checkouts"}).to_list()[0]
+  const moved = harness.process.run({
+    program: "/bin/bash", args: ["-c", cleanup.run], timeout_ms: 30000,
+    env: {PATH: to_string(harness.env.get("PATH") ?? ""), SHIP_WORK: work, SHIP_NONCE: nonce,
+      SHIP_LOOK: "success", SHIP_PREPARED: "true", SHIP_PUBLISH: "failure",
+      SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: "9", SHIP_RETAIN_ROOT: f.dir + "/retained"},
+  })
+  assert(moved.success, moved.stderr)
+  assert_eq(harness.fs.read_text(outside), "untouched")
+  const retained_alt = f.dir + "/retained/123-1-9/work/pr/.git/objects/info/alternates"
+  assert(harness.process.run({program: "/bin/test", args: ["-L", retained_alt]}).success)
+}
+
+/** Full recovery storage stops before an attempt marker, checkout or model spend. */
+pipeline test_full_recovery_storage_stops_only_the_repair(harness: Harness) {
+  const root = harness.fs.mkdtemp_in_workspace("smart-ship-cap-")
+  assert(retention_has_space(harness.tools, root), "a measured empty directory has capacity")
+  for i in 0..5 {
+    harness.fs.mkdir(root + "/saved-" + to_string(i))
+  }
+  assert(!retention_has_space(harness.tools, root), "five retained directories fill the cap")
+  const link = root + "-link"
+  assert(harness.process.run({program: "/bin/ln", args: ["-s", root, link]}).success)
+  let refused = false
+  try {
+    retention_has_space(harness.tools, link)
+  } catch (_) {
+    refused = true
+  }
+  assert(refused, "a symlinked retention root is refused")
+  const f = divergent(harness, false)
+  const seen = divergent_look(harness, f, false, "", "", true, root)
+  assert_eq(seen.result.action, "stop")
+  assert(contains(seen.result.reason, "no repair was started"), seen.result.reason)
+  assert(!harness.fs.exists(f.dir + "/work/job.json"), "no agent task was prepared")
+  assert(!seen.calls.any({call -> call.method == "POST" && contains(call.body ?? "", "smart-ship head=")}))
+  const api = "https://api.github.com"
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("POST", api + "/graphql", {responses: [
+    {status: 200, body: json_stringify({data: {repository: pr()}})},
+    {status: 200, body: json_stringify({data: {mergePullRequest: {pullRequest: {state: "MERGED"}}}})},
+  ]})
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/release-merge-lease/main", {status: 200, body: "[]"})
+  const green = look(harness, {repo: "o/r", number: 9, token: "fixture-token", work: f.dir + "/other",
+    publish: false, repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file://" + f.dir + "/", nonce: "fixture-nonce", retention: root})
+  assert_eq(green.action, "merge", "green PRs still land when recovery storage is full")
+  assert(harness.testing.http_mock_calls({include_sensitive: true}).any(
+    {call -> call.method == "POST" && contains(call.body ?? "", "mergePullRequest")},
+  ), "the actual merge API was reached")
+}
+
+/**
+ * A conflicted head once threw its saved work away: the next look deleted the trusted same-head
+ * WIP instead of restoring it. A WIP from another head or an untrusted note goes.
+ * A trusted WIP on an unknown or moved base is preserved and passed as context to a fresh merge.
+ */
+pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harness) {
+  for c in ["trusted", "untrusted", "wrong-head", "other-base", "base-moved", "no-base"] {
+    const f = divergent(harness)
+    f.git(["checkout", "--quiet", "topic"])
+    if c == "wrong-head" {
+      f.git(["checkout", "--quiet", "-b", "wrong-parent", "HEAD^"])
+    }
+    harness.fs.write_text(f.remote + "/file.txt", "saved unfinished resolution\n")
+    harness.fs.write_text(f.remote + "/added.txt", "new saved file\n")
+    f.git(["add", "file.txt", "added.txt"])
+    const saved_on = if c == "other-base" {
+      "1" * 40
+    } else if c == "base-moved" {
+      f.git(["rev-parse", "main^"])
+    } else {
+      f.base_oid
+    }
+    const subject =
+      c == "no-base" ? "unfinished" : "Smart Ship unfinished repair for #9 at ${f.head}, on base ${saved_on}"
+    f.git(["commit", "--quiet", "-m", subject])
+    const wip = f.git(["rev-parse", "HEAD"])
+    f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+    f.git(["checkout", "--quiet", "main"])
+    if ["other-base", "base-moved", "no-base"].contains(c) {
+      const seen = divergent_look(harness, f, false, wip, wip, true)
+      assert_eq(seen.result.action, "repair", c)
+      assert(!seen.calls.any({call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9")}), c)
+      assert(contains(harness.fs.read_text(f.dir + "/work/pr/file.txt"), "<<<<<<<"), c + ": current base is fresh")
+      assert(contains(harness.fs.read_text(f.dir + "/work/pr/.git/ship-previous.diff"), "saved unfinished resolution"), c)
+      assert(contains(harness.fs.read_text(f.dir + "/work/pr/.git/ship-task.json"), "previous attempt's checkpoint"), c)
+      if c == "base-moved" {
+        harness.fs.write_text(f.dir + "/work/pr/.git/ship-result.json", json_stringify({outcome: "timeout", summary: "unfinished", spend: "0.01"}))
+        const again = divergent_look(harness, f, true, wip, wip, true)
+        assert_eq(again.result.action, "publish_failed")
+        assert(!again.calls.any({call -> ["PATCH", "DELETE"].contains(call.method) && contains(call.url, "/git/refs/smart-ship/wip/9")}))
+      }
+      continue
+    }
+    const seen = divergent_look(harness, f, false, wip, wip, c != "untrusted")
+    assert_eq(seen.result.action, "repair", c)
+    const pr_dir = f.dir + "/work/pr"
+    const restored = harness.fs.read_text(pr_dir + "/file.txt") == "saved unfinished resolution\n"
+      && harness.fs.exists(pr_dir + "/added.txt")
+    const resumed = contains(
+      harness.fs.read_text(pr_dir + "/.git/ship-task.json"),
+      "This continues an earlier attempt that ran out of time",
+    )
+    const deleted = seen.calls.any(
+      { call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9") },
+    )
+    assert_eq([restored, resumed, deleted], [c == "trusted", c == "trusted", c != "trusted"], c)
+    if c != "trusted" {
+      assert(contains(harness.fs.read_text(pr_dir + "/file.txt"), "<<<<<<<"), c + ": fresh merge")
+    }
+  }
+}
+
+/** Saved filenames must be restored literally, including newlines and Git pathspec syntax. */
+pipeline test_a_saved_repair_restores_literal_filenames(harness: Harness) {
+  const f = divergent(harness, false)
+  f.git(["checkout", "--quiet", "topic"])
+  const names = ["newline\nname.txt", "literal[*].txt", ":(glob)magic.txt"]
+  for name in names {
+    harness.fs.write_text(f.remote + "/" + name, "unfinished " + name + "\n")
+  }
+  f.git(["rm", "--quiet", "file.txt"])
+  f.git(["add", "--all"])
+  f.git(["commit", "--quiet", "-m", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${f.base_oid}, checkout clean"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  const seen = divergent_look(harness, f, false, wip, wip, true)
+  assert_eq(seen.result.action, "repair")
+  for name in names {
+    assert_eq(harness.fs.read_text(f.dir + "/work/pr/" + name), "unfinished " + name + "\n", name)
+  }
+  assert(!harness.fs.exists(f.dir + "/work/pr/file.txt"), "saved deletion is restored")
+  assert(contains(harness.fs.read_text(f.dir + "/work/pr/.git/ship-task.json"), "This continues an earlier attempt"))
+}
+
+/**
+ * A timed-out repair of a conflicted head once kept nothing: only a clean head's tree was saved.
+ * Its merge in progress is now committed as the WIP; every saved tree names the base it was on.
+ */
+pipeline test_a_timed_out_repair_saves_its_tree_and_base(harness: Harness) {
+  for conflict in [true, false] {
+    timed_out_save(harness, conflict)
+  }
+}
+
+/** A fresh reconciliation that times out keeps both checkpoints and can continue. */
+pipeline test_a_second_timeout_archives_prior_work_before_continuing(harness: Harness) {
+  const f = divergent(harness, true)
+  f.git(["checkout", "--quiet", "topic"])
+  harness.fs.write_text(f.remote + "/file.txt", "earlier work\n")
+  f.git(["commit", "--quiet", "-am", "Smart Ship unfinished repair for #9 at ${f.head}, on base " + "1" * 40 + ", checkout merged"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  assert_eq(divergent_look(harness, f, false, wip, wip, true).result.action, "repair")
+  harness.fs.write_text(f.dir + "/work/pr/file.txt", "new progress\n")
+  harness.fs.write_text(f.dir + "/work/pr/.git/ship-result.json", json_stringify({outcome: "timeout", summary: "unfinished", spend: "0.01"}))
+  const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
+  const commit = red_check.commits.nodes[0].commit + {oid: f.head}
+  const state = pr(red_check + {headRefOid: f.head, mergeStateStatus: "DIRTY", commits: {nodes: [{commit: commit}]}})
+  const api = "https://api.github.com"
+  const newer = "b" * 40
+  const archive = "refs/smart-ship/previous/9/${wip}"
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("POST", api + "/graphql", {responses: [
+    {status: 200, body: json_stringify({data: {repository: state}})},
+    {status: 200, body: json_stringify({data: {createCommitOnBranch: {
+      commit: {oid: newer, url: "https://example.invalid/commit", signature: {isValid: true, state: "VALID", wasSignedByGitHub: true}},
+      ref: {name: "smart-ship/wip-9"},
+    }}})},
+  ]})
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/smart-ship/wip/9", {
+    status: 200, body: json_stringify([{ref: "refs/smart-ship/wip/9", object: {sha: wip}}]),
+  })
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/smart-ship/previous/9/${wip}", {status: 200, body: "[]"})
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/ref/heads/smart-ship/*", {status: 404, body: "{}"})
+  harness.testing.http_mock("POST", api + "/repos/o/r/git/refs", {responses: [
+    {status: 201, body: json_stringify({ref: archive, object: {sha: wip}})},
+    {status: 201, body: "{}"},
+  ]})
+  harness.testing.http_mock("PATCH", api + "/repos/o/r/git/refs/smart-ship/wip/9", {status: 200, body: "{}"})
+  harness.testing.http_mock("DELETE", api + "/repos/o/r/git/refs/heads/smart-ship/*", {status: 204, body: ""})
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(harness, {repo: "o/r", number: 9, token: "fixture-token", work: f.dir + "/work",
+    publish: true, repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file://" + f.dir + "/", nonce: "fixture-nonce"})
+  assert_eq(result.action, "published")
+  let archived = false
+  let patched_after = false
+  let continued = false
+  for call in harness.testing.http_mock_calls({include_sensitive: true}) {
+    if call.method == "POST" && contains(call.url, "/git/refs") && contains(call.body ?? "", archive) {
+      archived = true
+    }
+    if call.method == "PATCH" && contains(call.url, "/git/refs/smart-ship/wip/9") {
+      patched_after = archived && contains(call.body ?? "", newer)
+    }
+    if call.method == "POST" && contains(call.url, "/issues/9/comments") && contains(call.body ?? "", "smart-ship continue=") {
+      continued = contains(call.body ?? "", newer) && contains(call.body ?? "", archive)
+    }
+  }
+  assert(archived && patched_after && continued, "the prior ref is archived before the new continuation")
+}
+
+/** A clean checkout contains no base merge, so its edits survive a moved base. */
+pipeline test_a_clean_checkpoint_resumes_after_the_base_moves(harness: Harness) {
+  const f = divergent(harness, false)
+  f.git(["checkout", "--quiet", "topic"])
+  harness.fs.write_text(f.remote + "/file.txt", "saved clean edit\n")
+  f.git(["add", "file.txt"])
+  const old_base = f.git(["rev-parse", "main^"])
+  f.git(["commit", "--quiet", "-m", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${old_base}, checkout clean"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  const seen = divergent_look(harness, f, false, wip, wip, true)
+  assert_eq(seen.result.action, "repair")
+  assert_eq(harness.fs.read_text(f.dir + "/work/pr/file.txt"), "saved clean edit\n")
+  assert(!seen.calls.any({call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9")}))
+}
+
+/** An unmeasured merge state must not lay a saved merge over a clean checkout. */
+pipeline test_an_unknown_merge_state_keeps_the_saved_merge(harness: Harness) {
+  const f = divergent(harness, true)
+  f.git(["checkout", "--quiet", "topic"])
+  harness.fs.write_text(f.remote + "/file.txt", "saved merge\n")
+  f.git(["commit", "--quiet", "-am", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${f.base_oid}, checkout merged"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  const seen = divergent_look(harness, f + {state: "UNKNOWN"}, false, wip, wip, true)
+  assert_eq(seen.result.action, "repair")
+  assert_eq(harness.fs.read_text(f.dir + "/work/pr/file.txt"), "topic\n")
+  assert(contains(harness.fs.read_text(f.dir + "/work/pr/.git/ship-previous.diff"), "saved merge"))
+  assert(!seen.calls.any({call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9")}))
+}
+
+/** A previously clean checkpoint is not overlaid on a checkout that now conflicts. */
+pipeline test_a_clean_checkpoint_is_not_overlaid_on_a_conflict(harness: Harness) {
+  const f = divergent(harness, true)
+  f.git(["checkout", "--quiet", "topic"])
+  harness.fs.write_text(f.remote + "/file.txt", "saved edit\n")
+  f.git(["commit", "--quiet", "-am", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${f.base_oid}, checkout clean"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  const seen = divergent_look(harness, f, false, wip, wip, true)
+  assert_eq(seen.result.action, "repair")
+  assert(contains(harness.fs.read_text(f.dir + "/work/pr/file.txt"), "<<<<<<<"))
+  assert(contains(harness.fs.read_text(f.dir + "/work/pr/.git/ship-previous.diff"), "saved edit"))
+}
+
+/** A fresh attempt never receives a partial or credential-shaped previous patch. */
+pipeline test_previous_patch_must_be_whole_and_secret_free(harness: Harness) {
+  for c in ["credential", "oversized"] {
+    const f = divergent(harness, true)
+    f.git(["checkout", "--quiet", "topic"])
+    const content = c == "credential" ? "ghp_" + "Z" * 40 : "x" * 1100000
+    harness.fs.write_text(f.remote + "/file.txt", content)
+    f.git(["commit", "--quiet", "-am", "Smart Ship unfinished repair for #9 at ${f.head}, on base " + "1" * 40 + ", checkout merged"])
+    const wip = f.git(["rev-parse", "HEAD"])
+    f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+    f.git(["checkout", "--quiet", "main"])
+    let failure = ""
+    try {
+      divergent_look(harness, f, false, wip, wip, true)
+    } catch (e) {
+      failure = to_string(e)
+    }
+    assert(contains(failure, "kept for recovery"), c + ": " + failure)
+    assert(!harness.fs.exists(f.dir + "/work/pr/.git/ship-previous.diff"), c + ": patch not handed to agent")
+    assert(!harness.testing.http_mock_calls({include_sensitive: true}).any(
+      {call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9")},
+    ), c + ": checkpoint preserved")
+  }
+}
+
+/** An explicit give-up must not create a checkpoint or reopen paid retries. */
+pipeline test_a_stuck_repair_does_not_reopen_itself(harness: Harness) {
+  const f = divergent(harness, false)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  harness.fs.write_text(f.dir + "/work/pr/file.txt", "partial edit\n")
+  harness.fs.write_text(f.dir + "/work/pr/.git/ship-result.json", json_stringify({
+    outcome: "stuck", summary: "cannot proceed", spend: "0.01",
+  }))
+  const seen = divergent_look(harness, f, true, "", "", true)
+  assert_eq(seen.result.action, "publish_failed")
+  assert(!seen.calls.any({call -> call.method == "POST" && contains(call.body ?? "", "createCommitOnBranch")}))
+  assert(!seen.calls.any({call -> call.method == "POST" && contains(call.body ?? "", "smart-ship continue=")}))
+}
+
+/** A wall-clock kill leaves no result file, but its edited tree still needs a signed checkpoint. */
+pipeline test_a_killed_repair_saves_a_signed_checkpoint(harness: Harness) {
+  const f = divergent(harness, true)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  harness.fs.write_text(f.dir + "/work/pr/file.txt", "half resolved\n")
+  const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
+  const commit = red_check.commits.nodes[0].commit + {oid: f.head}
+  const state = pr(red_check + {headRefOid: f.head, mergeStateStatus: "DIRTY", commits: {nodes: [{commit: commit}]}})
+  const api = "https://api.github.com"
+  const wip = "b" * 40
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("POST", api + "/graphql", {responses: [
+    {status: 200, body: json_stringify({data: {repository: state}})},
+    {status: 200, body: json_stringify({data: {createCommitOnBranch: {
+      commit: {oid: wip, url: "https://example.invalid/commit", signature: {isValid: true,
+        state: "VALID", wasSignedByGitHub: true}}, ref: {name: "smart-ship/wip-9"},
+    }}})},
+  ]})
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/ref/heads/smart-ship/*", {status: 404, body: "{}"})
+  harness.testing.http_mock("POST", api + "/repos/o/r/git/refs", {status: 201, body: "{}"})
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/smart-ship/wip/9", {status: 200, body: "[]"})
+  harness.testing.http_mock("DELETE", api + "/repos/o/r/git/refs/heads/smart-ship/*", {status: 204, body: ""})
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(harness, {repo: "o/r", number: 9, token: "fixture-token", work: f.dir + "/work",
+    publish: true, repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file://" + f.dir + "/", nonce: "fixture-nonce"})
+  const calls = harness.testing.http_mock_calls({include_sensitive: true})
+  assert_eq(result.action, "published")
+  assert(calls.any({c -> c.method == "POST" && contains(c.url, "/git/refs")
+    && contains(c.body ?? "", "refs/smart-ship/wip/9") && contains(c.body ?? "", wip)}), "checkpoint ref")
+  assert(calls.any({c -> c.method == "POST" && contains(c.url, "/issues/9/comments")
+    && contains(c.body ?? "", "smart-ship continue=") && contains(c.body ?? "", "spend: unknown")}),
+    "the checkpoint and unknown spend are recorded")
+}
+
+fn timed_out_save(harness: Harness, conflict: bool) {
+  const f = divergent(harness, conflict)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const pr_dir = f.dir + "/work/pr"
+  harness.fs.write_text(pr_dir + "/file.txt", "half resolved\n")
+  harness.fs.write_text(
+    pr_dir + "/.git/ship-result.json",
+    json_stringify({outcome: "timeout", summary: "ran out of time", spend: "0.01"}),
+  )
+  const seen = divergent_look(harness, f, true, "", "", true)
+  const commits = seen.calls.filter(
+    { call ->
+      call.method == "POST" && contains(call.url, "/graphql")
+        && contains(call.body ?? "", "createCommitOnBranch")
+    },
+  )
+    .to_list()
+  assert_eq(len(commits), 1, "the unfinished tree went to GitHub as the saved commit")
+  assert(contains(commits[0].body, "on base ${f.base_oid}"), commits[0].body)
+  const checkout = conflict ? "merged" : "clean"
+  assert(contains(commits[0].body, "checkout ${checkout}"), commits[0].body)
+  assert(contains(commits[0].body, base64_encode("half resolved\n")), commits[0].body)
+  // The fake GitHub answers the commit with a PR, so saving fails: that is publish_failed, not published.
+  assert_eq(seen.result.action, "publish_failed")
+}
+
+/** A caught publish failure was once returned as published and exited 0; it now fails the step. */
+pipeline test_a_failed_publish_is_answered_once_and_not_published(harness: Harness) {
+  const work = harness.fs.mkdtemp_in_workspace("smart-ship-publish-failed-")
+  harness.fs.mkdir(work + "/pr/.git", true)
+  harness.fs.write_text(
+    work + "/job.json",
+    json_stringify({head: "abc", base_oid: "1" * 40, conflicted: [], threads: []}),
+  )
+  harness.fs.write_text(
+    work + "/pr/.git/ship-result.json",
+    json_stringify({outcome: "fixed", summary: "fixed it", spend: "0.02"}),
+  )
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {status: 200, body: json_stringify({data: {repository: pr(red())}})},
+  )
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(
+    harness,
+    {
+      repo: "o/r",
+      number: 9,
+      token: "fixture-token",
+      work: work,
+      publish: true,
+      repair: true,
+      run_id: "",
+      opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file:///nonexistent-smart-ship-host/",
+      nonce: "",
+    },
+  )
+  assert_eq(result.action, "publish_failed")
+  assert(result.error != "", "the error travels with the outcome")
+  const posted = harness.testing.http_mock_calls({include_sensitive: true}).filter(
+    { c -> c.method == "POST" && contains(c.url, "/issues/9/comments") },
+  )
+    .map({ c -> schema_expect(json_parse(c.body), schema_of(Posted)).body })
+    .to_list()
+  assert_eq(len(posted), 1)
+  assert(contains(posted[0], "Publishing the repair failed"), posted[0])
+  assert(contains(posted[0], "<!-- smart-ship done=abc -->"), "the attempt is answered once")
+}
+
+/** A moved head cannot accept the repair; keep the checkout instead of reporting success. */
+pipeline test_a_moved_head_does_not_discard_the_unpublished_repair(harness: Harness) {
+  const work = harness.fs.mkdtemp_in_workspace("smart-ship-moved-head-")
+  harness.fs.mkdir(work + "/pr/.git", true)
+  harness.fs.write_text(work + "/job.json", json_stringify({
+    head: "old-head", base_oid: "1" * 40, conflicted: [], threads: [],
+  }))
+  harness.fs.write_text(work + "/pr/.git/ship-result.json", json_stringify({
+    outcome: "fixed", summary: "fixed it", spend: "0.02",
+  }))
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  harness.testing.http_mock("POST", api + "/graphql", {
+    status: 200, body: json_stringify({data: {repository: pr(red())}}),
+  })
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(harness, {
+    repo: "o/r", number: 9, token: "fixture-token", work: work, publish: true,
+    repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file:///nonexistent-smart-ship-host/", nonce: "",
+  })
+  assert_eq(result.action, "publish_failed")
+  assert(contains(result.reason, "moved, closed or was held"), result.reason)
+}
+
+/** An unknown agent outcome is not a completed publication. */
+pipeline test_an_unknown_agent_outcome_does_not_discard_work(harness: Harness) {
+  const work = harness.fs.mkdtemp_in_workspace("smart-ship-unknown-outcome-")
+  harness.fs.mkdir(work + "/pr/.git", true)
+  harness.fs.write_text(work + "/job.json", json_stringify({
+    head: "abc", base_oid: "1" * 40, conflicted: [], threads: [],
+  }))
+  harness.fs.write_text(work + "/pr/.git/ship-result.json", json_stringify({
+    outcome: "unexpected", summary: "partial work", spend: "0.02",
+  }))
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  harness.testing.http_mock("POST", api + "/graphql", {
+    status: 200, body: json_stringify({data: {repository: pr(red())}}),
+  })
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(harness, {
+    repo: "o/r", number: 9, token: "fixture-token", work: work, publish: true,
+    repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file:///nonexistent-smart-ship-host/", nonce: "",
+  })
+  assert_eq(result.action, "publish_failed")
 }

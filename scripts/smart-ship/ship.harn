@@ -16,6 +16,8 @@ const HOLDS = ["hold", "do-not-merge"]
 
 pub const MAX_ATTEMPTS = 3
 
+const MAX_RETAINED = 5
+
 const RED = ["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"]
 
 const RERUN = ["CANCELLED", "STALE"]
@@ -33,6 +35,8 @@ const DONE = "<!-- smart-ship done="
 
 // An attempt died before any result; it does not answer the head.
 const ENDED = "<!-- smart-ship ended="
+
+const STORAGE_FULL = "<!-- smart-ship storage-full="
 
 const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
   nodes { ... on CheckRun { name status conclusion databaseId
@@ -317,6 +321,19 @@ fn run(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".
   )
 }
 
+/** A runner never starts another repair when its bounded recovery storage is full. */
+pub fn retention_has_space(tools: HarnessTools, root: string) -> bool {
+  require root != "", "the runner recovery directory is unmeasured"
+  require !run(tools, ["test", "-L", root]).success,
+    "the runner recovery directory is a symlink"
+  sh(tools, ["mkdir", "-p", root])
+  sh(tools, ["chmod", "700", root])
+  const listed = run(tools, ["ls", "-A", "-1", root])
+  require listed.success && !(listed?.stdout_truncated ?? false),
+    "the runner recovery directory could not be read whole"
+  return len(split(listed.stdout, "\n").filter({name -> name != "" })) < MAX_RETAINED
+}
+
 pub fn sh(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".") -> string {
   const r = run(tools, argv, env, cwd)
   require r.success, join(argv[0:3], " ") + ": " + trim(r.stderr)
@@ -461,6 +478,22 @@ pub fn checkout(
   return {base_oid: base_oid, conflicted: conflicted, sides: sides}
 }
 
+/** Read the previous checkpoint whole before giving its bounded excerpt to the agent. */
+fn previous_patch(harness: Harness, work: string, head: string, wip: string, env: dict) -> string {
+  const diff = run(
+    harness.tools,
+    ["git", "diff", "--binary", "--no-renames", head, wip],
+    env,
+    work + "/pristine",
+  )
+  require diff.success && !(diff?.stdout_truncated ?? false) && len(diff.stdout) <= DIFF_CAP,
+    "the previous checkpoint could not be read whole; it was kept for recovery"
+  require regex_match(SECRET, diff.stdout) == nil,
+    "the previous checkpoint contains a credential-shaped value; it was kept for recovery"
+  harness.fs.write_text(work + "/pr/.git/ship-previous.diff", diff.stdout)
+  return join(split(diff.stdout, "\n").slice(0, 400), "\n")
+}
+
 /** Prepare one repair: the checkout, any saved work to continue, and the agent's task. */
 fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
   const token = job.token
@@ -482,6 +515,9 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
     pr.baseRefName,
     pr.mergeStateStatus == "DIRTY",
   )
+  // Git's shared clone writes an absolute alternate. Set it while this fresh
+  // checkout is still trusted so the pair remains readable after retention.
+  harness.fs.write_text(work + "/pr/.git/objects/info/alternates", "../../../pristine/.git/objects\n")
   const base_oid = tree.base_oid
   const conflicted = tree.conflicted
   const sides = tree.sides
@@ -495,26 +531,60 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
       work + "/pristine",
     )
   }
-  const continuing = wip != "" && len(conflicted) == 0 && f.kept.contains(wip)
+  // A clean checkout contains no base merge and can continue on a newer base while still clean.
+  // A saved merge may not be laid over a different base or a checkout with no merge in progress.
+  const subject = wip == "" ? "" : sh(
+    harness.tools, ["git", "log", "-1", "--format=%s", wip], env, work + "/pristine",
+  )
+  const saved_on = regex_captures(
+    ", on base ([0-9a-f]{40})(, checkout (clean|merged))?$", subject,
+  )[0]?.groups?.[0] ?? ""
+  const saved_clean = regex_match(", checkout clean$", subject) != nil
+  const saved_merged = regex_match(", checkout merged$", subject) != nil
+  const trusted_wip = wip != "" && f.kept.contains(wip)
     && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/pristine") == pr.headRefOid
+  const safe_base = saved_on == base_oid
+    && ((!saved_clean && !saved_merged) || (saved_clean && len(conflicted) == 0)
+      || (saved_merged && len(conflicted) > 0))
+  const clean_rebase = saved_clean && len(conflicted) == 0
+  const continuing = trusted_wip && (safe_base || clean_rebase)
+  const previous = trusted_wip && !continuing
+  let previous_diff = ""
+  if previous {
+    // Do not overlay a saved merge onto a changed base. Give the agent the
+    // complete bounded patch to reconcile, and keep the original ref intact.
+    previous_diff = previous_patch(harness, work, pr.headRefOid, wip, env)
+  }
   if continuing {
-    // The saved commit was fetched into the trusted clone; the agent's copy only sees its files.
+    // The saved commit was fetched into the trusted clone; the agent's copy only sees its files,
+    // laid over this checkout (and its merge, conflicted or not) where the saved work changed them.
+    // Git paths may contain newlines or pathspec syntax. Keep their bytes in a
+    // NUL-delimited file and ask Git to treat every path literally.
+    const paths = work + "/wip-paths"
+    sh(
+      harness.tools,
+      ["git", "diff", "--name-only", "--no-renames", "-z", "--output=" + paths, pr.headRefOid, wip],
+      env,
+      work + "/pristine",
+    )
+    require run(harness.tools, ["test", "-s", paths]).success, "the saved work ${wip} changes nothing"
     sh(
       harness.tools,
       [
         "git",
+        "--literal-pathspecs",
         "--git-dir=" + work + "/pristine/.git",
         "--work-tree=" + work + "/pr",
         "restore",
         "--source=" + wip,
         "--worktree",
-        "--",
-        ":/",
+        "--pathspec-from-file=" + paths,
+        "--pathspec-file-nul",
       ],
       env,
       work + "/pr",
     )
-  } else if wip != "" {
+  } else if wip != "" && !previous {
     gh(harness, job.opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
   }
   const tail = { id ->
@@ -558,6 +628,7 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
       conflicted: join(conflicted, ", "),
       sides: sides,
       continuing: continuing,
+      previous_diff: previous_diff,
       failing: failing,
       threads: threads,
       attempt: f.marks + 1,
@@ -577,6 +648,8 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
         head: pr.headRefOid,
         base_oid: base_oid,
         conflicted: conflicted,
+        preserve_previous: previous,
+        previous_wip: previous ? wip : "",
         threads: threads.map({ t -> t.id }),
       },
     ),
@@ -595,9 +668,35 @@ fn wip_commit(harness: Harness, opts: GithubClientOptions, repo: string, number:
   return len(held) == 0 ? "" : held[0].object.sha
 }
 
+/** Preserve the old checkpoint before a fresh attempt replaces its WIP ref. */
+fn archive_previous(harness: Harness, opts: GithubClientOptions, repo: string, number: int, wip: string) -> string {
+  const ref = "refs/smart-ship/previous/${number}/${wip}"
+  const refs = gh(harness, opts, "/repos/${repo}/git/matching-refs/smart-ship/previous/${number}/${wip}")
+    .filter({r -> r?.ref == ref})
+    .to_list()
+  if len(refs) == 0 {
+    const made = gh(harness, opts, "/repos/${repo}/git/refs", "POST", {ref: ref, sha: wip})
+    require made?.ref == ref && made?.object?.sha == wip, "the earlier checkpoint archive was not confirmed"
+  } else {
+    require len(refs) == 1 && refs[0]?.object?.sha == wip, "the earlier checkpoint archive differs"
+  }
+  return ref
+}
+
+/**
+ * The saved subject records the original head, base and whether the checkout held a base merge.
+ */
+fn wip_headline(number: int, head: string, base_oid: string, merged: bool) -> string {
+  return "Smart Ship unfinished repair for #${number} at ${head}, on base ${base_oid}, checkout "
+    + (merged ? "merged" : "clean")
+}
+
 /**
  * Keep an unfinished repair's tree on the private ref refs/smart-ship/wip/<PR>, its parent the
  * head it started from. A diff over the size cap, or one holding anything shaped like a credential, is not kept.
+ * A conflicted repair's tree is its merge in progress, kept whole whatever its markers.
+ * The subject records the base and whether the checkout held a base merge, so a clean checkout
+ * may resume across base changes without overwriting newer base changes.
  */
 fn save_wip(
   harness: Harness,
@@ -606,6 +705,8 @@ fn save_wip(
   repo: string,
   number: int,
   head: string,
+  base_oid: string,
+  merged: bool,
 ) -> string {
   const base = work + "/pristine"
   sh(
@@ -613,20 +714,14 @@ fn save_wip(
     ["git", "--git-dir=" + base + "/.git", "--work-tree=" + work + "/pr", "add", "-A"],
   )
   const why = diff_refusal(harness.tools, base, head)
-  if why != "" {
-    return why == "empty" ? "No unfinished work to keep." : "The unfinished work was not kept: ${why}."
+  if why == "empty" {
+    return "No unfinished work to keep."
   }
+  require why == "", "The unfinished work was not kept: ${why}."
   const staging = "smart-ship/wip-${number}-" + substring(head, 0, 12)
   let kept = ""
   try {
-    kept = signed(
-      harness,
-      opts,
-      repo,
-      staging,
-      base,
-      "Smart Ship unfinished repair for #${number} at ${head}",
-    )
+    kept = signed(harness, opts, repo, staging, base, wip_headline(number, head, base_oid, merged))
     const ref = "refs/smart-ship/wip/${number}"
     if wip_commit(harness, opts, repo, number) == "" {
       gh(harness, opts, "/repos/${repo}/git/refs", "POST", {ref: ref, sha: kept})
@@ -810,20 +905,20 @@ fn publish(
   const job = json_parse(harness.fs.read_text(work + "/job.json"))
   const result = work + "/pr/.git/ship-result.json"
   const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {
-    outcome: "stuck",
-    summary: "The repair stopped without a result.",
+    outcome: "timeout",
+    summary: "The repair stopped without a result; its unfinished work was checked for a checkpoint.",
     spend: "unknown",
   }
+  require ["fixed", "timeout", "stuck", "unrelated"].contains(out.outcome),
+    "The repair reported an unknown outcome; its work was kept for recovery."
   const pr = r.pullRequest
   const labels = pr.labels.nodes.map({ l -> l.name })
   let note = quiet(to_string(out.summary ?? "")) + "\n\nRepair model spend: "
     + quiet(to_string(out.spend ?? "unknown"))
     + "."
-  if pr.headRefOid != job.head || pr.state != "OPEN" || !labels.contains("ship")
-    || HOLDS.any({ h -> labels.contains(h) }) {
-    return "The pull request moved, closed or was held during the repair; nothing was published. "
-      + note
-  }
+  require pr.headRefOid == job.head && pr.state == "OPEN" && labels.contains("ship")
+    && !HOLDS.any({ h -> labels.contains(h) }),
+    "The pull request moved, closed or was held during the repair; nothing was published."
   if out.outcome == "fixed" {
     let pushed = ""
     if len(job.conflicted) > 0 {
@@ -848,8 +943,18 @@ fn publish(
     if wip_commit(harness, opts, repo, number) != "" {
       gh(harness, opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
     }
-  } else if out.outcome == "timeout" && len(job.conflicted) == 0 {
-    note = save_wip(harness, opts, work, repo, number, job.head) + " " + note
+  } else if out.outcome == "timeout" {
+    let earlier_note = ""
+    if job?.preserve_previous ?? false {
+      const earlier = to_string(job?.previous_wip ?? "")
+      require earlier != "" && wip_commit(harness, opts, repo, number) == earlier,
+        "the earlier checkpoint moved; unfinished work was kept for recovery"
+      earlier_note = "Earlier checkpoint retained at " + archive_previous(harness, opts, repo, number, earlier) + ". "
+    }
+    note = earlier_note + save_wip(harness, opts, work, repo, number, job.head, to_string(job.base_oid), len(job.conflicted) > 0) + " "
+      + note
+  } else if out.outcome == "stuck" {
+    throw "The repair could not continue: " + quiet(to_string(out.summary ?? ""))
   }
   for reply in out.replies ?? [] {
     if job.threads.contains(reply?.id) {
@@ -953,6 +1058,7 @@ pub type Look = {
   git_host: string,
   // The look step's nonce, echoed into the job so the step can tell this look's job from a stale one.
   nonce: string,
+  retention?: string,
 }
 
 fn main(harness: Harness) {
@@ -960,6 +1066,9 @@ fn main(harness: Harness) {
   const number = to_int(harness.env.get("PR") ?? "") ?? 0
   const token = harness.env.get("GH_TOKEN") ?? ""
   const run_id = harness.env.get("GITHUB_RUN_ID") ?? ""
+  const retention = harness.env.get("SHIP_RETAIN_ROOT") ?? ""
+  require harness.env.get("SHIP_REPAIR") != "true" || retention != "",
+    "the runner recovery directory is unmeasured"
   // Actions masks only the token's literal value; mask the derived git header before any use.
   const header = base64_encode("x-access-token:" + token)
   harness.stdio.println("::add-mask::" + header)
@@ -970,7 +1079,7 @@ fn main(harness: Harness) {
   harness.stdio.println(
     "smart-ship digests: token=${digest(token)} header=${digest(header)} canary=${digest(canary)} canary64=${digest(base64_encode(canary))}",
   )
-  look(
+  const d = look(
     harness,
     {
       repo: repo,
@@ -983,8 +1092,11 @@ fn main(harness: Harness) {
       opts: {installation_token: token},
       git_host: "https://github.com/",
       nonce: harness.env.get("SHIP_NONCE") ?? "",
+      retention: retention,
     },
   )
+  // The note and marker are posted; the step still fails so a lost repair is not read as landed.
+  require d.action != "publish_failed", "publishing the repair failed: " + to_string(d?.error)
 }
 
 /** One look at one pull request; returns what it decided. */
@@ -1011,20 +1123,24 @@ pub fn look(harness: Harness, job: Look) {
       schema_of(Started),
     )
     const started = begun.head
+    let failure = ""
     const note = try {
       publish(harness, opts, work, repo, number, r)
     } catch (e) {
+      failure = quiet(to_string(e))
       // The spend is reported even when publishing fails.
       const result = work + "/pr/.git/ship-result.json"
       const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {}
       const spent = out?.spend
-      "Publishing the repair failed: " + quiet(to_string(e)) + "\n\nRepair model spend: "
+      "Publishing the repair failed: " + failure + "\n\nRepair model spend: "
         + quiet(to_string(spent ?? "unknown"))
         + "."
     }
+    // The attempt is answered either way, so it counts once; a failure still shows red.
     say("${note}\n\n${DONE}${started} -->")
-    harness.stdio.println("${repo}#${number}: published: ${note}")
-    return {action: "published", reason: note}
+    const action = failure == "" ? "published" : "publish_failed"
+    harness.stdio.println("${repo}#${number}: ${action}: ${note}")
+    return {action: action, reason: note, error: failure}
   }
   const lease = release_lease(harness, opts, repo, pr.baseRefName)
   const d = decide(r, lease, job.repair, own_workflow(harness, opts, repo, job.run_id))
@@ -1071,6 +1187,16 @@ pub fn look(harness: Harness, job: Look) {
     )
   }
   if d.action == "repair" {
+    if (job.retention ?? "") != "" && !retention_has_space(harness.tools, job.retention ?? "") {
+      const reason = "runner recovery storage is full; no repair was started"
+      const said = pr.comments.nodes.any(
+        {c -> c.viewerDidAuthor == true && contains(c.body, STORAGE_FULL + pr.headRefOid)},
+      )
+      if !said {
+        say("${reason}\n\n${STORAGE_FULL}${pr.headRefOid} -->")
+      }
+      return {action: "stop", reason: reason, facts: d.facts}
+    }
     // The attempt is recorded before any spend; if the marker cannot post, nothing is repaired.
     say(
       "repairing at ${pr.headRefOid} (attempt ${d.facts.marks + 1} of ${MAX_ATTEMPTS}).\n\n${MARK}${pr.headRefOid} -->",

@@ -135,6 +135,7 @@ jobs:
           SHIP_REPAIR: ${{ inputs.repair && secrets.OPENAI_API_KEY != '' && github.event_name != 'pull_request_review' }}
           SHIP_REPAIR_TURNS: ${{ inputs.repair-turns }}
           SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
+          SHIP_RETAIN_ROOT: ${{ runner.temp }}/../.smart-ship-retained
         run: |
           set -euo pipefail
           # A repair was prepared only if this look wrote its job, carrying this step's nonce; a
@@ -153,6 +154,7 @@ jobs:
       # The agent runs in Harn's sandbox in the checkout: no GitHub token in this step, no child
       # network, and the model key granted to model calls only, never to a command.
       - name: Repair without credentials
+        id: repair
         if: inputs.repair && steps.look.outputs.prepared == 'true'
         timeout-minutes: 25
         env:
@@ -172,6 +174,7 @@ jobs:
       # A prepared repair always publishes, even after the agent failed or timed out; without one
       # (a failed mint, checkout or look) there is nothing to publish and no checkout to run from.
       - name: Publish the repair
+        id: publish
         if: always() && inputs.repair && steps.look.outputs.prepared == 'true'
         working-directory: .smart-ship/scripts/smart-ship
         env:
@@ -183,20 +186,63 @@ jobs:
         run: |
           set -euo pipefail
           harn run --no-sandbox ship.harn
-      # A persistent owned runner keeps the workspace; the look's run records go with it.
+      # The agent cannot run without prepared=true; a measured look without it has no agent work.
+      # Otherwise keep the controller's records with a failed owned repair for recovery.
       - name: Remove Smart Ship's scripts
         if: always()
-        run: rm -rf -- "$GITHUB_WORKSPACE/.smart-ship"
-      # Only the work dir this job created goes; one it found already there may hold someone's work.
+        env:
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
+          SHIP_NONCE: ${{ steps.look.outputs.nonce }}
+          SHIP_LOOK: ${{ steps.look.outcome }}
+          SHIP_PREPARED: ${{ steps.look.outputs.prepared }}
+          SHIP_PUBLISH: ${{ steps.publish.outcome }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ] &&
+             ! { [ "${SHIP_PUBLISH:-}" = success ] || { [ "${SHIP_PREPARED:-}" != true ] && [ -n "${SHIP_LOOK:-}" ]; }; }; then
+            if [ -d "$GITHUB_WORKSPACE/.smart-ship" ] && [ ! -e "$SHIP_WORK/controller" ]; then
+              mv -- "$GITHUB_WORKSPACE/.smart-ship" "$SHIP_WORK/controller"
+            fi
+            echo "::warning::Left Smart Ship's records for immediate recovery; runner temporary storage may be cleared."
+          else
+            rm -rf -- "$GITHUB_WORKSPACE/.smart-ship"
+          fi
+      # Never delete an owned checkout whose repair did not reach a successful publication.
       - name: Remove the checkouts
         if: always()
         env:
           SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
           SHIP_NONCE: ${{ steps.look.outputs.nonce }}
+          SHIP_LOOK: ${{ steps.look.outcome }}
+          SHIP_PREPARED: ${{ steps.look.outputs.prepared }}
+          SHIP_PUBLISH: ${{ steps.publish.outcome }}
+          SHIP_RUN: ${{ github.run_id }}
+          SHIP_ATTEMPT: ${{ github.run_attempt }}
+          SHIP_PR: ${{ matrix.pr }}
+          SHIP_RETAIN_ROOT: ${{ runner.temp }}/../.smart-ship-retained
         run: |
           set -euo pipefail
-          if [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ]; then
+          if [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ] &&
+             { [ "${SHIP_PUBLISH:-}" = success ] || { [ "${SHIP_PREPARED:-}" != true ] && [ -n "${SHIP_LOOK:-}" ]; }; }; then
             rm -rf -- "$SHIP_WORK"
+          elif [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ]; then
+            if [[ "${SHIP_RUN:-}" =~ ^[0-9]+$ && "${SHIP_ATTEMPT:-}" =~ ^[0-9]+$ && "${SHIP_PR:-}" =~ ^[0-9]+$ && -n "${SHIP_RETAIN_ROOT:-}" ]]; then
+              umask 077
+              retained="$SHIP_RETAIN_ROOT"
+              [ ! -L "$retained" ] || { echo "::error::Refusing a symlinked retention directory."; exit 1; }
+              mkdir -p -- "$retained"
+              chmod 700 "$retained"
+              target="$retained/$SHIP_RUN-$SHIP_ATTEMPT-$SHIP_PR"
+              if [ -e "$target" ] || [ -L "$target" ]; then
+                [[ "$SHIP_NONCE" =~ ^[0-9a-f]{32}$ ]] || { echo "::error::Cannot identify a safe alternate retention target."; exit 1; }
+                target="$target-$SHIP_NONCE"
+              fi
+              mkdir -- "$target"
+              mv -- "$SHIP_WORK" "$target/work"
+              echo "::warning::Retained unfinished work at $target/work; cleanup is still required."
+            else
+              echo "::warning::Could not retain $SHIP_WORK outside runner temporary storage: run identity is unmeasured."
+            fi
           elif [ -e "$SHIP_WORK" ]; then
-            echo "::warning::Left $SHIP_WORK in place: this job did not create it."
+            echo "::warning::Left $SHIP_WORK in place: ownership or publication is unconfirmed; runner temporary storage may be cleared."
           fi
