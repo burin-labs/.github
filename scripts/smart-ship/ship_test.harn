@@ -490,6 +490,9 @@ fn real_repair(harness: Harness, stale: bool) {
       nonce: "unique-fixture-nonce",
     },
   )
+  if stale {
+    assert(harness.fs.exists(work + "/base/old-job"), "unconfirmed earlier work stays recoverable")
+  }
   assert_eq(result.action, "repair")
   const prepared = schema_expect(
     json_parse(harness.fs.read_text(work + "/job.json")),
@@ -716,8 +719,9 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
     "a prepared repair publishes even after the agent fails",
   )
   assert_eq(step("Remove the checkouts").if, "always()", "cleanup still runs after a failed mint")
-  // Each run and attempt owns its checkouts, so a leftover from an interrupted run is never reused.
-  const per_run = "\${{ runner.temp }}/smart-ship-\${{ github.run_id }}-\${{ github.run_attempt }}"
+  // Each run, attempt and PR owns its checkouts: no leftover, and no other PR in the sweep, shares one.
+  const per_run =
+    "\${{ runner.temp }}/smart-ship-\${{ github.run_id }}-\${{ github.run_attempt }}-\${{ matrix.pr }}"
   for name in [
     "Look at the pull request",
     "Repair without credentials",

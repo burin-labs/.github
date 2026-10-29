@@ -134,7 +134,7 @@ jobs:
           PR: ${{ matrix.pr }}
           SHIP_REPAIR: ${{ inputs.repair && secrets.OPENAI_API_KEY != '' && github.event_name != 'pull_request_review' }}
           SHIP_REPAIR_TURNS: ${{ inputs.repair-turns }}
-          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
         run: |
           set -euo pipefail
           # A repair was prepared only if this look wrote its job, carrying this step's nonce; a
@@ -153,7 +153,7 @@ jobs:
         timeout-minutes: 25
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
         run: |
           set -euo pipefail
           # The script runs from its own directory so the sandbox's write jail is only that copy and
@@ -175,7 +175,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ matrix.pr }}
           SHIP_MODE: publish
-          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
         run: |
           set -euo pipefail
           harn run --no-sandbox ship.harn
@@ -183,5 +183,5 @@ jobs:
       - name: Remove the checkouts
         if: always()
         env:
-          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
         run: rm -rf -- "$SHIP_WORK" "$GITHUB_WORKSPACE/.smart-ship"
