@@ -28,6 +28,10 @@ const CONTINUE = "<!-- smart-ship continue="
 
 const REFUSED = "<!-- smart-ship refused="
 
+const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
+  nodes { ... on CheckRun { name status conclusion databaseId checkSuite { workflowRun { workflow { name } } } }
+    ... on StatusContext { name: context state } }"""
+
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
   nameWithOwner defaultBranchRef { name } mergeQueue { id }
@@ -38,9 +42,14 @@ query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner
     comments(last: 100) { totalCount nodes { body viewerDidAuthor } }
     reviewThreads(first: 100) { totalCount nodes { isResolved path comments(first: 20) { nodes {
       databaseId body authorAssociation author { __typename } } } } }
-    commits(last: 1) { nodes { commit { signature { isValid } statusCheckRollup { contexts(first: 100) {
-      totalCount nodes { ... on CheckRun { name status conclusion databaseId
-        checkSuite { workflowRun { workflow { name } } } } ... on StatusContext { name: context state } } } } } } } } } }
+    commits(last: 1) { nodes { commit { oid signature { isValid } statusCheckRollup { contexts(first: 100) {
+      ${CONTEXTS} } } } } } } } }
+"""
+
+// A large repository's head carries more than one page of checks; later pages are read by cursor.
+const MORE_CONTEXTS = """
+query($owner: String!, $name: String!, $oid: GitObjectID!, $after: String!) { repository(owner: $owner, name: $name) {
+  object(oid: $oid) { ... on Commit { statusCheckRollup { contexts(first: 100, after: $after) { ${CONTEXTS} } } } } } }
 """
 
 pub type Check = {
@@ -60,6 +69,14 @@ type Comment = {
 }
 
 type Page<T> = {totalCount: int, nodes: list<T>}
+
+type Checks = {
+  totalCount: int,
+  pageInfo: {hasNextPage: bool, endCursor?: string?},
+  nodes: list<Check>,
+}
+
+type MoreChecks = {data: {repository: {object: {statusCheckRollup: {contexts: Checks}?}?}}}
 
 pub type Pull = {
   id: string,
@@ -81,7 +98,7 @@ pub type Pull = {
   reviewThreads: Page<{isResolved: bool, path: string?, comments: {nodes: list<Comment>}}>,
   commits: {
     nodes: list<{
-      commit: {signature: {isValid: bool}?, statusCheckRollup: {contexts: Page<Check>}?},
+      commit: {oid: string, signature: {isValid: bool}?, statusCheckRollup: {contexts: Checks}?},
     }>,
   },
 }
@@ -287,10 +304,50 @@ fn read(harness: Harness, opts: GithubClientOptions, repo: string, number: int) 
       schema_of(Response),
     )
     if body.data.repository.pullRequest.mergeStateStatus != "UNKNOWN" || wait == 10000 {
-      return body.data.repository
+      return all_checks(harness, opts, owner, name, body.data.repository)
     }
   }
   throw "unreachable"
+}
+
+/** The repo with every page of the head's checks; a partial list still reads as incomplete. */
+fn all_checks(
+  harness: Harness,
+  opts: GithubClientOptions,
+  owner: string,
+  name: string,
+  repo: Repo,
+) -> Repo {
+  const head = repo.pullRequest.commits.nodes[0]?.commit
+  const first = head?.statusCheckRollup?.contexts
+  if first == nil {
+    return repo
+  }
+  let nodes = first.nodes
+  let info = first.pageInfo
+  // 50 pages is 5,000 checks; past that the count mismatch refuses the look.
+  let pages = 0
+  while pages < 50 && info.hasNextPage {
+    const vars = {owner: owner, name: name, oid: head.oid, after: info.endCursor}
+    const more: MoreChecks = schema_expect(
+      gh(harness, opts, "/graphql", "POST", {query: MORE_CONTEXTS, variables: vars}),
+      schema_of(MoreChecks),
+    )
+    const page = more.data.repository.object?.statusCheckRollup?.contexts
+    if page == nil {
+      break
+    }
+    nodes = nodes + page.nodes
+    info = page.pageInfo
+    pages = pages + 1
+  }
+  const contexts = {...first, pageInfo: info, nodes: nodes}
+  const commit = {...head, statusCheckRollup: {...head.statusCheckRollup, contexts: contexts}}
+  const pr = repo.pullRequest
+  return schema_expect(
+    {...repo, pullRequest: {...pr, commits: {nodes: [{...pr.commits.nodes[0], commit: commit}]}}},
+    schema_of(Repo),
+  )
 }
 
 /**

@@ -6,8 +6,18 @@ fn page(nodes: list) {
 }
 
 fn checks(nodes: list, total: int = -1) {
-  const rollup = {contexts: {totalCount: total < 0 ? len(nodes) : total, nodes: nodes}}
-  return {commits: {nodes: [{commit: {signature: {isValid: true}, statusCheckRollup: rollup}}]}}
+  const rollup = {
+    contexts: {
+      totalCount: total < 0 ? len(nodes) : total,
+      pageInfo: {hasNextPage: false},
+      nodes: nodes,
+    },
+  }
+  return {
+    commits: {
+      nodes: [{commit: {oid: "abc", signature: {isValid: true}, statusCheckRollup: rollup}}],
+    },
+  }
 }
 
 const GREEN = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
@@ -88,7 +98,13 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
     {
       commits: {
         nodes: [
-          {commit: {signature: {isValid: false}, statusCheckRollup: {contexts: page([GREEN])}}},
+          {
+            commit: {
+              oid: "abc",
+              signature: {isValid: false},
+              statusCheckRollup: {contexts: {...page([GREEN]), pageInfo: {hasNextPage: false}}},
+            },
+          },
         ],
       },
     },
