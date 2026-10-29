@@ -8,7 +8,6 @@ import {
   GithubClientOptions,
   api_call,
   github_merge_queue_enqueue,
-  pulls_merge_safe,
 } from "harn-github-connector/default"
 import { github_merge_signed_staging } from "harn-github-connector/signed_merge"
 import { github_commit_worktree } from "harn-github-connector/worktree"
@@ -26,6 +25,8 @@ const TRUSTED = ["OWNER", "MEMBER", "COLLABORATOR"]
 const MARK = "<!-- smart-ship head="
 
 const CONTINUE = "<!-- smart-ship continue="
+
+const REFUSED = "<!-- smart-ship refused="
 
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
@@ -107,6 +108,8 @@ pub fn observe(pr: Pull, own: string = "") {
   )
   const reviews = pr.latestOpinionatedReviews.nodes
   const outcome = { c -> c.conclusion ?? c.state ?? "" }
+  // Only Smart Ship's own comments count; anyone else's marker is text.
+  const own_notes = pr.comments.nodes.filter({ c -> c.viewerDidAuthor == true })
   return {
     // Every census must be read whole; a page we did not read could hold the failure or the thread.
     complete: complete(pr.labels) && complete(pr.latestOpinionatedReviews)
@@ -128,15 +131,15 @@ pub fn observe(pr: Pull, own: string = "") {
       .map({ c -> c.name }),
     threads: pr.reviewThreads.nodes.filter({ t -> !t.isResolved }),
     marks: complete(pr.comments) ? len(
-      pr.comments.nodes.filter({ c -> contains(c.body, MARK) }),
+      own_notes.filter({ c -> contains(c.body, MARK) }),
     ) : MAX_ATTEMPTS,
-    // A head is answered once per attempt; only Smart Ship's own saved-work note reopens it.
-    answered: len(pr.comments.nodes.filter({ c -> contains(c.body, MARK + pr.headRefOid) }))
-      > len(
-        pr.comments.nodes.filter(
-          { c -> c.viewerDidAuthor == true && contains(c.body, CONTINUE + pr.headRefOid) },
-        ),
-      ),
+    // A head is answered once per attempt; only a saved-work note reopens it.
+    answered: len(own_notes.filter({ c -> contains(c.body, MARK + pr.headRefOid) }))
+      > len(own_notes.filter({ c -> contains(c.body, CONTINUE + pr.headRefOid) })),
+    // The saved work a continue note names; a ref nobody named is never restored.
+    kept: own_notes.filter({ c -> contains(c.body, CONTINUE + pr.headRefOid + " wip=") }).map(
+      { c -> regex_captures("wip=([0-9a-f]{40})", c.body)[0]?.groups?.[0] ?? "" },
+    ),
   }
 }
 
@@ -213,6 +216,7 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
     [f.answered, "already answered at this head"],
     [f.marks >= MAX_ATTEMPTS, "repair attempts used up; a person needs to take it"],
     [!can_repair, "blocked, and repair is off here"],
+    [labels.contains("no-auto-repair"), "blocked, and labeled no-auto-repair"],
   ]
   for gate in refusals {
     if gate[0] {
@@ -225,13 +229,21 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
 // No global or system git config: nothing the agent could have written outside its jail is read here.
 const GIT_ISOLATED = {GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null"}
 
-fn sh(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".") -> string {
-  const r = command_run(
+// Captured output past this is cut off; a cut-off read refuses rather than judge part of it.
+const READ_CAP = 16777216
+
+fn run(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".") {
+  return command_run(
     tools,
     {argv: argv, cwd: cwd, env_mode: "patch", env: GIT_ISOLATED + env},
-    {timeout_ms: 600000},
+    {timeout_ms: 600000, max_inline_bytes: READ_CAP},
   )
+}
+
+pub fn sh(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".") -> string {
+  const r = run(tools, argv, env, cwd)
   require r.success, join(argv[0:3], " ") + ": " + trim(r.stderr)
+  require !(r?.stdout_truncated ?? false), join(argv[0:3], " ") + ": output too large to read whole"
   return trim(r.stdout)
 }
 
@@ -320,23 +332,21 @@ fn prepare(
   let sides = ""
   if pr.mergeStateStatus == "DIRTY" {
     // Merge the base locally, in the checkout the agent gets; nothing reaches GitHub until publish.
-    const merged = command_run(
+    const merged = run(
       harness.tools,
-      {
-        argv: [
-          "git",
-          "-c",
-          "user.name=Smart Ship",
-          "-c",
-          "user.email=smart-ship@users.noreply.github.com",
-          "merge",
-          "--no-ff",
-          "--no-commit",
-          base_oid,
-        ],
-        cwd: work + "/pr",
-      },
-      {timeout_ms: 600000},
+      [
+        "git",
+        "-c",
+        "user.name=Smart Ship",
+        "-c",
+        "user.email=smart-ship@users.noreply.github.com",
+        "merge",
+        "--no-ff",
+        "--no-commit",
+        base_oid,
+      ],
+      {},
+      work + "/pr",
     )
     conflicted = split(
       sh(harness.tools, ["git", "diff", "--name-only", "--diff-filter=U"], {}, work + "/pr"),
@@ -351,7 +361,7 @@ fn prepare(
       "\n",
     )
   }
-  // Work saved when an earlier attempt ran out of time continues only from the same head.
+  // Saved work continues only from the same head, and only the commit Smart Ship's own note names.
   const wip = wip_commit(harness, {installation_token: token}, repo, number)
   if wip != "" {
     sh(
@@ -361,7 +371,7 @@ fn prepare(
       work + "/base",
     )
   }
-  const continuing = wip != "" && len(conflicted) == 0
+  const continuing = wip != "" && len(conflicted) == 0 && f.kept.contains(wip)
     && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/base") == pr.headRefOid
   if continuing {
     // The trusted clone holds the credential that lazily fetches the saved blobs.
@@ -388,33 +398,20 @@ fn prepare(
       "DELETE",
     )
   }
+  const tail = { id ->
+    const got = run(
+      harness.tools,
+      ["gh", "api", "--allow-escape-sequences", "repos/${repo}/actions/jobs/${id}/logs"],
+      {GH_TOKEN: token},
+    )
+    // A cut-off read holds the head of the log, not its end, so it is not passed off as the end.
+    return !got.success || (got?.stdout_truncated ?? false) ? "(the log could not be read whole)" : join(
+      split(regex_replace("\\x1b\\[[0-9;]*[A-Za-z]", "", got.stdout), "\n").slice(-120),
+      "\n",
+    )
+  }
   const failing = f.failing.map(
-    { c ->
-      {
-        name: c.name,
-        log: c.databaseId == nil ? "" : join(
-          split(
-            regex_replace(
-              "\\x1b\\[[0-9;]*[A-Za-z]",
-              "",
-              sh(
-                harness.tools,
-                [
-                  "gh",
-                  "api",
-                  "--allow-escape-sequences",
-                  "repos/${repo}/actions/jobs/${c.databaseId}/logs",
-                ],
-                {GH_TOKEN: token},
-              ),
-            ),
-            "\n",
-          )
-            .slice(-120),
-          "\n",
-        ),
-      }
-    },
+    { c -> {name: c.name, log: c.databaseId == nil ? "" : tail(c.databaseId)} },
   )
   // Only writers' words reach the agent; any unresolved thread still blocks the landing.
   const threads = f.threads.map(
@@ -448,22 +445,25 @@ fn prepare(
       max_attempts: MAX_ATTEMPTS,
     },
   )
+  // The agent reads its task inside its jail; what publish trusts stays outside it.
   harness.fs.write_text(
     work + "/pr/.git/ship-task.json",
+    json_stringify({turns: to_int(harness.env.get("SHIP_REPAIR_TURNS") ?? "60") ?? 60, task: task}),
+  )
+  harness.fs.write_text(
+    work + "/job.json",
     json_stringify(
       {
         head: pr.headRefOid,
         base_oid: base_oid,
         conflicted: conflicted,
-        turns: to_int(harness.env.get("SHIP_REPAIR_TURNS") ?? "60") ?? 60,
-        task: task,
         threads: threads.map({ t -> t.id }),
       },
     ),
   )
 }
 
-const WIP_CAP = 1048576
+const DIFF_CAP = 1048576
 
 const SECRET =
   "ghs_[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
@@ -492,9 +492,9 @@ fn save_wip(
     harness.tools,
     ["git", "--git-dir=" + base + "/.git", "--work-tree=" + work + "/pr", "add", "-A"],
   )
-  const diff = sh(harness.tools, ["git", "diff", "--cached", "--binary", head], {}, base)
-  if diff == "" || len(diff) > WIP_CAP || regex_match(SECRET, diff) != nil {
-    return diff == "" ? "No unfinished work to keep." : "The unfinished work was not kept: it is over the size cap or looks like it holds a credential."
+  const why = diff_refusal(harness.tools, base, head)
+  if why != "" {
+    return why == "empty" ? "No unfinished work to keep." : "The unfinished work was not kept: ${why}."
   }
   const staging = "smart-ship/wip-${number}-" + substring(head, 0, 12)
   let kept = ""
@@ -519,15 +519,37 @@ fn save_wip(
       {path: "/repos/${repo}/git/refs/heads/${staging}", method: "DELETE", options: opts},
     )
   }
-  return "The unfinished work is kept at ${kept}; the next attempt continues from it while the head stays ${head}. ${CONTINUE}${head} -->"
+  return "The unfinished work is kept at ${kept}; the next attempt continues from it while the head stays ${head}. ${CONTINUE}${head} wip=${kept} -->"
 }
 
-/** What gets published holds no conflict markers and nothing shaped like a credential. */
+/**
+ * Why the staged diff against `against` may not leave the runner, or "" when it may: read whole,
+ * under the size cap, and holding nothing shaped like a credential.
+ */
+pub fn diff_refusal(tools: HarnessTools, dir: string, against: string) -> string {
+  const got = run(tools, ["git", "diff", "--cached", "--binary", against], {}, dir)
+  if !got.success || (got?.stdout_truncated ?? false) {
+    return "its diff could not be read whole"
+  }
+  if trim(got.stdout) == "" {
+    return "empty"
+  }
+  if len(got.stdout) > DIFF_CAP {
+    return "its diff is over the ${DIFF_CAP}-byte cap"
+  }
+  return regex_match(SECRET, got.stdout) == nil ? "" : "its diff holds something shaped like a credential"
+}
+
+/** What gets published holds no conflict markers and passes `diff_refusal`. */
 fn staged_clean(tools: HarnessTools, dir: string, against: string) {
   sh(tools, ["git", "diff", "--cached", "--check"], {}, dir)
-  require regex_match(SECRET, sh(tools, ["git", "diff", "--cached", "--binary", against], {}, dir))
-    == nil,
-    "the repair's diff holds something shaped like a credential; nothing was published"
+  const why = diff_refusal(tools, dir, against)
+  require why == "", "nothing was published: " + why
+}
+
+/** Agent text posted as Smart Ship: no comment markers and nothing shaped like a credential. */
+pub fn quiet(text: string) -> string {
+  return regex_replace(SECRET, "[redacted]", replace(text, "<!--", "&lt;!--"))
 }
 
 fn auth(token: string) -> dict {
@@ -664,7 +686,8 @@ fn publish(
   number: int,
   r: Repo,
 ) -> string {
-  const job = json_parse(harness.fs.read_text(work + "/pr/.git/ship-task.json"))
+  // The look step wrote job.json outside the agent's jail; the agent's own report is only text.
+  const job = json_parse(harness.fs.read_text(work + "/job.json"))
   const result = work + "/pr/.git/ship-result.json"
   const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {
     outcome: "stuck",
@@ -673,8 +696,8 @@ fn publish(
   }
   const pr = r.pullRequest
   const labels = pr.labels.nodes.map({ l -> l.name })
-  let note = to_string(out.summary ?? "") + "\n\nRepair model spend: "
-    + to_string(out.spend ?? "unknown")
+  let note = quiet(to_string(out.summary ?? "")) + "\n\nRepair model spend: "
+    + quiet(to_string(out.spend ?? "unknown"))
     + "."
   if pr.headRefOid != job.head || pr.state != "OPEN" || !labels.contains("ship")
     || HOLDS.any({ h -> labels.contains(h) }) {
@@ -715,11 +738,41 @@ fn publish(
         opts,
         "/repos/${repo}/pulls/${number}/comments/${reply.id}/replies",
         "POST",
-        {body: to_string(reply?.body)},
+        {body: quiet(to_string(reply?.body))},
       )
     }
   }
   return note
+}
+
+/**
+ * Squash-merge the exact judged head with no merge queue; "" on success, else GitHub's reason.
+ * GitHub refuses when the head moved, and applies the base's rules server side.
+ */
+fn merge_now(harness: Harness, opts: GithubClientOptions, pr: Pull) -> string {
+  const sent = api_call(
+    harness,
+    {
+      path: "/graphql",
+      method: "POST",
+      body: {
+        query:
+          "mutation($id: ID!, $head: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head, mergeMethod: SQUASH}) { pullRequest { state } } }",
+        variables: {id: pr.id, head: pr.headRefOid},
+      },
+      options: opts,
+    },
+  )
+  if !is_ok(sent) {
+    return to_string(unwrap_err(sent)?.message)
+  }
+  const body = unwrap(sent)
+  const errors = body?.errors ?? []
+  if len(errors) > 0 {
+    return join(errors.map({ e -> to_string(e?.message) }), "; ")
+  }
+  const state = body?.data?.mergePullRequest?.pullRequest?.state
+  return state == "MERGED" ? "" : "GitHub left it ${state}"
 }
 
 fn main(harness: Harness) {
@@ -758,8 +811,8 @@ fn main(harness: Harness) {
       const result = work + "/pr/.git/ship-result.json"
       const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {}
       const spent = out?.spend
-      "Publishing the repair failed: " + to_string(e) + "\n\nRepair model spend: "
-        + to_string(spent ?? "unknown")
+      "Publishing the repair failed: " + quiet(to_string(e)) + "\n\nRepair model spend: "
+        + quiet(to_string(spent ?? "unknown"))
         + "."
     }
     say(note)
@@ -783,12 +836,22 @@ fn main(harness: Harness) {
       expected_head_oid: pr.headRefOid,
       options: opts,
     }
-    const sent = r.mergeQueue != nil ? github_merge_queue_enqueue(harness, req) : pulls_merge_safe(
-      harness,
-      req + {method: "squash"},
+    let refusal = ""
+    if r.mergeQueue != nil {
+      const queued = github_merge_queue_enqueue(harness, req)
+      refusal = is_ok(queued) ? "" : to_string(unwrap_err(queued)?.message)
+    } else {
+      refusal = merge_now(harness, opts, pr)
+    }
+    note = refusal == "" ? "landing at ${pr.headRefOid}" : "merge refused at ${pr.headRefOid}: "
+      + refusal
+    // A refusal is said once per head on the PR, not only in the log.
+    const said = pr.comments.nodes.any(
+      { c -> c.viewerDidAuthor == true && contains(c.body, REFUSED + pr.headRefOid) },
     )
-    note = is_ok(sent) ? "landing at ${pr.headRefOid}" : "merge refused at ${pr.headRefOid}: "
-      + to_string(unwrap_err(sent)?.message)
+    if refusal != "" && !said {
+      say("${note}\n\n${REFUSED}${pr.headRefOid} -->")
+    }
   }
   if d.action == "update" {
     gh(

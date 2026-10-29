@@ -64,7 +64,12 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          prs="$(gh pr list -R "$REPO" --label ship --state open --limit 200 --json number --jq '[.[].number]')"
+          prs="$(gh pr list -R "$REPO" --label ship --state open --limit 201 --json number --jq '[.[].number]')"
+          # A list cut at its limit could leave any PR out; refuse rather than sweep part of it.
+          if [ "$(jq length <<< "$prs")" -gt 200 ]; then
+            echo "::error::More than 200 pull requests are labeled ship; the sweep refuses to look at a partial list."
+            exit 1
+          fi
           echo "prs=$prs" >> "$GITHUB_OUTPUT"
           echo "Looking at: $prs"
 
@@ -162,7 +167,8 @@ jobs:
           SHIP_WORK: ${{ runner.temp }}/smart-ship
         run: |
           set -euo pipefail
-          [ -f "$SHIP_WORK/pr/.git/ship-task.json" ] || exit 0
+          # The look step wrote job.json outside the repair's write jail.
+          [ -f "$SHIP_WORK/job.json" ] || exit 0
           harn run --no-sandbox ship.harn
       - name: Remove the checkouts
         if: always()
