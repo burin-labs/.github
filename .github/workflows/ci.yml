@@ -14,33 +14,26 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  smart-ship-control-runtime:
-    name: Pinned shipping control runtime
+  smart-ship:
+    name: Smart Ship look
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
-      - name: Check out the immutable shipping control
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the Smart Ship runtime
+        uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808 # supports compressed release archives
         with:
-          repository: burin-labs/.github
-          ref: df9c75308b05be787532b0d2a827e0ae8a61c095
-          path: .smart-ship-control
-          persist-credentials: false
-      - name: Install the shipping consumer runtime
-        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
-        with:
-          version: "0.10.166"
-      - name: Exercise the immutable control script
-        run: >-
-          harn test .smart-ship-control/scripts/smart-ship-label/policy_test.harn
-          --json-out "${{ runner.temp }}/smart-ship-control-tests.json"
-      - name: Exercise the candidate policy reader on the shipping runtime
-        run: harn test scripts/smart-ship-policy
+          version: "0.10.180"
+      - name: Check and test the landing gate
+        working-directory: scripts/smart-ship
+        run: |
+          harn install --locked
+          harn check ship.harn repair.harn
+          harn lint ship.harn repair.harn ship_test.harn
+          harn test ship_test.harn
 
   local-check-contract:
     name: Local workflow check contract
@@ -66,9 +59,6 @@ jobs:
           harn test scripts/release-promotion
           harn test scripts/release-repin
           harn test scripts/merge-override
-          harn test scripts/smart-ship-label
-          harn test scripts/smart-ship-policy
-          harn test scripts/smart-ship-targets
           harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels
           harn test scripts/harn-required-review
@@ -177,7 +167,7 @@ jobs:
 
   ci-status:
     name: CI status
-    needs: [local-check-contract, package-smoke, smart-ship-control-runtime, smart-ship-relay]
+    needs: [local-check-contract, package-smoke, smart-ship, smart-ship-relay]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     permissions:
@@ -200,29 +190,6 @@ jobs:
         with:
           baseline-sha: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
           github-token: ${{ github.token }}
-      - name: Check out the Smart Ship target publisher
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: burin-labs/.github
-          ref: 91ad5a4b9c7fe58823e1433808eda60c5cd48cdb
-          path: .smart-ship-targets
-          sparse-checkout: scripts/smart-ship-targets
-          persist-credentials: false
-      - name: Record the selected pull requests
-        env:
-          NUMBERS: "7 8"
-        run: >-
-          harn run --no-sandbox
-          .smart-ship-targets/scripts/smart-ship-targets/cli.harn --
-          --output "$RUNNER_TEMP/ship-targets/targets.json"
-      - name: Publish the selected pull requests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: smart-ship-targets-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ship-targets/targets.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
       - name: Markdown lint
         uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
@@ -259,12 +226,12 @@ jobs:
         env:
           LOCAL_CHECK_CONTRACT_RESULT: ${{ needs.local-check-contract.result }}
           PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
-          SMART_SHIP_CONTROL_RESULT: ${{ needs.smart-ship-control-runtime.result }}
+          SMART_SHIP_RESULT: ${{ needs.smart-ship.result }}
           SMART_SHIP_RELAY_RESULT: ${{ needs.smart-ship-relay.result }}
         run: |
           test "$LOCAL_CHECK_CONTRACT_RESULT" = success
           test "$PACKAGE_SMOKE_RESULT" = success
-          test "$SMART_SHIP_CONTROL_RESULT" = success
+          test "$SMART_SHIP_RESULT" = success
           test "$SMART_SHIP_RELAY_RESULT" = success
       - name: Check Dependabot config
         uses: ./.github/actions/check-dependabot-config

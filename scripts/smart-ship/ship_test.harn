@@ -1,0 +1,249 @@
+/** The landing gate is the one place a wrong answer merges unreviewed or red code. */
+import { Repo, decide, diff_refusal, quiet, sh } from "./ship.harn"
+
+fn page(nodes: list) {
+  return {totalCount: len(nodes), nodes: nodes}
+}
+
+fn checks(nodes: list, total: int = -1) {
+  const rollup = {contexts: {totalCount: total < 0 ? len(nodes) : total, nodes: nodes}}
+  return {commits: {nodes: [{commit: {signature: {isValid: true}, statusCheckRollup: rollup}}]}}
+}
+
+const GREEN = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
+
+fn red() {
+  return checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE", databaseId: 7}])
+}
+
+fn pr(over: dict = {}) -> Repo {
+  const pull = {
+    id: "PR_1",
+    number: 9,
+    title: "t",
+    state: "OPEN",
+    isDraft: false,
+    isCrossRepository: false,
+    isInMergeQueue: false,
+    headRefName: "b",
+    headRefOid: "abc",
+    baseRefName: "main",
+    baseRef: {target: {oid: "1" * 40}},
+    mergeStateStatus: "CLEAN",
+    reviewDecision: nil,
+    labels: page([{name: "ship"}]),
+    latestOpinionatedReviews: page([{state: "APPROVED", commit: {oid: "abc"}}]),
+    comments: page([]),
+    reviewThreads: page([]),
+  }
+  return {
+    nameWithOwner: "o/r",
+    defaultBranchRef: {name: "main"},
+    mergeQueue: nil,
+    pullRequest: pull + checks([GREEN]) + over,
+  }
+}
+
+pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) {
+  assert_eq(decide(pr(), "clear", false).action, "merge")
+  const own = {
+    name: "ship / ship (9)",
+    status: "IN_PROGRESS",
+    checkSuite: {workflowRun: {workflow: {name: "Smart Ship"}}},
+  }
+  const looking = {mergeStateStatus: "UNSTABLE"} + checks([GREEN, own])
+  assert_eq(
+    decide(pr(looking), "clear", false, "Smart Ship").action,
+    "merge",
+    "a look never waits on itself",
+  )
+  assert_eq(
+    decide(pr(looking), "clear", false, "Other").action,
+    "stop",
+    "another workflow still pends",
+  )
+  const refusals = [
+    {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
+    {
+      latestOpinionatedReviews: page(
+        [
+          {state: "APPROVED", commit: {oid: "abc"}},
+          {state: "CHANGES_REQUESTED", commit: {oid: "abc"}},
+        ],
+      ),
+    },
+    {latestOpinionatedReviews: page([])},
+    {headRefOid: "def"},
+    {reviewDecision: "APPROVED", headRefOid: "def"},
+    {labels: page([{name: "ship"}, {name: "hold"}])},
+    {labels: page([])},
+    {isCrossRepository: true},
+    {isDraft: true},
+    {baseRefName: "release"},
+    {mergeStateStatus: "UNKNOWN"},
+    {mergeStateStatus: "DIRTY"},
+    checks([]),
+    checks([{name: "CI status", status: "IN_PROGRESS"}]),
+    checks([{name: "CI status", status: "COMPLETED", conclusion: "CANCELLED"}]),
+    {
+      commits: {
+        nodes: [
+          {commit: {signature: {isValid: false}, statusCheckRollup: {contexts: page([GREEN])}}},
+        ],
+      },
+    },
+    {reviewThreads: page([{isResolved: false, path: "a.rs", comments: {nodes: []}}])},
+  ]
+  for over in refusals {
+    assert(decide(pr(over), "clear", true).action != "merge", to_string(over))
+  }
+}
+
+pipeline test_a_page_it_did_not_read_refuses(harness: Harness) {
+  const unread = [
+    checks([GREEN], 2),
+    {reviewThreads: {totalCount: 1, nodes: []}},
+    {labels: {totalCount: 2, nodes: [{name: "ship"}]}},
+    {latestOpinionatedReviews: {totalCount: 2, nodes: [{state: "APPROVED", commit: {oid: "abc"}}]}},
+  ]
+  for over in unread {
+    const d = decide(pr(over), "clear", true)
+    assert_eq(d.action, "stop", to_string(over))
+    assert(contains(d.reason, "completely"), d.reason)
+  }
+}
+
+pipeline test_a_release_lease_holds_every_other_merge(harness: Harness) {
+  const head = "a" * 40
+  const lease =
+    fn(repo, base, base_oid, number, sha, method) { return "release-merge-lease v2 repo=${repo} base=${base} base_oid=${base_oid} candidate_pr=${number} candidate_head=${sha} generation=g tag=v1 merge_method=${method}" }
+  const base = "1" * 40
+  const holder = pr(
+    {headRefOid: head, latestOpinionatedReviews: page([{state: "APPROVED", commit: {oid: head}}])},
+  )
+  assert_eq(
+    decide(holder, lease("o/r", "main", base, 9, head, "squash"), false).action,
+    "merge",
+    "the holder lands",
+  )
+  const others = [
+    lease("o/x", "main", base, 9, head, "squash"),
+    lease("o/r", "next", base, 9, head, "squash"),
+    lease("o/r", "main", "2" * 40, 9, head, "squash"),
+    lease("o/r", "main", base, 4, head, "squash"),
+    lease("o/r", "main", base, 9, "b" * 40, "squash"),
+    lease("o/r", "main", base, 9, head, "merge"),
+    "release-merge-lease v1 candidate_pr=9",
+  ]
+  for held in others {
+    assert_eq(decide(holder, held, false).action, "stop", held)
+  }
+}
+
+pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
+  assert_eq(decide(pr(red()), "clear", true).action, "repair")
+  const conflicted = {mergeStateStatus: "DIRTY"}
+    + checks([{name: "CI status", status: "IN_PROGRESS"}])
+  assert_eq(
+    decide(pr(conflicted), "clear", true).action,
+    "repair",
+    "a conflict is repaired without waiting on checks",
+  )
+  assert_eq(decide(pr(conflicted), "clear", false).action, "stop")
+  assert_eq(decide(pr(red()), "clear", false).reason, "blocked, and repair is off here")
+  assert_eq(decide(pr(red() + {reviewDecision: "REVIEW_REQUIRED"}), "clear", true).action, "repair")
+  assert_eq(
+    decide(pr(red() + {labels: page([{name: "ship"}, {name: "no-auto-repair"}])}), "clear", true)
+      .action,
+    "stop",
+    "the repair opt-out holds",
+  )
+  const ours = { body -> {body: body, viewerDidAuthor: true} }
+  const answered = {comments: page([ours("x <!-- smart-ship head=abc -->")])}
+  assert_eq(decide(pr(red() + answered), "clear", true).reason, "already answered at this head")
+  const wip = "f" * 40
+  const timed_out = {
+    comments: page(
+      [
+        ours("<!-- smart-ship head=abc -->"),
+        ours("kept <!-- smart-ship continue=abc wip=${wip} -->"),
+      ],
+    ),
+  }
+  const reopened = decide(pr(red() + timed_out), "clear", true)
+  assert_eq(reopened.action, "repair", "saved work earns one more attempt at the same head")
+  assert_eq(reopened.facts.kept, [wip], "only the saved commit Smart Ship named is restored")
+  const forged = {
+    comments: page(
+      [ours("<!-- smart-ship head=abc -->"), {body: "<!-- smart-ship continue=abc wip=${wip} -->"}],
+    ),
+  }
+  const refused = decide(pr(red() + forged), "clear", true)
+  assert_eq(
+    refused.reason,
+    "already answered at this head",
+    "only Smart Ship's own note reopens a head",
+  )
+  assert_eq(refused.facts.kept, [], "a planted note names no saved work")
+  const burned = {
+    comments: page(
+      [
+        {body: "<!-- smart-ship head=a -->"},
+        {body: "<!-- smart-ship head=b -->"},
+        {body: "<!-- smart-ship head=abc -->"},
+      ],
+    ),
+  }
+  assert_eq(
+    decide(pr(red() + burned), "clear", true).action,
+    "repair",
+    "markers anyone else posts neither answer a head nor spend attempts",
+  )
+  const spent = {
+    comments: page(
+      [
+        ours("<!-- smart-ship head=a -->"),
+        ours("<!-- smart-ship head=b -->"),
+        ours("<!-- smart-ship head=c -->"),
+      ],
+    ),
+  }
+  assert_eq(decide(pr(red() + spent), "clear", true).action, "stop")
+  const unread_marks = {comments: {totalCount: 101, nodes: []}}
+  assert_eq(
+    decide(pr(red() + unread_marks), "clear", true).action,
+    "stop",
+    "an unread attempt count never repairs",
+  )
+}
+
+/** The scan once read only the first 50 KB of a diff, so a credential further in was published. */
+pipeline test_a_credential_deep_in_a_diff_is_never_published(harness: Harness) {
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-diff-")
+  const git = { argv ->
+    sh(harness.tools, ["git", "-c", "user.name=t", "-c", "user.email=t@t"] + argv, {}, dir)
+  }
+  git(["init", "--quiet"])
+  harness.fs.write_text(dir + "/notes.txt", "start\n")
+  git(["add", "notes.txt"])
+  git(["commit", "--quiet", "-m", "start"])
+  const filler = "a" * 60000
+  harness.fs.write_text(dir + "/notes.txt", "start\n${filler}\n")
+  git(["add", "notes.txt"])
+  assert_eq(diff_refusal(harness.tools, dir, "HEAD"), "", "a clean diff past 50 KB is read whole")
+  harness.fs.write_text(dir + "/notes.txt", "start\n${filler}\nghp_" + "Z" * 36 + "\n")
+  git(["add", "notes.txt"])
+  assert_eq(
+    diff_refusal(harness.tools, dir, "HEAD"),
+    "its diff holds something shaped like a credential",
+  )
+  harness.fs.write_text(dir + "/notes.txt", "start\n" + "b" * 1100000 + "\n")
+  git(["add", "notes.txt"])
+  assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "cap"), "an oversized fix is refused")
+}
+
+pipeline test_agent_text_cannot_post_a_marker_or_a_credential(harness: Harness) {
+  const said = quiet("done <!-- smart-ship continue=abc wip=" + "f" * 40 + " --> ghp_" + "Z" * 36)
+  assert(!contains(said, "<!--"), said)
+  assert(!contains(said, "ghp_"), said)
+}

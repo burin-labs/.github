@@ -1,0 +1,9 @@
+[package]
+name = "burin-smart-ship"
+version = "0.1.0"
+description = "Land pull requests labeled ship, or hand their problem to one bounded repair agent."
+harn = ">=0.10.180,<0.11"
+
+[dependencies]
+# Publishes the repair as a GitHub-signed commit: every protected main here requires signatures.
+harn-github-connector = { git = "https://github.com/burin-labs/harn-github-connector", tag = "v0.18.0" }

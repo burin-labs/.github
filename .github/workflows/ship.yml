@@ -1,17 +1,14 @@
 name: Smart Ship
 
-# Hands pull requests labeled `ship` to the Smart Ship shepherd, which lands
-# them and reports each step on the PR. The shared runner lives in
-# burin-labs/.github; see burin-labs/burin-code docs/design/smart-ship.md.
+# Hands pull requests labeled `ship` to Smart Ship, which lands an approved,
+# green head or repairs what blocks it; see scripts/smart-ship/ship.harn.
 
 on:
-  pull_request_target:
-    types: [labeled, unlabeled, synchronize, ready_for_review, dequeued, closed]
+  pull_request_target: # zizmor: ignore[dangerous-triggers] same-repository PRs only; the shared look runs its own pinned script, and only its repair checks out PR code, without credentials
+    types: [labeled, unlabeled, ready_for_review]
   pull_request_review:
     types: [submitted]
-  # The shared runner decides which CI completions it acts on, so a green PR
-  # joins the merge queue when CI finishes instead of at the next sweep.
-  workflow_run: # zizmor: ignore[dangerous-triggers] the shared runner admits only completed same-repository runs, reads metadata through the API, and never checks out the parent-run ref
+  workflow_run: # zizmor: ignore[dangerous-triggers] the shared look reads the PR through the API and acts only on a same-repository PR's own CI run
     workflows: [CI]
     types: [completed]
   schedule:
@@ -19,11 +16,6 @@ on:
   # The review-thread relay (services/smart-ship-relay) dispatches with `pr`.
   workflow_dispatch:
     inputs:
-      main_red:
-        description: Optional fix-forward request for a red default branch.
-        required: false
-        type: string
-        default: ""
       pr:
         description: Pull request number to look at; empty runs a sweep.
         type: string
@@ -34,14 +26,7 @@ permissions:
 
 jobs:
   ship:
-    # The shared runner decides which events wake the shepherd.
     uses: burin-labs/.github/.github/workflows/smart-ship.yml@main
-    with:
-      main-red: ${{ inputs.main_red }}
-      # .github/smart-ship.toml limits repair to merge conflicts.
-      repair: true
     secrets:
       RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
       RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
