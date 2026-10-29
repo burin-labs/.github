@@ -501,6 +501,14 @@ fn save_wip(
   return "The unfinished work is kept at ${kept}; the next attempt continues from it while the head stays ${head}. ${CONTINUE}${head} -->"
 }
 
+/** What gets published holds no conflict markers and nothing shaped like a credential. */
+fn staged_clean(tools: HarnessTools, dir: string, against: string) {
+  sh(tools, ["git", "diff", "--cached", "--check"], {}, dir)
+  require regex_match(SECRET, sh(tools, ["git", "diff", "--cached", "--binary", against], {}, dir))
+    == nil,
+    "the repair's diff holds something shaped like a credential; nothing was published"
+}
+
 fn auth(token: string) -> dict {
   return GIT_ISOLATED
     + {
@@ -599,7 +607,7 @@ fn publish_merge(
       harness.tools,
       ["git", "--git-dir=" + base + "/.git", "--work-tree=" + work + "/pr", "add", "-A"],
     )
-    sh(harness.tools, ["git", "diff", "--cached", "--check"], {}, base)
+    staged_clean(harness.tools, base, merge_oid)
     resolved = signed(
       harness,
       opts,
@@ -661,7 +669,7 @@ fn publish(
         harness.tools,
         ["git", "--git-dir=" + work + "/base/.git", "--work-tree=" + work + "/pr", "add", "-A"],
       )
-      sh(harness.tools, ["git", "diff", "--cached", "--check"], {}, work + "/base")
+      staged_clean(harness.tools, work + "/base", job.head)
       pushed = signed(
         harness,
         opts,
