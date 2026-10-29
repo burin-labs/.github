@@ -1053,6 +1053,55 @@ fn divergent_look(
   return {result: result, calls: harness.testing.http_mock_calls({include_sensitive: true})}
 }
 
+/** A moved shared clone must still resolve its pristine Git objects. */
+pipeline test_a_retained_checkout_can_read_its_git_objects(harness: Harness) {
+  const f = divergent(harness, false)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const work = f.dir + "/work"
+  const nonce = "c" * 32
+  harness.fs.write_text(work + "/.owner", nonce + "\n")
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const cleanup = steps.filter({s -> s?.name == "Remove the checkouts"}).to_list()[0]
+  const root = f.dir + "/retained"
+  const moved = harness.process.run({
+    program: "/bin/bash", args: ["-c", cleanup.run], timeout_ms: 30000,
+    env: {PATH: to_string(harness.env.get("PATH") ?? ""), SHIP_WORK: work, SHIP_NONCE: nonce,
+      SHIP_LOOK: "success", SHIP_PREPARED: "true", SHIP_PUBLISH: "failure",
+      SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: "9", SHIP_RETAIN_ROOT: root},
+  })
+  assert(moved.success, moved.stderr)
+  const git = harness.process.run({
+    program: "git", args: ["-C", root + "/123-1-9/work/pr", "cat-file", "-e", f.head], timeout_ms: 30000,
+  })
+  assert(git.success, "retained checkout cannot read its head: " + git.stderr)
+}
+
+/** Retention must not write through an alternate path planted by the agent. */
+pipeline test_a_retained_checkout_never_follows_an_alternate_symlink(harness: Harness) {
+  const f = divergent(harness, false)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const work = f.dir + "/work"
+  const nonce = "c" * 32
+  harness.fs.write_text(work + "/.owner", nonce + "\n")
+  const alternate = work + "/pr/.git/objects/info/alternates"
+  assert(harness.process.run({program: "/bin/mv", args: [alternate, alternate + ".old"]}).success)
+  const outside = f.dir + "/outside"
+  harness.fs.write_text(outside, "untouched")
+  assert(harness.process.run({program: "/bin/ln", args: ["-s", outside, alternate]}).success)
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const cleanup = steps.filter({s -> s?.name == "Remove the checkouts"}).to_list()[0]
+  const moved = harness.process.run({
+    program: "/bin/bash", args: ["-c", cleanup.run], timeout_ms: 30000,
+    env: {PATH: to_string(harness.env.get("PATH") ?? ""), SHIP_WORK: work, SHIP_NONCE: nonce,
+      SHIP_LOOK: "success", SHIP_PREPARED: "true", SHIP_PUBLISH: "failure",
+      SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: "9", SHIP_RETAIN_ROOT: f.dir + "/retained"},
+  })
+  assert(moved.success, moved.stderr)
+  assert_eq(harness.fs.read_text(outside), "untouched")
+  const retained_alt = f.dir + "/retained/123-1-9/work/pr/.git/objects/info/alternates"
+  assert(harness.process.run({program: "/bin/test", args: ["-L", retained_alt]}).success)
+}
+
 /** Full recovery storage stops before an attempt marker, checkout or model spend. */
 pipeline test_full_recovery_storage_stops_only_the_repair(harness: Harness) {
   const root = harness.fs.mkdtemp_in_workspace("smart-ship-cap-")

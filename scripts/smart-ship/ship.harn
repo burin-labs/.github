@@ -515,6 +515,9 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
     pr.baseRefName,
     pr.mergeStateStatus == "DIRTY",
   )
+  // Git's shared clone writes an absolute alternate. Set it while this fresh
+  // checkout is still trusted so the pair remains readable after retention.
+  harness.fs.write_text(work + "/pr/.git/objects/info/alternates", "../../../pristine/.git/objects\n")
   const base_oid = tree.base_oid
   const conflicted = tree.conflicted
   const sides = tree.sides
