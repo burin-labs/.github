@@ -170,6 +170,13 @@ jobs:
           # The look step wrote job.json outside the repair's write jail.
           [ -f "$SHIP_WORK/job.json" ] || exit 0
           harn run --no-sandbox ship.harn
+      # Probe branch only: census every file the look, repair and publish wrote for the credential.
+      - name: Census what the steps wrote
+        if: always() && inputs.repair
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CENSUS_CONTROL: census-control-5d1e83
+        run: python3 -I .smart-ship/scripts/smart-ship/census.py "${{ runner.temp }}" "$GITHUB_WORKSPACE" "$HOME/.harn" "$HOME/.cache" "$HOME/.local"
       - name: Remove the checkouts
         if: always()
         env:
