@@ -34,7 +34,7 @@ query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner
     headRefName headRefOid baseRefName baseRef { target { oid } } mergeStateStatus reviewDecision
     labels(first: 100) { totalCount nodes { name } }
     latestOpinionatedReviews(first: 100, writersOnly: true) { totalCount nodes { state commit { oid } } }
-    comments(last: 100) { totalCount nodes { body } }
+    comments(last: 100) { totalCount nodes { body viewerDidAuthor } }
     reviewThreads(first: 100) { totalCount nodes { isResolved path comments(first: 20) { nodes {
       databaseId body authorAssociation author { __typename } } } } }
     commits(last: 1) { nodes { commit { signature { isValid } statusCheckRollup { contexts(first: 100) {
@@ -76,7 +76,7 @@ pub type Pull = {
   reviewDecision: string?,
   labels: Page<{name: string}>,
   latestOpinionatedReviews: Page<{state: string, commit: {oid: string}?}>,
-  comments: Page<{body: string}>,
+  comments: Page<{body: string, viewerDidAuthor?: bool}>,
   reviewThreads: Page<{isResolved: bool, path: string?, comments: {nodes: list<Comment>}}>,
   commits: {
     nodes: list<{
@@ -130,9 +130,13 @@ pub fn observe(pr: Pull, own: string = "") {
     marks: complete(pr.comments) ? len(
       pr.comments.nodes.filter({ c -> contains(c.body, MARK) }),
     ) : MAX_ATTEMPTS,
-    // A head is answered once per attempt; saved unfinished work reopens it for the next attempt.
+    // A head is answered once per attempt; only Smart Ship's own saved-work note reopens it.
     answered: len(pr.comments.nodes.filter({ c -> contains(c.body, MARK + pr.headRefOid) }))
-      > len(pr.comments.nodes.filter({ c -> contains(c.body, CONTINUE + pr.headRefOid) })),
+      > len(
+        pr.comments.nodes.filter(
+          { c -> c.viewerDidAuthor == true && contains(c.body, CONTINUE + pr.headRefOid) },
+        ),
+      ),
   }
 }
 
@@ -562,7 +566,8 @@ fn publish_merge(
 ) -> string {
   const base = work + "/base"
   const env = auth(opts.installation_token ?? "")
-  const staging = "harn-worktree-staging/smart-ship-merge-${pr.number}-" + substring(job.head, 0, 12)
+  const staging = "harn-worktree-staging/smart-ship-merge-${pr.number}-"
+    + substring(job.head, 0, 12)
   let resolved = ""
   try {
     for p in job.conflicted {
