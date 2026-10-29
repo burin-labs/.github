@@ -6,6 +6,13 @@ You have no network and no credentials, and you cannot push, merge, or talk to G
 Do not commit. Leave your changes in the working tree.
 
 What is in the way:
+{{ if conflicted }}
+- The branch conflicts with `{{ base }}`. Smart Ship already merged `{{ base }}` into the checkout; these files hold conflict markers: {{ conflicted }}. The checkout's combined diff, with both sides:
+```
+{{ sides }}
+```
+Resolve every marker so both sides' intent survives, then run the narrowest check that covers those files. `git show :2:<path>` is this branch's side and `git show :3:<path>` is `{{ base }}`'s.
+{{ end }}
 {{ for check in failing }}
 - The check "{{ check.name }}" failed.{{ if check.log }} The end of its failing log:
 ```

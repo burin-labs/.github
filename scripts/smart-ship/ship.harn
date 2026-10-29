@@ -10,6 +10,7 @@ import {
   github_merge_queue_enqueue,
   pulls_merge_safe,
 } from "harn-github-connector/default"
+import { github_merge_signed_staging } from "harn-github-connector/signed_merge"
 import { github_commit_worktree } from "harn-github-connector/worktree"
 
 const HOLDS = ["hold", "do-not-merge"]
@@ -156,7 +157,8 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
   const f = observe(pr, own)
   const stop = { why -> {action: "stop", reason: why, facts: f} }
   const labels = pr.labels.nodes.map({ l -> l.name })
-  const blocked = len(f.failing) > 0 || len(f.threads) > 0
+  const conflict = pr.mergeStateStatus == "DIRTY"
+  const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
   // The first gate that holds stops the look, in this order.
   const gates = [
     [pr.state != "OPEN" || !labels.contains("ship"), "not shepherded: closed, or not labeled ship"],
@@ -170,13 +172,13 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
       "not shepherded: a fork, a draft, or a non-default base",
     ],
     [pr.isInMergeQueue, "already in the merge queue"],
+    // A conflicted head may never get checks; its repair does not wait on them.
+    [!conflict && f.no_checks, "waiting on checks to report"],
+    [!conflict && len(f.pending) > 0, "waiting on " + join(f.pending, ", ")],
     [
-      pr.mergeStateStatus == "DIRTY",
-      "conflicts with ${pr.baseRefName}; the author must merge or rebase it",
+      !conflict && len(f.rerun) > 0,
+      "cancelled or stale checks need a fresh push: " + join(f.rerun, ", "),
     ],
-    [f.no_checks, "waiting on checks to report"],
-    [len(f.pending) > 0, "waiting on " + join(f.pending, ", ")],
-    [len(f.rerun) > 0, "cancelled or stale checks need a fresh push: " + join(f.rerun, ", ")],
   ]
   for gate in gates {
     if gate[0] {
@@ -275,11 +277,7 @@ fn prepare(
   f: dict,
 ) {
   const pr = r.pullRequest
-  const auth = {
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
-    GIT_CONFIG_VALUE_0: "AUTHORIZATION: basic " + base64_encode("x-access-token:" + token),
-  }
+  const env = auth(token)
   sh(
     harness.tools,
     [
@@ -290,11 +288,52 @@ fn prepare(
       "https://github.com/${repo}.git",
       work + "/base",
     ],
-    auth,
+    env,
   )
-  sh(harness.tools, ["git", "checkout", "--quiet", "--detach", pr.headRefOid], auth, work + "/base")
+  sh(harness.tools, ["git", "checkout", "--quiet", "--detach", pr.headRefOid], env, work + "/base")
   sh(harness.tools, ["git", "clone", "--quiet", "--shared", work + "/base", work + "/pr"])
   sh(harness.tools, ["git", "checkout", "--quiet", "--detach", pr.headRefOid], {}, work + "/pr")
+  const base_oid = sh(
+    harness.tools,
+    ["git", "rev-parse", "origin/" + pr.baseRefName],
+    {},
+    work + "/pr",
+  )
+  let conflicted = []
+  let sides = ""
+  if pr.mergeStateStatus == "DIRTY" {
+    // Merge the base locally, in the checkout the agent gets; nothing reaches GitHub until publish.
+    const merged = command_run(
+      harness.tools,
+      {
+        argv: [
+          "git",
+          "-c",
+          "user.name=Smart Ship",
+          "-c",
+          "user.email=smart-ship@users.noreply.github.com",
+          "merge",
+          "--no-ff",
+          "--no-commit",
+          base_oid,
+        ],
+        cwd: work + "/pr",
+      },
+      {timeout_ms: 600000},
+    )
+    conflicted = split(
+      sh(harness.tools, ["git", "diff", "--name-only", "--diff-filter=U"], {}, work + "/pr"),
+      "\n",
+    )
+      .filter({ p -> p != "" })
+    require !merged.success && len(conflicted) > 0,
+      "GitHub reports a conflict, but merging ${pr.baseRefName} locally found none: "
+      + trim(merged.stderr)
+    sides = join(
+      split(sh(harness.tools, ["git", "diff"], {}, work + "/pr"), "\n").slice(0, 400),
+      "\n",
+    )
+  }
   const failing = f.failing.map(
     { c ->
       {
@@ -337,6 +376,8 @@ fn prepare(
       title: pr.title,
       head: pr.headRefOid,
       base: pr.baseRefName,
+      conflicted: join(conflicted, ", "),
+      sides: sides,
       failing: failing,
       threads: threads,
       attempt: f.marks + 1,
@@ -345,13 +386,142 @@ fn prepare(
   )
   harness.fs.write_text(
     work + "/pr/.git/ship-task.json",
-    json_stringify({head: pr.headRefOid, task: task, threads: threads.map({ t -> t.id })}),
+    json_stringify(
+      {
+        head: pr.headRefOid,
+        base_oid: base_oid,
+        conflicted: conflicted,
+        task: task,
+        threads: threads.map({ t -> t.id }),
+      },
+    ),
   )
 }
 
+fn auth(token: string) -> dict {
+  return {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+    GIT_CONFIG_VALUE_0: "AUTHORIZATION: basic " + base64_encode("x-access-token:" + token),
+  }
+}
+
 /**
- * After the credential-free repair: re-check the PR, then publish the agent's tree once as one signed commit.
+ * Commit the trusted clone's index onto `branch` as one GitHub-signed commit; a moved branch refuses.
  */
+fn signed(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  branch: string,
+  dir: string,
+  headline: string,
+) -> string {
+  const owner: string = split(repo, "/")[0]
+  const name: string = split(repo, "/")[1]
+  const sent = github_commit_worktree(
+    harness,
+    {
+      owner: owner,
+      repo: name,
+      branch: branch,
+      headline: headline,
+      repo_dir: dir,
+      source: "index",
+      options: opts,
+    },
+  )
+  require is_ok(sent), "signed publication failed: " + to_string(unwrap_err(sent)?.message)
+  return unwrap(sent).commit_oid
+}
+
+/**
+ * A resolved conflict lands as GitHub-signed commits built on a scratch branch: the base's
+ * side of the conflicted files, GitHub's merge of the base, then the agent's resolution.
+ * The pull request's head moves once, by fast-forward, only after every step succeeded.
+ */
+fn publish_merge(
+  harness: Harness,
+  opts: GithubClientOptions,
+  work: string,
+  repo: string,
+  pr: Pull,
+  job: dict,
+) -> string {
+  const base = work + "/base"
+  const env = auth(opts.installation_token ?? "")
+  const staging = "smart-ship/merge-${pr.number}-" + substring(job.head, 0, 12)
+  let resolved = ""
+  try {
+    for p in job.conflicted {
+      const taken = command_run(
+        harness.tools,
+        {argv: ["git", "checkout", job.base_oid, "--", p], cwd: base, env_mode: "patch", env: env},
+        {timeout_ms: 600000},
+      )
+      if !taken.success {
+        sh(harness.tools, ["git", "rm", "--quiet", "--cached", "--", p], env, base)
+      }
+    }
+    const side = signed(
+      harness,
+      opts,
+      repo,
+      staging,
+      base,
+      "Take ${pr.baseRefName}'s side of the conflicted files",
+    )
+    const owner: string = split(repo, "/")[0]
+    const name: string = split(repo, "/")[1]
+    const merged = github_merge_signed_staging(
+      harness,
+      {
+        owner: owner,
+        repo: name,
+        staging_branch: staging,
+        expected_head_oid: side,
+        base_oid: job.base_oid,
+        message: "Merge ${pr.baseRefName} into ${pr.headRefName}",
+        options: opts,
+      },
+    )
+    require is_ok(merged),
+      "GitHub could not merge ${pr.baseRefName}: "
+      + to_string(unwrap_err(merged)?.message)
+    const merge_oid = unwrap(merged).oid
+    sh(harness.tools, ["git", "fetch", "--quiet", "origin", merge_oid], env, base)
+    sh(harness.tools, ["git", "reset", "--quiet", "--soft", merge_oid], env, base)
+    sh(
+      harness.tools,
+      ["git", "--git-dir=" + base + "/.git", "--work-tree=" + work + "/pr", "add", "-A"],
+    )
+    sh(harness.tools, ["git", "diff", "--cached", "--check"], {}, base)
+    resolved = signed(
+      harness,
+      opts,
+      repo,
+      staging,
+      base,
+      "Resolve the conflicts with ${pr.baseRefName}",
+    )
+    // force: false is a fast-forward only; GitHub refuses if the head moved during the repair.
+    gh(
+      harness,
+      opts,
+      "/repos/${repo}/git/refs/heads/${pr.headRefName}",
+      "PATCH",
+      {sha: resolved, force: false},
+    )
+  } finally {
+    api_call(
+      harness,
+      {path: "/repos/${repo}/git/refs/heads/${staging}", method: "DELETE", options: opts},
+    )
+  }
+  return resolved
+}
+
+/** After the credential-free repair: re-check the PR, then publish the agent's tree once. */
 fn publish(
   harness: Harness,
   opts: GithubClientOptions,
@@ -361,9 +531,12 @@ fn publish(
   r: Repo,
 ) -> string {
   const job = json_parse(harness.fs.read_text(work + "/pr/.git/ship-task.json"))
-  const out = harness.fs.exists(work + "/pr/.git/ship-result.json") ? json_parse(
-    harness.fs.read_text(work + "/pr/.git/ship-result.json"),
-  ) : {outcome: "stuck", summary: "The repair stopped without a result.", spend: "unknown"}
+  const result = work + "/pr/.git/ship-result.json"
+  const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {
+    outcome: "stuck",
+    summary: "The repair stopped without a result.",
+    spend: "unknown",
+  }
   const pr = r.pullRequest
   const labels = pr.labels.nodes.map({ l -> l.name })
   let note = to_string(out.summary ?? "") + "\n\nRepair model spend: "
@@ -375,28 +548,26 @@ fn publish(
       + note
   }
   if out.outcome == "fixed" {
-    // The trusted clone's git reads the agent's files; nothing in the agent's own .git ever runs with the token.
-    sh(
-      harness.tools,
-      ["git", "--git-dir=" + work + "/base/.git", "--work-tree=" + work + "/pr", "add", "-A"],
-    )
-    sh(harness.tools, ["git", "diff", "--cached", "--check"], {}, work + "/base")
-    const owner: string = split(repo, "/")[0]
-    const name: string = split(repo, "/")[1]
-    const sent = github_commit_worktree(
-      harness,
-      {
-        owner: owner,
-        repo: name,
-        branch: pr.headRefName,
-        headline: "Smart Ship repair for #${number}",
-        repo_dir: work + "/base",
-        source: "index",
-        options: opts,
-      },
-    )
-    require is_ok(sent), "signed publication failed: " + to_string(unwrap_err(sent)?.message)
-    note = "Pushed ${unwrap(sent).commit_oid}. " + note
+    let pushed = ""
+    if len(job.conflicted) > 0 {
+      pushed = publish_merge(harness, opts, work, repo, pr, job)
+    } else {
+      // The trusted clone's git reads the agent's files; nothing in the agent's own .git runs with the token.
+      sh(
+        harness.tools,
+        ["git", "--git-dir=" + work + "/base/.git", "--work-tree=" + work + "/pr", "add", "-A"],
+      )
+      sh(harness.tools, ["git", "diff", "--cached", "--check"], {}, work + "/base")
+      pushed = signed(
+        harness,
+        opts,
+        repo,
+        pr.headRefName,
+        work + "/base",
+        "Smart Ship repair for #${number}",
+      )
+    }
+    note = "Pushed ${pushed}. " + note
   }
   for reply in out.replies ?? [] {
     if job.threads.contains(reply?.id) {
