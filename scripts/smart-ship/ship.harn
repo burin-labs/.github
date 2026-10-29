@@ -849,6 +849,8 @@ fn publish(
     summary: "The repair stopped without a result; its unfinished work was checked for a checkpoint.",
     spend: "unknown",
   }
+  require ["fixed", "timeout", "stuck", "unrelated"].contains(out.outcome),
+    "The repair reported an unknown outcome; its work was kept for recovery."
   const pr = r.pullRequest
   const labels = pr.labels.nodes.map({ l -> l.name })
   let note = quiet(to_string(out.summary ?? "")) + "\n\nRepair model spend: "

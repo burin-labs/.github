@@ -1178,3 +1178,27 @@ pipeline test_a_moved_head_does_not_discard_the_unpublished_repair(harness: Harn
   assert_eq(result.action, "publish_failed")
   assert(contains(result.reason, "moved, closed or was held"), result.reason)
 }
+
+/** An unknown agent outcome is not a completed publication. */
+pipeline test_an_unknown_agent_outcome_does_not_discard_work(harness: Harness) {
+  const work = harness.fs.mkdtemp_in_workspace("smart-ship-unknown-outcome-")
+  harness.fs.mkdir(work + "/pr/.git", true)
+  harness.fs.write_text(work + "/job.json", json_stringify({
+    head: "abc", base_oid: "1" * 40, conflicted: [], threads: [],
+  }))
+  harness.fs.write_text(work + "/pr/.git/ship-result.json", json_stringify({
+    outcome: "unexpected", summary: "partial work", spend: "0.02",
+  }))
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  harness.testing.http_mock("POST", api + "/graphql", {
+    status: 200, body: json_stringify({data: {repository: pr(red())}}),
+  })
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(harness, {
+    repo: "o/r", number: 9, token: "fixture-token", work: work, publish: true,
+    repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file:///nonexistent-smart-ship-host/", nonce: "",
+  })
+  assert_eq(result.action, "publish_failed")
+}
