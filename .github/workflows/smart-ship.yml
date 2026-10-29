@@ -19,6 +19,10 @@ on:
           caller opts in; the agent also needs OPENAI_API_KEY.
         type: boolean
         default: false
+      repair-turns:
+        description: Model turns one repair attempt may take before its unfinished work is kept for the next.
+        type: number
+        default: 60
       repair-environment:
         description: >-
           GitHub environment whose secret OPENAI_API_KEY reaches the repair
@@ -121,6 +125,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ matrix.pr }}
           SHIP_REPAIR: ${{ inputs.repair && secrets.OPENAI_API_KEY != '' && github.event_name != 'pull_request_review' }}
+          SHIP_REPAIR_TURNS: ${{ inputs.repair-turns }}
           SHIP_WORK: ${{ runner.temp }}/smart-ship
         run: |
           set -euo pipefail
@@ -130,6 +135,7 @@ jobs:
       # network, and the model key granted to model calls only, never to a command.
       - name: Repair without credentials
         if: inputs.repair
+        timeout-minutes: 25
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SHIP_WORK: ${{ runner.temp }}/smart-ship

@@ -154,6 +154,16 @@ pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
   assert_eq(decide(pr(red() + {reviewDecision: "REVIEW_REQUIRED"}), "clear", true).action, "repair")
   const answered = {comments: page([{body: "x <!-- smart-ship head=abc -->"}])}
   assert_eq(decide(pr(red() + answered), "clear", true).reason, "already answered at this head")
+  const timed_out = {
+    comments: page(
+      [{body: "<!-- smart-ship head=abc -->"}, {body: "kept <!-- smart-ship continue=abc -->"}],
+    ),
+  }
+  assert_eq(
+    decide(pr(red() + timed_out), "clear", true).action,
+    "repair",
+    "saved work earns one more attempt at the same head",
+  )
   const spent = {
     comments: page(
       [

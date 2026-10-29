@@ -25,6 +25,8 @@ const TRUSTED = ["OWNER", "MEMBER", "COLLABORATOR"]
 
 const MARK = "<!-- smart-ship head="
 
+const CONTINUE = "<!-- smart-ship continue="
+
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
   nameWithOwner defaultBranchRef { name } mergeQueue { id }
@@ -128,7 +130,9 @@ pub fn observe(pr: Pull, own: string = "") {
     marks: complete(pr.comments) ? len(
       pr.comments.nodes.filter({ c -> contains(c.body, MARK) }),
     ) : MAX_ATTEMPTS,
-    answered: pr.comments.nodes.any({ c -> contains(c.body, MARK + pr.headRefOid) }),
+    // A head is answered once per attempt; saved unfinished work reopens it for the next attempt.
+    answered: len(pr.comments.nodes.filter({ c -> contains(c.body, MARK + pr.headRefOid) }))
+      > len(pr.comments.nodes.filter({ c -> contains(c.body, CONTINUE + pr.headRefOid) })),
   }
 }
 
@@ -334,16 +338,52 @@ fn prepare(
       "\n",
     )
   }
+  // Work saved when an earlier attempt ran out of time continues only from the same head.
+  const wip = wip_commit(harness, {installation_token: token}, repo, number)
+  if wip != "" {
+    sh(
+      harness.tools,
+      ["git", "fetch", "--quiet", "origin", "refs/smart-ship/wip/${number}"],
+      env,
+      work + "/base",
+    )
+  }
+  const continuing = wip != "" && len(conflicted) == 0
+    && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/base") == pr.headRefOid
+  if continuing {
+    sh(
+      harness.tools,
+      ["git", "restore", "--source=" + wip, "--worktree", "--", ":/"],
+      {},
+      work + "/pr",
+    )
+  } else if wip != "" {
+    gh(
+      harness,
+      {installation_token: token},
+      "/repos/${repo}/git/refs/smart-ship/wip/${number}",
+      "DELETE",
+    )
+  }
   const failing = f.failing.map(
     { c ->
       {
         name: c.name,
         log: c.databaseId == nil ? "" : join(
           split(
-            sh(
-              harness.tools,
-              ["gh", "api", "repos/${repo}/actions/jobs/${c.databaseId}/logs"],
-              {GH_TOKEN: token},
+            regex_replace(
+              "\\x1b\\[[0-9;]*[A-Za-z]",
+              "",
+              sh(
+                harness.tools,
+                [
+                  "gh",
+                  "api",
+                  "--allow-escape-sequences",
+                  "repos/${repo}/actions/jobs/${c.databaseId}/logs",
+                ],
+                {GH_TOKEN: token},
+              ),
             ),
             "\n",
           )
@@ -378,6 +418,7 @@ fn prepare(
       base: pr.baseRefName,
       conflicted: join(conflicted, ", "),
       sides: sides,
+      continuing: continuing,
       failing: failing,
       threads: threads,
       attempt: f.marks + 1,
@@ -396,6 +437,65 @@ fn prepare(
       },
     ),
   )
+}
+
+const WIP_CAP = 1048576
+
+const SECRET =
+  "ghs_[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+
+/** The saved work for this PR, fetched into the trusted clone, or "" when there is none. */
+fn wip_commit(harness: Harness, opts: GithubClientOptions, repo: string, number: int) -> string {
+  const refs = gh(harness, opts, "/repos/${repo}/git/matching-refs/smart-ship/wip/${number}")
+  const held = refs.filter({ r -> r?.ref == "refs/smart-ship/wip/${number}" })
+  return len(held) == 0 ? "" : held[0].object.sha
+}
+
+/**
+ * Keep an unfinished repair's tree on the private ref refs/smart-ship/wip/<PR>, its parent the
+ * head it started from. A diff over the size cap, or one holding anything shaped like a credential, is not kept.
+ */
+fn save_wip(
+  harness: Harness,
+  opts: GithubClientOptions,
+  work: string,
+  repo: string,
+  number: int,
+  head: string,
+) -> string {
+  const base = work + "/base"
+  sh(
+    harness.tools,
+    ["git", "--git-dir=" + base + "/.git", "--work-tree=" + work + "/pr", "add", "-A"],
+  )
+  const diff = sh(harness.tools, ["git", "diff", "--cached", "--binary", head], {}, base)
+  if diff == "" || len(diff) > WIP_CAP || regex_match(SECRET, diff) != nil {
+    return diff == "" ? "No unfinished work to keep." : "The unfinished work was not kept: it is over the size cap or looks like it holds a credential."
+  }
+  const staging = "smart-ship/wip-${number}-" + substring(head, 0, 12)
+  let kept = ""
+  try {
+    kept = signed(
+      harness,
+      opts,
+      repo,
+      staging,
+      base,
+      "Smart Ship unfinished repair for #${number} at ${head}",
+    )
+    const ref = "refs/smart-ship/wip/${number}"
+    if wip_commit(harness, opts, repo, number) == "" {
+      gh(harness, opts, "/repos/${repo}/git/refs", "POST", {ref: ref, sha: kept})
+    } else {
+      gh(harness, opts, "/repos/${repo}/git/" + ref, "PATCH", {sha: kept, force: true})
+    }
+  } finally {
+    api_call(
+      harness,
+      {path: "/repos/${repo}/git/refs/heads/${staging}", method: "DELETE", options: opts},
+    )
+  }
+  return "The unfinished work is kept at ${kept}; the next attempt continues from it while the head stays ${head}. ${CONTINUE}${head} -->"
 }
 
 fn auth(token: string) -> dict {
@@ -568,6 +668,11 @@ fn publish(
       )
     }
     note = "Pushed ${pushed}. " + note
+    if wip_commit(harness, opts, repo, number) != "" {
+      gh(harness, opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
+    }
+  } else if out.outcome == "timeout" && len(job.conflicted) == 0 {
+    note = save_wip(harness, opts, work, repo, number, job.head) + " " + note
   }
   for reply in out.replies ?? [] {
     if job.threads.contains(reply?.id) {

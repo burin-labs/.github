@@ -29,9 +29,10 @@ fn main(harness: Harness) {
       },
     },
   )
+  // Running out of turns or budget before `finish` is a timeout; its work is kept for the next attempt.
   let result = {
-    outcome: "stuck",
-    summary: "The repair agent stopped without reporting.",
+    outcome: "timeout",
+    summary: "The repair agent ran out of turns or budget before it reported.",
     replies: [],
   }
   let spend = "unknown"
@@ -46,7 +47,7 @@ fn main(harness: Harness) {
           model: "gpt-6-luna",
           tools: tools,
           loop_until_done: true,
-          max_iterations: 60,
+          max_iterations: job.turns ?? 60,
           budget: {total_budget_usd: 2.0},
           stop_after_successful_tools: ["finish"],
         },
@@ -60,7 +61,7 @@ fn main(harness: Harness) {
       result = json_parse(harness.fs.read_text(".git/ship-finish.json"))
     }
   } catch (e) {
-    result = result + {summary: "The repair agent failed: " + to_string(e)}
+    result = result + {outcome: "stuck", summary: "The repair agent failed: " + to_string(e)}
   }
   harness.fs.write_text(".git/ship-result.json", json_stringify(result + {spend: spend}))
   harness.stdio.println("repair: ${result.outcome}: ${spend}")

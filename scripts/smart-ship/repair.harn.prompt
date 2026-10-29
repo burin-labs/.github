@@ -4,6 +4,9 @@ Pull request #{{ number }} ("{{ title }}") cannot land yet. Your job is to remov
 The checkout in your working directory is the pull request head {{ head }}, based on `{{ base }}`.
 You have no network and no credentials, and you cannot push, merge, or talk to GitHub. When you call `finish`, Smart Ship publishes your working tree as a signed commit and posts your summary and replies.
 Do not commit. Leave your changes in the working tree.
+{{ if continuing }}
+This continues an earlier attempt that ran out of time: the working tree already holds its changes. Review them, then finish the job.
+{{ end }}
 
 What is in the way:
 {{ if conflicted }}
