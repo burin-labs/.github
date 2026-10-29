@@ -21,7 +21,7 @@ inputs:
     required: false
     default: ""
   origin-receipt-sha:
-    description: Optional control-signed historical-origin receipt commit in the caller repository.
+    description: Optional control-attested historical-origin receipt commit; requires checks read permission.
     required: false
     default: ""
   harn-version:

@@ -106,6 +106,10 @@ test("actual action binds a signed historical origin while preserving caller and
     [`${prefix}commits/${proof}?per_page=100`]: { sha: proof, author: { login: "burin-control[bot]" },
       committer: { login: "web-flow" }, commit: { verification: { verified: true, reason: "valid" } },
       parents: [{ sha: fixtureBase }], files: [{ filename: receiptPath, status: "added", sha: receipt.sha }] },
+    [`${prefix}commits/${proof}/check-runs?per_page=100`]: { total_count: 1, check_runs: [
+      { name: "Smart Ship replay origin", head_sha: proof, external_id: proof,
+        status: "completed", conclusion: "success", app: { id: 5413304 } },
+    ] },
     [`${prefix}contents/${receiptPath}?ref=${proof}`]: receipt,
     [`${prefix}git/commits/${fixtureBase}`]: { sha: fixtureBase, tree: { sha: tree } },
     [`${prefix}compare/${fixtureBase}...${base}`]: { status: "ahead", base_commit: { sha: fixtureBase },
@@ -141,6 +145,12 @@ test("actual action binds a signed historical origin while preserving caller and
       ORIGIN_RECEIPT_SHA: proof, FIXTURE_MODE: "origin", ORIGIN_FIXTURE: JSON.stringify(forged) });
     assert.equal(refused.status, 1);
     assert.match(refused.stderr, /historical origin evidence was refused/);
+    const wrongApp = structuredClone(responses);
+    wrongApp[`${prefix}commits/${proof}/check-runs?per_page=100`].check_runs[0].app.id = 123456;
+    const untrusted = run(originReader, { GITHUB_REPOSITORY: caller, BASELINE_SHA: base,
+      ORIGIN_RECEIPT_SHA: proof, FIXTURE_MODE: "origin", ORIGIN_FIXTURE: JSON.stringify(wrongApp) });
+    assert.equal(untrusted.status, 1);
+    assert.match(untrusted.stderr, /historical origin evidence was refused/);
   }, sourcePolicy);
 });
 

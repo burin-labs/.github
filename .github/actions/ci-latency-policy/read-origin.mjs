@@ -7,6 +7,8 @@ const shaPattern = /^[0-9a-f]{40}$/;
 const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const receiptPath = "evidence/replay-origin-proof.json";
 const maxBytes = 8 * 1024 * 1024;
+const controlAppId = 5413304;
+const attestationName = "Smart Ship replay origin";
 
 function repository(value) {
   return typeof value === "string" && repoPattern.test(value)
@@ -89,6 +91,17 @@ export async function readOrigin(request, { fetch = globalThis.fetch, capture = 
     && commit.parents.length === 1 && Array.isArray(commit.files) && commit.files.length === 1
     && commit.files[0].filename === receiptPath && commit.files[0].status === "added"
     && shaPattern.test(commit.files[0].sha || ""), "untrusted or incomplete signed receipt");
+  // GitHub's verified commit signature and author metadata alone do not prove
+  // which actor authorized a receipt. Check-run app identity comes from GitHub,
+  // and the attestation binds the control App to this exact immutable commit.
+  const checks = await get(`commits/${proof}/check-runs?per_page=100`);
+  requireValue(Array.isArray(checks.check_runs) && checks.total_count === checks.check_runs.length
+    && checks.check_runs.length < 100, "incomplete attestation census");
+  const attestations = checks.check_runs.filter(run => run.name === attestationName
+    && run.app?.id === controlAppId);
+  requireValue(attestations.length === 1 && attestations[0].head_sha === proof
+    && attestations[0].external_id === proof && attestations[0].status === "completed"
+    && attestations[0].conclusion === "success", "missing control-App attestation");
   const file = await get(`contents/${receiptPath}?ref=${proof}`);
   requireValue(file.sha === commit.files[0].sha, "receipt blob does not match its signed commit");
   let receipt;
@@ -127,7 +140,7 @@ async function main() {
     proof: process.env.ORIGIN_RECEIPT_SHA, policy: process.env.POLICY_PATH, token: process.env.GH_TOKEN };
   const responses = [];
   const result = await readOrigin(request, { capture: (url, body) => responses.push({ url, body }) });
-  requireValue(responses.length === 5, "incomplete response census");
+  requireValue(responses.length === 6, "incomplete response census");
   const captured = JSON.stringify({ caller: request.caller, base: request.base, proof: request.proof,
     policy: request.policy, responses });
   const captureRoot = await mkdtemp(join(process.env.RUNNER_TEMP, "ci-origin-"));
@@ -149,7 +162,7 @@ async function verifyCapturedResponses() {
   let total = 0;
   for await (const chunk of process.stdin) {
     total += chunk.length;
-    requireValue(total <= 5 * maxBytes + 8192, "captured evidence is oversized");
+    requireValue(total <= 6 * maxBytes + 8192, "captured evidence is oversized");
     chunks.push(chunk);
   }
   let input;
@@ -157,7 +170,7 @@ async function verifyCapturedResponses() {
   catch { throw new Error("historical origin refused: invalid captured evidence"); }
   requireValue(process.argv.length === 8 && input.caller === process.argv[3] && input.base === process.argv[4]
     && input.proof === process.argv[5] && input.policy === process.argv[6], "captured identity mismatch");
-  requireValue(Array.isArray(input.responses) && input.responses.length === 5, "incomplete response census");
+  requireValue(Array.isArray(input.responses) && input.responses.length === 6, "incomplete response census");
   const result = await readOrigin({ caller: input.caller, base: input.base, proof: input.proof,
     policy: input.policy, token: "captured-responses-only" }, { fetch: async url => {
     const found = input.responses.filter(item => item.url === url && typeof item.body === "string");

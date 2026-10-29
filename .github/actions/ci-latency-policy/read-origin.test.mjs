@@ -25,6 +25,10 @@ function world() {
     files: [{ filename: receiptPath, status: "added", sha: receipt.sha }] };
   const responses = {
     [`commits/${proof}?per_page=100`]: commit,
+    [`commits/${proof}/check-runs?per_page=100`]: { total_count: 1, check_runs: [
+      { name: "Smart Ship replay origin", head_sha: proof, external_id: proof,
+        status: "completed", conclusion: "success", app: { id: 5413304 } },
+    ] },
     [`contents/${receiptPath}?ref=${proof}`]: receipt,
     [`git/commits/${fixture}`]: { sha: fixture, tree: { sha: tree } },
     [`compare/${fixture}...${base}`]: { status: "ahead", base_commit: { sha: fixture },
@@ -52,7 +56,7 @@ test("actual reader binds signed origin to caller, base ancestry and measured po
   assert.equal(result.evidenceRepository, source);
   assert.equal(result.sourceCommit, sourceCommit);
   assert.equal(result.policyBlob, w.policy.sha);
-  assert.equal(w.calls.length, 5);
+  assert.equal(w.calls.length, 6);
 });
 
 test("sandboxed source gate uses the same verifier and refuses missing or duplicate captures", () => {
@@ -82,6 +86,12 @@ test("missing, forged, unrelated and tampered evidence fails closed", async () =
     w => { w.commit.author.login = "another-bot"; },
     w => { w.commit.committer.login = "another-committer"; },
     w => { w.commit.commit.verification.verified = false; },
+    w => { w.responses[`commits/${proof}/check-runs?per_page=100`].check_runs[0].app.id = 123456; },
+    w => { w.responses[`commits/${proof}/check-runs?per_page=100`].check_runs[0].head_sha = "f".repeat(40); },
+    w => { w.responses[`commits/${proof}/check-runs?per_page=100`].check_runs[0].external_id = "f".repeat(40); },
+    w => { w.responses[`commits/${proof}/check-runs?per_page=100`].check_runs[0].conclusion = "failure"; },
+    w => { w.responses[`commits/${proof}/check-runs?per_page=100`].total_count = 2; },
+    w => { delete w.responses[`commits/${proof}/check-runs?per_page=100`]; },
     w => { w.commit.files.push({ filename: "hidden", status: "added", sha: "f".repeat(40) }); },
     w => { w.commit.files[0].sha = "f".repeat(40); },
     w => { w.receipt.content = Buffer.from("tampered").toString("base64"); },
@@ -95,6 +105,16 @@ test("missing, forged, unrelated and tampered evidence fails closed", async () =
     mutate(w);
     await assert.rejects(readOrigin(w.request, { fetch: w.fetch }));
   }
+});
+
+test("a GitHub-signed receipt without control-App attestation is refused", async () => {
+  const w = world();
+  w.responses[`commits/${proof}/check-runs?per_page=100`] = {
+    total_count: 1,
+    check_runs: [{ name: "Smart Ship replay origin", head_sha: proof, external_id: proof,
+      status: "completed", conclusion: "success", app: { id: 123456 } }],
+  };
+  await assert.rejects(readOrigin(w.request, { fetch: w.fetch }));
 });
 
 test("truncated and oversized authenticated responses are never accepted", async () => {
