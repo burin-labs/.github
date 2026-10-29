@@ -1,6 +1,17 @@
 /** The landing gate is the one place a wrong answer merges unreviewed or red code. */
 import { read_yaml } from "std/fs"
-import { Repo, checkout, decide, diff_refusal, look, quiet, retention_has_space, sh } from "./ship.harn"
+import {
+  Repo,
+  checkout,
+  decide,
+  diff_refusal,
+  look,
+  quiet,
+  retention_has_space,
+  sh,
+  stage_repair,
+  stage_resolution,
+} from "./ship.harn"
 
 fn page(nodes: list) {
   return {totalCount: len(nodes), nodes: nodes}
@@ -701,6 +712,232 @@ pipeline test_a_credential_deep_in_a_diff_is_never_published(harness: Harness) {
   harness.fs.write_text(dir + "/notes.txt", "start\n" + "b" * 1100000 + "\n")
   git(["add", "notes.txt"])
   assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "cap"), "an oversized fix is refused")
+  // A NUL byte makes Git encode the file as a binary patch, which hid the same fake token.
+  harness.fs.write_text(dir + "/notes.txt", "start\n")
+  harness.fs.write_text(dir + "/blob.bin", "head\0ghp_" + "Z" * 36 + "\0tail")
+  git(["add", "notes.txt", "blob.bin"])
+  assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "binary content"), "a binary is refused")
+}
+
+/** A modified tracked binary is refused, as is one a `diff` attribute would show as text. */
+pipeline test_binary_changes_are_refused_whatever_the_attributes(harness: Harness) {
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-binary-")
+  const git = { argv ->
+    sh(harness.tools, ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + argv, {}, dir)
+  }
+  git(["init", "--quiet"])
+  harness.fs.write_text(dir + "/.gitattributes", "*.dat diff\n")
+  harness.fs.write_text(dir + "/logo.png", "\0old image\0")
+  git(["add", ".gitattributes", "logo.png"])
+  git(["commit", "--quiet", "-m", "base"])
+  harness.fs.write_text(dir + "/logo.png", "\0new image\0")
+  git(["add", "logo.png"])
+  assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "logo.png"), "a modified binary is refused")
+  git(["reset", "--quiet"])
+  harness.fs.write_text(dir + "/blob.dat", "\0" + base64_encode("ghp_" + "Z" * 36) + "\0")
+  git(["add", "blob.dat"])
+  assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "blob.dat"), "attributes cannot hide a binary")
+  // Git samples only the first 8000 bytes for a NUL; the blob is read whole.
+  git(["reset", "--quiet"])
+  harness.fs.write_text(dir + "/late.dat", "a" * 9000 + "\0" + base64_encode("ghp_" + "Z" * 36) + "\0")
+  git(["add", "late.dat"])
+  assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "late.dat"), "a late NUL is still binary")
+}
+
+/** A prepared repair checkout over the divergent fixture. */
+fn prepared(harness: Harness, conflict: bool) {
+  const f = divergent(harness, conflict)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  return f + {work: f.dir + "/work", pr_dir: f.dir + "/work/pr"}
+}
+
+fn staged_names(harness: Harness, work: string, against: string) -> string {
+  return sh(harness.tools, ["git", "diff", "--cached", "--name-status", "--no-renames", against], {}, work + "/pristine")
+}
+
+/**
+ * The cache policy once dropped every new path under `.harn` or a cache directory, so a genuine new
+ * source file vanished from a successful repair. Only exact cache shapes are left out now; any
+ * other path there stops the repair and is named.
+ */
+pipeline test_an_ambiguous_new_file_stops_the_repair(harness: Harness) {
+  const cases = [
+    ".harn/workflows/new.harn",
+    "conformance/tests/scenarios/s1/.harn/skills/x/SKILL.md",
+    "node_modules/pkg/index.js",
+    "stray.pyc",
+    ".env",
+  ]
+  for path in cases {
+    const f = prepared(harness, false)
+    harness.fs.write_text(f.pr_dir + "/file.txt", "real fix\n")
+    const parts = split(path, "/")
+    if len(parts) > 1 {
+      harness.fs.mkdir(f.pr_dir + "/" + join(parts.slice(0, len(parts) - 1), "/"), true)
+    }
+    harness.fs.write_text(f.pr_dir + "/" + path, "intended\n")
+    const refused = to_string(stage_repair(harness, f.work))
+    assert(contains(refused, "cannot classify") && contains(refused, path), path + ": " + refused)
+  }
+}
+
+/** Move a tracked file into Harn's run state, optionally editing it on the way. */
+fn move_into_cache(harness: Harness, pr_dir: string, edit: bool) {
+  harness.fs.mkdir(pr_dir + "/.harn/state", true)
+  assert(harness.process.run({program: "/bin/mv", args: [pr_dir + "/file.txt", pr_dir + "/.harn/state/file.txt"]}).success)
+  if edit {
+    harness.fs.write_text(pr_dir + "/.harn/state/file.txt", "moved and edited\n")
+  }
+}
+
+/**
+ * A tracked file moved into a cache path would commit as a bare deletion. Matching content missed
+ * an edited move, so any deletion beside a cache file stops the repair.
+ */
+pipeline test_a_tracked_file_moved_into_a_cache_stops_the_repair(harness: Harness) {
+  for edit in [false, true] {
+    const f = prepared(harness, false)
+    move_into_cache(harness, f.pr_dir, edit)
+    const refused = to_string(stage_repair(harness, f.work))
+    assert(contains(refused, "deleted tracked files") && contains(refused, ".harn/state/file.txt"), refused)
+  }
+}
+
+/** Checkpoint and publish both refuse a deletion beside a cache file and keep the work. */
+pipeline test_a_deletion_beside_a_cache_publishes_nothing_and_keeps_the_work(harness: Harness) {
+  for outcome in ["timeout", "fixed"] {
+    const f = prepared(harness, false)
+    move_into_cache(harness, f.pr_dir, true)
+    harness.fs.write_text(
+      f.pr_dir + "/.git/ship-result.json",
+      json_stringify({outcome: outcome, summary: "s", spend: "0.01"}),
+    )
+    const branch = ["GET", "/repos/o/r/git/ref/heads/b", {status: 200, body: json_stringify({ref: "refs/heads/b", object: {sha: f.head}})}]
+    const seen = divergent_look(harness, f, true, "", "", true, "", [branch])
+    assert_eq(seen.result.action, "publish_failed", outcome)
+    assert(contains(seen.result.reason, "deleted tracked files"), outcome + ": " + seen.result.reason)
+    assert_eq(committed_paths(seen.calls), "", outcome + ": nothing reached GitHub")
+    assert_eq(harness.fs.read_text(f.pr_dir + "/.harn/state/file.txt"), "moved and edited\n", outcome + ": work kept")
+  }
+}
+
+/** A nested repository would commit as a broken gitlink; the repair stops and names it. */
+pipeline test_a_nested_repository_stops_the_repair(harness: Harness) {
+  const f = prepared(harness, false)
+  harness.fs.mkdir(f.pr_dir + "/vendor/dep", true)
+  sh(harness.tools, ["git", "init", "--quiet"], {}, f.pr_dir + "/vendor/dep")
+  harness.fs.write_text(f.pr_dir + "/vendor/dep/x.txt", "x\n")
+  const refused = to_string(stage_repair(harness, f.work))
+  assert(contains(refused, "nested repository") && contains(refused, "vendor/dep/"), refused)
+}
+
+/** A conflicted checkpoint holds the base merge; a binary the base changed is not the repair's. */
+pipeline test_a_conflicted_checkpoint_keeps_the_bases_binaries(harness: Harness) {
+  const f = divergent(harness, true)
+  harness.fs.write_text(f.remote + "/logo.png", "\0base image\0")
+  f.git(["add", "logo.png"])
+  f.git(["commit", "--quiet", "-m", "base binary"])
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  harness.fs.write_text(f.dir + "/work/pr/file.txt", "half resolved\n")
+  harness.fs.write_text(
+    f.dir + "/work/pr/.git/ship-result.json",
+    json_stringify({outcome: "timeout", summary: "ran out of time", spend: "0.01"}),
+  )
+  const sent = committed_paths(divergent_look(harness, f, true, "", "", true).calls)
+  assert(contains(sent, base64_encode("half resolved\n")), "the checkpoint was sent: " + sent)
+}
+
+/** The resolution stages onto the merge's tree, so a tracked base file in a cache path stays. */
+pipeline test_a_resolution_keeps_tracked_base_files_in_cache_paths(harness: Harness) {
+  const f = divergent(harness, true)
+  harness.fs.mkdir(f.remote + "/pkg/__pycache__", true)
+  harness.fs.write_text(f.remote + "/pkg/__pycache__/base.pyc", "tracked by the base\n")
+  f.git(["add", "pkg"])
+  f.git(["commit", "--quiet", "-m", "base tracks a cache file"])
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const work = f.dir + "/work"
+  harness.fs.write_text(work + "/pr/file.txt", "resolved\n")
+  // GitHub's merge of the base, made locally: the base's side of the conflict, then the merge.
+  f.git(["checkout", "--quiet", "-b", "merged", f.head])
+  f.git(["merge", "--quiet", "-X", "theirs", "-m", "merge", "main"])
+  const merge_oid = f.git(["rev-parse", "HEAD"])
+  f.git(["checkout", "--quiet", "main"])
+  stage_resolution(harness, work, merge_oid, {})
+  const staged = staged_names(harness, work, merge_oid)
+  assert(contains(staged, "file.txt"), staged)
+  assert(!contains(staged, "base.pyc"), "the base's tracked file is kept: " + staged)
+}
+
+/** The repair's write set: one real edit, one new test, and the junk its tools left behind. */
+fn leave_repair_and_junk(harness: Harness, pr_dir: string, outcome: string) {
+  harness.fs.write_text(pr_dir + "/file.txt", "real fix\n")
+  harness.fs.mkdir(pr_dir + "/tests", true)
+  harness.fs.write_text(pr_dir + "/tests/test_new.py", "def test_new(): pass\n")
+  harness.fs.mkdir(pr_dir + "/.harn/state/snapshots", true)
+  harness.fs.write_text(pr_dir + "/.harn/state/snapshots/x", "agent snapshot\n")
+  harness.fs.mkdir(pr_dir + "/pkg/__pycache__", true)
+  harness.fs.write_text(pr_dir + "/pkg/__pycache__/m.pyc", "compiled\n")
+  harness.fs.write_text(
+    pr_dir + "/.git/ship-result.json",
+    json_stringify({outcome: outcome, summary: "s", spend: "0.01"}),
+  )
+}
+
+fn committed_paths(calls: list) -> string {
+  return join(
+    calls.filter(
+      { c -> c.method == "POST" && contains(c.body ?? "", "createCommitOnBranch") },
+    )
+      .map({ c -> c.body })
+      .to_list(),
+    "\n",
+  )
+}
+
+/**
+ * Staging once ran `git add -A`, so agent state and caches rode along on checkpoints and
+ * published repairs. Both now commit the real edit and the new test only.
+ */
+pipeline test_a_repair_commits_only_its_intended_changes(harness: Harness) {
+  for outcome in ["timeout", "fixed"] {
+    const f = divergent(harness, false)
+    assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+    leave_repair_and_junk(harness, f.dir + "/work/pr", outcome)
+    // The fixed repair commits onto the PR branch, which GitHub reports at the head.
+    const branch = ["GET", "/repos/o/r/git/ref/heads/b", {status: 200, body: json_stringify({ref: "refs/heads/b", object: {sha: f.head}})}]
+    const sent = committed_paths(divergent_look(harness, f, true, "", "", true, "", [branch]).calls)
+    assert(contains(sent, base64_encode("real fix\n")), outcome + ": the real edit is committed")
+    assert(contains(sent, "tests/test_new.py"), outcome + ": a genuine new file is committed")
+    assert(!contains(sent, ".harn/"), outcome + ": agent state is not committed")
+    assert(!contains(sent, "__pycache__"), outcome + ": caches are not committed")
+  }
+}
+
+/** A checkpoint staged by the repair resumes with its genuine edits and none of the junk. */
+pipeline test_a_resumed_checkpoint_restores_only_genuine_edits(harness: Harness) {
+  const f = divergent(harness, false)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const work = f.dir + "/work"
+  leave_repair_and_junk(harness, work + "/pr", "timeout")
+  divergent_look(harness, f, true, "", "", true)
+  // GitHub's signed commit is mocked, so commit the very index the checkpoint sent.
+  const subject = "Smart Ship unfinished repair for #9 at ${f.head}, on base ${f.base_oid}, checkout clean"
+  sh(
+    harness.tools,
+    ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", subject],
+    {},
+    work + "/pristine",
+  )
+  f.git(["fetch", "--quiet", work + "/pristine", "HEAD"])
+  const wip = f.git(["rev-parse", "FETCH_HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  assert(harness.process.run({program: "/bin/rm", args: ["-rf", work]}).success)
+  assert_eq(divergent_look(harness, f, false, wip, wip, true).result.action, "repair")
+  const pr_dir = work + "/pr"
+  assert_eq(harness.fs.read_text(pr_dir + "/file.txt"), "real fix\n")
+  assert(harness.fs.exists(pr_dir + "/tests/test_new.py"), "the new test is restored")
+  assert(!harness.fs.exists(pr_dir + "/.harn"), "agent state is not restored")
+  assert(!harness.fs.exists(pr_dir + "/pkg/__pycache__"), "caches are not restored")
 }
 
 /**
@@ -977,6 +1214,7 @@ fn divergent_look(
   kept: string,
   trusted: bool,
   retention: string = "",
+  extra: list = [],
 ) {
   const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
   const commit = red_check.commits.nodes[0].commit + {oid: f.head}
@@ -1027,6 +1265,9 @@ fn divergent_look(
     api + "/repos/o/r/git/refs",
     {status: 201, body: "{\"ref\":\"refs/heads/smart-ship/wip\"}"},
   )
+  for m in extra {
+    harness.testing.http_mock(m[0], api + m[1], m[2])
+  }
   for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
     harness.testing.http_mock(
       method,
