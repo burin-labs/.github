@@ -59,18 +59,28 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   const own = {
     name: "ship / ship (9)",
     status: "IN_PROGRESS",
-    checkSuite: {workflowRun: {workflow: {name: "Smart Ship"}}},
+    checkSuite: {workflowRun: {workflow: {id: "W_ship", name: "Smart Ship"}}},
   }
   const looking = {mergeStateStatus: "UNSTABLE"} + checks([GREEN, own])
   assert_eq(
-    decide(pr(looking), "clear", false, "Smart Ship").action,
+    decide(pr(looking), "clear", false, "W_ship").action,
     "merge",
     "a look never waits on itself",
   )
   assert_eq(
-    decide(pr(looking), "clear", false, "Other").action,
+    decide(pr(looking), "clear", false, "W_other").action,
     "stop",
     "another workflow still pends",
+  )
+  assert_eq(
+    decide(pr(looking), "clear", false, "Smart Ship").action,
+    "stop",
+    "a display name never names the look",
+  )
+  assert_eq(
+    decide(pr(looking), "clear", false, "").action,
+    "stop",
+    "an unresolved look counts its own checks",
   )
   const refusals = [
     {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
@@ -112,6 +122,127 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   ]
   for over in refusals {
     assert(decide(pr(over), "clear", true).action != "merge", to_string(over))
+  }
+}
+
+/** A superseded failure once held an approved, green head blocked on every look. */
+pipeline test_only_the_newest_attempt_of_a_check_counts(harness: Harness) {
+  const run = { workflow, name, conclusion, id ->
+    {
+      name: name,
+      status: "COMPLETED",
+      conclusion: conclusion,
+      databaseId: id,
+      checkSuite: {
+        app: {id: "actions"},
+        workflowRun: {workflow: {id: "W_" + workflow, name: workflow}},
+      },
+    }
+  }
+  const superseded = checks(
+    [
+      run("PR gates", "Public metadata privacy", "FAILURE", 10),
+      run("PR gates", "Public metadata privacy", "SUCCESS", 11),
+      GREEN,
+    ],
+  )
+  assert_eq(decide(pr(superseded), "clear", false).action, "merge", "a later pass clears it")
+  const still_red = checks(
+    [
+      run("PR gates", "Public metadata privacy", "SUCCESS", 10),
+      run("PR gates", "Public metadata privacy", "FAILURE", 11),
+      GREEN,
+    ],
+  )
+  const d = decide(pr(still_red), "clear", false)
+  assert_eq(d.reason, "blocked, and repair is off here", "the newest attempt still blocks")
+  assert_eq(len(d.facts.failing), 1)
+  const two_workflows = checks(
+    [run("Lint", "check", "FAILURE", 10), run("Test", "check", "SUCCESS", 11), GREEN],
+  )
+  assert_eq(
+    decide(pr(two_workflows), "clear", false).action,
+    "stop",
+    "one workflow's pass never clears another's failure",
+  )
+  const old_look = checks([run("Smart Ship", "ship / looks (9) / look (9)", "FAILURE", 12), GREEN])
+  assert_eq(
+    decide(pr(old_look), "clear", false, "W_Smart Ship").action,
+    "merge",
+    "an old look of its own never blocks",
+  )
+  assert_eq(
+    decide(pr(old_look), "clear", false, "W_other").action,
+    "stop",
+    "another workflow's does",
+  )
+  const namesake = {
+    name: "security",
+    status: "COMPLETED",
+    conclusion: "FAILURE",
+    databaseId: 10,
+    checkSuite: {
+      app: {id: "other-app"},
+      workflowRun: {workflow: {id: "W_namesake", name: "Smart Ship"}},
+    },
+  }
+  assert_eq(
+    decide(pr(checks([namesake, GREEN])), "clear", false, "W_Smart Ship").action,
+    "stop",
+    "another workflow named Smart Ship cannot hide a failure",
+  )
+}
+
+/** Display names are not identity: only a known producer's newer attempt clears its own failure. */
+pipeline test_only_the_same_known_producer_supersedes(harness: Harness) {
+  const by = { suite, conclusion, id ->
+    {name: "verify", status: "COMPLETED", conclusion: conclusion, databaseId: id, checkSuite: suite}
+  }
+  const workflow = { id -> {app: {id: "actions"}, workflowRun: {workflow: {id: id, name: "CI"}}} }
+  const app = { id -> {app: {id: id}, workflowRun: nil} }
+  const distinct = [
+    [by(workflow("W_a"), "FAILURE", 10), by(workflow("W_b"), "SUCCESS", 11)],
+    [by(app("A_a"), "FAILURE", 10), by(app("A_b"), "SUCCESS", 11)],
+    [by(nil, "FAILURE", 10), by(nil, "SUCCESS", 11)],
+    [
+      by({workflowRun: {workflow: {id: "W_a", name: "CI"}}}, "FAILURE", 10),
+      by(workflow("W_a"), "SUCCESS", 11),
+    ],
+  ]
+  for pair in distinct {
+    assert_eq(decide(pr(checks(pair + [GREEN])), "clear", false).action, "stop", to_string(pair))
+  }
+  assert_eq(
+    decide(
+      pr(checks([by(app("A_a"), "FAILURE", 10), by(app("A_a"), "SUCCESS", 11), GREEN])),
+      "clear",
+      false,
+    ).action,
+    "merge",
+    "an external app's own rerun clears it",
+  )
+  const status = { state, at ->
+    {name: "legacy", state: state, createdAt: at, creator: {login: "bot"}}
+  }
+  const one = "2026-10-29T01:00:00Z"
+  const two = "2026-10-29T02:00:00Z"
+  assert_eq(
+    decide(pr(checks([status("FAILURE", one), status("SUCCESS", two), GREEN])), "clear", false)
+      .action,
+    "merge",
+    "a newer status clears its older failure",
+  )
+  const unordered = [
+    [status("FAILURE", two), status("SUCCESS", one)],
+    [status("FAILURE", one), status("SUCCESS", one)],
+    [{name: "legacy", state: "FAILURE", creator: {login: "bot"}}, status("SUCCESS", two)],
+    [
+      {name: "legacy", state: "FAILURE", createdAt: one},
+      {name: "legacy", state: "SUCCESS", createdAt: two},
+    ],
+  ]
+  for pair in unordered {
+    assert_eq(decide(pr(checks(pair + [GREEN])), "clear", false).action, "stop", to_string(pair))
   }
 }
 

@@ -29,8 +29,9 @@ const CONTINUE = "<!-- smart-ship continue="
 const REFUSED = "<!-- smart-ship refused="
 
 const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
-  nodes { ... on CheckRun { name status conclusion databaseId checkSuite { workflowRun { workflow { name } } } }
-    ... on StatusContext { name: context state } }"""
+  nodes { ... on CheckRun { name status conclusion databaseId
+      checkSuite { app { id } workflowRun { workflow { id name } } } }
+    ... on StatusContext { name: context state createdAt creator { login } } }"""
 
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
@@ -58,7 +59,9 @@ pub type Check = {
   conclusion?: string?,
   state?: string?,
   databaseId?: int?,
-  checkSuite?: {workflowRun: {workflow: {name: string}}?}?,
+  createdAt?: string?,
+  creator?: {login: string}?,
+  checkSuite?: {app?: {id: string}?, workflowRun?: {workflow: {id?: string?, name: string}}?}?,
 }
 
 type Comment = {
@@ -116,12 +119,49 @@ fn complete(page: Page<any>) -> bool {
   return len(page.nodes) == page.totalCount
 }
 
-/** What the head shows. A look never waits on, or repairs, the Smart Ship workflow running it. */
+/**
+ * Who produced a check, by stable ids rather than display names: the app and workflow for a check
+ * run, the creator for a status. Nil when any part is unknown, and an unknown producer never collapses.
+ */
+fn producer(c: Check) -> string? {
+  if c.state != nil {
+    const creator = c.creator?.login
+    return creator == nil || c.createdAt == nil ? nil : "status\n${creator}\n${c.name}"
+  }
+  const app = c.checkSuite?.app?.id
+  const run = c.checkSuite?.workflowRun
+  const workflow = run == nil ? "" : run.workflow.id
+  return app == nil || workflow == nil || c.databaseId == nil ? nil : "check\n${app}\n${workflow}\n${c.name}"
+}
+
+/** Strictly newer; a tie never supersedes. */
+fn later(a: Check, b: Check) -> bool {
+  return a.state != nil ? a.createdAt > b.createdAt : a.databaseId > b.databaseId
+}
+
+/**
+ * A head keeps every attempt of a check, and re-running an old run replays its old workflow, so
+ * only the newest attempt from each producer speaks for it.
+ */
+fn newest(checks: list<Check>) -> list<Check> {
+  return checks.filter(
+    { c ->
+      const key = producer(c)
+      key == nil || !checks.any({ o -> producer(o) == key && later(o, c) })
+    },
+  )
+    .to_list()
+}
+
+/**
+ * What the head shows. A look never waits on, or repairs, the Smart Ship workflow running it,
+ * named by `own`: that workflow's node id, since any workflow may share its display name.
+ */
 pub fn observe(pr: Pull, own: string = "") {
   const head = pr.commits.nodes[0]?.commit
   const rollup = head?.statusCheckRollup?.contexts ?? {totalCount: 0, nodes: []}
-  const checks = rollup.nodes.filter(
-    { c -> own == "" || c.checkSuite?.workflowRun?.workflow?.name != own },
+  const checks = newest(
+    rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.id != own }),
   )
   const reviews = pr.latestOpinionatedReviews.nodes
   const outcome = { c -> c.conclusion ?? c.state ?? "" }
@@ -836,6 +876,43 @@ fn merge_now(harness: Harness, opts: GithubClientOptions, pr: Pull) -> string {
   return state == "MERGED" ? "" : "GitHub left it ${state}"
 }
 
+/**
+ * The node id of the workflow running this look, which its checks carry. On any failure it is "",
+ * which excludes nothing, so every check counts, including Smart Ship's own.
+ */
+fn own_workflow(harness: Harness, opts: GithubClientOptions, repo: string) -> string {
+  const unresolved = { why ->
+    harness.stdio.println("smart-ship: own workflow unresolved (${why}); counting every check")
+    ""
+  }
+  const run_id = harness.env.get("GITHUB_RUN_ID") ?? ""
+  if run_id == "" {
+    return unresolved("no GITHUB_RUN_ID")
+  }
+  const run = api_call(
+    harness,
+    {path: "/repos/${repo}/actions/runs/${run_id}", method: "GET", options: opts},
+  )
+  const workflow_id = is_ok(run) ? unwrap(run)?.workflow_id : nil
+  if workflow_id == nil {
+    return unresolved(
+      "run ${run_id}: " + to_string(is_ok(run) ? "no workflow_id" : unwrap_err(run)?.message),
+    )
+  }
+  const workflow = api_call(
+    harness,
+    {path: "/repos/${repo}/actions/workflows/${workflow_id}", method: "GET", options: opts},
+  )
+  const id = is_ok(workflow) ? unwrap(workflow)?.node_id ?? "" : ""
+  if id == "" {
+    return unresolved(
+      "workflow ${workflow_id}: "
+        + to_string(is_ok(workflow) ? "no node_id" : unwrap_err(workflow)?.message),
+    )
+  }
+  return id
+}
+
 fn main(harness: Harness) {
   const repo = harness.env.get("REPO") ?? ""
   const number = to_int(harness.env.get("PR") ?? "") ?? 0
@@ -885,7 +962,7 @@ fn main(harness: Harness) {
     r,
     lease,
     harness.env.get("SHIP_REPAIR") == "true",
-    harness.env.get("GITHUB_WORKFLOW") ?? "",
+    own_workflow(harness, opts, repo),
   )
   let note = d.reason
   if d.action == "merge" {
