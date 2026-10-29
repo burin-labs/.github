@@ -111,6 +111,8 @@ jobs:
           permission-statuses: read
           permission-contents: write
           permission-pull-requests: write
+          # GitHub refuses to merge or push a change under .github/workflows without it.
+          permission-workflows: write
       - name: Check out Smart Ship at this workflow's own commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
