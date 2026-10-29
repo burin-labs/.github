@@ -418,6 +418,74 @@ pipeline test_a_crashed_attempt_counts_once_and_closes(harness: Harness) {
 
 type Posted = {body: string}
 
+type PreparedJob = {nonce: string, head: string}
+
+/** The real look, not a stub, binds its freshly prepared job to the supplied nonce. */
+pipeline test_real_repair_look_binds_prepared_nonce(harness: Harness) {
+  const dir = harness.fs.mkdtemp_in_workspace("real-prepare-nonce-")
+  const remote = dir + "/o/r.git"
+  harness.fs.mkdir(dir + "/o", true)
+  harness.fs.mkdir(remote)
+  const git = { args ->
+    sh(
+      harness.tools,
+      ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + args,
+      {},
+      remote,
+    )
+  }
+  git(["init", "--quiet", "--initial-branch=main"])
+  harness.fs.write_text(remote + "/file.txt", "content\n")
+  git(["add", "file.txt"])
+  git(["commit", "--quiet", "-m", "fixture"])
+  const head = git(["rev-parse", "HEAD"])
+  const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
+  const commit = red_check.commits.nodes[0].commit + {oid: head}
+  const state = pr(red_check + {headRefOid: head, commits: {nodes: [{commit: commit}]}})
+  const api = "https://api.github.com"
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {status: 200, body: json_stringify({data: {repository: state}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/release-merge-lease/main",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/smart-ship/wip/9",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const work = dir + "/work"
+  const result = look(
+    harness,
+    {
+      repo: "o/r",
+      number: 9,
+      token: "fixture-token",
+      work: work,
+      publish: false,
+      repair: true,
+      run_id: "",
+      opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file://" + dir + "/",
+      nonce: "unique-fixture-nonce",
+    },
+  )
+  assert_eq(result.action, "repair")
+  const prepared = schema_expect(
+    json_parse(harness.fs.read_text(work + "/job.json")),
+    schema_of(PreparedJob),
+  )
+  assert_eq(prepared.nonce, "unique-fixture-nonce")
+  assert_eq(prepared.head, head)
+  assert(harness.fs.exists(work + "/pr/.git/ship-task.json"), "the actual repair task was written")
+}
+
 /** A whole look against a fake GitHub serving this PR state; returns the comments it posted. */
 fn look_at(harness: Harness, comments: list, repair: bool, over: dict = {}) {
   harness.testing.http_mock_clear()
