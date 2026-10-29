@@ -115,6 +115,52 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   }
 }
 
+/** A superseded failure once held an approved, green head blocked on every look. */
+pipeline test_only_the_newest_attempt_of_a_check_counts(harness: Harness) {
+  const run = { workflow, name, conclusion, id ->
+    {
+      name: name,
+      status: "COMPLETED",
+      conclusion: conclusion,
+      databaseId: id,
+      checkSuite: {workflowRun: {workflow: {name: workflow}}},
+    }
+  }
+  const superseded = checks(
+    [
+      run("PR gates", "Public metadata privacy", "FAILURE", 10),
+      run("PR gates", "Public metadata privacy", "SUCCESS", 11),
+      GREEN,
+    ],
+  )
+  assert_eq(decide(pr(superseded), "clear", false).action, "merge", "a later pass clears it")
+  const still_red = checks(
+    [
+      run("PR gates", "Public metadata privacy", "SUCCESS", 10),
+      run("PR gates", "Public metadata privacy", "FAILURE", 11),
+      GREEN,
+    ],
+  )
+  const d = decide(pr(still_red), "clear", false)
+  assert_eq(d.reason, "blocked, and repair is off here", "the newest attempt still blocks")
+  assert_eq(len(d.facts.failing), 1)
+  const two_workflows = checks(
+    [run("Lint", "check", "FAILURE", 10), run("Test", "check", "SUCCESS", 11), GREEN],
+  )
+  assert_eq(
+    decide(pr(two_workflows), "clear", false).action,
+    "stop",
+    "one workflow's pass never clears another's failure",
+  )
+  const old_look = checks([run("Smart Ship", "ship / looks (9) / look (9)", "FAILURE", 12), GREEN])
+  assert_eq(
+    decide(pr(old_look), "clear", false, "Smart Ship").action,
+    "merge",
+    "an old look of its own never blocks",
+  )
+  assert_eq(decide(pr(old_look), "clear", false, "Other").action, "stop", "another workflow's does")
+}
+
 pipeline test_a_page_it_did_not_read_refuses(harness: Harness) {
   const unread = [
     checks([GREEN], 2),

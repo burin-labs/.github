@@ -116,12 +116,31 @@ fn complete(page: Page<any>) -> bool {
   return len(page.nodes) == page.totalCount
 }
 
+/**
+ * A head keeps every attempt of a check, and re-running an old run replays its old workflow, so
+ * only the newest attempt of each check (workflow and name, or status context) speaks for it.
+ */
+fn newest(checks: list<Check>) -> list<Check> {
+  const identity = { c ->
+    c.state != nil ? "status\n" + c.name : (c.checkSuite?.workflowRun?.workflow?.name ?? "") + "\n"
+      + c.name
+  }
+  return checks.filter(
+    { c ->
+      !checks.any(
+        { o -> identity(o) == identity(c) && (o.databaseId ?? -1) > (c.databaseId ?? -1) },
+      )
+    },
+  )
+    .to_list()
+}
+
 /** What the head shows. A look never waits on, or repairs, the Smart Ship workflow running it. */
 pub fn observe(pr: Pull, own: string = "") {
   const head = pr.commits.nodes[0]?.commit
   const rollup = head?.statusCheckRollup?.contexts ?? {totalCount: 0, nodes: []}
-  const checks = rollup.nodes.filter(
-    { c -> own == "" || c.checkSuite?.workflowRun?.workflow?.name != own },
+  const checks = newest(
+    rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.name != own }),
   )
   const reviews = pr.latestOpinionatedReviews.nodes
   const outcome = { c -> c.conclusion ?? c.state ?? "" }
