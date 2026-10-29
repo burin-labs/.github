@@ -709,7 +709,7 @@ fn save_wip(
   merged: bool,
 ) -> string {
   const base = work + "/pristine"
-  const refused = stage_repair(harness, work)
+  const refused = stage_repair(harness, work, merged ? base_oid : "")
   require refused == "", "The unfinished work was not kept: ${refused}."
   // A merged checkout holds the base's changes too; only the repair's binaries are refused.
   const why = diff_refusal(harness.tools, base, head, merged ? base_oid : "")
@@ -774,13 +774,20 @@ fn new_file_kind(path: string) -> string {
   return "new"
 }
 
+/** Staged deletions against `against`; NUL-delimited, so any path bytes survive. */
+fn staged_deletions(tools: HarnessTools, git: list<string>, dir: string, against: string) -> list<string> {
+  const names = sh(tools, git + ["diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=D", against], {}, dir)
+  return split(names, "\0").filter({ p -> p != "" }).to_list()
+}
+
 /**
  * Stage the repair into the trusted clone's index: every change to a tracked file and every new
  * file, leaving out only GENERATED caches. Returns why it refused, or "" once staged. It refuses
- * an ambiguous new path, a nested repository, and a tracked file moved into a cache.
+ * an ambiguous new path, a nested repository, and a tracked deletion beside a cache file. With a
+ * `merged_base`, a deletion the base merge made is the base's, not the repair's.
  * Paths stay NUL-delimited and literal, whatever bytes they hold.
  */
-pub fn stage_repair(harness: Harness, work: string) -> string {
+pub fn stage_repair(harness: Harness, work: string, merged_base: string = "") -> string {
   const tools = harness.tools
   const pr = work + "/pr"
   const git = ["git", "--literal-pathspecs", "--git-dir=" + work + "/pristine/.git", "--work-tree=" + pr]
@@ -798,25 +805,16 @@ pub fn stage_repair(harness: Harness, work: string) -> string {
       + join(ambiguous, ", ")
   }
   const caches = untracked.filter({ p -> new_file_kind(p) == "cache" })
-  // A tracked file moved into a cache would otherwise commit as a bare deletion.
-  const deleted = split(
-    sh(tools, git + ["diff", "--cached", "--raw", "--no-abbrev", "-z", "--no-renames", "--diff-filter=D", "HEAD"], {}, pr),
-    "\0",
-  )
-    .filter({ e -> starts_with(e, ":") })
-    .map({ e -> split(e, " ")[2] })
+  // A tracked file moved into a cache, edited or not, would commit as a bare deletion. Content
+  // cannot tell a move from a coincidence, so any deletion beside a cache file stops the repair.
+  let deleted = staged_deletions(tools, git, pr, "HEAD")
+  if merged_base != "" && len(deleted) > 0 {
+    const own = staged_deletions(tools, git, pr, merged_base)
+    deleted = deleted.filter({ p -> own.contains(p) }).to_list()
+  }
   if len(deleted) > 0 && len(caches) > 0 {
-    const hashed = split(sh(tools, ["git", "hash-object", "--no-filters", "--"] + caches, {}, pr), "\n")
-    let moved = []
-    for i in 0..len(caches) {
-      if deleted.contains(hashed[i]) {
-        moved = moved + [caches[i]]
-      }
-    }
-    if len(moved) > 0 {
-      return "the repair moved a tracked file into a cache path, which is not committed: "
-        + join(moved, ", ")
-    }
+    return "the repair deleted tracked files while leaving cache files, so a move cannot be ruled out: deleted "
+      + join(deleted, ", ") + "; cache " + join(caches, ", ")
   }
   const fresh = untracked.filter({ p -> new_file_kind(p) == "new" })
   if len(fresh) > 0 {
@@ -831,21 +829,37 @@ pub fn stage_repair(harness: Harness, work: string) -> string {
 // binary content into text the credential scan misreads.
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-/** NUL-delimited paths of staged binary content that differs from `against`. */
+/**
+ * Paths whose staged content differs from `against` and holds a NUL anywhere, read from the blob
+ * itself: Git's own binary test samples only the start of a file. nil when a blob cannot be read.
+ */
 fn staged_binaries(tools: HarnessTools, dir: string, against: string) -> list<string>? {
-  const counts = run(
+  const raw = run(
     tools,
-    ["git", "--attr-source=" + EMPTY_TREE, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "--no-renames", "--diff-filter=d", against],
+    ["git", "diff", "--cached", "--raw", "--no-abbrev", "-z", "--no-renames", "--diff-filter=d", against],
     {},
     dir,
   )
-  if !counts.success || (counts?.stdout_truncated ?? false) {
+  if !raw.success || (raw?.stdout_truncated ?? false) {
     return nil
   }
-  // numstat marks a binary change "-\t-\t<path>"; a deletion carries no content to scan.
-  return split(counts.stdout, "\0").filter({ e -> starts_with(e, "-\t-\t") })
-    .map({ e -> regex_replace("^-\t-\t", "", e) })
-    .to_list()
+  // Each entry is ":<old mode> <new mode> <old oid> <new oid> <status>" then its path.
+  const entries = split(raw.stdout, "\0")
+  let binary = []
+  for i in 0..len(entries) {
+    const meta = split(entries[i], " ")
+    if !starts_with(entries[i], ":") || len(meta) < 5 || meta[1] == "160000" {
+      continue
+    }
+    const blob = run(tools, ["git", "cat-file", "blob", meta[3]], {}, dir)
+    if !blob.success || (blob?.stdout_truncated ?? false) {
+      return nil
+    }
+    if contains(blob.stdout, "\0") {
+      binary = binary + [entries[i + 1]]
+    }
+  }
+  return binary
 }
 
 /**

@@ -737,6 +737,11 @@ pipeline test_binary_changes_are_refused_whatever_the_attributes(harness: Harnes
   harness.fs.write_text(dir + "/blob.dat", "\0" + base64_encode("ghp_" + "Z" * 36) + "\0")
   git(["add", "blob.dat"])
   assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "blob.dat"), "attributes cannot hide a binary")
+  // Git samples only the first 8000 bytes for a NUL; the blob is read whole.
+  git(["reset", "--quiet"])
+  harness.fs.write_text(dir + "/late.dat", "a" * 9000 + "\0" + base64_encode("ghp_" + "Z" * 36) + "\0")
+  git(["add", "late.dat"])
+  assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "late.dat"), "a late NUL is still binary")
 }
 
 /** A prepared repair checkout over the divergent fixture. */
@@ -776,13 +781,44 @@ pipeline test_an_ambiguous_new_file_stops_the_repair(harness: Harness) {
   }
 }
 
-/** A tracked file moved into a cache path would otherwise commit as a bare deletion. */
+/** Move a tracked file into Harn's run state, optionally editing it on the way. */
+fn move_into_cache(harness: Harness, pr_dir: string, edit: bool) {
+  harness.fs.mkdir(pr_dir + "/.harn/state", true)
+  assert(harness.process.run({program: "/bin/mv", args: [pr_dir + "/file.txt", pr_dir + "/.harn/state/file.txt"]}).success)
+  if edit {
+    harness.fs.write_text(pr_dir + "/.harn/state/file.txt", "moved and edited\n")
+  }
+}
+
+/**
+ * A tracked file moved into a cache path would commit as a bare deletion. Matching content missed
+ * an edited move, so any deletion beside a cache file stops the repair.
+ */
 pipeline test_a_tracked_file_moved_into_a_cache_stops_the_repair(harness: Harness) {
-  const f = prepared(harness, false)
-  harness.fs.mkdir(f.pr_dir + "/.harn/state", true)
-  assert(harness.process.run({program: "/bin/mv", args: [f.pr_dir + "/file.txt", f.pr_dir + "/.harn/state/file.txt"]}).success)
-  const refused = to_string(stage_repair(harness, f.work))
-  assert(contains(refused, "moved a tracked file") && contains(refused, ".harn/state/file.txt"), refused)
+  for edit in [false, true] {
+    const f = prepared(harness, false)
+    move_into_cache(harness, f.pr_dir, edit)
+    const refused = to_string(stage_repair(harness, f.work))
+    assert(contains(refused, "deleted tracked files") && contains(refused, ".harn/state/file.txt"), refused)
+  }
+}
+
+/** Checkpoint and publish both refuse a deletion beside a cache file and keep the work. */
+pipeline test_a_deletion_beside_a_cache_publishes_nothing_and_keeps_the_work(harness: Harness) {
+  for outcome in ["timeout", "fixed"] {
+    const f = prepared(harness, false)
+    move_into_cache(harness, f.pr_dir, true)
+    harness.fs.write_text(
+      f.pr_dir + "/.git/ship-result.json",
+      json_stringify({outcome: outcome, summary: "s", spend: "0.01"}),
+    )
+    const branch = ["GET", "/repos/o/r/git/ref/heads/b", {status: 200, body: json_stringify({ref: "refs/heads/b", object: {sha: f.head}})}]
+    const seen = divergent_look(harness, f, true, "", "", true, "", [branch])
+    assert_eq(seen.result.action, "publish_failed", outcome)
+    assert(contains(seen.result.reason, "deleted tracked files"), outcome + ": " + seen.result.reason)
+    assert_eq(committed_paths(seen.calls), "", outcome + ": nothing reached GitHub")
+    assert_eq(harness.fs.read_text(f.pr_dir + "/.harn/state/file.txt"), "moved and edited\n", outcome + ": work kept")
+  }
 }
 
 /** A nested repository would commit as a broken gitlink; the repair stops and names it. */
