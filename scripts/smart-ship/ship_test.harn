@@ -418,9 +418,9 @@ pipeline test_a_crashed_attempt_counts_once_and_closes(harness: Harness) {
 type Posted = {body: string}
 
 /** A whole look against a fake GitHub serving this PR state; returns the comments it posted. */
-fn look_at(harness: Harness, comments: list, repair: bool) {
+fn look_at(harness: Harness, comments: list, repair: bool, over: dict = {}) {
   harness.testing.http_mock_clear()
-  const state = {data: {repository: pr(red() + {comments: page(comments)})}}
+  const state = {data: {repository: pr(red() + {comments: page(comments)} + over)}}
   const api = "https://api.github.com"
   harness.testing.http_mock("POST", api + "/graphql", {status: 200, body: json_stringify(state)})
   harness.testing.http_mock(
@@ -452,7 +452,34 @@ fn look_at(harness: Harness, comments: list, repair: bool) {
   return {result: result, posted: posted}
 }
 
-/** The look itself closes a dead attempt once, starts the next within the cap, and stops at it. */
+/**
+ * The look itself closes a dead attempt once, starts the next within the cap, and stops at it.
+ * A look once closed attempts on PRs it does not shepherd, and from a partial comment census.
+ */
+pipeline test_only_an_admitted_whole_census_closes_an_attempt(harness: Harness) {
+  const started = {body: "<!-- smart-ship head=abc -->", viewerDidAuthor: true}
+  const active = look_at(harness, [started], false)
+  assert_eq(len(active.posted), 1, "an admitted PR with its whole history closes once")
+  assert(contains(active.posted[0], "smart-ship ended=abc"), active.posted[0])
+  const unlabeled = look_at(harness, [started], true, {labels: page([])})
+  assert_eq(unlabeled.posted, [], "an unlabeled PR is never written to")
+  for hold in ["do-not-merge", "hold"] {
+    const held = look_at(harness, [started], true, {labels: page([{name: "ship"}, {name: hold}])})
+    assert_eq(held.posted, [], "a PR held by ${hold} is never written to")
+  }
+  let visible = [started]
+  for _ in 0..99 {
+    visible = visible + [{body: "ordinary comment", viewerDidAuthor: false}]
+  }
+  const partial = look_at(harness, [], true, {comments: {totalCount: 101, nodes: visible}})
+  assert_eq(partial.posted, [], "a partial census closes nothing")
+  assert_eq(
+    unwrap(partial.result).reason,
+    "repair attempts used up; a person needs to take it",
+    "and its unread attempts read as used up",
+  )
+}
+
 pipeline test_a_look_closes_a_crashed_attempt_once(harness: Harness) {
   const ours = { body -> {body: body, viewerDidAuthor: true} }
   const started = ours("<!-- smart-ship head=abc -->")

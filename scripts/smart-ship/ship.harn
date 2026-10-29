@@ -230,16 +230,13 @@ pub fn lease_admits(lease: string, slug: string, pr: Pull) -> bool {
 
 pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
   const pr = repo.pullRequest
-  const f = observe(pr, own)
-  const stop = { why -> {action: "stop", reason: why, facts: f} }
+  const seen = observe(pr, own)
   const labels = pr.labels.nodes.map({ l -> l.name })
-  const conflict = pr.mergeStateStatus == "DIRTY"
-  const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
-  // The first gate that holds stops the look, in this order.
-  const gates = [
+  // Whether Smart Ship shepherds this PR at all; a PR it does not is never written to.
+  const admission = [
     [pr.state != "OPEN" || !labels.contains("ship"), "not shepherded: closed, or not labeled ship"],
     [
-      !f.complete,
+      !seen.complete,
       "too many labels, reviews, threads or checks to read completely; a person must land it",
     ],
     [HOLDS.any({ h -> labels.contains(h) }), "held by a label"],
@@ -247,15 +244,26 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
       pr.isCrossRepository || pr.isDraft || pr.baseRefName != repo.defaultBranchRef.name,
       "not shepherded: a fork, a draft, or a non-default base",
     ],
-    [pr.isInMergeQueue, "already in the merge queue"],
-    // A conflicted head may never get checks; its repair does not wait on them.
-    [!conflict && f.no_checks, "waiting on checks to report"],
-    [!conflict && len(f.pending) > 0, "waiting on " + join(f.pending, ", ")],
-    [
-      !conflict && len(f.rerun) > 0,
-      "cancelled or stale checks need a fresh push: " + join(f.rerun, ", "),
-    ],
   ]
+  const admitted = !admission.any({ g -> g[0] == true })
+  // Dead attempts the look closes: only for an admitted PR, and only from the whole comment
+  // census; a partial one closes nothing and already reads as attempts used up.
+  const f = seen + {close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0}
+  const stop = { why -> {action: "stop", reason: why, facts: f} }
+  const conflict = pr.mergeStateStatus == "DIRTY"
+  const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
+  // The first gate that holds stops the look, in this order.
+  const gates = admission
+    + [
+      [pr.isInMergeQueue, "already in the merge queue"],
+      // A conflicted head may never get checks; its repair does not wait on them.
+      [!conflict && f.no_checks, "waiting on checks to report"],
+      [!conflict && len(f.pending) > 0, "waiting on " + join(f.pending, ", ")],
+      [
+        !conflict && len(f.rerun) > 0,
+        "cancelled or stale checks need a fresh push: " + join(f.rerun, ", "),
+      ],
+    ]
   for gate in gates {
     if gate[0] {
       return stop(gate[1])
@@ -1021,15 +1029,14 @@ pub fn look(harness: Harness, job: Look) {
     harness.stdio.println("${repo}#${number}: published: ${note}")
     return {action: "published", reason: note}
   }
+  const lease = release_lease(harness, opts, repo, pr.baseRefName)
+  const d = decide(r, lease, job.repair, own_workflow(harness, opts, repo, job.run_id))
   // Looks on one PR never overlap, so an attempt still open now died; it is closed, not repeated.
-  const open = observe(pr).open
-  for _ in 0..open {
+  for _ in 0..d.facts.close {
     say(
       "the repair attempt at ${pr.headRefOid} ended without a result; it counts as one of ${MAX_ATTEMPTS} attempts.\n\n${ENDED}${pr.headRefOid} -->",
     )
   }
-  const lease = release_lease(harness, opts, repo, pr.baseRefName)
-  const d = decide(r, lease, job.repair, own_workflow(harness, opts, repo, job.run_id))
   let note = d.reason
   if d.action == "merge" {
     // The exact head is the lease: GitHub refuses if it moved since it was judged. Branch rules still apply server side.
