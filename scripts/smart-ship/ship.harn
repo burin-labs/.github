@@ -562,7 +562,7 @@ fn publish_merge(
 ) -> string {
   const base = work + "/base"
   const env = auth(opts.installation_token ?? "")
-  const staging = "smart-ship/merge-${pr.number}-" + substring(job.head, 0, 12)
+  const staging = "harn-worktree-staging/smart-ship-merge-${pr.number}-" + substring(job.head, 0, 12)
   let resolved = ""
   try {
     for p in job.conflicted {
