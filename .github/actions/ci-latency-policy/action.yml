@@ -20,10 +20,34 @@ inputs:
     description: Read-only token used to fetch the policy at baseline-sha.
     required: false
     default: ""
+  origin-receipt-sha:
+    description: Optional control-signed historical-origin receipt commit in the caller repository.
+    required: false
+    default: ""
   harn-version:
     description: Exact released Harn runtime for the shared typed policy contract.
     required: false
     default: "0.10.155"
+
+outputs:
+  evidence-repository:
+    description: Verified historical evidence repository, or empty for the ordinary caller-owned policy.
+    value: ${{ steps.origin.outputs.evidence-repository }}
+  verifier-path:
+    description: Immutable action verifier for a sandboxed source gate to validate captured responses.
+    value: ${{ steps.origin.outputs.verifier-path }}
+  verifier-root:
+    description: Read-only filesystem root containing the immutable verifier.
+    value: ${{ steps.origin.outputs.verifier-root }}
+  capture-path:
+    description: Authenticated, token-free origin response census.
+    value: ${{ steps.origin.outputs.capture-path }}
+  capture-root:
+    description: Read-only filesystem root containing the response census.
+    value: ${{ steps.origin.outputs.capture-root }}
+  capture-sha256:
+    description: SHA-256 of the exact authenticated response census.
+    value: ${{ steps.origin.outputs.capture-sha256 }}
 
 runs:
   using: composite
@@ -38,6 +62,17 @@ runs:
         POLICY_PATH: ${{ inputs.policy }}
       run: node "$GITHUB_ACTION_PATH/read-baseline.mjs"
 
+    - name: Verify signed historical origin
+      id: origin
+      if: ${{ inputs.origin-receipt-sha != '' }}
+      shell: bash
+      env:
+        BASELINE_SHA: ${{ inputs.baseline-sha }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        POLICY_PATH: ${{ inputs.policy }}
+        ORIGIN_RECEIPT_SHA: ${{ inputs.origin-receipt-sha }}
+      run: node "$GITHUB_ACTION_PATH/read-origin.mjs"
+
     - name: Set up typed policy runtime
       uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808 # supports compressed release archives
       with:
@@ -47,11 +82,11 @@ runs:
       shell: bash
       env:
         BASELINE_SHA: ${{ inputs.baseline-sha }}
-        GH_TOKEN: ${{ inputs.github-token }}
         POLICY_PATH: ${{ inputs.policy }}
         WORKFLOW_PATH: ${{ inputs.workflow }}
         BASELINE_STATE: ${{ steps.baseline.outputs.state }}
         BASELINE_FILE: ${{ steps.baseline.outputs.baseline-path }}
+        EVIDENCE_REPOSITORY: ${{ steps.origin.outputs.evidence-repository }}
       run: |
         set -euo pipefail
         bash "$GITHUB_ACTION_PATH/run.sh"
