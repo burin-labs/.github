@@ -469,6 +469,11 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
   const number = job.number
   const pr = r.pullRequest
   const env = auth(token)
+  // An interrupted run can leave its checkouts on a persistent runner; clone into an empty dir.
+  if harness.fs.exists(work) {
+    harness.fs.delete(work)
+  }
+  require !harness.fs.exists(work), "could not clear the work dir " + work
   const tree = checkout(
     harness.tools,
     "${job.git_host}${repo}.git",

@@ -422,6 +422,16 @@ type PreparedJob = {nonce: string, head: string}
 
 /** The real look, not a stub, binds its freshly prepared job to the supplied nonce. */
 pipeline test_real_repair_look_binds_prepared_nonce(harness: Harness) {
+  real_repair(harness, false)
+}
+
+/** An interrupted run left its checkout behind; the next attempt still clones and repairs. */
+pipeline test_real_repair_survives_a_stale_checkout(harness: Harness) {
+  real_repair(harness, true)
+}
+
+/** A whole repair look against a local git remote and a fake GitHub. */
+fn real_repair(harness: Harness, stale: bool) {
   const dir = harness.fs.mkdtemp_in_workspace("real-prepare-nonce-")
   const remote = dir + "/o/r.git"
   harness.fs.mkdir(dir + "/o", true)
@@ -461,6 +471,10 @@ pipeline test_real_repair_look_binds_prepared_nonce(harness: Harness) {
   )
   harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
   const work = dir + "/work"
+  if stale {
+    harness.fs.mkdir(work + "/base", true)
+    harness.fs.write_text(work + "/base/old-job", "left by an interrupted runner\n")
+  }
   const result = look(
     harness,
     {
@@ -702,6 +716,16 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
     "a prepared repair publishes even after the agent fails",
   )
   assert_eq(step("Remove the checkouts").if, "always()", "cleanup still runs after a failed mint")
+  // Each run and attempt owns its checkouts, so a leftover from an interrupted run is never reused.
+  const per_run = "\${{ runner.temp }}/smart-ship-\${{ github.run_id }}-\${{ github.run_attempt }}"
+  for name in [
+    "Look at the pull request",
+    "Repair without credentials",
+    "Publish the repair",
+    "Remove the checkouts",
+  ] {
+    assert_eq(step(name).env.SHIP_WORK, per_run, name)
+  }
   const dir = harness.fs.mkdtemp_in_workspace("smart-ship-look-step-")
   const fake = dir + "/harn"
   harness.fs.write_text(
