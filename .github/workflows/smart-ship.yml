@@ -45,6 +45,8 @@ jobs:
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: read
       - name: List the pull requests labeled ship
         id: list
         env:
@@ -87,6 +89,13 @@ jobs:
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          # Read the PR and its CI logs; push a signed repair, comment, merge or enqueue.
+          permission-actions: read
+          permission-checks: read
+          permission-statuses: read
+          permission-contents: write
+          permission-pull-requests: write
       - name: Check out Smart Ship at this workflow's own commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
