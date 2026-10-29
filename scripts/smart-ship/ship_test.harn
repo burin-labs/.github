@@ -1,4 +1,5 @@
 /** The landing gate is the one place a wrong answer merges unreviewed or red code. */
+import { read_yaml } from "std/fs"
 import { Repo, checkout, decide, diff_refusal, look, quiet, sh } from "./ship.harn"
 
 fn page(nodes: list) {
@@ -572,6 +573,54 @@ pipeline test_a_credential_deep_in_a_diff_is_never_published(harness: Harness) {
   harness.fs.write_text(dir + "/notes.txt", "start\n" + "b" * 1100000 + "\n")
   git(["add", "notes.txt"])
   assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "cap"), "an oversized fix is refused")
+}
+
+/**
+ * A failed token mint once skipped the look yet still ran the publish step, which then failed
+ * starting in a checkout that was never made. Only a look that prepared a repair sets `prepared`.
+ */
+pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const step = { name -> steps.filter({ s -> s?.name == name }).to_list()[0] }
+  const prepared = "steps.look.outputs.prepared == 'true'"
+  assert_eq(step("Look at the pull request").id, "look")
+  assert_eq(step("Repair without credentials").if, "inputs.repair && ${prepared}")
+  assert_eq(
+    step("Publish the repair").if,
+    "always() && inputs.repair && ${prepared}",
+    "a prepared repair publishes even after the agent fails",
+  )
+  assert_eq(step("Remove the checkouts").if, "always()", "cleanup still runs after a failed mint")
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-look-step-")
+  const fake = dir + "/harn"
+  harness.fs.write_text(
+    fake,
+    "#!/bin/sh\n[ \"$1\" = run ] || exit 0\n"
+      + "[ \"$LOOK\" = prepared ] && echo '{}' > \"$SHIP_WORK/job.json\"\n"
+      + "[ \"$LOOK\" = failed ] && exit 1\nexit 0\n",
+  )
+  assert(harness.process.run({program: "/bin/chmod", args: ["755", fake]}).success)
+  for c in [["prepared", true, "prepared=true\n"], ["stopped", true, ""], ["failed", false, ""]] {
+    const work = dir + "/" + c[0]
+    harness.fs.mkdir(work)
+    harness.fs.write_text(work + "/output", "")
+    const ran = harness.process.run(
+      {
+        program: "/bin/bash",
+        args: ["-c", step("Look at the pull request").run],
+        cwd: work,
+        env: {
+          PATH: dir + ":" + to_string(harness.env.get("PATH") ?? ""),
+          LOOK: c[0],
+          SHIP_WORK: work,
+          GITHUB_OUTPUT: work + "/output",
+        },
+        timeout_ms: 30000,
+      },
+    )
+    assert_eq(ran.success, c[1], c[0] + ": " + ran.stderr)
+    assert_eq(harness.fs.read_text(work + "/output"), c[2], c[0])
+  }
 }
 
 pipeline test_agent_text_cannot_post_a_marker_or_a_credential(harness: Harness) {
