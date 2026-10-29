@@ -31,7 +31,12 @@ fn pr(over: dict = {}) -> Repo {
       ],
     },
   }
-  return {defaultBranchRef: {name: "main"}, mergeQueue: nil, pullRequest: pull + over}
+  return {
+    nameWithOwner: "o/r",
+    defaultBranchRef: {name: "main"},
+    mergeQueue: nil,
+    pullRequest: pull + over,
+  }
 }
 
 const RED = {
@@ -91,13 +96,27 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
 }
 
 pipeline test_a_release_lease_holds_every_other_merge(harness: Harness) {
-  const held =
-    "release-merge-lease v2 repo=o/r base=main base_oid=${"1" * 40} candidate_pr=4 candidate_head=${"2" * 40} generation=g tag=v1 merge_method=squash "
-  assert_eq(decide(pr(), held, false).action, "stop")
-  assert_eq(decide(pr(), "unreadable", false).action, "stop", "an unreadable lease fails closed")
-  const mine =
-    "release-merge-lease v2 repo=o/r base=main base_oid=${"1" * 40} candidate_pr=9 candidate_head=abc generation=g tag=v1 merge_method=squash "
-  assert_eq(decide(pr(), mine, false).action, "merge", "the named candidate may land")
+  const head = "a" * 40
+  const lease =
+    fn(repo, base, number, sha, method) { return "release-merge-lease v2 repo=${repo} base=${base} base_oid=${"1" * 40} candidate_pr=${number} candidate_head=${sha} generation=g tag=v1 merge_method=${method} " }
+  const holder = pr({headRefOid: head})
+  assert_eq(
+    decide(holder, lease("o/r", "main", 9, head, "squash"), false).action,
+    "merge",
+    "the holder lands",
+  )
+  const others = [
+    lease("o/x", "main", 9, head, "squash"),
+    lease("o/r", "next", 9, head, "squash"),
+    lease("o/r", "main", 4, head, "squash"),
+    lease("o/r", "main", 9, "b" * 40, "squash"),
+    lease("o/r", "main", 9, head, "merge"),
+    "unreadable",
+    "release-merge-lease v1 candidate_pr=9",
+  ]
+  for held in others {
+    assert_eq(decide(holder, held, false).action, "stop", held)
+  }
 }
 
 pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {

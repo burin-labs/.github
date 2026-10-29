@@ -15,7 +15,7 @@ const MARK = "<!-- smart-ship head="
 
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
-  defaultBranchRef { name } mergeQueue { id }
+  nameWithOwner defaultBranchRef { name } mergeQueue { id }
   pullRequest(number: $number) { id number title state isDraft isCrossRepository isInMergeQueue
     headRefName headRefOid baseRefName mergeStateStatus reviewDecision
     labels(first: 50) { nodes { name } } latestOpinionatedReviews(first: 20) { nodes { state } }
@@ -61,7 +61,12 @@ pub type Pull = {
   commits: {nodes: list<{commit: {statusCheckRollup: Rollup?}}>},
 }
 
-pub type Repo = {defaultBranchRef: {name: string}, mergeQueue: {id: string}?, pullRequest: Pull}
+pub type Repo = {
+  nameWithOwner: string,
+  defaultBranchRef: {name: string},
+  mergeQueue: {id: string}?,
+  pullRequest: Pull,
+}
 
 type Response = {data: {repository: Repo}}
 
@@ -112,6 +117,28 @@ pub fn observe(pr: Pull) -> Facts {
 /**
  * Every landing rule, deterministic and never delegated to a model: `merge`, `update`, `repair`, or `stop`.
  */
+/**
+ * A release cut holds the base through its lease: only the exact holder it names
+ * (repo, base, PR, head, squash) may land; any other or unparseable lease refuses.
+ */
+pub fn lease_admits(lease: string, slug: string, pr: Pull) -> bool {
+  if lease == "clear" {
+    return true
+  }
+  const rows = regex_captures(
+    "^release-merge-lease v2 repo=([^ ]+) base=([^ ]+) base_oid=[0-9a-fA-F]{40} candidate_pr=([1-9][0-9]*) candidate_head=([0-9a-fA-F]{40}) generation=[^ ]+ tag=[^ ]+ merge_method=(merge|rebase|squash)$",
+    trim(lease),
+  )
+  if len(rows) != 1 {
+    return false
+  }
+  const g = rows[0].groups
+  return lowercase(g[0]) == lowercase(slug) && g[1] == pr.baseRefName
+    && g[2] == to_string(pr.number)
+    && lowercase(g[3]) == lowercase(pr.headRefOid)
+    && g[4] == "squash"
+}
+
 pub fn decide(
   repo: Repo,
   lease: string,
@@ -138,9 +165,7 @@ pub fn decide(
     return stop("waiting on " + join(f.pending, ", "))
   }
   if f.approved && pr.mergeStateStatus == "CLEAN" && !blocked {
-    // A release cut holds main through this lease; only the exact candidate it names may land.
-    const candidate = "candidate_pr=${pr.number} candidate_head=${lowercase(pr.headRefOid)} "
-    if lease != "clear" && !contains(lease, candidate) {
+    if !lease_admits(lease, repo.nameWithOwner, pr) {
       return stop("a release merge lease holds ${pr.baseRefName}: ${lease}")
     }
     return {action: "merge", reason: "approved and green", facts: f}
