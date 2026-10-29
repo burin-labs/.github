@@ -59,6 +59,25 @@ const RED = {
 
 pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) {
   assert_eq(decide(pr(), "clear", false).action, "merge")
+  const own = {
+    name: "ship / ship (9)",
+    status: "IN_PROGRESS",
+    checkSuite: {workflowRun: {workflow: {name: "Smart Ship"}}},
+  }
+  const ci = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
+  const looking = {
+    commits: {nodes: [{commit: {statusCheckRollup: {contexts: {nodes: [ci, own]}}}}]},
+  }
+  assert_eq(
+    decide(pr(looking), "clear", false, "Smart Ship").action,
+    "merge",
+    "a look never waits on itself",
+  )
+  assert_eq(
+    decide(pr(looking), "clear", false, "Other").action,
+    "stop",
+    "another workflow still pends",
+  )
   const refusals = [
     {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
     {

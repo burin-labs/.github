@@ -22,7 +22,8 @@ query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner
     comments(last: 100) { nodes { body } }
     reviewThreads(first: 100) { nodes { isResolved path comments(first: 10) { nodes { databaseId body } } } }
     commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
-      ... on CheckRun { name status conclusion databaseId } ... on StatusContext { name: context state } } } } } } } } } }
+      ... on CheckRun { name status conclusion databaseId checkSuite { workflowRun { workflow { name } } } }
+      ... on StatusContext { name: context state } } } } } } } } } }
 """
 
 pub type Check = {
@@ -31,6 +32,7 @@ pub type Check = {
   conclusion?: string?,
   state?: string?,
   databaseId?: int?,
+  checkSuite?: {workflowRun: {workflow: {name: string}}?}?,
 }
 
 type Thread = {
@@ -82,8 +84,11 @@ pub type Facts = {
 }
 
 /** What the pull request's head shows, read once from GitHub's answer. */
-pub fn observe(pr: Pull) -> Facts {
-  const checks = pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []
+pub fn observe(pr: Pull, own: string = "") -> Facts {
+  // A look never waits on, or repairs, the Smart Ship workflow running it.
+  const checks = (pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).filter(
+    { c -> own == "" || c.checkSuite?.workflowRun?.workflow?.name != own },
+  )
   const reviews = pr.latestOpinionatedReviews.nodes.map({ v -> v.state })
   const marks = pr.comments.nodes.filter({ c -> contains(c.body, MARK) })
   return {
@@ -143,10 +148,11 @@ pub fn decide(
   repo: Repo,
   lease: string,
   has_key: bool,
+  own: string = "",
 ) -> {action: string, reason: string, facts: Facts} {
   const pr = repo.pullRequest
   const labels = pr.labels.nodes.map({ l -> l.name })
-  const f = observe(pr)
+  const f = observe(pr, own)
   const stop = { why -> {action: "stop", reason: why, facts: f} }
   const blocked = f.conflict || len(f.failing) > 0 || len(f.threads) > 0
   if pr.state != "OPEN" || !labels.contains("ship") {
@@ -512,7 +518,8 @@ fn main(harness: Harness) {
   const r = read(harness, token, repo, number)
   const pr = r.pullRequest
   const lease = release_lease(harness, token, repo, pr.baseRefName)
-  const d = decide(r, lease, (harness.env.get("OPENAI_API_KEY") ?? "") != "")
+  const has_key = (harness.env.get("OPENAI_API_KEY") ?? "") != ""
+  const d = decide(r, lease, has_key, harness.env.get("GITHUB_WORKFLOW") ?? "")
   let note = d.reason
   if d.action == "merge" {
     // expectedHeadOid is --match-head-commit: GitHub refuses if the head moved since it was judged.
