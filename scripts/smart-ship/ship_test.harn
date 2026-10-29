@@ -422,6 +422,16 @@ type PreparedJob = {nonce: string, head: string}
 
 /** The real look, not a stub, binds its freshly prepared job to the supplied nonce. */
 pipeline test_real_repair_look_binds_prepared_nonce(harness: Harness) {
+  real_repair(harness, false)
+}
+
+/** An interrupted run left its checkout behind; the next attempt still clones and repairs. */
+pipeline test_real_repair_survives_a_stale_checkout(harness: Harness) {
+  real_repair(harness, true)
+}
+
+/** A whole repair look against a local git remote and a fake GitHub. */
+fn real_repair(harness: Harness, stale: bool) {
   const dir = harness.fs.mkdtemp_in_workspace("real-prepare-nonce-")
   const remote = dir + "/o/r.git"
   harness.fs.mkdir(dir + "/o", true)
@@ -461,6 +471,10 @@ pipeline test_real_repair_look_binds_prepared_nonce(harness: Harness) {
   )
   harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
   const work = dir + "/work"
+  if stale {
+    harness.fs.mkdir(work + "/base", true)
+    harness.fs.write_text(work + "/base/old-job", "left by an interrupted runner\n")
+  }
   const result = look(
     harness,
     {
@@ -476,6 +490,9 @@ pipeline test_real_repair_look_binds_prepared_nonce(harness: Harness) {
       nonce: "unique-fixture-nonce",
     },
   )
+  if stale {
+    assert(harness.fs.exists(work + "/base/old-job"), "unconfirmed earlier work stays recoverable")
+  }
   assert_eq(result.action, "repair")
   const prepared = schema_expect(
     json_parse(harness.fs.read_text(work + "/job.json")),
@@ -688,7 +705,8 @@ pipeline test_a_credential_deep_in_a_diff_is_never_published(harness: Harness) {
 
 /**
  * A failed token mint once skipped the look yet still ran the publish step, which then failed
- * starting in a checkout that was never made. Only a look that prepared a repair sets `prepared`.
+ * starting in a checkout that was never made. Only a look that prepared a repair sets `prepared`,
+ * and cleanup removes only the work dir this job's look created.
  */
 pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
   const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
@@ -701,7 +719,21 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
     "always() && inputs.repair && ${prepared}",
     "a prepared repair publishes even after the agent fails",
   )
+  assert_eq(step("Publish the repair").id, "publish")
   assert_eq(step("Remove the checkouts").if, "always()", "cleanup still runs after a failed mint")
+  assert_eq(step("Remove Smart Ship's scripts").if, "always()")
+  assert_eq(step("Remove the checkouts").env.SHIP_NONCE, "\${{ steps.look.outputs.nonce }}")
+  // Each run, attempt and PR owns its checkouts: no leftover, and no other PR in the sweep, shares one.
+  const per_run =
+    "\${{ runner.temp }}/smart-ship-\${{ github.run_id }}-\${{ github.run_attempt }}-\${{ matrix.pr }}"
+  for name in [
+    "Look at the pull request",
+    "Repair without credentials",
+    "Publish the repair",
+    "Remove the checkouts",
+  ] {
+    assert_eq(step(name).env.SHIP_WORK, per_run, name)
+  }
   const dir = harness.fs.mkdtemp_in_workspace("smart-ship-look-step-")
   const fake = dir + "/harn"
   harness.fs.write_text(
@@ -711,18 +743,23 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
       + "[ \"$LOOK\" = failed ] && exit 1\nexit 0\n",
   )
   assert(harness.process.run({program: "/bin/chmod", args: ["755", fake]}).success)
+  // [case, look succeeds, repair prepared, job owns the work dir]
   const cases = [
-    ["prepared", true, "prepared=true\n"],
-    ["stopped", true, ""],
-    ["failed", false, ""],
-    // A persistent runner kept an earlier job's job.json; a look that stops must not arm it.
-    ["stale", true, ""],
+    ["prepared", true, true, true],
+    ["stopped", true, false, true],
+    // A failed look may hold unfinished work and stays for recovery.
+    ["failed", false, false, true],
+    // A persistent runner kept a dir with an earlier job's job.json: never armed, never deleted.
+    ["stale", false, false, false],
   ]
   for c in cases {
-    const work = dir + "/" + c[0]
-    harness.fs.mkdir(work)
-    harness.fs.write_text(work + "/output", "")
-    if c[0] == "stale" {
+    const name = to_string(c[0])
+    const home = dir + "/" + name
+    const work = home + "/work"
+    harness.fs.mkdir(home)
+    harness.fs.write_text(home + "/output", "")
+    if name == "stale" {
+      harness.fs.mkdir(work)
       harness.fs.write_text(
         work + "/job.json",
         "{\"nonce\":\"from-an-earlier-job\",\"head\":\"old\"}",
@@ -732,18 +769,86 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
       {
         program: "/bin/bash",
         args: ["-c", step("Look at the pull request").run],
-        cwd: work,
+        cwd: home,
         env: {
           PATH: dir + ":" + to_string(harness.env.get("PATH") ?? ""),
-          LOOK: c[0],
+          LOOK: name,
           SHIP_WORK: work,
-          GITHUB_OUTPUT: work + "/output",
+          GITHUB_OUTPUT: home + "/output",
         },
         timeout_ms: 30000,
       },
     )
-    assert_eq(ran.success, c[1], c[0] + ": " + ran.stderr)
-    assert_eq(harness.fs.read_text(work + "/output"), c[2], c[0])
+    assert_eq(ran.success, c[1], name + ": " + ran.stderr)
+    const outputs = split(trim(harness.fs.read_text(home + "/output")), "\n")
+    assert_eq(outputs.contains("prepared=true"), c[2], name)
+    const nonces = outputs.filter({ o -> contains(o, "nonce=") }).map(
+      { o -> replace(o, "nonce=", "") },
+    )
+      .to_list()
+    assert_eq(len(nonces) == 1, c[3], name + " claims the work dir")
+    // The real cleanup script, handed the nonce the look step published.
+    const cleaned = harness.process.run(
+      {
+        program: "/bin/bash",
+        args: ["-c", step("Remove the checkouts").run],
+        cwd: home,
+        env: {
+          PATH: to_string(harness.env.get("PATH") ?? ""),
+          SHIP_WORK: work,
+          SHIP_NONCE: len(nonces) == 1 ? nonces[0] : "",
+          SHIP_LOOK: c[1] ? "success" : "failure",
+          SHIP_PREPARED: c[2] ? "true" : "false",
+          SHIP_PUBLISH: c[2] ? "success" : "skipped",
+        },
+        timeout_ms: 30000,
+      },
+    )
+    assert(cleaned.success, name + ": " + cleaned.stderr)
+    const removed = c[3] && c[1]
+    assert_eq(harness.fs.exists(work), !removed, name + ": only confirmed owned work is removed")
+    if !c[3] {
+      assert(contains(cleaned.stdout, "unconfirmed"), name + ": " + cleaned.stdout)
+      assert(contains(harness.fs.read_text(work + "/job.json"), "from-an-earlier-job"), name)
+    }
+  }
+}
+
+/** A failed publish must keep both the repair and its controller records for recovery. */
+pipeline test_cleanup_preserves_an_unpublished_repair_and_its_records(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const step = { name -> steps.filter({ s -> s?.name == name }).to_list()[0] }
+  for outcome in ["failure", "cancelled", "success"] {
+    const dir = harness.fs.mkdtemp_in_workspace("smart-ship-cleanup-")
+    const work = dir + "/work"
+    const workspace = dir + "/workspace"
+    harness.fs.mkdir(work, true)
+    harness.fs.mkdir(workspace + "/.smart-ship", true)
+    harness.fs.write_text(work + "/.owner", "own-nonce\n")
+    harness.fs.write_text(work + "/unfinished", "repair work")
+    harness.fs.write_text(workspace + "/.smart-ship/record", "controller record")
+    const env = {
+      PATH: to_string(harness.env.get("PATH") ?? ""),
+      GITHUB_WORKSPACE: workspace,
+      SHIP_WORK: work,
+      SHIP_NONCE: "own-nonce",
+      SHIP_LOOK: "success",
+      SHIP_PREPARED: "true",
+      SHIP_PUBLISH: outcome,
+    }
+    for name in ["Remove Smart Ship's scripts", "Remove the checkouts"] {
+      const ran = harness.process.run({
+        program: "/bin/bash", args: ["-c", step(name).run], env: env, timeout_ms: 30000,
+      })
+      assert(ran.success, name + ": " + ran.stderr)
+    }
+    if outcome == "success" {
+      assert(!harness.fs.exists(work), "confirmed publication cleans the owned checkout")
+      assert(!harness.fs.exists(workspace + "/.smart-ship"), "confirmed publication cleans the controller")
+    } else {
+      assert_eq(harness.fs.read_text(work + "/unfinished"), "repair work")
+      assert_eq(harness.fs.read_text(work + "/controller/record"), "controller record")
+    }
   }
 }
 
@@ -876,9 +981,8 @@ fn divergent_look(
 
 /**
  * A conflicted head once threw its saved work away: the next look deleted the trusted same-head
- * WIP instead of restoring it. A WIP from another head, an untrusted note or another base goes.
- * "base-moved" is work saved while the head was clean, before main moved into a conflict: laid
- * over the new merge it would revert main's change, so it goes and the merge starts fresh.
+ * WIP instead of restoring it. A WIP from another head or an untrusted note goes.
+ * A trusted WIP on an unknown or moved base is preserved and stops rather than reverting main.
  */
 pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harness) {
   for c in ["trusted", "untrusted", "wrong-head", "other-base", "base-moved", "no-base"] {
@@ -903,6 +1007,18 @@ pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harn
     const wip = f.git(["rev-parse", "HEAD"])
     f.git(["update-ref", "refs/smart-ship/wip/9", wip])
     f.git(["checkout", "--quiet", "main"])
+    if ["other-base", "base-moved", "no-base"].contains(c) {
+      let failure = ""
+      try {
+        divergent_look(harness, f, false, wip, wip, true)
+      } catch (e) {
+        failure = to_string(e)
+      }
+      assert(contains(failure, "was kept for recovery"), c + ": " + failure)
+      const calls = harness.testing.http_mock_calls({include_sensitive: true})
+      assert(!calls.any({ call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9") }), c)
+      continue
+    }
     const seen = divergent_look(harness, f, false, wip, wip, c != "untrusted")
     assert_eq(seen.result.action, "repair", c)
     const pr_dir = f.dir + "/work/pr"
@@ -930,6 +1046,41 @@ pipeline test_a_timed_out_repair_saves_its_tree_and_base(harness: Harness) {
   for conflict in [true, false] {
     timed_out_save(harness, conflict)
   }
+}
+
+/** A wall-clock kill leaves no result file, but its edited tree still needs a signed checkpoint. */
+pipeline test_a_killed_repair_saves_a_signed_checkpoint(harness: Harness) {
+  const f = divergent(harness, true)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  harness.fs.write_text(f.dir + "/work/pr/file.txt", "half resolved\n")
+  const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
+  const commit = red_check.commits.nodes[0].commit + {oid: f.head}
+  const state = pr(red_check + {headRefOid: f.head, mergeStateStatus: "DIRTY", commits: {nodes: [{commit: commit}]}})
+  const api = "https://api.github.com"
+  const wip = "b" * 40
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("POST", api + "/graphql", {responses: [
+    {status: 200, body: json_stringify({data: {repository: state}})},
+    {status: 200, body: json_stringify({data: {createCommitOnBranch: {
+      commit: {oid: wip, url: "https://example.invalid/commit", signature: {isValid: true,
+        state: "VALID", wasSignedByGitHub: true}}, ref: {name: "smart-ship/wip-9"},
+    }}})},
+  ]})
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/ref/heads/smart-ship/*", {status: 404, body: "{}"})
+  harness.testing.http_mock("POST", api + "/repos/o/r/git/refs", {status: 201, body: "{}"})
+  harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/smart-ship/wip/9", {status: 200, body: "[]"})
+  harness.testing.http_mock("DELETE", api + "/repos/o/r/git/refs/heads/smart-ship/*", {status: 204, body: ""})
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(harness, {repo: "o/r", number: 9, token: "fixture-token", work: f.dir + "/work",
+    publish: true, repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file://" + f.dir + "/", nonce: "fixture-nonce"})
+  const calls = harness.testing.http_mock_calls({include_sensitive: true})
+  assert_eq(result.action, "published")
+  assert(calls.any({c -> c.method == "POST" && contains(c.url, "/git/refs")
+    && contains(c.body ?? "", "refs/smart-ship/wip/9") && contains(c.body ?? "", wip)}), "checkpoint ref")
+  assert(calls.any({c -> c.method == "POST" && contains(c.url, "/issues/9/comments")
+    && contains(c.body ?? "", "smart-ship continue=") && contains(c.body ?? "", "spend: unknown")}),
+    "the checkpoint and unknown spend are recorded")
 }
 
 fn timed_out_save(harness: Harness, conflict: bool) {
@@ -1001,4 +1152,29 @@ pipeline test_a_failed_publish_is_answered_once_and_not_published(harness: Harne
   assert_eq(len(posted), 1)
   assert(contains(posted[0], "Publishing the repair failed"), posted[0])
   assert(contains(posted[0], "<!-- smart-ship done=abc -->"), "the attempt is answered once")
+}
+
+/** A moved head cannot accept the repair; keep the checkout instead of reporting success. */
+pipeline test_a_moved_head_does_not_discard_the_unpublished_repair(harness: Harness) {
+  const work = harness.fs.mkdtemp_in_workspace("smart-ship-moved-head-")
+  harness.fs.mkdir(work + "/pr/.git", true)
+  harness.fs.write_text(work + "/job.json", json_stringify({
+    head: "old-head", base_oid: "1" * 40, conflicted: [], threads: [],
+  }))
+  harness.fs.write_text(work + "/pr/.git/ship-result.json", json_stringify({
+    outcome: "fixed", summary: "fixed it", spend: "0.02",
+  }))
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  harness.testing.http_mock("POST", api + "/graphql", {
+    status: 200, body: json_stringify({data: {repository: pr(red())}}),
+  })
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(harness, {
+    repo: "o/r", number: 9, token: "fixture-token", work: work, publish: true,
+    repair: true, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file:///nonexistent-smart-ship-host/", nonce: "",
+  })
+  assert_eq(result.action, "publish_failed")
+  assert(contains(result.reason, "moved, closed or was held"), result.reason)
 }

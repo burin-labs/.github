@@ -424,9 +424,9 @@ pub fn checkout(
   base: string,
   dirty: bool,
 ) {
-  sh(tools, ["git", "clone", "--quiet", url, work + "/base"], env)
-  sh(tools, ["git", "checkout", "--quiet", "--detach", head], env, work + "/base")
-  sh(tools, ["git", "clone", "--quiet", "--shared", work + "/base", work + "/pr"])
+  sh(tools, ["git", "clone", "--quiet", url, work + "/pristine"], env)
+  sh(tools, ["git", "checkout", "--quiet", "--detach", head], env, work + "/pristine")
+  sh(tools, ["git", "clone", "--quiet", "--shared", work + "/pristine", work + "/pr"])
   sh(tools, ["git", "checkout", "--quiet", "--detach", head], {}, work + "/pr")
   const base_oid = sh(tools, ["git", "rev-parse", "origin/" + base], {}, work + "/pr")
   if !dirty {
@@ -469,6 +469,10 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
   const number = job.number
   const pr = r.pullRequest
   const env = auth(token)
+  // Leftovers are never deleted here: they may hold unconfirmed work. Only an occupied target stops us.
+  for dir in [work + "/pristine", work + "/pr"] {
+    require !harness.fs.exists(dir), "an earlier run left " + dir + "; not overwriting it"
+  }
   const tree = checkout(
     harness.tools,
     "${job.git_host}${repo}.git",
@@ -488,19 +492,21 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
       harness.tools,
       ["git", "fetch", "--quiet", "origin", "refs/smart-ship/wip/${number}"],
       env,
-      work + "/base",
+      work + "/pristine",
     )
   }
   // Saved work continues only on the base it was saved against: laid over a merge of a newer base,
   // its files would silently revert that base's changes. Work naming no base is not restored.
   const saved_on = wip == "" ? "" : regex_captures(
     ", on base ([0-9a-f]{40})$",
-    sh(harness.tools, ["git", "log", "-1", "--format=%s", wip], env, work + "/base"),
+    sh(harness.tools, ["git", "log", "-1", "--format=%s", wip], env, work + "/pristine"),
   )[0]?.groups?.[0]
     ?? ""
-  const continuing = wip != "" && f.kept.contains(wip)
-    && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/base") == pr.headRefOid
-    && saved_on == base_oid
+  const trusted_wip = wip != "" && f.kept.contains(wip)
+    && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/pristine") == pr.headRefOid
+  require !trusted_wip || saved_on == base_oid,
+    "the saved repair ${wip} is on a different or unknown base; it was kept for recovery"
+  const continuing = trusted_wip
   if continuing {
     // The saved commit was fetched into the trusted clone; the agent's copy only sees its files,
     // laid over this checkout (and its merge, conflicted or not) where the saved work changed them.
@@ -518,7 +524,7 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
           wip,
         ],
         env,
-        work + "/base",
+        work + "/pristine",
       ),
       "\n",
     )
@@ -528,7 +534,7 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
       harness.tools,
       [
         "git",
-        "--git-dir=" + work + "/base/.git",
+        "--git-dir=" + work + "/pristine/.git",
         "--work-tree=" + work + "/pr",
         "restore",
         "--source=" + wip,
@@ -642,15 +648,16 @@ fn save_wip(
   head: string,
   base_oid: string,
 ) -> string {
-  const base = work + "/base"
+  const base = work + "/pristine"
   sh(
     harness.tools,
     ["git", "--git-dir=" + base + "/.git", "--work-tree=" + work + "/pr", "add", "-A"],
   )
   const why = diff_refusal(harness.tools, base, head)
-  if why != "" {
-    return why == "empty" ? "No unfinished work to keep." : "The unfinished work was not kept: ${why}."
+  if why == "empty" {
+    return "No unfinished work to keep."
   }
+  require why == "", "The unfinished work was not kept: ${why}."
   const staging = "smart-ship/wip-${number}-" + substring(head, 0, 12)
   let kept = ""
   try {
@@ -751,7 +758,7 @@ fn publish_merge(
   pr: Pull,
   job: dict,
 ) -> string {
-  const base = work + "/base"
+  const base = work + "/pristine"
   const env = auth(opts.installation_token ?? "")
   const staging = "harn-worktree-staging/smart-ship-merge-${pr.number}-"
     + substring(job.head, 0, 12)
@@ -838,8 +845,8 @@ fn publish(
   const job = json_parse(harness.fs.read_text(work + "/job.json"))
   const result = work + "/pr/.git/ship-result.json"
   const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {
-    outcome: "stuck",
-    summary: "The repair stopped without a result.",
+    outcome: "timeout",
+    summary: "The repair stopped without a result; its unfinished work was checked for a checkpoint.",
     spend: "unknown",
   }
   const pr = r.pullRequest
@@ -847,11 +854,9 @@ fn publish(
   let note = quiet(to_string(out.summary ?? "")) + "\n\nRepair model spend: "
     + quiet(to_string(out.spend ?? "unknown"))
     + "."
-  if pr.headRefOid != job.head || pr.state != "OPEN" || !labels.contains("ship")
-    || HOLDS.any({ h -> labels.contains(h) }) {
-    return "The pull request moved, closed or was held during the repair; nothing was published. "
-      + note
-  }
+  require pr.headRefOid == job.head && pr.state == "OPEN" && labels.contains("ship")
+    && !HOLDS.any({ h -> labels.contains(h) }),
+    "The pull request moved, closed or was held during the repair; nothing was published."
   if out.outcome == "fixed" {
     let pushed = ""
     if len(job.conflicted) > 0 {
@@ -860,15 +865,15 @@ fn publish(
       // The trusted clone's git reads the agent's files; nothing in the agent's own .git runs with the token.
       sh(
         harness.tools,
-        ["git", "--git-dir=" + work + "/base/.git", "--work-tree=" + work + "/pr", "add", "-A"],
+        ["git", "--git-dir=" + work + "/pristine/.git", "--work-tree=" + work + "/pr", "add", "-A"],
       )
-      staged_clean(harness.tools, work + "/base", job.head)
+      staged_clean(harness.tools, work + "/pristine", job.head)
       pushed = signed(
         harness,
         opts,
         repo,
         pr.headRefName,
-        work + "/base",
+        work + "/pristine",
         "Smart Ship repair for #${number}",
       )
     }
@@ -876,7 +881,7 @@ fn publish(
     if wip_commit(harness, opts, repo, number) != "" {
       gh(harness, opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
     }
-  } else if out.outcome == "timeout" {
+  } else if ["timeout", "stuck"].contains(out.outcome) {
     note = save_wip(harness, opts, work, repo, number, job.head, to_string(job.base_oid)) + " "
       + note
   }
