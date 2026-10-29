@@ -752,3 +752,235 @@ pipeline test_agent_text_cannot_post_a_marker_or_a_credential(harness: Harness) 
   assert(!contains(said, "<!--"), said)
   assert(!contains(said, "ghp_"), said)
 }
+
+/** A local remote whose topic head and main both changed file.txt, so merging main conflicts. */
+fn divergent(harness: Harness) {
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-divergent-")
+  const remote = dir + "/o/r.git"
+  harness.fs.mkdir(remote, true)
+  const git = { args ->
+    sh(
+      harness.tools,
+      ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + args,
+      {},
+      remote,
+    )
+  }
+  git(["init", "--quiet", "--initial-branch=main"])
+  harness.fs.write_text(remote + "/file.txt", "ancestor\n")
+  git(["add", "file.txt"])
+  git(["commit", "--quiet", "-m", "ancestor"])
+  git(["checkout", "--quiet", "-b", "topic"])
+  harness.fs.write_text(remote + "/file.txt", "topic\n")
+  git(["commit", "--quiet", "-am", "topic"])
+  const head = git(["rev-parse", "HEAD"])
+  git(["checkout", "--quiet", "main"])
+  harness.fs.write_text(remote + "/file.txt", "base\n")
+  git(["commit", "--quiet", "-am", "base"])
+  return {dir: dir, remote: remote, git: git, head: head, base_oid: git(["rev-parse", "HEAD"])}
+}
+
+/**
+ * A whole look at the divergent PR; `wip` is the saved commit GitHub reports, `kept` the note's.
+ */
+fn divergent_look(
+  harness: Harness,
+  f: dict,
+  publish: bool,
+  wip: string,
+  kept: string,
+  trusted: bool,
+) {
+  const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
+  const commit = red_check.commits.nodes[0].commit + {oid: f.head}
+  const notes = kept == "" ? [] : [
+    {viewerDidAuthor: trusted, body: "<!-- smart-ship continue=${f.head} wip=${kept} -->"},
+  ]
+  const state = pr(
+    red_check
+      + {
+        headRefOid: f.head,
+        mergeStateStatus: "DIRTY",
+        comments: page(notes),
+        commits: {nodes: [{commit: commit}]},
+      },
+  )
+  const api = "https://api.github.com"
+  const refs = wip == "" ? [] : [{ref: "refs/smart-ship/wip/9", object: {sha: wip}}]
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {status: 200, body: json_stringify({data: {repository: state}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/release-merge-lease/main",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/smart-ship/wip/9",
+    {status: 200, body: json_stringify(refs)},
+  )
+  harness.testing.http_mock(
+    "DELETE",
+    api + "/repos/o/r/git/refs/smart-ship/wip/9",
+    {status: 204, body: ""},
+  )
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  // The saved commit's scratch branch: absent, then created.
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/ref/heads/smart-ship/*",
+    {status: 404, body: "{\"message\":\"Not Found\"}"},
+  )
+  harness.testing.http_mock(
+    "POST",
+    api + "/repos/o/r/git/refs",
+    {status: 201, body: "{\"ref\":\"refs/heads/smart-ship/wip\"}"},
+  )
+  for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
+    harness.testing.http_mock(
+      method,
+      api + "/*",
+      {status: 500, body: "{\"message\":\"unexpected\"}"},
+    )
+  }
+  const result = look(
+    harness,
+    {
+      repo: "o/r",
+      number: 9,
+      token: "fixture-token",
+      work: f.dir + "/work",
+      publish: publish,
+      repair: true,
+      run_id: "",
+      opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file://" + f.dir + "/",
+      nonce: "fixture-nonce",
+    },
+  )
+  return {result: result, calls: harness.testing.http_mock_calls({include_sensitive: true})}
+}
+
+/**
+ * A conflicted head once threw its saved work away: the next look deleted the trusted same-head
+ * WIP instead of restoring it. A WIP from another head, an untrusted note or another base goes.
+ */
+pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harness) {
+  for c in ["trusted", "untrusted", "wrong-head", "other-base"] {
+    const f = divergent(harness)
+    f.git(["checkout", "--quiet", "topic"])
+    if c == "wrong-head" {
+      f.git(["checkout", "--quiet", "-b", "wrong-parent", "HEAD^"])
+    }
+    harness.fs.write_text(f.remote + "/file.txt", "saved unfinished resolution\n")
+    harness.fs.write_text(f.remote + "/added.txt", "new saved file\n")
+    f.git(["add", "file.txt", "added.txt"])
+    const merging = c == "other-base" ? "1" * 40 : f.base_oid
+    f.git(
+      [
+        "commit",
+        "--quiet",
+        "-m",
+        "Smart Ship unfinished repair for #9 at ${f.head}, merging ${merging}",
+      ],
+    )
+    const wip = f.git(["rev-parse", "HEAD"])
+    f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+    f.git(["checkout", "--quiet", "main"])
+    const seen = divergent_look(harness, f, false, wip, wip, c != "untrusted")
+    assert_eq(seen.result.action, "repair", c)
+    const pr_dir = f.dir + "/work/pr"
+    const restored = harness.fs.read_text(pr_dir + "/file.txt") == "saved unfinished resolution\n"
+      && harness.fs.exists(pr_dir + "/added.txt")
+    const resumed = contains(
+      harness.fs.read_text(pr_dir + "/.git/ship-task.json"),
+      "This continues an earlier attempt that ran out of time",
+    )
+    const deleted = seen.calls.any(
+      { call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9") },
+    )
+    assert_eq([restored, resumed, deleted], [c == "trusted", c == "trusted", c != "trusted"], c)
+    if c != "trusted" {
+      assert(contains(harness.fs.read_text(pr_dir + "/file.txt"), "<<<<<<<"), c + ": fresh merge")
+    }
+  }
+}
+
+/**
+ * A timed-out repair of a conflicted head once kept nothing: only a clean head's tree was saved.
+ * Its merge in progress is now committed as the WIP, named with the base it merged.
+ */
+pipeline test_a_timed_out_conflict_repair_saves_its_merge(harness: Harness) {
+  const f = divergent(harness)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  const pr_dir = f.dir + "/work/pr"
+  harness.fs.write_text(pr_dir + "/file.txt", "half resolved\n")
+  harness.fs.write_text(
+    pr_dir + "/.git/ship-result.json",
+    json_stringify({outcome: "timeout", summary: "ran out of time", spend: "0.01"}),
+  )
+  const seen = divergent_look(harness, f, true, "", "", true)
+  const commits = seen.calls.filter(
+    { call ->
+      call.method == "POST" && contains(call.url, "/graphql")
+        && contains(call.body ?? "", "createCommitOnBranch")
+    },
+  )
+    .to_list()
+  assert_eq(len(commits), 1, "the merge in progress went to GitHub as the saved commit")
+  assert(contains(commits[0].body, "merging ${f.base_oid}"), commits[0].body)
+  assert(contains(commits[0].body, base64_encode("half resolved\n")), commits[0].body)
+  // The fake GitHub answers the commit with a PR, so saving fails: that is publish_failed, not published.
+  assert_eq(seen.result.action, "publish_failed")
+}
+
+/** A caught publish failure was once returned as published and exited 0; it now fails the step. */
+pipeline test_a_failed_publish_is_answered_once_and_not_published(harness: Harness) {
+  const work = harness.fs.mkdtemp_in_workspace("smart-ship-publish-failed-")
+  harness.fs.mkdir(work + "/pr/.git", true)
+  harness.fs.write_text(
+    work + "/job.json",
+    json_stringify({head: "abc", base_oid: "1" * 40, conflicted: [], threads: []}),
+  )
+  harness.fs.write_text(
+    work + "/pr/.git/ship-result.json",
+    json_stringify({outcome: "fixed", summary: "fixed it", spend: "0.02"}),
+  )
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {status: 200, body: json_stringify({data: {repository: pr(red())}})},
+  )
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const result = look(
+    harness,
+    {
+      repo: "o/r",
+      number: 9,
+      token: "fixture-token",
+      work: work,
+      publish: true,
+      repair: true,
+      run_id: "",
+      opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file:///nonexistent-smart-ship-host/",
+      nonce: "",
+    },
+  )
+  assert_eq(result.action, "publish_failed")
+  assert(result.error != "", "the error travels with the outcome")
+  const posted = harness.testing.http_mock_calls({include_sensitive: true}).filter(
+    { c -> c.method == "POST" && contains(c.url, "/issues/9/comments") },
+  )
+    .map({ c -> schema_expect(json_parse(c.body), schema_of(Posted)).body })
+    .to_list()
+  assert_eq(len(posted), 1)
+  assert(contains(posted[0], "Publishing the repair failed"), posted[0])
+  assert(contains(posted[0], "<!-- smart-ship done=abc -->"), "the attempt is answered once")
+}

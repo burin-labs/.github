@@ -491,10 +491,38 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
       work + "/base",
     )
   }
-  const continuing = wip != "" && len(conflicted) == 0 && f.kept.contains(wip)
+  // A saved merge continues only on the base it merged; a stale one would revert the newer base.
+  const merged = wip == "" ? "" : regex_captures(
+    ", merging ([0-9a-f]{40})$",
+    sh(harness.tools, ["git", "log", "-1", "--format=%s", wip], env, work + "/base"),
+  )[0]?.groups?.[0]
+    ?? ""
+  const continuing = wip != "" && f.kept.contains(wip)
     && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/base") == pr.headRefOid
+    && (merged == "" || (len(conflicted) > 0 && merged == base_oid))
   if continuing {
-    // The saved commit was fetched into the trusted clone; the agent's copy only sees its files.
+    // The saved commit was fetched into the trusted clone; the agent's copy only sees its files,
+    // laid over this checkout (and its merge, conflicted or not) where the saved work changed them.
+    const changed = split(
+      sh(
+        harness.tools,
+        [
+          "git",
+          "-c",
+          "core.quotePath=false",
+          "diff",
+          "--name-only",
+          "--no-renames",
+          pr.headRefOid,
+          wip,
+        ],
+        env,
+        work + "/base",
+      ),
+      "\n",
+    )
+      .filter({ p -> p != "" })
+    require len(changed) > 0, "the saved work ${wip} changes nothing"
     sh(
       harness.tools,
       [
@@ -505,8 +533,8 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
         "--source=" + wip,
         "--worktree",
         "--",
-        ":/",
-      ],
+      ]
+        + changed,
       env,
       work + "/pr",
     )
@@ -591,9 +619,16 @@ fn wip_commit(harness: Harness, opts: GithubClientOptions, repo: string, number:
   return len(held) == 0 ? "" : held[0].object.sha
 }
 
+/** The saved commit's subject; a conflicted repair's also names the base commit it merged. */
+fn wip_headline(number: int, head: string, merging: string) -> string {
+  const at = "Smart Ship unfinished repair for #${number} at ${head}"
+  return merging == "" ? at : at + ", merging ${merging}"
+}
+
 /**
  * Keep an unfinished repair's tree on the private ref refs/smart-ship/wip/<PR>, its parent the
  * head it started from. A diff over the size cap, or one holding anything shaped like a credential, is not kept.
+ * A conflicted repair's tree is its merge in progress, kept whole whatever its markers.
  */
 fn save_wip(
   harness: Harness,
@@ -602,6 +637,7 @@ fn save_wip(
   repo: string,
   number: int,
   head: string,
+  merging: string,
 ) -> string {
   const base = work + "/base"
   sh(
@@ -615,14 +651,7 @@ fn save_wip(
   const staging = "smart-ship/wip-${number}-" + substring(head, 0, 12)
   let kept = ""
   try {
-    kept = signed(
-      harness,
-      opts,
-      repo,
-      staging,
-      base,
-      "Smart Ship unfinished repair for #${number} at ${head}",
-    )
+    kept = signed(harness, opts, repo, staging, base, wip_headline(number, head, merging))
     const ref = "refs/smart-ship/wip/${number}"
     if wip_commit(harness, opts, repo, number) == "" {
       gh(harness, opts, "/repos/${repo}/git/refs", "POST", {ref: ref, sha: kept})
@@ -844,8 +873,9 @@ fn publish(
     if wip_commit(harness, opts, repo, number) != "" {
       gh(harness, opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
     }
-  } else if out.outcome == "timeout" && len(job.conflicted) == 0 {
-    note = save_wip(harness, opts, work, repo, number, job.head) + " " + note
+  } else if out.outcome == "timeout" {
+    const merging = len(job.conflicted) > 0 ? to_string(job.base_oid) : ""
+    note = save_wip(harness, opts, work, repo, number, job.head, merging) + " " + note
   }
   for reply in out.replies ?? [] {
     if job.threads.contains(reply?.id) {
@@ -966,7 +996,7 @@ fn main(harness: Harness) {
   harness.stdio.println(
     "smart-ship digests: token=${digest(token)} header=${digest(header)} canary=${digest(canary)} canary64=${digest(base64_encode(canary))}",
   )
-  look(
+  const d = look(
     harness,
     {
       repo: repo,
@@ -981,6 +1011,8 @@ fn main(harness: Harness) {
       nonce: harness.env.get("SHIP_NONCE") ?? "",
     },
   )
+  // The note and marker are posted; the step still fails so a lost repair is not read as landed.
+  require d.action != "publish_failed", "publishing the repair failed: " + to_string(d?.error)
 }
 
 /** One look at one pull request; returns what it decided. */
@@ -1007,20 +1039,24 @@ pub fn look(harness: Harness, job: Look) {
       schema_of(Started),
     )
     const started = begun.head
+    let failure = ""
     const note = try {
       publish(harness, opts, work, repo, number, r)
     } catch (e) {
+      failure = quiet(to_string(e))
       // The spend is reported even when publishing fails.
       const result = work + "/pr/.git/ship-result.json"
       const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {}
       const spent = out?.spend
-      "Publishing the repair failed: " + quiet(to_string(e)) + "\n\nRepair model spend: "
+      "Publishing the repair failed: " + failure + "\n\nRepair model spend: "
         + quiet(to_string(spent ?? "unknown"))
         + "."
     }
+    // The attempt is answered either way, so it counts once; a failure still shows red.
     say("${note}\n\n${DONE}${started} -->")
-    harness.stdio.println("${repo}#${number}: published: ${note}")
-    return {action: "published", reason: note}
+    const action = failure == "" ? "published" : "publish_failed"
+    harness.stdio.println("${repo}#${number}: ${action}: ${note}")
+    return {action: action, reason: note, error: failure}
   }
   const lease = release_lease(harness, opts, repo, pr.baseRefName)
   const d = decide(r, lease, job.repair, own_workflow(harness, opts, repo, job.run_id))
