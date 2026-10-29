@@ -30,4 +30,3 @@ jobs:
     secrets:
       RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
       RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

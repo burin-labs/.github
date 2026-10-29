@@ -1,6 +1,21 @@
 /** The landing gate is the one place a wrong answer merges unreviewed or red code. */
 import { Repo, decide } from "./ship.harn"
 
+fn page(nodes: list) {
+  return {totalCount: len(nodes), nodes: nodes}
+}
+
+fn checks(nodes: list, total: int = -1) {
+  const rollup = {contexts: {totalCount: total < 0 ? len(nodes) : total, nodes: nodes}}
+  return {commits: {nodes: [{commit: {signature: {isValid: true}, statusCheckRollup: rollup}}]}}
+}
+
+const GREEN = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
+
+fn red() {
+  return checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE", databaseId: 7}])
+}
+
 fn pr(over: dict = {}) -> Repo {
   const pull = {
     id: "PR_1",
@@ -13,48 +28,20 @@ fn pr(over: dict = {}) -> Repo {
     headRefName: "b",
     headRefOid: "abc",
     baseRefName: "main",
+    baseRef: {target: {oid: "1" * 40}},
     mergeStateStatus: "CLEAN",
-    reviewDecision: "APPROVED",
-    labels: {nodes: [{name: "ship"}]},
-    latestOpinionatedReviews: {nodes: [{state: "APPROVED", commit: {oid: "abc"}}]},
-    comments: {nodes: []},
-    reviewThreads: {nodes: []},
-    commits: {
-      nodes: [
-        {
-          commit: {
-            statusCheckRollup: {
-              contexts: {nodes: [{name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}]},
-            },
-          },
-        },
-      ],
-    },
+    reviewDecision: nil,
+    labels: page([{name: "ship"}]),
+    latestOpinionatedReviews: page([{state: "APPROVED", commit: {oid: "abc"}}]),
+    comments: page([]),
+    reviewThreads: page([]),
   }
   return {
     nameWithOwner: "o/r",
     defaultBranchRef: {name: "main"},
     mergeQueue: nil,
-    pullRequest: pull + over,
+    pullRequest: pull + checks([GREEN]) + over,
   }
-}
-
-const RED = {
-  commits: {
-    nodes: [
-      {
-        commit: {
-          statusCheckRollup: {
-            contexts: {
-              nodes: [
-                {name: "CI status", status: "COMPLETED", conclusion: "FAILURE", databaseId: 7},
-              ],
-            },
-          },
-        },
-      },
-    ],
-  },
 }
 
 pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) {
@@ -64,11 +51,7 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
     status: "IN_PROGRESS",
     checkSuite: {workflowRun: {workflow: {name: "Smart Ship"}}},
   }
-  const ci = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
-  const looking = {
-    mergeStateStatus: "UNSTABLE",
-    commits: {nodes: [{commit: {statusCheckRollup: {contexts: {nodes: [ci, own]}}}}]},
-  }
+  const looking = {mergeStateStatus: "UNSTABLE"} + checks([GREEN, own])
   assert_eq(
     decide(pr(looking), "clear", false, "Smart Ship").action,
     "merge",
@@ -82,68 +65,74 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   const refusals = [
     {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
     {
-      reviewDecision: nil,
-      latestOpinionatedReviews: {
-        nodes: [
+      latestOpinionatedReviews: page(
+        [
           {state: "APPROVED", commit: {oid: "abc"}},
           {state: "CHANGES_REQUESTED", commit: {oid: "abc"}},
         ],
-      },
+      ),
     },
+    {latestOpinionatedReviews: page([])},
     {headRefOid: "def"},
     {reviewDecision: "APPROVED", headRefOid: "def"},
-    {labels: {nodes: [{name: "ship"}, {name: "hold"}]}},
-    {labels: {nodes: []}},
+    {labels: page([{name: "ship"}, {name: "hold"}])},
+    {labels: page([])},
     {isCrossRepository: true},
     {isDraft: true},
     {baseRefName: "release"},
     {mergeStateStatus: "UNKNOWN"},
+    {mergeStateStatus: "DIRTY"},
+    checks([]),
+    checks([{name: "CI status", status: "IN_PROGRESS"}]),
+    checks([{name: "CI status", status: "COMPLETED", conclusion: "CANCELLED"}]),
     {
       commits: {
         nodes: [
-          {
-            commit: {
-              statusCheckRollup: {contexts: {nodes: [{name: "CI status", status: "IN_PROGRESS"}]}},
-            },
-          },
+          {commit: {signature: {isValid: false}, statusCheckRollup: {contexts: page([GREEN])}}},
         ],
       },
     },
-    {
-      reviewThreads: {
-        nodes: [
-          {isResolved: false, path: "a.rs", comments: {nodes: [{databaseId: 3, body: "why?"}]}},
-        ],
-      },
-    },
+    {reviewThreads: page([{isResolved: false, path: "a.rs", comments: {nodes: []}}])},
   ]
   for over in refusals {
     assert(decide(pr(over), "clear", true).action != "merge", to_string(over))
   }
 }
 
+pipeline test_a_page_it_did_not_read_refuses(harness: Harness) {
+  const unread = [
+    checks([GREEN], 2),
+    {reviewThreads: {totalCount: 1, nodes: []}},
+    {labels: {totalCount: 2, nodes: [{name: "ship"}]}},
+    {latestOpinionatedReviews: {totalCount: 2, nodes: [{state: "APPROVED", commit: {oid: "abc"}}]}},
+  ]
+  for over in unread {
+    const d = decide(pr(over), "clear", true)
+    assert_eq(d.action, "stop", to_string(over))
+    assert(contains(d.reason, "completely"), d.reason)
+  }
+}
+
 pipeline test_a_release_lease_holds_every_other_merge(harness: Harness) {
   const head = "a" * 40
   const lease =
-    fn(repo, base, number, sha, method) { return "release-merge-lease v2 repo=${repo} base=${base} base_oid=${"1" * 40} candidate_pr=${number} candidate_head=${sha} generation=g tag=v1 merge_method=${method} " }
+    fn(repo, base, base_oid, number, sha, method) { return "release-merge-lease v2 repo=${repo} base=${base} base_oid=${base_oid} candidate_pr=${number} candidate_head=${sha} generation=g tag=v1 merge_method=${method}" }
+  const base = "1" * 40
   const holder = pr(
-    {
-      headRefOid: head,
-      latestOpinionatedReviews: {nodes: [{state: "APPROVED", commit: {oid: head}}]},
-    },
+    {headRefOid: head, latestOpinionatedReviews: page([{state: "APPROVED", commit: {oid: head}}])},
   )
   assert_eq(
-    decide(holder, lease("o/r", "main", 9, head, "squash"), false).action,
+    decide(holder, lease("o/r", "main", base, 9, head, "squash"), false).action,
     "merge",
     "the holder lands",
   )
   const others = [
-    lease("o/x", "main", 9, head, "squash"),
-    lease("o/r", "next", 9, head, "squash"),
-    lease("o/r", "main", 4, head, "squash"),
-    lease("o/r", "main", 9, "b" * 40, "squash"),
-    lease("o/r", "main", 9, head, "merge"),
-    "unreadable",
+    lease("o/x", "main", base, 9, head, "squash"),
+    lease("o/r", "next", base, 9, head, "squash"),
+    lease("o/r", "main", "2" * 40, 9, head, "squash"),
+    lease("o/r", "main", base, 4, head, "squash"),
+    lease("o/r", "main", base, 9, "b" * 40, "squash"),
+    lease("o/r", "main", base, 9, head, "merge"),
     "release-merge-lease v1 candidate_pr=9",
   ]
   for held in others {
@@ -152,25 +141,25 @@ pipeline test_a_release_lease_holds_every_other_merge(harness: Harness) {
 }
 
 pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
-  assert_eq(decide(pr(RED), "clear", true).action, "repair")
-  assert_eq(decide(pr(RED), "clear", false).action, "stop", "no model key, no repair")
-  assert_eq(decide(pr(RED + {reviewDecision: "REVIEW_REQUIRED"}), "clear", true).action, "repair")
-  assert_eq(
-    decide(pr({reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"}), "clear", true)
-      .action,
-    "stop",
-    "green waits for review",
-  )
-  const answered = {comments: {nodes: [{body: "x <!-- smart-ship head=abc -->"}]}}
-  assert_eq(decide(pr(RED + answered), "clear", true).reason, "already answered at this head")
+  assert_eq(decide(pr(red()), "clear", true).action, "repair")
+  assert_eq(decide(pr(red()), "clear", false).reason, "blocked, and repair is off here")
+  assert_eq(decide(pr(red() + {reviewDecision: "REVIEW_REQUIRED"}), "clear", true).action, "repair")
+  const answered = {comments: page([{body: "x <!-- smart-ship head=abc -->"}])}
+  assert_eq(decide(pr(red() + answered), "clear", true).reason, "already answered at this head")
   const spent = {
-    comments: {
-      nodes: [
+    comments: page(
+      [
         {body: "<!-- smart-ship head=a -->"},
         {body: "<!-- smart-ship head=b -->"},
         {body: "<!-- smart-ship head=c -->"},
       ],
-    },
+    ),
   }
-  assert_eq(decide(pr(RED + spent), "clear", true).action, "stop")
+  assert_eq(decide(pr(red() + spent), "clear", true).action, "stop")
+  const unread_marks = {comments: {totalCount: 101, nodes: []}}
+  assert_eq(
+    decide(pr(red() + unread_marks), "clear", true).action,
+    "stop",
+    "an unread attempt count never repairs",
+  )
 }

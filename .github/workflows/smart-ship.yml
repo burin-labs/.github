@@ -13,6 +13,12 @@ on:
         description: JSON runner label, or list of labels, for each look.
         type: string
         default: '"ubuntu-24.04"'
+      repair:
+        description: >-
+          Let a blocked pull request get one bounded repair agent. Off unless a
+          caller opts in; the agent also needs OPENAI_API_KEY.
+        type: boolean
+        default: false
       repair-environment:
         description: >-
           GitHub environment whose secret OPENAI_API_KEY reaches the repair
@@ -112,10 +118,43 @@ jobs:
         working-directory: .smart-ship/scripts/smart-ship
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REPO: ${{ github.repository }}
           PR: ${{ matrix.pr }}
+          SHIP_REPAIR: ${{ inputs.repair && secrets.OPENAI_API_KEY != '' && github.event_name != 'pull_request_review' }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship
         run: |
           set -euo pipefail
           harn install --locked
           harn run --no-sandbox ship.harn
+      # The agent runs in Harn's sandbox in the checkout: no GitHub token in this step, no child
+      # network, and the model key granted to model calls only, never to a command.
+      - name: Repair without credentials
+        if: inputs.repair
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship
+        run: |
+          set -euo pipefail
+          [ -f "$SHIP_WORK/pr/.git/ship-task.json" ] || exit 0
+          cd "$SHIP_WORK/pr"
+          harn run --environment-policy granted \
+            --grant "openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,to=in_process" \
+            "$GITHUB_WORKSPACE/.smart-ship/scripts/smart-ship/repair.harn"
+      - name: Publish the repair
+        if: always() && inputs.repair
+        working-directory: .smart-ship/scripts/smart-ship
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ matrix.pr }}
+          SHIP_MODE: publish
+          SHIP_WORK: ${{ runner.temp }}/smart-ship
+        run: |
+          set -euo pipefail
+          [ -f "$SHIP_WORK/pr/.git/ship-task.json" ] || exit 0
+          harn run --no-sandbox ship.harn
+      - name: Remove the checkouts
+        if: always()
+        env:
+          SHIP_WORK: ${{ runner.temp }}/smart-ship
+        run: rm -rf -- "$SHIP_WORK"

@@ -31,8 +31,8 @@ jobs:
         working-directory: scripts/smart-ship
         run: |
           harn install --locked
-          harn check ship.harn
-          harn lint ship.harn ship_test.harn
+          harn check ship.harn repair.harn
+          harn lint ship.harn repair.harn ship_test.harn
           harn test ship_test.harn
 
   local-check-contract:

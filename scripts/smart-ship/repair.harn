@@ -1,0 +1,67 @@
+/**
+ * The repair agent. It runs inside Harn's sandbox in the pull request's checkout,
+ * with no GitHub credential, no child network, and the model key granted to model
+ * calls only. It edits files and reports; ship.harn publishes afterwards.
+ */
+import { agent_edit_tools, agent_host_tools } from "std/agent/host_tools"
+import { agent_loop } from "std/agent/loop"
+import { agent_options } from "std/agent/options"
+
+fn main(harness: Harness) {
+  const job = json_parse(harness.fs.read_text(".git/ship-task.json"))
+  const scope = {root: ".", cwd: "."}
+  const tools = tool_define(
+    agent_edit_tools(harness.fs, harness.tools, agent_host_tools(harness, nil, scope), scope),
+    "finish",
+    "Report the outcome once, at the end.",
+    {
+      parameters: {
+        outcome: {type: "string", enum: ["fixed", "unrelated", "stuck"]},
+        summary: {type: "string"},
+        replies: {
+          type: "array",
+          items: {type: "object", properties: {id: {type: "integer"}, body: {type: "string"}}},
+        },
+      },
+      handler: { args ->
+        harness.fs.write_text(".git/ship-finish.json", json_stringify(args))
+        return "recorded"
+      },
+    },
+  )
+  let result = {
+    outcome: "stuck",
+    summary: "The repair agent stopped without reporting.",
+    replies: [],
+  }
+  let spend = "unknown"
+  try {
+    const run = agent_loop(
+      harness,
+      job.task,
+      nil,
+      agent_options(
+        {
+          provider: "openai",
+          model: "gpt-6-luna",
+          tools: tools,
+          loop_until_done: true,
+          max_iterations: 60,
+          budget: {total_budget_usd: 2.0},
+          stop_after_successful_tools: ["finish"],
+        },
+      ),
+    )
+    const usd = run.cost_usd ?? run.known_cost_usd
+    // Unpriced or unreported calls make the figure a floor, and the comment says so.
+    const floor = run.cost_usd == nil || run.llm.accounting_status != "reported" ? "at least " : ""
+    spend = "${floor}$${round(usd * 10000.0) / 10000.0} over ${run.llm.iterations} turns (${run.llm.input_tokens} input, ${run.llm.output_tokens} output tokens)"
+    if harness.fs.exists(".git/ship-finish.json") {
+      result = json_parse(harness.fs.read_text(".git/ship-finish.json"))
+    }
+  } catch (e) {
+    result = result + {summary: "The repair agent failed: " + to_string(e)}
+  }
+  harness.fs.write_text(".git/ship-result.json", json_stringify(result + {spend: spend}))
+  harness.stdio.println("repair: ${result.outcome}: ${spend}")
+}
