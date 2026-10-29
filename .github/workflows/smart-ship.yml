@@ -137,10 +137,15 @@ jobs:
           SHIP_WORK: ${{ runner.temp }}/smart-ship
         run: |
           set -euo pipefail
+          # A repair was prepared only if this look wrote its job, carrying this step's nonce; a
+          # job.json an earlier job left on a persistent runner never matches.
+          SHIP_NONCE="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          export SHIP_NONCE
           harn install --locked
           harn run --no-sandbox ship.harn
-          # A repair was prepared only if the look finished and wrote its job; nothing else runs one.
-          if [ -f "$SHIP_WORK/job.json" ]; then echo "prepared=true" >> "$GITHUB_OUTPUT"; fi
+          if [ -f "$SHIP_WORK/job.json" ] && [ "$(jq -r '.nonce // ""' "$SHIP_WORK/job.json")" = "$SHIP_NONCE" ]; then
+            echo "prepared=true" >> "$GITHUB_OUTPUT"
+          fi
       # The agent runs in Harn's sandbox in the checkout: no GitHub token in this step, no child
       # network, and the model key granted to model calls only, never to a command.
       - name: Repair without credentials

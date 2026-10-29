@@ -580,6 +580,7 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
     work + "/job.json",
     json_stringify(
       {
+        nonce: job.nonce,
         head: pr.headRefOid,
         base_oid: base_oid,
         conflicted: conflicted,
@@ -957,6 +958,8 @@ pub type Look = {
   run_id: string,
   opts: GithubClientOptions,
   git_host: string,
+  // The look step's nonce, echoed into the job so the step can tell this look's job from a stale one.
+  nonce: string,
 }
 
 fn main(harness: Harness) {
@@ -986,6 +989,7 @@ fn main(harness: Harness) {
       run_id: run_id,
       opts: {installation_token: token},
       git_host: "https://github.com/",
+      nonce: harness.env.get("SHIP_NONCE") ?? "",
     },
   )
 }

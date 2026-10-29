@@ -441,6 +441,7 @@ fn look_at(harness: Harness, comments: list, repair: bool, over: dict = {}) {
     opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
     // No host serves this, so a repair's checkout fails the way a dead clone does.
     git_host: "file:///nonexistent-smart-ship-host/",
+    nonce: "",
   }
   const result = try {
     look(harness, job)
@@ -596,14 +597,27 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
   harness.fs.write_text(
     fake,
     "#!/bin/sh\n[ \"$1\" = run ] || exit 0\n"
-      + "[ \"$LOOK\" = prepared ] && echo '{}' > \"$SHIP_WORK/job.json\"\n"
+      + "[ \"$LOOK\" = prepared ] && printf '{\"nonce\":\"%s\"}' \"$SHIP_NONCE\" > \"$SHIP_WORK/job.json\"\n"
       + "[ \"$LOOK\" = failed ] && exit 1\nexit 0\n",
   )
   assert(harness.process.run({program: "/bin/chmod", args: ["755", fake]}).success)
-  for c in [["prepared", true, "prepared=true\n"], ["stopped", true, ""], ["failed", false, ""]] {
+  const cases = [
+    ["prepared", true, "prepared=true\n"],
+    ["stopped", true, ""],
+    ["failed", false, ""],
+    // A persistent runner kept an earlier job's job.json; a look that stops must not arm it.
+    ["stale", true, ""],
+  ]
+  for c in cases {
     const work = dir + "/" + c[0]
     harness.fs.mkdir(work)
     harness.fs.write_text(work + "/output", "")
+    if c[0] == "stale" {
+      harness.fs.write_text(
+        work + "/job.json",
+        "{\"nonce\":\"from-an-earlier-job\",\"head\":\"old\"}",
+      )
+    }
     const ran = harness.process.run(
       {
         program: "/bin/bash",
