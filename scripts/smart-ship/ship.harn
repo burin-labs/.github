@@ -193,7 +193,6 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
       return stop(gate[1])
     }
   }
-  // GitHub reads this look's own running check as UNSTABLE; with every other check green the merge enforces the rest.
   if !blocked {
     if !f.approved || !f.signed {
       return stop("green; waiting for a writer's approval of this signed head")
