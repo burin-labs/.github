@@ -200,7 +200,7 @@ jobs:
             if [ -d "$GITHUB_WORKSPACE/.smart-ship" ] && [ ! -e "$SHIP_WORK/controller" ]; then
               mv -- "$GITHUB_WORKSPACE/.smart-ship" "$SHIP_WORK/controller"
             fi
-            echo "::warning::Kept Smart Ship's records for the unfinished repair."
+            echo "::warning::Left Smart Ship's records for immediate recovery; runner temporary storage may be cleared."
           else
             rm -rf -- "$GITHUB_WORKSPACE/.smart-ship"
           fi
@@ -213,11 +213,32 @@ jobs:
           SHIP_LOOK: ${{ steps.look.outcome }}
           SHIP_PREPARED: ${{ steps.look.outputs.prepared }}
           SHIP_PUBLISH: ${{ steps.publish.outcome }}
+          SHIP_RUN: ${{ github.run_id }}
+          SHIP_ATTEMPT: ${{ github.run_attempt }}
+          SHIP_PR: ${{ matrix.pr }}
         run: |
           set -euo pipefail
           if [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ] &&
              { [ "${SHIP_PUBLISH:-}" = success ] || { [ "${SHIP_LOOK:-}" = success ] && [ "${SHIP_PREPARED:-}" != true ]; }; }; then
             rm -rf -- "$SHIP_WORK"
+          elif [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ]; then
+            if [[ "${SHIP_RUN:-}" =~ ^[0-9]+$ && "${SHIP_ATTEMPT:-}" =~ ^[0-9]+$ && "${SHIP_PR:-}" =~ ^[0-9]+$ && -n "${GITHUB_WORKSPACE:-}" ]]; then
+              umask 077
+              retained="$(dirname -- "$GITHUB_WORKSPACE")/.smart-ship-retained"
+              [ ! -L "$retained" ] || { echo "::error::Refusing a symlinked retention directory."; exit 1; }
+              mkdir -p -- "$retained"
+              chmod 700 "$retained"
+              target="$retained/$SHIP_RUN-$SHIP_ATTEMPT-$SHIP_PR"
+              if [ -e "$target" ] || [ -L "$target" ]; then
+                [[ "$SHIP_NONCE" =~ ^[0-9a-f]{32}$ ]] || { echo "::error::Cannot identify a safe alternate retention target."; exit 1; }
+                target="$target-$SHIP_NONCE"
+              fi
+              mkdir -- "$target"
+              mv -- "$SHIP_WORK" "$target/work"
+              echo "::warning::Retained unfinished work at $target/work; cleanup is still required."
+            else
+              echo "::warning::Could not retain $SHIP_WORK outside runner temporary storage: run identity is unmeasured."
+            fi
           elif [ -e "$SHIP_WORK" ]; then
-            echo "::warning::Left $SHIP_WORK in place: ownership or publication is unconfirmed."
+            echo "::warning::Left $SHIP_WORK in place: ownership or publication is unconfirmed; runner temporary storage may be cleared."
           fi

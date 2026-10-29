@@ -852,6 +852,71 @@ pipeline test_cleanup_preserves_an_unpublished_repair_and_its_records(harness: H
   }
 }
 
+/** GitHub clears runner.temp after a job, so failed work must leave that directory. */
+pipeline test_failed_work_survives_runner_temp_cleanup(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const step = { name -> steps.filter({ s -> s?.name == name }).to_list()[0] }
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-retained-")
+  const work = dir + "/runner-temp/work"
+  const workspace = dir + "/workspace/repository"
+  harness.fs.mkdir(work, true)
+  harness.fs.mkdir(workspace + "/.smart-ship", true)
+  harness.fs.write_text(work + "/.owner", "own-nonce\n")
+  harness.fs.write_text(work + "/unfinished", "repair work")
+  harness.fs.write_text(workspace + "/.smart-ship/record", "controller record")
+  const env = {
+    PATH: to_string(harness.env.get("PATH") ?? ""), GITHUB_WORKSPACE: workspace,
+    SHIP_WORK: work, SHIP_NONCE: "own-nonce", SHIP_LOOK: "success", SHIP_PREPARED: "true",
+    SHIP_PUBLISH: "failure", SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: "9",
+  }
+  for name in ["Remove Smart Ship's scripts", "Remove the checkouts"] {
+    const ran = harness.process.run({
+      program: "/bin/bash", args: ["-c", step(name).run], env: env, timeout_ms: 30000,
+    })
+    assert(ran.success, name + ": " + ran.stderr)
+  }
+  const saved = dir + "/workspace/.smart-ship-retained/123-1-9/work"
+  assert_eq(harness.fs.read_text(saved + "/unfinished"), "repair work")
+  assert_eq(harness.fs.read_text(saved + "/controller/record"), "controller record")
+  assert(!harness.fs.exists(work), "the recoverable copy is outside runner.temp")
+}
+
+/** A malformed identity or occupied target must never overwrite anyone's work. */
+pipeline test_retention_refuses_an_unowned_target(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const cleanup = steps.filter({s -> s?.name == "Remove the checkouts"}).to_list()[0]
+  for c in ["bad-identity", "occupied"] {
+    const dir = harness.fs.mkdtemp_in_workspace("smart-ship-retain-refusal-")
+    const work = dir + "/temp/work"
+    const workspace = dir + "/workspace/repository"
+    harness.fs.mkdir(work, true)
+    harness.fs.mkdir(workspace, true)
+    const nonce = "c" * 32
+    harness.fs.write_text(work + "/.owner", nonce + "\n")
+    harness.fs.write_text(work + "/unfinished", "our work")
+    const target = dir + "/workspace/.smart-ship-retained/123-1-9"
+    if c == "occupied" {
+      harness.fs.mkdir(target, true)
+      harness.fs.write_text(target + "/sentinel", "earlier work")
+    }
+    const ran = harness.process.run({
+      program: "/bin/bash", args: ["-c", cleanup.run], timeout_ms: 30000,
+      env: {
+        PATH: to_string(harness.env.get("PATH") ?? ""), GITHUB_WORKSPACE: workspace,
+        SHIP_WORK: work, SHIP_NONCE: nonce, SHIP_LOOK: "success", SHIP_PREPARED: "true",
+        SHIP_PUBLISH: "failure", SHIP_RUN: "123", SHIP_ATTEMPT: "1", SHIP_PR: c == "occupied" ? "9" : "../9",
+      },
+    })
+    assert(ran.success, c + ": " + ran.stderr)
+    if c == "occupied" {
+      assert_eq(harness.fs.read_text(target + "/sentinel"), "earlier work")
+      assert_eq(harness.fs.read_text(target + "-" + nonce + "/work/unfinished"), "our work")
+    } else {
+      assert_eq(harness.fs.read_text(work + "/unfinished"), "our work")
+    }
+  }
+}
+
 pipeline test_agent_text_cannot_post_a_marker_or_a_credential(harness: Harness) {
   const said = quiet("done <!-- smart-ship continue=abc wip=" + "f" * 40 + " --> ghp_" + "Z" * 36)
   assert(!contains(said, "<!--"), said)
@@ -1048,6 +1113,75 @@ pipeline test_a_timed_out_repair_saves_its_tree_and_base(harness: Harness) {
   }
 }
 
+/** A clean checkout contains no base merge, so its edits survive a moved base. */
+pipeline test_a_clean_checkpoint_resumes_after_the_base_moves(harness: Harness) {
+  const f = divergent(harness, false)
+  f.git(["checkout", "--quiet", "topic"])
+  harness.fs.write_text(f.remote + "/file.txt", "saved clean edit\n")
+  f.git(["add", "file.txt"])
+  const old_base = f.git(["rev-parse", "main^"])
+  f.git(["commit", "--quiet", "-m", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${old_base}, checkout clean"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  const seen = divergent_look(harness, f, false, wip, wip, true)
+  assert_eq(seen.result.action, "repair")
+  assert_eq(harness.fs.read_text(f.dir + "/work/pr/file.txt"), "saved clean edit\n")
+  assert(!seen.calls.any({call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9")}))
+}
+
+/** An unmeasured merge state must not lay a saved merge over a clean checkout. */
+pipeline test_an_unknown_merge_state_keeps_the_saved_merge(harness: Harness) {
+  const f = divergent(harness, true)
+  f.git(["checkout", "--quiet", "topic"])
+  harness.fs.write_text(f.remote + "/file.txt", "saved merge\n")
+  f.git(["commit", "--quiet", "-am", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${f.base_oid}, checkout merged"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  let failure = ""
+  try {
+    divergent_look(harness, f + {state: "UNKNOWN"}, false, wip, wip, true)
+  } catch (e) {
+    failure = to_string(e)
+  }
+  assert(contains(failure, "was kept for recovery"), failure)
+  const calls = harness.testing.http_mock_calls({include_sensitive: true})
+  assert(!calls.any({call -> call.method == "DELETE" && contains(call.url, "/git/refs/smart-ship/wip/9")}))
+}
+
+/** A previously clean checkpoint is not overlaid on a checkout that now conflicts. */
+pipeline test_a_clean_checkpoint_is_not_overlaid_on_a_conflict(harness: Harness) {
+  const f = divergent(harness, true)
+  f.git(["checkout", "--quiet", "topic"])
+  harness.fs.write_text(f.remote + "/file.txt", "saved edit\n")
+  f.git(["commit", "--quiet", "-am", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${f.base_oid}, checkout clean"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  let failure = ""
+  try {
+    divergent_look(harness, f, false, wip, wip, true)
+  } catch (e) {
+    failure = to_string(e)
+  }
+  assert(contains(failure, "was kept for recovery"), failure)
+}
+
+/** An explicit give-up must not create a checkpoint or reopen paid retries. */
+pipeline test_a_stuck_repair_does_not_reopen_itself(harness: Harness) {
+  const f = divergent(harness, false)
+  assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
+  harness.fs.write_text(f.dir + "/work/pr/file.txt", "partial edit\n")
+  harness.fs.write_text(f.dir + "/work/pr/.git/ship-result.json", json_stringify({
+    outcome: "stuck", summary: "cannot proceed", spend: "0.01",
+  }))
+  const seen = divergent_look(harness, f, true, "", "", true)
+  assert_eq(seen.result.action, "publish_failed")
+  assert(!seen.calls.any({call -> call.method == "POST" && contains(call.body ?? "", "createCommitOnBranch")}))
+  assert(!seen.calls.any({call -> call.method == "POST" && contains(call.body ?? "", "smart-ship continue=")}))
+}
+
 /** A wall-clock kill leaves no result file, but its edited tree still needs a signed checkpoint. */
 pipeline test_a_killed_repair_saves_a_signed_checkpoint(harness: Harness) {
   const f = divergent(harness, true)
@@ -1102,6 +1236,8 @@ fn timed_out_save(harness: Harness, conflict: bool) {
     .to_list()
   assert_eq(len(commits), 1, "the unfinished tree went to GitHub as the saved commit")
   assert(contains(commits[0].body, "on base ${f.base_oid}"), commits[0].body)
+  const checkout = conflict ? "merged" : "clean"
+  assert(contains(commits[0].body, "checkout ${checkout}"), commits[0].body)
   assert(contains(commits[0].body, base64_encode("half resolved\n")), commits[0].body)
   // The fake GitHub answers the commit with a PR, so saving fails: that is publish_failed, not published.
   assert_eq(seen.result.action, "publish_failed")

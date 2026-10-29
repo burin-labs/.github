@@ -495,16 +495,23 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
       work + "/pristine",
     )
   }
-  // Saved work continues only on the base it was saved against: laid over a merge of a newer base,
-  // its files would silently revert that base's changes. Work naming no base is not restored.
-  const saved_on = wip == "" ? "" : regex_captures(
-    ", on base ([0-9a-f]{40})$",
-    sh(harness.tools, ["git", "log", "-1", "--format=%s", wip], env, work + "/pristine"),
-  )[0]?.groups?.[0]
-    ?? ""
+  // A clean checkout contains no base merge and can continue on a newer base while still clean.
+  // A saved merge may not be laid over a different base or a checkout with no merge in progress.
+  const subject = wip == "" ? "" : sh(
+    harness.tools, ["git", "log", "-1", "--format=%s", wip], env, work + "/pristine",
+  )
+  const saved_on = regex_captures(
+    ", on base ([0-9a-f]{40})(, checkout (clean|merged))?$", subject,
+  )[0]?.groups?.[0] ?? ""
+  const saved_clean = regex_match(", checkout clean$", subject) != nil
+  const saved_merged = regex_match(", checkout merged$", subject) != nil
   const trusted_wip = wip != "" && f.kept.contains(wip)
     && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/pristine") == pr.headRefOid
-  require !trusted_wip || saved_on == base_oid,
+  const safe_base = saved_on == base_oid
+    && ((!saved_clean && !saved_merged) || (saved_clean && len(conflicted) == 0)
+      || (saved_merged && len(conflicted) > 0))
+  const clean_rebase = saved_clean && len(conflicted) == 0
+  require !trusted_wip || safe_base || clean_rebase,
     "the saved repair ${wip} is on a different or unknown base; it was kept for recovery"
   const continuing = trusted_wip
   if continuing {
@@ -627,17 +634,19 @@ fn wip_commit(harness: Harness, opts: GithubClientOptions, repo: string, number:
 }
 
 /**
- * The saved commit's subject names the head it started from and the base commit it was checked out against.
+ * The saved subject records the original head, base and whether the checkout held a base merge.
  */
-fn wip_headline(number: int, head: string, base_oid: string) -> string {
-  return "Smart Ship unfinished repair for #${number} at ${head}, on base ${base_oid}"
+fn wip_headline(number: int, head: string, base_oid: string, merged: bool) -> string {
+  return "Smart Ship unfinished repair for #${number} at ${head}, on base ${base_oid}, checkout "
+    + (merged ? "merged" : "clean")
 }
 
 /**
  * Keep an unfinished repair's tree on the private ref refs/smart-ship/wip/<PR>, its parent the
  * head it started from. A diff over the size cap, or one holding anything shaped like a credential, is not kept.
  * A conflicted repair's tree is its merge in progress, kept whole whatever its markers.
- * Either way the subject records the base, which the next look must still be on to restore it.
+ * The subject records the base and whether the checkout held a base merge, so a clean checkout
+ * may resume across base changes without overwriting newer base changes.
  */
 fn save_wip(
   harness: Harness,
@@ -647,6 +656,7 @@ fn save_wip(
   number: int,
   head: string,
   base_oid: string,
+  merged: bool,
 ) -> string {
   const base = work + "/pristine"
   sh(
@@ -661,7 +671,7 @@ fn save_wip(
   const staging = "smart-ship/wip-${number}-" + substring(head, 0, 12)
   let kept = ""
   try {
-    kept = signed(harness, opts, repo, staging, base, wip_headline(number, head, base_oid))
+    kept = signed(harness, opts, repo, staging, base, wip_headline(number, head, base_oid, merged))
     const ref = "refs/smart-ship/wip/${number}"
     if wip_commit(harness, opts, repo, number) == "" {
       gh(harness, opts, "/repos/${repo}/git/refs", "POST", {ref: ref, sha: kept})
@@ -883,9 +893,11 @@ fn publish(
     if wip_commit(harness, opts, repo, number) != "" {
       gh(harness, opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
     }
-  } else if ["timeout", "stuck"].contains(out.outcome) {
-    note = save_wip(harness, opts, work, repo, number, job.head, to_string(job.base_oid)) + " "
+  } else if out.outcome == "timeout" {
+    note = save_wip(harness, opts, work, repo, number, job.head, to_string(job.base_oid), len(job.conflicted) > 0) + " "
       + note
+  } else if out.outcome == "stuck" {
+    throw "The repair could not continue: " + quiet(to_string(out.summary ?? ""))
   }
   for reply in out.replies ?? [] {
     if job.threads.contains(reply?.id) {
