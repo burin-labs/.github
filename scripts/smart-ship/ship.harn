@@ -18,7 +18,7 @@ query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner
   nameWithOwner defaultBranchRef { name } mergeQueue { id }
   pullRequest(number: $number) { id number title state isDraft isCrossRepository isInMergeQueue
     headRefName headRefOid baseRefName mergeStateStatus reviewDecision
-    labels(first: 50) { nodes { name } } latestOpinionatedReviews(first: 20) { nodes { state } }
+    labels(first: 50) { nodes { name } } latestOpinionatedReviews(first: 20) { nodes { state commit { oid } } }
     comments(last: 100) { nodes { body } }
     reviewThreads(first: 100) { nodes { isResolved path comments(first: 10) { nodes { databaseId body } } } }
     commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
@@ -57,7 +57,7 @@ pub type Pull = {
   mergeStateStatus: string,
   reviewDecision: string?,
   labels: {nodes: list<{name: string}>},
-  latestOpinionatedReviews: {nodes: list<{state: string}>},
+  latestOpinionatedReviews: {nodes: list<{state: string, commit: {oid: string}?}>},
   comments: {nodes: list<{body: string}>},
   reviewThreads: {nodes: list<Thread>},
   commits: {nodes: list<{commit: {statusCheckRollup: Rollup?}}>},
@@ -89,14 +89,16 @@ pub fn observe(pr: Pull, own: string = "") -> Facts {
   const checks = (pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).filter(
     { c -> own == "" || c.checkSuite?.workflowRun?.workflow?.name != own },
   )
-  const reviews = pr.latestOpinionatedReviews.nodes.map({ v -> v.state })
+  const reviews = pr.latestOpinionatedReviews.nodes
+  const states = reviews.map({ v -> v.state })
   const marks = pr.comments.nodes.filter({ c -> contains(c.body, MARK) })
   return {
     head: pr.headRefOid,
     conflict: pr.mergeStateStatus == "DIRTY",
-    approved: pr.reviewDecision == "APPROVED"
-      || (pr.reviewDecision == nil && reviews.contains("APPROVED")
-        && !reviews.contains("CHANGES_REQUESTED")),
+    // An approval counts only for the head it reviewed; a later push needs a fresh one.
+    approved: (pr.reviewDecision == "APPROVED" || pr.reviewDecision == nil)
+      && !states.contains("CHANGES_REQUESTED")
+      && reviews.any({ v -> v.state == "APPROVED" && v.commit?.oid == pr.headRefOid }),
     failing: checks.filter({ c -> RED.contains(c.conclusion ?? c.state ?? "") }),
     pending: checks.filter(
       { c ->
@@ -170,7 +172,8 @@ pub fn decide(
   if !f.conflict && len(f.pending) > 0 {
     return stop("waiting on " + join(f.pending, ", "))
   }
-  if f.approved && pr.mergeStateStatus == "CLEAN" && !blocked {
+  // GitHub reads this look's own running check as UNSTABLE; with every other check green the merge itself enforces the rules.
+  if f.approved && ["CLEAN", "UNSTABLE"].contains(pr.mergeStateStatus) && !blocked {
     if !lease_admits(lease, repo.nameWithOwner, pr) {
       return stop("a release merge lease holds ${pr.baseRefName}: ${lease}")
     }

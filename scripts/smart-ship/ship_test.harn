@@ -16,7 +16,7 @@ fn pr(over: dict = {}) -> Repo {
     mergeStateStatus: "CLEAN",
     reviewDecision: "APPROVED",
     labels: {nodes: [{name: "ship"}]},
-    latestOpinionatedReviews: {nodes: [{state: "APPROVED"}]},
+    latestOpinionatedReviews: {nodes: [{state: "APPROVED", commit: {oid: "abc"}}]},
     comments: {nodes: []},
     reviewThreads: {nodes: []},
     commits: {
@@ -66,6 +66,7 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   }
   const ci = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
   const looking = {
+    mergeStateStatus: "UNSTABLE",
     commits: {nodes: [{commit: {statusCheckRollup: {contexts: {nodes: [ci, own]}}}}]},
   }
   assert_eq(
@@ -82,14 +83,21 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
     {reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED"},
     {
       reviewDecision: nil,
-      latestOpinionatedReviews: {nodes: [{state: "APPROVED"}, {state: "CHANGES_REQUESTED"}]},
+      latestOpinionatedReviews: {
+        nodes: [
+          {state: "APPROVED", commit: {oid: "abc"}},
+          {state: "CHANGES_REQUESTED", commit: {oid: "abc"}},
+        ],
+      },
     },
+    {headRefOid: "def"},
+    {reviewDecision: "APPROVED", headRefOid: "def"},
     {labels: {nodes: [{name: "ship"}, {name: "hold"}]}},
     {labels: {nodes: []}},
     {isCrossRepository: true},
     {isDraft: true},
     {baseRefName: "release"},
-    {mergeStateStatus: "UNSTABLE"},
+    {mergeStateStatus: "UNKNOWN"},
     {
       commits: {
         nodes: [
@@ -118,7 +126,12 @@ pipeline test_a_release_lease_holds_every_other_merge(harness: Harness) {
   const head = "a" * 40
   const lease =
     fn(repo, base, number, sha, method) { return "release-merge-lease v2 repo=${repo} base=${base} base_oid=${"1" * 40} candidate_pr=${number} candidate_head=${sha} generation=g tag=v1 merge_method=${method} " }
-  const holder = pr({headRefOid: head})
+  const holder = pr(
+    {
+      headRefOid: head,
+      latestOpinionatedReviews: {nodes: [{state: "APPROVED", commit: {oid: head}}]},
+    },
+  )
   assert_eq(
     decide(holder, lease("o/r", "main", 9, head, "squash"), false).action,
     "merge",
