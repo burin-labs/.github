@@ -1,5 +1,5 @@
 /** The landing gate is the one place a wrong answer merges unreviewed or red code. */
-import { Repo, decide, diff_refusal, quiet, sh } from "./ship.harn"
+import { Repo, checkout, decide, diff_refusal, quiet, sh } from "./ship.harn"
 
 fn page(nodes: list) {
   return {totalCount: len(nodes), nodes: nodes}
@@ -316,14 +316,16 @@ pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
     "the agent never repairs from a partial thread",
   )
   const ours = { body -> {body: body, viewerDidAuthor: true} }
-  const answered = {comments: page([ours("x <!-- smart-ship head=abc -->")])}
+  const answered = {
+    comments: page([ours("x <!-- smart-ship head=abc -->"), ours("<!-- smart-ship done=abc -->")]),
+  }
   assert_eq(decide(pr(red() + answered), "clear", true).reason, "already answered at this head")
   const wip = "f" * 40
   const timed_out = {
     comments: page(
       [
         ours("<!-- smart-ship head=abc -->"),
-        ours("kept <!-- smart-ship continue=abc wip=${wip} -->"),
+        ours("kept <!-- smart-ship continue=abc wip=${wip} -->\n\n<!-- smart-ship done=abc -->"),
       ],
     ),
   }
@@ -332,7 +334,11 @@ pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
   assert_eq(reopened.facts.kept, [wip], "only the saved commit Smart Ship named is restored")
   const forged = {
     comments: page(
-      [ours("<!-- smart-ship head=abc -->"), {body: "<!-- smart-ship continue=abc wip=${wip} -->"}],
+      [
+        ours("<!-- smart-ship head=abc -->"),
+        ours("<!-- smart-ship done=abc -->"),
+        {body: "<!-- smart-ship continue=abc wip=${wip} -->"},
+      ],
     ),
   }
   const refused = decide(pr(red() + forged), "clear", true)
@@ -371,6 +377,81 @@ pipeline test_a_blocked_head_gets_one_bounded_repair(harness: Harness) {
     decide(pr(red() + unread_marks), "clear", true).action,
     "stop",
     "an unread attempt count never repairs",
+  )
+}
+
+/** An attempt whose job died left its marker open, and the head read as answered forever. */
+pipeline test_a_crashed_attempt_counts_once_and_closes(harness: Harness) {
+  const ours = { body -> {body: body, viewerDidAuthor: true} }
+  const notes = { bodies -> {comments: page(bodies)} }
+  const crashed = decide(pr(red() + notes([ours("<!-- smart-ship head=abc -->")])), "clear", true)
+  assert_eq(crashed.facts.open, 1, "the dead attempt is the one a look closes")
+  assert_eq(crashed.facts.marks, 1, "it spent one attempt")
+  assert_eq(crashed.action, "repair", "a crash is not an answer")
+  const closed = decide(
+    pr(
+      red() + notes([ours("<!-- smart-ship head=abc -->"), ours("<!-- smart-ship ended=abc -->")]),
+    ),
+    "clear",
+    true,
+  )
+  assert_eq([closed.facts.open, closed.facts.marks, closed.action], [0, 1, "repair"], "closed once")
+  const three = notes(
+    [
+      ours("<!-- smart-ship head=abc -->"),
+      ours("<!-- smart-ship ended=abc -->"),
+      ours("<!-- smart-ship head=abc -->"),
+      ours("<!-- smart-ship ended=abc -->"),
+      ours("<!-- smart-ship head=abc -->"),
+    ],
+  )
+  const spent = decide(pr(red() + three), "clear", true)
+  assert_eq(spent.reason, "repair attempts used up; a person needs to take it")
+  assert_eq(spent.facts.open, 1, "the last one still closes")
+  const planted = notes(
+    [ours("<!-- smart-ship head=abc -->"), {body: "<!-- smart-ship done=abc -->"}],
+  )
+  const p = decide(pr(red() + planted), "clear", true)
+  assert_eq([p.facts.open, p.action], [1, "repair"], "only Smart Ship's own note closes or answers")
+}
+
+/**
+ * A blobless clone once failed a conflicted repair: the merge base's blob sat in neither endpoint
+ * tree, and the agent's working copy has no way to fetch it.
+ */
+pipeline test_a_conflict_merges_from_a_blobless_clone(harness: Harness) {
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-merge-")
+  const remote = dir + "/remote"
+  const git = { argv ->
+    sh(harness.tools, ["git", "-c", "user.name=t", "-c", "user.email=t@t"] + argv, {}, remote)
+  }
+  harness.fs.mkdir(remote)
+  git(["init", "--quiet", "--initial-branch=main"])
+  git(["config", "uploadpack.allowFilter", "true"])
+  git(["config", "uploadpack.allowAnySHA1InWant", "true"])
+  const commit = { text, message ->
+    harness.fs.write_text(remote + "/f.txt", text)
+    git(["add", "f.txt"])
+    git(["commit", "--quiet", "-m", message])
+  }
+  commit("a\nancestor\nc\n", "start")
+  git(["checkout", "--quiet", "-b", "head"])
+  commit("a\nours\nc\n", "ours")
+  const head = git(["rev-parse", "HEAD"])
+  git(["checkout", "--quiet", "main"])
+  commit("a\ntheirs\nc\n", "theirs")
+  const got = checkout(harness.tools, "file://" + remote, {}, dir + "/work", head, "main", true)
+  assert_eq(got.conflicted, ["f.txt"])
+  assert(contains(got.sides, "ours") && contains(got.sides, "theirs"), got.sides)
+  assert_eq(
+    sh(
+      harness.tools,
+      ["git", "config", "remote.origin.partialclonefilter"],
+      {},
+      dir + "/work/base",
+    ),
+    "blob:none",
+    "the trusted clone really is blobless",
   )
 }
 

@@ -28,6 +28,12 @@ const CONTINUE = "<!-- smart-ship continue="
 
 const REFUSED = "<!-- smart-ship refused="
 
+// An attempt's result was posted; it answers the head.
+const DONE = "<!-- smart-ship done="
+
+// An attempt died before any result; it does not answer the head.
+const ENDED = "<!-- smart-ship ended="
+
 const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
   nodes { ... on CheckRun { name status conclusion databaseId
       checkSuite { app { id } workflowRun { workflow { id name } } } }
@@ -167,6 +173,7 @@ pub fn observe(pr: Pull, own: string = "") {
   const outcome = { c -> c.conclusion ?? c.state ?? "" }
   // Only Smart Ship's own comments count; anyone else's marker is text.
   const own_notes = pr.comments.nodes.filter({ c -> c.viewerDidAuthor == true })
+  const at = { mark -> len(own_notes.filter({ c -> contains(c.body, mark + pr.headRefOid) })) }
   return {
     // Every census must be read whole; a page we did not read could hold the failure or the thread.
     complete: complete(pr.labels) && complete(pr.latestOpinionatedReviews)
@@ -190,9 +197,10 @@ pub fn observe(pr: Pull, own: string = "") {
     marks: complete(pr.comments) ? len(
       own_notes.filter({ c -> contains(c.body, MARK) }),
     ) : MAX_ATTEMPTS,
-    // A head is answered once per attempt; only a saved-work note reopens it.
-    answered: len(own_notes.filter({ c -> contains(c.body, MARK + pr.headRefOid) }))
-      > len(own_notes.filter({ c -> contains(c.body, CONTINUE + pr.headRefOid) })),
+    // A head is answered by an attempt's result; only a saved-work note reopens it.
+    answered: at(DONE) > at(CONTINUE),
+    // Attempts that died before any result: each still counts once, and a look closes it.
+    open: at(MARK) - at(DONE) - at(ENDED),
     // The saved work a continue note names; a ref nobody named is never restored.
     kept: own_notes.filter({ c -> contains(c.body, CONTINUE + pr.headRefOid + " wip=") }).map(
       { c -> regex_captures("wip=([0-9a-f]{40})", c.body)[0]?.groups?.[0] ?? "" },
@@ -395,8 +403,68 @@ fn all_checks(
 }
 
 /**
- * Clone the head twice: a pristine copy the publish step trusts, and the agent's own working copy.
+ * Clone the head twice: a blobless pristine copy the publish step trusts, holding the credential
+ * that fetches missing blobs, and the agent's working copy, which shares its objects but cannot
+ * fetch. A conflicted head gets the base merged in, with the conflicts left for the agent.
  */
+pub fn checkout(
+  tools: HarnessTools,
+  url: string,
+  env: dict,
+  work: string,
+  head: string,
+  base: string,
+  dirty: bool,
+) {
+  sh(tools, ["git", "clone", "--quiet", "--filter=blob:none", url, work + "/base"], env)
+  sh(tools, ["git", "checkout", "--quiet", "--detach", head], env, work + "/base")
+  sh(tools, ["git", "clone", "--quiet", "--shared", work + "/base", work + "/pr"])
+  sh(tools, ["git", "checkout", "--quiet", "--detach", head], {}, work + "/pr")
+  const base_oid = sh(tools, ["git", "rev-parse", "origin/" + base], {}, work + "/pr")
+  if !dirty {
+    return {base_oid: base_oid, conflicted: [], sides: ""}
+  }
+  // The merge reads blobs neither endpoint holds, such as the merge base's; merging once in the
+  // trusted clone fetches exactly those, since the working copy cannot. Exit 1 is a conflict.
+  const fetched = run(
+    tools,
+    ["git", "merge-tree", "--write-tree", head, base_oid],
+    env,
+    work + "/base",
+  )
+  require fetched.success || fetched.exit_code == 1,
+    "reading the merge of ${base} failed: "
+    + trim(fetched.stderr)
+  // Merge the base locally, in the checkout the agent gets; nothing reaches GitHub until publish.
+  const merged = run(
+    tools,
+    [
+      "git",
+      "-c",
+      "user.name=Smart Ship",
+      "-c",
+      "user.email=smart-ship@users.noreply.github.com",
+      "merge",
+      "--no-ff",
+      "--no-commit",
+      base_oid,
+    ],
+    {},
+    work + "/pr",
+  )
+  const conflicted = split(
+    sh(tools, ["git", "diff", "--name-only", "--diff-filter=U"], {}, work + "/pr"),
+    "\n",
+  )
+    .filter({ p -> p != "" })
+  require !merged.success && len(conflicted) > 0,
+    "GitHub reports a conflict, but merging ${base} locally found none: "
+    + trim(merged.stderr)
+  const sides = join(split(sh(tools, ["git", "diff"], {}, work + "/pr"), "\n").slice(0, 400), "\n")
+  return {base_oid: base_oid, conflicted: conflicted, sides: sides}
+}
+
+/** Prepare one repair: the checkout, any saved work to continue, and the agent's task. */
 fn prepare(
   harness: Harness,
   token: string,
@@ -408,60 +476,18 @@ fn prepare(
 ) {
   const pr = r.pullRequest
   const env = auth(token)
-  sh(
+  const tree = checkout(
     harness.tools,
-    [
-      "git",
-      "clone",
-      "--quiet",
-      "--filter=blob:none",
-      "https://github.com/${repo}.git",
-      work + "/base",
-    ],
+    "https://github.com/${repo}.git",
     env,
+    work,
+    pr.headRefOid,
+    pr.baseRefName,
+    pr.mergeStateStatus == "DIRTY",
   )
-  sh(harness.tools, ["git", "checkout", "--quiet", "--detach", pr.headRefOid], env, work + "/base")
-  sh(harness.tools, ["git", "clone", "--quiet", "--shared", work + "/base", work + "/pr"])
-  sh(harness.tools, ["git", "checkout", "--quiet", "--detach", pr.headRefOid], {}, work + "/pr")
-  const base_oid = sh(
-    harness.tools,
-    ["git", "rev-parse", "origin/" + pr.baseRefName],
-    {},
-    work + "/pr",
-  )
-  let conflicted = []
-  let sides = ""
-  if pr.mergeStateStatus == "DIRTY" {
-    // Merge the base locally, in the checkout the agent gets; nothing reaches GitHub until publish.
-    const merged = run(
-      harness.tools,
-      [
-        "git",
-        "-c",
-        "user.name=Smart Ship",
-        "-c",
-        "user.email=smart-ship@users.noreply.github.com",
-        "merge",
-        "--no-ff",
-        "--no-commit",
-        base_oid,
-      ],
-      {},
-      work + "/pr",
-    )
-    conflicted = split(
-      sh(harness.tools, ["git", "diff", "--name-only", "--diff-filter=U"], {}, work + "/pr"),
-      "\n",
-    )
-      .filter({ p -> p != "" })
-    require !merged.success && len(conflicted) > 0,
-      "GitHub reports a conflict, but merging ${pr.baseRefName} locally found none: "
-      + trim(merged.stderr)
-    sides = join(
-      split(sh(harness.tools, ["git", "diff"], {}, work + "/pr"), "\n").slice(0, 400),
-      "\n",
-    )
-  }
+  const base_oid = tree.base_oid
+  const conflicted = tree.conflicted
+  const sides = tree.sides
   // Saved work continues only from the same head, and only the commit Smart Ship's own note names.
   const wip = wip_commit(harness, {installation_token: token}, repo, number)
   if wip != "" {
@@ -913,6 +939,8 @@ fn own_workflow(harness: Harness, opts: GithubClientOptions, repo: string) -> st
   return id
 }
 
+type Started = {head: string}
+
 fn main(harness: Harness) {
   const repo = harness.env.get("REPO") ?? ""
   const number = to_int(harness.env.get("PR") ?? "") ?? 0
@@ -942,6 +970,12 @@ fn main(harness: Harness) {
     )
   }
   if harness.env.get("SHIP_MODE") == "publish" {
+    // The head the attempt started from, which its result answers even if the PR moved since.
+    const job: Started = schema_expect(
+      json_parse(harness.fs.read_text(work + "/job.json")),
+      schema_of(Started),
+    )
+    const started = job.head
     const note = try {
       publish(harness, opts, work, repo, number, r)
     } catch (e) {
@@ -953,9 +987,16 @@ fn main(harness: Harness) {
         + quiet(to_string(spent ?? "unknown"))
         + "."
     }
-    say(note)
+    say("${note}\n\n${DONE}${started} -->")
     harness.stdio.println("${repo}#${number}: published: ${note}")
     return
+  }
+  // Looks on one PR never overlap, so an attempt still open now died; it is closed, not repeated.
+  const open = observe(pr).open
+  for _ in 0..open {
+    say(
+      "the repair attempt at ${pr.headRefOid} ended without a result; it counts as one of ${MAX_ATTEMPTS} attempts.\n\n${ENDED}${pr.headRefOid} -->",
+    )
   }
   const lease = release_lease(harness, opts, repo, pr.baseRefName)
   const d = decide(
@@ -1005,7 +1046,14 @@ fn main(harness: Harness) {
     say(
       "repairing at ${pr.headRefOid} (attempt ${d.facts.marks + 1} of ${MAX_ATTEMPTS}).\n\n${MARK}${pr.headRefOid} -->",
     )
-    prepare(harness, token, work, repo, number, r, d.facts)
+    try {
+      prepare(harness, token, work, repo, number, r, d.facts)
+    } catch (e) {
+      say(
+        "the repair attempt at ${pr.headRefOid} could not start: ${quiet(to_string(e))}\n\n${ENDED}${pr.headRefOid} -->",
+      )
+      throw e
+    }
   }
   harness.stdio.println("${repo}#${number}: ${d.action}: ${note}")
 }
