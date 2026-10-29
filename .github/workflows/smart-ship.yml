@@ -170,8 +170,9 @@ jobs:
           # The look step wrote job.json outside the repair's write jail.
           [ -f "$SHIP_WORK/job.json" ] || exit 0
           harn run --no-sandbox ship.harn
+      # A persistent owned runner keeps the workspace; the look's run records go with it.
       - name: Remove the checkouts
         if: always()
         env:
           SHIP_WORK: ${{ runner.temp }}/smart-ship
-        run: rm -rf -- "$SHIP_WORK"
+        run: rm -rf -- "$SHIP_WORK" "$GITHUB_WORKSPACE/.smart-ship"
