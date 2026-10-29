@@ -1,4 +1,5 @@
 /** The landing gate is the one place a wrong answer merges unreviewed or red code. */
+import { read_yaml } from "std/fs"
 import { Repo, checkout, decide, diff_refusal, look, quiet, sh } from "./ship.harn"
 
 fn page(nodes: list) {
@@ -417,6 +418,74 @@ pipeline test_a_crashed_attempt_counts_once_and_closes(harness: Harness) {
 
 type Posted = {body: string}
 
+type PreparedJob = {nonce: string, head: string}
+
+/** The real look, not a stub, binds its freshly prepared job to the supplied nonce. */
+pipeline test_real_repair_look_binds_prepared_nonce(harness: Harness) {
+  const dir = harness.fs.mkdtemp_in_workspace("real-prepare-nonce-")
+  const remote = dir + "/o/r.git"
+  harness.fs.mkdir(dir + "/o", true)
+  harness.fs.mkdir(remote)
+  const git = { args ->
+    sh(
+      harness.tools,
+      ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + args,
+      {},
+      remote,
+    )
+  }
+  git(["init", "--quiet", "--initial-branch=main"])
+  harness.fs.write_text(remote + "/file.txt", "content\n")
+  git(["add", "file.txt"])
+  git(["commit", "--quiet", "-m", "fixture"])
+  const head = git(["rev-parse", "HEAD"])
+  const red_check = checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE"}])
+  const commit = red_check.commits.nodes[0].commit + {oid: head}
+  const state = pr(red_check + {headRefOid: head, commits: {nodes: [{commit: commit}]}})
+  const api = "https://api.github.com"
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {status: 200, body: json_stringify({data: {repository: state}})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/release-merge-lease/main",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/smart-ship/wip/9",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const work = dir + "/work"
+  const result = look(
+    harness,
+    {
+      repo: "o/r",
+      number: 9,
+      token: "fixture-token",
+      work: work,
+      publish: false,
+      repair: true,
+      run_id: "",
+      opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file://" + dir + "/",
+      nonce: "unique-fixture-nonce",
+    },
+  )
+  assert_eq(result.action, "repair")
+  const prepared = schema_expect(
+    json_parse(harness.fs.read_text(work + "/job.json")),
+    schema_of(PreparedJob),
+  )
+  assert_eq(prepared.nonce, "unique-fixture-nonce")
+  assert_eq(prepared.head, head)
+  assert(harness.fs.exists(work + "/pr/.git/ship-task.json"), "the actual repair task was written")
+}
+
 /** A whole look against a fake GitHub serving this PR state; returns the comments it posted. */
 fn look_at(harness: Harness, comments: list, repair: bool, over: dict = {}) {
   harness.testing.http_mock_clear()
@@ -440,6 +509,7 @@ fn look_at(harness: Harness, comments: list, repair: bool, over: dict = {}) {
     opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
     // No host serves this, so a repair's checkout fails the way a dead clone does.
     git_host: "file:///nonexistent-smart-ship-host/",
+    nonce: "",
   }
   const result = try {
     look(harness, job)
@@ -614,6 +684,67 @@ pipeline test_a_credential_deep_in_a_diff_is_never_published(harness: Harness) {
   harness.fs.write_text(dir + "/notes.txt", "start\n" + "b" * 1100000 + "\n")
   git(["add", "notes.txt"])
   assert(contains(diff_refusal(harness.tools, dir, "HEAD"), "cap"), "an oversized fix is refused")
+}
+
+/**
+ * A failed token mint once skipped the look yet still ran the publish step, which then failed
+ * starting in a checkout that was never made. Only a look that prepared a repair sets `prepared`.
+ */
+pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
+  const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
+  const step = { name -> steps.filter({ s -> s?.name == name }).to_list()[0] }
+  const prepared = "steps.look.outputs.prepared == 'true'"
+  assert_eq(step("Look at the pull request").id, "look")
+  assert_eq(step("Repair without credentials").if, "inputs.repair && ${prepared}")
+  assert_eq(
+    step("Publish the repair").if,
+    "always() && inputs.repair && ${prepared}",
+    "a prepared repair publishes even after the agent fails",
+  )
+  assert_eq(step("Remove the checkouts").if, "always()", "cleanup still runs after a failed mint")
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-look-step-")
+  const fake = dir + "/harn"
+  harness.fs.write_text(
+    fake,
+    "#!/bin/sh\n[ \"$1\" = run ] || exit 0\n"
+      + "[ \"$LOOK\" = prepared ] && printf '{\"nonce\":\"%s\"}' \"$SHIP_NONCE\" > \"$SHIP_WORK/job.json\"\n"
+      + "[ \"$LOOK\" = failed ] && exit 1\nexit 0\n",
+  )
+  assert(harness.process.run({program: "/bin/chmod", args: ["755", fake]}).success)
+  const cases = [
+    ["prepared", true, "prepared=true\n"],
+    ["stopped", true, ""],
+    ["failed", false, ""],
+    // A persistent runner kept an earlier job's job.json; a look that stops must not arm it.
+    ["stale", true, ""],
+  ]
+  for c in cases {
+    const work = dir + "/" + c[0]
+    harness.fs.mkdir(work)
+    harness.fs.write_text(work + "/output", "")
+    if c[0] == "stale" {
+      harness.fs.write_text(
+        work + "/job.json",
+        "{\"nonce\":\"from-an-earlier-job\",\"head\":\"old\"}",
+      )
+    }
+    const ran = harness.process.run(
+      {
+        program: "/bin/bash",
+        args: ["-c", step("Look at the pull request").run],
+        cwd: work,
+        env: {
+          PATH: dir + ":" + to_string(harness.env.get("PATH") ?? ""),
+          LOOK: c[0],
+          SHIP_WORK: work,
+          GITHUB_OUTPUT: work + "/output",
+        },
+        timeout_ms: 30000,
+      },
+    )
+    assert_eq(ran.success, c[1], c[0] + ": " + ran.stderr)
+    assert_eq(harness.fs.read_text(work + "/output"), c[2], c[0])
+  }
 }
 
 pipeline test_agent_text_cannot_post_a_marker_or_a_credential(harness: Harness) {

@@ -126,6 +126,7 @@ jobs:
         with:
           version: "0.10.180"
       - name: Look at the pull request
+        id: look
         working-directory: .smart-ship/scripts/smart-ship
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -136,19 +137,25 @@ jobs:
           SHIP_WORK: ${{ runner.temp }}/smart-ship
         run: |
           set -euo pipefail
+          # A repair was prepared only if this look wrote its job, carrying this step's nonce; a
+          # job.json an earlier job left on a persistent runner never matches.
+          SHIP_NONCE="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          export SHIP_NONCE
           harn install --locked
           harn run --no-sandbox ship.harn
+          if [ -f "$SHIP_WORK/job.json" ] && [ "$(jq -r '.nonce // ""' "$SHIP_WORK/job.json")" = "$SHIP_NONCE" ]; then
+            echo "prepared=true" >> "$GITHUB_OUTPUT"
+          fi
       # The agent runs in Harn's sandbox in the checkout: no GitHub token in this step, no child
       # network, and the model key granted to model calls only, never to a command.
       - name: Repair without credentials
-        if: inputs.repair
+        if: inputs.repair && steps.look.outputs.prepared == 'true'
         timeout-minutes: 25
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SHIP_WORK: ${{ runner.temp }}/smart-ship
         run: |
           set -euo pipefail
-          [ -f "$SHIP_WORK/pr/.git/ship-task.json" ] || exit 0
           # The script runs from its own directory so the sandbox's write jail is only that copy and
           # the checkout, never the Smart Ship scripts the publish step runs next.
           mkdir -p "$SHIP_WORK/agent"
@@ -158,8 +165,10 @@ jobs:
             --grant "openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,to=in_process" \
             --write-root "$SHIP_WORK/pr" \
             "$SHIP_WORK/agent/repair.harn"
+      # A prepared repair always publishes, even after the agent failed or timed out; without one
+      # (a failed mint, checkout or look) there is nothing to publish and no checkout to run from.
       - name: Publish the repair
-        if: always() && inputs.repair
+        if: always() && inputs.repair && steps.look.outputs.prepared == 'true'
         working-directory: .smart-ship/scripts/smart-ship
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -169,8 +178,6 @@ jobs:
           SHIP_WORK: ${{ runner.temp }}/smart-ship
         run: |
           set -euo pipefail
-          # The look step wrote job.json outside the repair's write jail.
-          [ -f "$SHIP_WORK/job.json" ] || exit 0
           harn run --no-sandbox ship.harn
       # A persistent owned runner keeps the workspace; the look's run records go with it.
       - name: Remove the checkouts
