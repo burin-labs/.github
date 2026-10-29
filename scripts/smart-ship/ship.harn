@@ -439,6 +439,7 @@ fn prepare(
         head: pr.headRefOid,
         base_oid: base_oid,
         conflicted: conflicted,
+        turns: to_int(harness.env.get("SHIP_REPAIR_TURNS") ?? "60") ?? 60,
         task: task,
         threads: threads.map({ t -> t.id }),
       },
