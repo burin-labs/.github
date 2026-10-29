@@ -242,8 +242,8 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
       }
       return 7
     },
-    upload_assets: fn(tag, paths) {
-      assert_eq(tag, state.drafts[0].tag_name)
+    upload_assets: fn(release_id, paths) {
+      assert_eq(release_id, state.drafts[0].id)
       let assets = state.drafts[0].assets
       for path in paths {
         const name = basename(path)
@@ -382,7 +382,7 @@ pipeline test_inspection_reuses_sealed_intent_without_reaching_mutations(harness
       create_draft: fn(_release) {
         throw "inspection reached create"
       },
-      upload_assets: fn(_tag, _paths) {
+      upload_assets: fn(_release_id, _paths) {
         throw "inspection reached upload"
       },
       create_tag: fn(_tag, _sha, _message) {

@@ -15,7 +15,7 @@ pub type PublicationGitHub = {
   json: fn(string) -> unknown,
   create_draft: fn(dict) -> int,
   sleep_ms: fn(int) -> nil,
-  upload_assets: fn(string, list<string>) -> nil,
+  upload_assets: fn(int, list<string>) -> nil,
   create_tag: fn(string, string, string) -> nil,
   publish_draft: fn(int, bool) -> unknown,
 }
@@ -221,7 +221,7 @@ pub fn reconcile_publication(
   }
   const missing = missing_files(github, plan, release)
   if len(missing) > 0 {
-    github.upload_assets(plan.tag, missing.map({ file -> file.path }))
+    github.upload_assets(release.id, missing.map({ file -> file.path }))
   }
   const observed = release_for(github, plan, release.id)
   require observed != nil && observed.id == release.id && observed.draft,

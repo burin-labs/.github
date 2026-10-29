@@ -90,3 +90,54 @@ pipeline test_live_draft_creation_refuses_missing_or_invalid_identity(harness: H
   )
   assert_eq(len(harness.testing.calls()), 0)
 }
+
+pipeline test_live_asset_upload_uses_the_verified_id_without_resolving_the_tag(harness: Harness) {
+  const github = live_github(
+    harness.net,
+    harness.tools,
+    harness.fs,
+    "fixture-token",
+    "acme/release",
+    harness.fs.mkdtemp_in_workspace("draft-upload-"),
+    fn(_ms: int) {
+      throw "an upload cannot retry tag discovery"
+    },
+  )
+  harness.testing.clear()
+  harness.testing.http_mock(
+    "GET",
+    "https://api.github.com/repos/acme/release/releases/tags/v1.0.0",
+    {status: 404, body: "{}"},
+  )
+  harness.testing.respond("tools", "run_command", {exit_code: 0, stdout: "{\"id\":9}"})
+  github.upload_assets(7, ["candidate/archive.zip"])
+  const calls = harness.testing.calls()
+  assert_eq(len(calls), 1)
+  assert_eq(calls[0].method, "run_command")
+  const command = calls[0].args[0]
+  assert_eq(
+    command.argv,
+    [
+      "gh",
+      "api",
+      "--method",
+      "POST",
+      "https://uploads.github.com/repos/acme/release/releases/7/assets?name=archive.zip",
+      "--input",
+      "candidate/archive.zip",
+      "-H",
+      "Content-Type: application/octet-stream",
+    ],
+  )
+  assert_eq(command.env.GH_TOKEN, "fixture-token")
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+  harness.testing.clear()
+  assert(
+    is_err(
+      try {
+        github.upload_assets(0, ["candidate/archive.zip"])
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.calls()), 0)
+}

@@ -24,7 +24,7 @@ pub type GitHub = {
   attest: fn(string, dict) -> string?,
   create_draft: fn(dict) -> int,
   sleep_ms: fn(int) -> nil,
-  upload_assets: fn(string, list<string>) -> nil,
+  upload_assets: fn(int, list<string>) -> nil,
   create_tag: fn(string, string, string) -> nil,
   publish_draft: fn(int, bool) -> unknown,
 }

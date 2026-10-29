@@ -250,13 +250,26 @@ pub fn live_github(
       require draft.id > 0, "draft creation returned no release identity"
       return draft.id
     },
-    upload_assets: fn(tag, paths) {
-      gh_ok(
-        tools,
-        env,
-        ["release", "upload", tag, "--repo", repository] + paths,
-        "uploading missing release assets",
-      )
+    upload_assets: fn(release_id, paths) {
+      require release_id > 0, "asset upload requires a verified release identity"
+      parallel each paths with { max_concurrent: 5 } { path ->
+        const name = url_encode(basename(path))
+        gh_ok(
+          tools,
+          env,
+          [
+            "api",
+            "--method",
+            "POST",
+            "https://uploads.github.com/repos/${repository}/releases/${release_id}/assets?name=${name}",
+            "--input",
+            path,
+            "-H",
+            "Content-Type: application/octet-stream",
+          ],
+          "uploading missing release asset ${basename(path)}",
+        )
+      }
       return nil
     },
     create_tag: fn(tag, sha, message) {

@@ -68,8 +68,10 @@ promotions serialize without cancelling the active publisher.
 
 After creating a draft, the promoter reads its returned ID, tag and release
 listing up to six times. Missing results back off for 1, 2, 4, 8 and 16 seconds.
-A conflicting identity or body fails immediately. If the draft remains missing,
-promotion stops before uploading assets or creating a tag; recover through the
+A conflicting identity or body fails immediately. Asset uploads use that verified
+release ID directly, so they don't depend on the tag lookup becoming visible.
+If the draft remains missing, promotion stops before uploading assets or creating
+a tag; recover through the
 same workflow after diagnosing visibility.
 
 ## Register the package
