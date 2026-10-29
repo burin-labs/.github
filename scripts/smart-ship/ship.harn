@@ -422,7 +422,7 @@ fn repair(
       max_attempts: MAX_ATTEMPTS,
     },
   )
-  agent_loop(
+  const spent = agent_loop(
     harness,
     task,
     nil,
@@ -440,7 +440,9 @@ fn repair(
   )
   require harness.fs.exists(done_path), "the repair agent stopped without reporting"
   const done = json_parse(harness.fs.read_text(done_path))
+  const usd = spent.cost_usd ?? spent.known_cost_usd
   let note = to_string(done?.summary ?? "")
+    + "\n\nRepair model spend: $${round(usd * 10000.0) / 10000.0} over ${spent.llm.iterations} turns."
   if done?.outcome == "fixed" {
     git(harness, token, dir, ["add", "-A"])
     require git(harness, token, dir, ["diff", "--cached", "--check"]).ok,
