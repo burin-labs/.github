@@ -445,7 +445,7 @@ fn repair(
   const done = json_parse(harness.fs.read_text(done_path))
   const usd = spent.cost_usd ?? spent.known_cost_usd
   let note = to_string(done?.summary ?? "")
-    + "\n\nRepair model spend: $${round(usd * 10000.0) / 10000.0} over ${spent.llm.iterations} turns."
+    + "\n\nRepair model spend: $${round(usd * 10000.0) / 10000.0} over ${spent.llm.iterations} turns, ${spent.llm.input_tokens} input and ${spent.llm.output_tokens} output tokens, accounting ${spent.llm.accounting_status}."
   if done?.outcome == "fixed" {
     git(harness, token, dir, ["add", "-A"])
     require git(harness, token, dir, ["diff", "--cached", "--check"]).ok,
