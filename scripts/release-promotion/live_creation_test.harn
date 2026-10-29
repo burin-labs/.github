@@ -1,0 +1,92 @@
+import { live_github } from "./live.harn"
+
+const REQUEST = {
+  tag: "v1.0.0",
+  sha: "a".repeat(40),
+  title: "v1.0.0",
+  notes_file: "candidate/release-notes.md",
+  prerelease: false,
+  files: [],
+}
+
+pipeline test_live_draft_creation_retains_the_rest_id_and_reads_notes_from_a_file(
+  harness: Harness,
+) {
+  const github = live_github(
+    harness.net,
+    harness.tools,
+    harness.fs,
+    "fixture-token",
+    "acme/release",
+    harness.fs.mkdtemp_in_workspace("draft-creation-"),
+    fn(_ms: int) {
+      throw "creation cannot wait before its read-back"
+    },
+  )
+  harness.testing.clear()
+  harness.testing.respond("tools", "run_command", {exit_code: 0, stdout: "{\"id\":7}"})
+  assert_eq(github.create_draft(REQUEST), 7)
+  const calls = harness.testing.calls()
+  assert_eq(len(calls), 1)
+  assert_eq(calls[0].method, "run_command")
+  const command = calls[0].args[0]
+  assert_eq(
+    command.argv,
+    [
+      "gh",
+      "api",
+      "--method",
+      "POST",
+      "repos/acme/release/releases",
+      "-f",
+      "tag_name=v1.0.0",
+      "-f",
+      "target_commitish=${REQUEST.sha}",
+      "-f",
+      "name=v1.0.0",
+      "-F",
+      "draft=true",
+      "-F",
+      "prerelease=false",
+      "-F",
+      "body=@candidate/release-notes.md",
+    ],
+  )
+  assert_eq(command.env.GH_TOKEN, "fixture-token")
+  assert(!command.argv.contains("fixture-token"))
+}
+
+pipeline test_live_draft_creation_refuses_missing_or_invalid_identity(harness: Harness) {
+  const github = live_github(
+    harness.net,
+    harness.tools,
+    harness.fs,
+    "fixture-token",
+    "acme/release",
+    harness.fs.mkdtemp_in_workspace("draft-creation-refusal-"),
+    fn(_ms: int) {
+      throw "creation cannot wait before its read-back"
+    },
+  )
+  for response in ["{}", "{\"id\":0}", "{\"id\":-1}", "{\"id\":\"7\"}", ""] {
+    harness.testing.clear()
+    harness.testing.respond("tools", "run_command", {exit_code: 0, stdout: response})
+    assert(
+      is_err(
+        try {
+          github.create_draft(REQUEST)
+        },
+      ),
+    )
+    assert_eq(len(harness.testing.calls()), 1)
+  }
+  harness.testing.clear()
+  assert(
+    is_err(
+      try {
+        github.create_draft(REQUEST + {files: ["unexpected.zip"]})
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.calls()), 0)
+}

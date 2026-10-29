@@ -57,6 +57,9 @@ pipeline test_actual_http_reader_reports_missing_then_visible_draft_without_writ
     "fixture-token",
     "acme/release",
     harness.fs.mkdtemp_in_workspace("inspection-http-"),
+    fn(_ms: int) {
+      throw "inspection reached a write-back retry"
+    },
   )
   reads(harness, false)
   const missing = inspect_publication({json: github.json}, plan())

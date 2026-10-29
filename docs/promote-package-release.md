@@ -66,6 +66,12 @@ incomplete upload or changed digest. Preserve the draft and retained proof when
 it refuses; diagnose the named conflict before another attempt. Same-tag
 promotions serialize without cancelling the active publisher.
 
+After creating a draft, the promoter reads its returned ID, tag and release
+listing up to six times. Missing results back off for 1, 2, 4, 8 and 16 seconds.
+A conflicting identity or body fails immediately. If the draft remains missing,
+promotion stops before uploading assets or creating a tag; recover through the
+same workflow after diagnosing visibility.
+
 ## Register the package
 
 After publication, register the immutable archive URL and checksum with the
