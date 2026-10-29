@@ -754,7 +754,13 @@ fn main(harness: Harness) {
     const note = try {
       publish(harness, opts, work, repo, number, r)
     } catch (e) {
-      "Publishing the repair failed: " + to_string(e)
+      // The spend is reported even when publishing fails.
+      const result = work + "/pr/.git/ship-result.json"
+      const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {}
+      const spent = out?.spend
+      "Publishing the repair failed: " + to_string(e) + "\n\nRepair model spend: "
+        + to_string(spent ?? "unknown")
+        + "."
     }
     say(note)
     harness.stdio.println("${repo}#${number}: published: ${note}")
