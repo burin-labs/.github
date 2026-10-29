@@ -1,5 +1,5 @@
 /** The landing gate is the one place a wrong answer merges unreviewed or red code. */
-import { Repo, checkout, decide, diff_refusal, quiet, sh } from "./ship.harn"
+import { Repo, checkout, decide, diff_refusal, look, quiet, sh } from "./ship.harn"
 
 fn page(nodes: list) {
   return {totalCount: len(nodes), nodes: nodes}
@@ -413,6 +413,73 @@ pipeline test_a_crashed_attempt_counts_once_and_closes(harness: Harness) {
   )
   const p = decide(pr(red() + planted), "clear", true)
   assert_eq([p.facts.open, p.action], [1, "repair"], "only Smart Ship's own note closes or answers")
+}
+
+type Posted = {body: string}
+
+/** A whole look against a fake GitHub serving this PR state; returns the comments it posted. */
+fn look_at(harness: Harness, comments: list, repair: bool) {
+  harness.testing.http_mock_clear()
+  const state = {data: {repository: pr(red() + {comments: page(comments)})}}
+  const api = "https://api.github.com"
+  harness.testing.http_mock("POST", api + "/graphql", {status: 200, body: json_stringify(state)})
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/o/r/git/matching-refs/release-merge-lease/main",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
+  const job = {
+    repo: "o/r",
+    number: 9,
+    token: "fixture-token",
+    work: harness.fs.mkdtemp_in_workspace("smart-ship-look-"),
+    publish: false,
+    repair: repair,
+    run_id: "",
+    opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    // No host serves this, so a repair's checkout fails the way a dead clone does.
+    git_host: "file:///nonexistent-smart-ship-host/",
+  }
+  const result = try {
+    look(harness, job)
+  }
+  const posted = harness.testing.http_mock_calls({include_sensitive: true}).filter(
+    { c -> c.method == "POST" && contains(c.url, "/issues/9/comments") },
+  )
+    .map({ c -> schema_expect(json_parse(c.body), schema_of(Posted)).body })
+    .to_list()
+  return {result: result, posted: posted}
+}
+
+/** The look itself closes a dead attempt once, starts the next within the cap, and stops at it. */
+pipeline test_a_look_closes_a_crashed_attempt_once(harness: Harness) {
+  const ours = { body -> {body: body, viewerDidAuthor: true} }
+  const started = ours("<!-- smart-ship head=abc -->")
+  const ended = ours("<!-- smart-ship ended=abc -->")
+  const first = look_at(harness, [started], false)
+  assert_eq(len(first.posted), 1, to_string(first.posted))
+  assert(contains(first.posted[0], "smart-ship ended=abc"), first.posted[0])
+  assert_eq(unwrap(first.result).reason, "blocked, and repair is off here")
+  const again = look_at(harness, [started, ended], false)
+  assert_eq(again.posted, [], "a later look posts no duplicate")
+  const next = look_at(harness, [started, ended], true)
+  assert(is_err(next.result), "a failed checkout reaches the look's caller")
+  assert_eq(len(next.posted), 2, to_string(next.posted))
+  assert(
+    contains(next.posted[0], "attempt 2 of 3") && contains(next.posted[0], "smart-ship head=abc"),
+    next.posted[0],
+  )
+  assert(
+    contains(next.posted[1], "could not start") && contains(next.posted[1], "smart-ship ended=abc"),
+    next.posted[1],
+  )
+  const third = look_at(harness, [started, ended, started, ended, started], true)
+  assert_eq(len(third.posted), 1, "the third crash is closed and no fourth attempt starts")
+  assert(contains(third.posted[0], "smart-ship ended=abc"), third.posted[0])
+  assert_eq(unwrap(third.result).reason, "repair attempts used up; a person needs to take it")
+  const capped = look_at(harness, [started, ended, started, ended, started, ended], true)
+  assert_eq(capped.posted, [], "a capped head posts nothing")
 }
 
 /**

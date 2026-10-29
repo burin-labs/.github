@@ -465,20 +465,16 @@ pub fn checkout(
 }
 
 /** Prepare one repair: the checkout, any saved work to continue, and the agent's task. */
-fn prepare(
-  harness: Harness,
-  token: string,
-  work: string,
-  repo: string,
-  number: int,
-  r: Repo,
-  f: dict,
-) {
+fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
+  const token = job.token
+  const work = job.work
+  const repo = job.repo
+  const number = job.number
   const pr = r.pullRequest
   const env = auth(token)
   const tree = checkout(
     harness.tools,
-    "https://github.com/${repo}.git",
+    "${job.git_host}${repo}.git",
     env,
     work,
     pr.headRefOid,
@@ -489,7 +485,7 @@ fn prepare(
   const conflicted = tree.conflicted
   const sides = tree.sides
   // Saved work continues only from the same head, and only the commit Smart Ship's own note names.
-  const wip = wip_commit(harness, {installation_token: token}, repo, number)
+  const wip = wip_commit(harness, job.opts, repo, number)
   if wip != "" {
     sh(
       harness.tools,
@@ -518,12 +514,7 @@ fn prepare(
       work + "/pr",
     )
   } else if wip != "" {
-    gh(
-      harness,
-      {installation_token: token},
-      "/repos/${repo}/git/refs/smart-ship/wip/${number}",
-      "DELETE",
-    )
+    gh(harness, job.opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
   }
   const tail = { id ->
     const got = run(
@@ -906,12 +897,16 @@ fn merge_now(harness: Harness, opts: GithubClientOptions, pr: Pull) -> string {
  * The node id of the workflow running this look, which its checks carry. On any failure it is "",
  * which excludes nothing, so every check counts, including Smart Ship's own.
  */
-fn own_workflow(harness: Harness, opts: GithubClientOptions, repo: string) -> string {
+fn own_workflow(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  run_id: string,
+) -> string {
   const unresolved = { why ->
     harness.stdio.println("smart-ship: own workflow unresolved (${why}); counting every check")
     ""
   }
-  const run_id = harness.env.get("GITHUB_RUN_ID") ?? ""
   if run_id == "" {
     return unresolved("no GITHUB_RUN_ID")
   }
@@ -941,23 +936,58 @@ fn own_workflow(harness: Harness, opts: GithubClientOptions, repo: string) -> st
 
 type Started = {head: string}
 
+/**
+ * One look's inputs. `main` reads them from the job; a test supplies a fake GitHub and git host.
+ */
+pub type Look = {
+  repo: string,
+  number: int,
+  token: string,
+  work: string,
+  publish: bool,
+  repair: bool,
+  run_id: string,
+  opts: GithubClientOptions,
+  git_host: string,
+}
+
 fn main(harness: Harness) {
   const repo = harness.env.get("REPO") ?? ""
   const number = to_int(harness.env.get("PR") ?? "") ?? 0
   const token = harness.env.get("GH_TOKEN") ?? ""
-  const work = harness.env.get("SHIP_WORK") ?? ""
+  const run_id = harness.env.get("GITHUB_RUN_ID") ?? ""
   // Actions masks only the token's literal value; mask the derived git header before any use.
   const header = base64_encode("x-access-token:" + token)
   harness.stdio.println("::add-mask::" + header)
   // Digests let a log audit look for the token, the header and a printed canary without holding them.
-  const canary = "smartship-canary-"
-    + substring(sha256((harness.env.get("GITHUB_RUN_ID") ?? "") + repo + to_string(number)), 0, 16)
+  const canary = "smartship-canary-" + substring(sha256(run_id + repo + to_string(number)), 0, 16)
   const digest = { s -> substring(sha256(s), 0, 16) }
   harness.stdio.println("smart-ship log canary: ${canary} ${base64_encode(canary)}")
   harness.stdio.println(
     "smart-ship digests: token=${digest(token)} header=${digest(header)} canary=${digest(canary)} canary64=${digest(base64_encode(canary))}",
   )
-  const opts: GithubClientOptions = {installation_token: token}
+  look(
+    harness,
+    {
+      repo: repo,
+      number: number,
+      token: token,
+      work: harness.env.get("SHIP_WORK") ?? "",
+      publish: harness.env.get("SHIP_MODE") == "publish",
+      repair: harness.env.get("SHIP_REPAIR") == "true",
+      run_id: run_id,
+      opts: {installation_token: token},
+      git_host: "https://github.com/",
+    },
+  )
+}
+
+/** One look at one pull request; returns what it decided. */
+pub fn look(harness: Harness, job: Look) {
+  const repo = job.repo
+  const number = job.number
+  const work = job.work
+  const opts = job.opts
   const r = read(harness, opts, repo, number)
   const pr = r.pullRequest
   const say = { body ->
@@ -969,13 +999,13 @@ fn main(harness: Harness) {
       {body: "**Smart Ship:** " + body},
     )
   }
-  if harness.env.get("SHIP_MODE") == "publish" {
+  if job.publish {
     // The head the attempt started from, which its result answers even if the PR moved since.
-    const job: Started = schema_expect(
+    const begun: Started = schema_expect(
       json_parse(harness.fs.read_text(work + "/job.json")),
       schema_of(Started),
     )
-    const started = job.head
+    const started = begun.head
     const note = try {
       publish(harness, opts, work, repo, number, r)
     } catch (e) {
@@ -989,7 +1019,7 @@ fn main(harness: Harness) {
     }
     say("${note}\n\n${DONE}${started} -->")
     harness.stdio.println("${repo}#${number}: published: ${note}")
-    return
+    return {action: "published", reason: note}
   }
   // Looks on one PR never overlap, so an attempt still open now died; it is closed, not repeated.
   const open = observe(pr).open
@@ -999,12 +1029,7 @@ fn main(harness: Harness) {
     )
   }
   const lease = release_lease(harness, opts, repo, pr.baseRefName)
-  const d = decide(
-    r,
-    lease,
-    harness.env.get("SHIP_REPAIR") == "true",
-    own_workflow(harness, opts, repo),
-  )
+  const d = decide(r, lease, job.repair, own_workflow(harness, opts, repo, job.run_id))
   let note = d.reason
   if d.action == "merge" {
     // The exact head is the lease: GitHub refuses if it moved since it was judged. Branch rules still apply server side.
@@ -1047,7 +1072,7 @@ fn main(harness: Harness) {
       "repairing at ${pr.headRefOid} (attempt ${d.facts.marks + 1} of ${MAX_ATTEMPTS}).\n\n${MARK}${pr.headRefOid} -->",
     )
     try {
-      prepare(harness, token, work, repo, number, r, d.facts)
+      prepare(harness, job, r, d.facts)
     } catch (e) {
       say(
         "the repair attempt at ${pr.headRefOid} could not start: ${quiet(to_string(e))}\n\n${ENDED}${pr.headRefOid} -->",
@@ -1056,4 +1081,5 @@ fn main(harness: Harness) {
     }
   }
   harness.stdio.println("${repo}#${number}: ${d.action}: ${note}")
+  return d
 }
