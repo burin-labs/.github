@@ -1203,6 +1203,29 @@ pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harn
   }
 }
 
+/** Saved filenames must be restored literally, including newlines and Git pathspec syntax. */
+pipeline test_a_saved_repair_restores_literal_filenames(harness: Harness) {
+  const f = divergent(harness, false)
+  f.git(["checkout", "--quiet", "topic"])
+  const names = ["newline\nname.txt", "literal[*].txt", ":(glob)magic.txt"]
+  for name in names {
+    harness.fs.write_text(f.remote + "/" + name, "unfinished " + name + "\n")
+  }
+  f.git(["rm", "--quiet", "file.txt"])
+  f.git(["add", "--all"])
+  f.git(["commit", "--quiet", "-m", "Smart Ship unfinished repair for #9 at ${f.head}, on base ${f.base_oid}, checkout clean"])
+  const wip = f.git(["rev-parse", "HEAD"])
+  f.git(["update-ref", "refs/smart-ship/wip/9", wip])
+  f.git(["checkout", "--quiet", "main"])
+  const seen = divergent_look(harness, f, false, wip, wip, true)
+  assert_eq(seen.result.action, "repair")
+  for name in names {
+    assert_eq(harness.fs.read_text(f.dir + "/work/pr/" + name), "unfinished " + name + "\n", name)
+  }
+  assert(!harness.fs.exists(f.dir + "/work/pr/file.txt"), "saved deletion is restored")
+  assert(contains(harness.fs.read_text(f.dir + "/work/pr/.git/ship-task.json"), "This continues an earlier attempt"))
+}
+
 /**
  * A timed-out repair of a conflicted head once kept nothing: only a clean head's tree was saved.
  * Its merge in progress is now committed as the WIP; every saved tree names the base it was on.

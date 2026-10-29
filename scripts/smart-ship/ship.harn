@@ -558,38 +558,29 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
   if continuing {
     // The saved commit was fetched into the trusted clone; the agent's copy only sees its files,
     // laid over this checkout (and its merge, conflicted or not) where the saved work changed them.
-    const changed = split(
-      sh(
-        harness.tools,
-        [
-          "git",
-          "-c",
-          "core.quotePath=false",
-          "diff",
-          "--name-only",
-          "--no-renames",
-          pr.headRefOid,
-          wip,
-        ],
-        env,
-        work + "/pristine",
-      ),
-      "\n",
+    // Git paths may contain newlines or pathspec syntax. Keep their bytes in a
+    // NUL-delimited file and ask Git to treat every path literally.
+    const paths = work + "/wip-paths"
+    sh(
+      harness.tools,
+      ["git", "diff", "--name-only", "--no-renames", "-z", "--output=" + paths, pr.headRefOid, wip],
+      env,
+      work + "/pristine",
     )
-      .filter({ p -> p != "" })
-    require len(changed) > 0, "the saved work ${wip} changes nothing"
+    require run(harness.tools, ["test", "-s", paths]).success, "the saved work ${wip} changes nothing"
     sh(
       harness.tools,
       [
         "git",
+        "--literal-pathspecs",
         "--git-dir=" + work + "/pristine/.git",
         "--work-tree=" + work + "/pr",
         "restore",
         "--source=" + wip,
         "--worktree",
-        "--",
-      ]
-        + changed,
+        "--pathspec-from-file=" + paths,
+        "--pathspec-file-nul",
+      ],
       env,
       work + "/pr",
     )
