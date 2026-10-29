@@ -42,6 +42,7 @@ fn main(harness: Harness) {
     required_env(harness.env, "GH_TOKEN"),
     request.repository,
     harness.fs.mkdtemp_in_workspace("promote-release-gh-"),
+    fn(ms: int) { harness.clock.sleep_ms(ms) },
   )
   const mode = required_env(harness.env, "PROMOTE_MODE")
   const authorization = parse_authorization(

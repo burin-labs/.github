@@ -60,6 +60,8 @@ const API_VERSION = "2026-03-10"
 
 const MAX_JSON_RESPONSE_BYTES = 33554432
 
+type CreatedDraft = {id: int}
+
 fn diagnostic(tools: HarnessTools, result: dict) -> string {
   const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
   const lines = trim(stderr).split("\n")
@@ -139,6 +141,7 @@ pub fn live_github(
   token: string,
   repository: string,
   scratch: string,
+  sleep_ms: fn(int) -> nil,
 ) -> GitHub {
   const env = {
     GH_TOKEN: token,
@@ -151,6 +154,7 @@ pub fn live_github(
     NO_COLOR: "1",
   }
   return {
+    sleep_ms: sleep_ms,
     json: fn(endpoint) { return api_json(net, token, endpoint) },
     download_bound: fn(run_id, name, identity, directory) {
       download_bound_manifest(
@@ -218,36 +222,54 @@ pub fn live_github(
       return nil
     },
     create_draft: fn(release) {
-      gh_ok(
+      require len(release.files) == 0, "draft creation must precede asset uploads"
+      const created = gh_ok(
         tools,
         env,
         [
-          "release",
-          "create",
-          release.tag,
-          "--repo",
-          repository,
-          "--target",
-          release.sha,
-          "--draft",
-          "--title",
-          release.title,
-          "--notes-file",
-          release.notes_file,
-        ]
-          + (release.prerelease ? ["--prerelease"] : [])
-          + release.files,
+          "api",
+          "--method",
+          "POST",
+          "repos/${repository}/releases",
+          "-f",
+          "tag_name=${release.tag}",
+          "-f",
+          "target_commitish=${release.sha}",
+          "-f",
+          "name=${release.title}",
+          "-F",
+          "draft=true",
+          "-F",
+          "prerelease=${release.prerelease}",
+          "-F",
+          "body=@${release.notes_file}",
+        ],
         "creating the draft release",
       )
-      return nil
+      const draft = schema_expect(json_parse(created.stdout), schema_of(CreatedDraft))
+      require draft.id > 0, "draft creation returned no release identity"
+      return draft.id
     },
-    upload_assets: fn(tag, paths) {
-      gh_ok(
-        tools,
-        env,
-        ["release", "upload", tag, "--repo", repository] + paths,
-        "uploading missing release assets",
-      )
+    upload_assets: fn(release_id, paths) {
+      require release_id > 0, "asset upload requires a verified release identity"
+      parallel each paths with { max_concurrent: 5 } { path ->
+        const name = url_encode(basename(path))
+        gh_ok(
+          tools,
+          env,
+          [
+            "api",
+            "--method",
+            "POST",
+            "https://uploads.github.com/repos/${repository}/releases/${release_id}/assets?name=${name}",
+            "--input",
+            path,
+            "-H",
+            "Content-Type: application/octet-stream",
+          ],
+          "uploading missing release asset ${basename(path)}",
+        )
+      }
       return nil
     },
     create_tag: fn(tag, sha, message) {

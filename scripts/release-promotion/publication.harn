@@ -13,8 +13,9 @@ pub type ReleasePlan = {
 
 pub type PublicationGitHub = {
   json: fn(string) -> unknown,
-  create_draft: fn(dict) -> nil,
-  upload_assets: fn(string, list<string>) -> nil,
+  create_draft: fn(dict) -> int,
+  sleep_ms: fn(int) -> nil,
+  upload_assets: fn(int, list<string>) -> nil,
   create_tag: fn(string, string, string) -> nil,
   publish_draft: fn(int, bool) -> unknown,
 }
@@ -68,9 +69,16 @@ fn release_record(raw: unknown, plan: ReleasePlan) -> Release {
   return release
 }
 
-fn release_for(github: PublicationReader, plan: ReleasePlan) -> Release? {
+fn release_for(github: PublicationReader, plan: ReleasePlan, release_id: int? = nil) -> Release? {
+  const by_id = release_id == nil ? nil : github.json("${prefix(plan)}/releases/${release_id}")
   const published = github.json("${prefix(plan)}/releases/tags/${url_encode(plan.tag)}")
-  let found = published == nil ? nil : release_record(published, plan)
+  let found = by_id == nil ? nil : release_record(by_id, plan)
+  require found == nil || found.id == release_id, "release read-back returned another draft"
+  if published != nil {
+    const release = release_record(published, plan)
+    require found == nil || found.id == release.id, "multiple releases claim the candidate tag"
+    found = found ?? release
+  }
   for page in range(1, 11) {
     const suffix = page == 1 ? "" : "&page=${page}"
     const records = schema_expect(
@@ -82,7 +90,7 @@ fn release_for(github: PublicationReader, plan: ReleasePlan) -> Release? {
       if raw?.tag_name == plan.tag {
         const release = release_record(raw, plan)
         require found == nil || found.id == release.id, "multiple releases claim the candidate tag"
-        found = release
+        found = found ?? release
       }
     }
     if len(records) < 100 {
@@ -90,6 +98,22 @@ fn release_for(github: PublicationReader, plan: ReleasePlan) -> Release? {
     }
   }
   throw "release census is incomplete after 1000 records"
+}
+
+fn created_draft(github: PublicationGitHub, plan: ReleasePlan, release_id: int) -> Release {
+  require release_id > 0, "draft creation returned no release identity"
+  for delay in [0, 1000, 2000, 4000, 8000, 16000] {
+    if delay > 0 {
+      github.sleep_ms(delay)
+    }
+    const release = release_for(github, plan, release_id)
+    if release != nil {
+      require release.id == release_id && release.draft,
+        "the created candidate draft changed identity or state"
+      return release
+    }
+  }
+  throw "candidate draft ${release_id} is still missing after 6 read-back attempts"
 }
 
 fn tag_commit(github: PublicationReader, plan: ReleasePlan) -> string? {
@@ -179,7 +203,7 @@ pub fn reconcile_publication(
     "tag ${plan.tag} already points at ${to_string(tagged)}, not ${plan.sha}"
   let release = release_for(github, plan)
   if release == nil {
-    github.create_draft(
+    const release_id = github.create_draft(
       {
         tag: plan.tag,
         sha: plan.sha,
@@ -189,8 +213,7 @@ pub fn reconcile_publication(
         files: [],
       },
     )
-    release = release_for(github, plan)
-    require release != nil && release.draft, "the candidate draft did not appear"
+    release = created_draft(github, plan, release_id)
   }
   if !release.draft {
     require_complete(github, plan, release)
@@ -198,9 +221,9 @@ pub fn reconcile_publication(
   }
   const missing = missing_files(github, plan, release)
   if len(missing) > 0 {
-    github.upload_assets(plan.tag, missing.map({ file -> file.path }))
+    github.upload_assets(release.id, missing.map({ file -> file.path }))
   }
-  const observed = release_for(github, plan)
+  const observed = release_for(github, plan, release.id)
   require observed != nil && observed.id == release.id && observed.draft,
     "candidate draft changed during asset upload"
   const pending = missing_files(github, plan, observed)
@@ -212,7 +235,7 @@ pub fn reconcile_publication(
     github.create_tag(plan.tag, plan.sha, "Release ${plan.tag}")
   }
   github.publish_draft(observed.id, plan.latest)
-  const published = release_for(github, plan)
+  const published = release_for(github, plan, observed.id)
   require published != nil && published.id == observed.id && !published.draft,
     "publication did not report the candidate release as published"
   require_complete(github, plan, published)

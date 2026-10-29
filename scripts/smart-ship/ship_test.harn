@@ -512,11 +512,11 @@ pipeline test_a_look_closes_a_crashed_attempt_once(harness: Harness) {
 }
 
 /**
- * A blobless clone once failed a conflicted repair: the merge base's blob sat in neither endpoint
- * tree, and the agent's working copy has no way to fetch it.
+ * A remote that would serve a blobless clone, whose head and main each change one line of f.txt
+ * from an ancestor neither endpoint tree holds; `head_line` "" leaves the head's line alone.
  */
-pipeline test_a_conflict_merges_from_a_blobless_clone(harness: Harness) {
-  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-merge-")
+fn diverged(harness: Harness, head_line: string) {
+  const dir = harness.fs.mkdtemp_in_workspace("smart-ship-checkout-")
   const remote = dir + "/remote"
   const git = { argv ->
     sh(harness.tools, ["git", "-c", "user.name=t", "-c", "user.email=t@t"] + argv, {}, remote)
@@ -525,30 +525,72 @@ pipeline test_a_conflict_merges_from_a_blobless_clone(harness: Harness) {
   git(["init", "--quiet", "--initial-branch=main"])
   git(["config", "uploadpack.allowFilter", "true"])
   git(["config", "uploadpack.allowAnySHA1InWant", "true"])
-  const commit = { text, message ->
-    harness.fs.write_text(remote + "/f.txt", text)
+  const commit = { first, last, message ->
+    harness.fs.write_text(remote + "/f.txt", "${first}\n2\n3\n4\n5\n6\n7\n8\n9\n${last}\n")
     git(["add", "f.txt"])
     git(["commit", "--quiet", "-m", message])
   }
-  commit("a\nancestor\nc\n", "start")
+  commit("ancestor", "10", "start")
   git(["checkout", "--quiet", "-b", "head"])
-  commit("a\nours\nc\n", "ours")
+  commit("intermediate", "10", "intermediate")
+  commit("ours", head_line == "" ? "10" : head_line, "ours")
   const head = git(["rev-parse", "HEAD"])
   git(["checkout", "--quiet", "main"])
-  commit("a\ntheirs\nc\n", "theirs")
-  const got = checkout(harness.tools, "file://" + remote, {}, dir + "/work", head, "main", true)
+  commit("ancestor", "theirs", "theirs")
+  return {dir: dir, url: "file://" + remote, head: head}
+}
+
+// With lazy fetch off, a read that needs an object the clone lacks fails instead of fetching it.
+const OFFLINE = {GIT_NO_LAZY_FETCH: "1"}
+
+/**
+ * A blobless clone once failed a conflicted repair: the merge base's blob sat in neither endpoint
+ * tree, and the agent's working copy has no way to fetch it.
+ */
+pipeline test_a_conflict_merges_with_its_ancestors_in_the_clone(harness: Harness) {
+  const fixture = diverged(harness, "ours")
+  const got = checkout(
+    harness.tools,
+    fixture.url,
+    {},
+    fixture.dir + "/work",
+    fixture.head,
+    "main",
+    true,
+  )
   assert_eq(got.conflicted, ["f.txt"])
   assert(contains(got.sides, "ours") && contains(got.sides, "theirs"), got.sides)
-  assert_eq(
-    sh(
-      harness.tools,
-      ["git", "config", "remote.origin.partialclonefilter"],
-      {},
-      dir + "/work/base",
-    ),
-    "blob:none",
-    "the trusted clone really is blobless",
+}
+
+/**
+ * A clean PR's checkout once returned before anything hydrated its history, so comparing the head
+ * with its merge base, or reading an intermediate commit, failed in the agent's offline copy.
+ */
+pipeline test_a_clean_head_reads_its_whole_history_offline(harness: Harness) {
+  const fixture = diverged(harness, "")
+  const got = checkout(
+    harness.tools,
+    fixture.url,
+    {},
+    fixture.dir + "/work",
+    fixture.head,
+    "main",
+    false,
   )
+  assert_eq(got.conflicted, [], "the clean path")
+  const pr = fixture.dir + "/work/pr"
+  const read = { argv -> sh(harness.tools, ["git"] + argv, OFFLINE, pr) }
+  const ancestor = read(["merge-base", "HEAD", "origin/main"])
+  for rev in [ancestor, "HEAD^", "HEAD", "origin/main"] {
+    read(["cat-file", "-e", read(["rev-parse", rev + ":f.txt"])])
+  }
+  const since = read(["diff", ancestor, "HEAD", "--", "f.txt"])
+  assert(contains(since, "-ancestor") && contains(since, "+ours"), since)
+  assert(
+    contains(read(["log", "-p", ancestor + "..HEAD"]), "+intermediate"),
+    "every commit's change reads",
+  )
+  assert(contains(read(["diff", ancestor, "origin/main"]), "+theirs"), "the base's side reads too")
 }
 
 /** The scan once read only the first 50 KB of a diff, so a credential further in was published. */
