@@ -29,8 +29,9 @@ const CONTINUE = "<!-- smart-ship continue="
 const REFUSED = "<!-- smart-ship refused="
 
 const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
-  nodes { ... on CheckRun { name status conclusion databaseId checkSuite { workflowRun { workflow { name } } } }
-    ... on StatusContext { name: context state } }"""
+  nodes { ... on CheckRun { name status conclusion databaseId
+      checkSuite { app { id } workflowRun { workflow { id name } } } }
+    ... on StatusContext { name: context state createdAt creator { login } } }"""
 
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
@@ -58,7 +59,9 @@ pub type Check = {
   conclusion?: string?,
   state?: string?,
   databaseId?: int?,
-  checkSuite?: {workflowRun: {workflow: {name: string}}?}?,
+  createdAt?: string?,
+  creator?: {login: string}?,
+  checkSuite?: {app?: {id: string}?, workflowRun?: {workflow: {id?: string?, name: string}}?}?,
 }
 
 type Comment = {
@@ -117,19 +120,34 @@ fn complete(page: Page<any>) -> bool {
 }
 
 /**
+ * Who produced a check, by stable ids rather than display names: the app and workflow for a check
+ * run, the creator for a status. Nil when any part is unknown, and an unknown producer never collapses.
+ */
+fn producer(c: Check) -> string? {
+  if c.state != nil {
+    const creator = c.creator?.login
+    return creator == nil || c.createdAt == nil ? nil : "status\n${creator}\n${c.name}"
+  }
+  const app = c.checkSuite?.app?.id
+  const run = c.checkSuite?.workflowRun
+  const workflow = run == nil ? "" : run.workflow.id
+  return app == nil || workflow == nil || c.databaseId == nil ? nil : "check\n${app}\n${workflow}\n${c.name}"
+}
+
+/** Strictly newer; a tie never supersedes. */
+fn later(a: Check, b: Check) -> bool {
+  return a.state != nil ? a.createdAt > b.createdAt : a.databaseId > b.databaseId
+}
+
+/**
  * A head keeps every attempt of a check, and re-running an old run replays its old workflow, so
- * only the newest attempt of each check (workflow and name, or status context) speaks for it.
+ * only the newest attempt from each producer speaks for it.
  */
 fn newest(checks: list<Check>) -> list<Check> {
-  const identity = { c ->
-    c.state != nil ? "status\n" + c.name : (c.checkSuite?.workflowRun?.workflow?.name ?? "") + "\n"
-      + c.name
-  }
   return checks.filter(
     { c ->
-      !checks.any(
-        { o -> identity(o) == identity(c) && (o.databaseId ?? -1) > (c.databaseId ?? -1) },
-      )
+      const key = producer(c)
+      key == nil || !checks.any({ o -> producer(o) == key && later(o, c) })
     },
   )
     .to_list()

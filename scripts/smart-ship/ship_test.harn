@@ -123,7 +123,10 @@ pipeline test_only_the_newest_attempt_of_a_check_counts(harness: Harness) {
       status: "COMPLETED",
       conclusion: conclusion,
       databaseId: id,
-      checkSuite: {workflowRun: {workflow: {name: workflow}}},
+      checkSuite: {
+        app: {id: "actions"},
+        workflowRun: {workflow: {id: "W_" + workflow, name: workflow}},
+      },
     }
   }
   const superseded = checks(
@@ -159,6 +162,59 @@ pipeline test_only_the_newest_attempt_of_a_check_counts(harness: Harness) {
     "an old look of its own never blocks",
   )
   assert_eq(decide(pr(old_look), "clear", false, "Other").action, "stop", "another workflow's does")
+}
+
+/** Display names are not identity: only a known producer's newer attempt clears its own failure. */
+pipeline test_only_the_same_known_producer_supersedes(harness: Harness) {
+  const by = { suite, conclusion, id ->
+    {name: "verify", status: "COMPLETED", conclusion: conclusion, databaseId: id, checkSuite: suite}
+  }
+  const workflow = { id -> {app: {id: "actions"}, workflowRun: {workflow: {id: id, name: "CI"}}} }
+  const app = { id -> {app: {id: id}, workflowRun: nil} }
+  const distinct = [
+    [by(workflow("W_a"), "FAILURE", 10), by(workflow("W_b"), "SUCCESS", 11)],
+    [by(app("A_a"), "FAILURE", 10), by(app("A_b"), "SUCCESS", 11)],
+    [by(nil, "FAILURE", 10), by(nil, "SUCCESS", 11)],
+    [
+      by({workflowRun: {workflow: {id: "W_a", name: "CI"}}}, "FAILURE", 10),
+      by(workflow("W_a"), "SUCCESS", 11),
+    ],
+  ]
+  for pair in distinct {
+    assert_eq(decide(pr(checks(pair + [GREEN])), "clear", false).action, "stop", to_string(pair))
+  }
+  assert_eq(
+    decide(
+      pr(checks([by(app("A_a"), "FAILURE", 10), by(app("A_a"), "SUCCESS", 11), GREEN])),
+      "clear",
+      false,
+    ).action,
+    "merge",
+    "an external app's own rerun clears it",
+  )
+  const status = { state, at ->
+    {name: "legacy", state: state, createdAt: at, creator: {login: "bot"}}
+  }
+  const one = "2026-10-29T01:00:00Z"
+  const two = "2026-10-29T02:00:00Z"
+  assert_eq(
+    decide(pr(checks([status("FAILURE", one), status("SUCCESS", two), GREEN])), "clear", false)
+      .action,
+    "merge",
+    "a newer status clears its older failure",
+  )
+  const unordered = [
+    [status("FAILURE", two), status("SUCCESS", one)],
+    [status("FAILURE", one), status("SUCCESS", one)],
+    [{name: "legacy", state: "FAILURE", creator: {login: "bot"}}, status("SUCCESS", two)],
+    [
+      {name: "legacy", state: "FAILURE", createdAt: one},
+      {name: "legacy", state: "SUCCESS", createdAt: two},
+    ],
+  ]
+  for pair in unordered {
+    assert_eq(decide(pr(checks(pair + [GREEN])), "clear", false).action, "stop", to_string(pair))
+  }
 }
 
 pipeline test_a_page_it_did_not_read_refuses(harness: Harness) {
