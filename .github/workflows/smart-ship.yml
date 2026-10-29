@@ -135,6 +135,7 @@ jobs:
           SHIP_REPAIR: ${{ inputs.repair && secrets.OPENAI_API_KEY != '' && github.event_name != 'pull_request_review' }}
           SHIP_REPAIR_TURNS: ${{ inputs.repair-turns }}
           SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
+          SHIP_RETAIN_ROOT: ${{ runner.temp }}/../.smart-ship-retained
         run: |
           set -euo pipefail
           # A repair was prepared only if this look wrote its job, carrying this step's nonce; a
@@ -153,6 +154,7 @@ jobs:
       # The agent runs in Harn's sandbox in the checkout: no GitHub token in this step, no child
       # network, and the model key granted to model calls only, never to a command.
       - name: Repair without credentials
+        id: repair
         if: inputs.repair && steps.look.outputs.prepared == 'true'
         timeout-minutes: 25
         env:
@@ -184,7 +186,8 @@ jobs:
         run: |
           set -euo pipefail
           harn run --no-sandbox ship.harn
-      # Keep the controller's records with a failed or interrupted owned repair for recovery.
+      # The agent cannot run without prepared=true; a measured look without it has no agent work.
+      # Otherwise keep the controller's records with a failed owned repair for recovery.
       - name: Remove Smart Ship's scripts
         if: always()
         env:
@@ -196,7 +199,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ] &&
-             ! { [ "$SHIP_PUBLISH" = success ] || { [ "$SHIP_LOOK" = success ] && [ "$SHIP_PREPARED" != true ]; }; }; then
+             ! { [ "${SHIP_PUBLISH:-}" = success ] || { [ "${SHIP_PREPARED:-}" != true ] && [ -n "${SHIP_LOOK:-}" ]; }; }; then
             if [ -d "$GITHUB_WORKSPACE/.smart-ship" ] && [ ! -e "$SHIP_WORK/controller" ]; then
               mv -- "$GITHUB_WORKSPACE/.smart-ship" "$SHIP_WORK/controller"
             fi
@@ -216,15 +219,16 @@ jobs:
           SHIP_RUN: ${{ github.run_id }}
           SHIP_ATTEMPT: ${{ github.run_attempt }}
           SHIP_PR: ${{ matrix.pr }}
+          SHIP_RETAIN_ROOT: ${{ runner.temp }}/../.smart-ship-retained
         run: |
           set -euo pipefail
           if [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ] &&
-             { [ "${SHIP_PUBLISH:-}" = success ] || { [ "${SHIP_LOOK:-}" = success ] && [ "${SHIP_PREPARED:-}" != true ]; }; }; then
+             { [ "${SHIP_PUBLISH:-}" = success ] || { [ "${SHIP_PREPARED:-}" != true ] && [ -n "${SHIP_LOOK:-}" ]; }; }; then
             rm -rf -- "$SHIP_WORK"
           elif [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ]; then
-            if [[ "${SHIP_RUN:-}" =~ ^[0-9]+$ && "${SHIP_ATTEMPT:-}" =~ ^[0-9]+$ && "${SHIP_PR:-}" =~ ^[0-9]+$ && -n "${GITHUB_WORKSPACE:-}" ]]; then
+            if [[ "${SHIP_RUN:-}" =~ ^[0-9]+$ && "${SHIP_ATTEMPT:-}" =~ ^[0-9]+$ && "${SHIP_PR:-}" =~ ^[0-9]+$ && -n "${SHIP_RETAIN_ROOT:-}" ]]; then
               umask 077
-              retained="$(dirname -- "$GITHUB_WORKSPACE")/.smart-ship-retained"
+              retained="$SHIP_RETAIN_ROOT"
               [ ! -L "$retained" ] || { echo "::error::Refusing a symlinked retention directory."; exit 1; }
               mkdir -p -- "$retained"
               chmod 700 "$retained"
