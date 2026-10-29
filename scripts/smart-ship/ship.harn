@@ -709,8 +709,10 @@ fn save_wip(
   merged: bool,
 ) -> string {
   const base = work + "/pristine"
-  stage_repair(harness, work)
-  const why = diff_refusal(harness.tools, base, head)
+  const refused = stage_repair(harness, work)
+  require refused == "", "The unfinished work was not kept: ${refused}."
+  // A merged checkout holds the base's changes too; only the repair's binaries are refused.
+  const why = diff_refusal(harness.tools, base, head, merged ? base_oid : "")
   if why == "empty" {
     return "No unfinished work to keep."
   }
@@ -735,82 +737,141 @@ fn save_wip(
 }
 
 /**
- * Untracked paths a repair never means to commit: the agent's own Harn state and standard
- * tool caches, matched by any path component, plus compiled-file suffixes.
+ * New-file policy for a repair. `caches` are the exact shapes Harn and language tools leave
+ * behind, as consecutive path components; they are never committed. Any other new path under a
+ * `guarded` component, ending in a `guarded_suffixes` suffix, or named like an env file is
+ * ambiguous, so the repair stops and names it instead of committing or dropping it.
  */
 pub const GENERATED = {
-  dirs: [
-    ".harn",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".hypothesis",
-    ".tox",
-    ".nox",
-    ".venv",
-    "node_modules",
-  ],
-  suffixes: [".pyc", ".pyo"],
+  caches: [[".harn", "state"], ["__pycache__"], ["node_modules", ".cache"]],
+  guarded: [".harn", "__pycache__", "node_modules"],
+  guarded_suffixes: [".pyc", ".pyo"],
 }
 
-fn generated(path: string) -> bool {
+fn under(parts: list<string>, shape: list<string>) -> bool {
+  for i in 0..(len(parts) - len(shape) + 1) {
+    if parts.slice(i, i + len(shape)) == shape {
+      return true
+    }
+  }
+  return false
+}
+
+/** "cache", "ambiguous" or "new" for one untracked path. */
+fn new_file_kind(path: string) -> string {
   const parts = split(path, "/")
-  return parts.slice(0, len(parts) - 1).any({ d -> GENERATED.dirs.contains(d) })
-    || GENERATED.dirs.contains(parts[len(parts) - 1])
-    || GENERATED.suffixes.any({ s -> ends_with(path, s) })
+  const name = parts[len(parts) - 1]
+  const compiled = GENERATED.guarded_suffixes.any({ s -> ends_with(name, s) })
+  if under(parts, [".harn", "state"]) || under(parts, ["node_modules", ".cache"])
+    || (compiled && len(parts) > 1 && parts[len(parts) - 2] == "__pycache__") {
+    return "cache"
+  }
+  const dirs = parts.slice(0, len(parts) - 1)
+  if dirs.any({ d -> GENERATED.guarded.contains(d) }) || compiled
+    || name == ".env" || starts_with(name, ".env.") {
+    return "ambiguous"
+  }
+  return "new"
 }
 
 /**
- * Stage the repair into the trusted clone's index: every change to a tracked file, and every new
- * file except the GENERATED policy's. An untracked nested repository is refused, not dropped.
+ * Stage the repair into the trusted clone's index: every change to a tracked file and every new
+ * file, leaving out only GENERATED caches. Returns why it refused, or "" once staged. It refuses
+ * an ambiguous new path, a nested repository, and a tracked file moved into a cache.
  * Paths stay NUL-delimited and literal, whatever bytes they hold.
  */
-pub fn stage_repair(harness: Harness, work: string) {
+pub fn stage_repair(harness: Harness, work: string) -> string {
   const tools = harness.tools
-  const git = ["git", "--literal-pathspecs", "--git-dir=" + work + "/pristine/.git", "--work-tree=" + work + "/pr"]
-  sh(tools, git + ["add", "--update"], {}, work + "/pr")
-  const listed = run(tools, git + ["ls-files", "-z", "--others", "--exclude-standard"], {}, work + "/pr")
+  const pr = work + "/pr"
+  const git = ["git", "--literal-pathspecs", "--git-dir=" + work + "/pristine/.git", "--work-tree=" + pr]
+  sh(tools, git + ["add", "--update"], {}, pr)
+  const listed = run(tools, git + ["ls-files", "-z", "--others", "--exclude-standard"], {}, pr)
   require listed.success && !(listed?.stdout_truncated ?? false), "the new files could not be listed whole"
-  const fresh = split(listed.stdout, "\0").filter({ p -> p != "" && !generated(p) })
-  const nested = fresh.filter({ p -> ends_with(p, "/") })
-  require len(nested) == 0,
-    "the repair left a nested repository, which is not committed: " + join(nested, ", ")
-  if len(fresh) == 0 {
-    return
+  const untracked = split(listed.stdout, "\0").filter({ p -> p != "" })
+  const nested = untracked.filter({ p -> ends_with(p, "/") })
+  if len(nested) > 0 {
+    return "the repair left a nested repository, which is not committed: " + join(nested, ", ")
   }
-  const paths = work + "/stage-paths"
-  harness.fs.write_text(paths, join(fresh, "\0") + "\0")
-  sh(tools, git + ["add", "--pathspec-from-file=" + paths, "--pathspec-file-nul"], {}, work + "/pr")
+  const ambiguous = untracked.filter({ p -> new_file_kind(p) == "ambiguous" })
+  if len(ambiguous) > 0 {
+    return "the repair left new files the policy cannot classify, so nothing was committed: "
+      + join(ambiguous, ", ")
+  }
+  const caches = untracked.filter({ p -> new_file_kind(p) == "cache" })
+  // A tracked file moved into a cache would otherwise commit as a bare deletion.
+  const deleted = split(
+    sh(tools, git + ["diff", "--cached", "--raw", "--no-abbrev", "-z", "--no-renames", "--diff-filter=D", "HEAD"], {}, pr),
+    "\0",
+  )
+    .filter({ e -> starts_with(e, ":") })
+    .map({ e -> split(e, " ")[2] })
+  if len(deleted) > 0 && len(caches) > 0 {
+    const hashed = split(sh(tools, ["git", "hash-object", "--no-filters", "--"] + caches, {}, pr), "\n")
+    let moved = []
+    for i in 0..len(caches) {
+      if deleted.contains(hashed[i]) {
+        moved = moved + [caches[i]]
+      }
+    }
+    if len(moved) > 0 {
+      return "the repair moved a tracked file into a cache path, which is not committed: "
+        + join(moved, ", ")
+    }
+  }
+  const fresh = untracked.filter({ p -> new_file_kind(p) == "new" })
+  if len(fresh) > 0 {
+    const paths = work + "/stage-paths"
+    harness.fs.write_text(paths, join(fresh, "\0") + "\0")
+    sh(tools, git + ["add", "--pathspec-from-file=" + paths, "--pathspec-file-nul"], {}, pr)
+  }
+  return ""
+}
+
+// Read diffs under no repository attributes, so a `diff` or textconv attribute cannot turn
+// binary content into text the credential scan misreads.
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+/** NUL-delimited paths of staged binary content that differs from `against`. */
+fn staged_binaries(tools: HarnessTools, dir: string, against: string) -> list<string>? {
+  const counts = run(
+    tools,
+    ["git", "--attr-source=" + EMPTY_TREE, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "--no-renames", "--diff-filter=d", against],
+    {},
+    dir,
+  )
+  if !counts.success || (counts?.stdout_truncated ?? false) {
+    return nil
+  }
+  // numstat marks a binary change "-\t-\t<path>"; a deletion carries no content to scan.
+  return split(counts.stdout, "\0").filter({ e -> starts_with(e, "-\t-\t") })
+    .map({ e -> regex_replace("^-\t-\t", "", e) })
+    .to_list()
 }
 
 /**
  * Why the staged diff against `against` may not leave the runner, or "" when it may: read whole,
  * under the size cap, holding nothing shaped like a credential, and no binary content, whose
- * encoded or compressed bytes the credential scan cannot read.
+ * encoded or compressed bytes the credential scan cannot read. With a `merged_base`, a binary the
+ * base merge brought in unchanged is the base's own content, not the repair's.
  */
-pub fn diff_refusal(tools: HarnessTools, dir: string, against: string) -> string {
-  const got = run(tools, ["git", "diff", "--cached", "--binary", against], {}, dir)
+pub fn diff_refusal(tools: HarnessTools, dir: string, against: string, merged_base: string = "") -> string {
+  const got = run(tools, ["git", "--attr-source=" + EMPTY_TREE, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary", against], {}, dir)
   if !got.success || (got?.stdout_truncated ?? false) {
     return "its diff could not be read whole"
   }
   if trim(got.stdout) == "" {
     return "empty"
   }
-  // numstat marks a binary change "-\t-\t<path>"; a deletion carries no content to scan.
-  const counts = run(
-    tools,
-    ["git", "diff", "--cached", "--numstat", "-z", "--no-renames", "--diff-filter=d", against],
-    {},
-    dir,
-  )
-  if !counts.success || (counts?.stdout_truncated ?? false) {
+  let binary = staged_binaries(tools, dir, against)
+  if binary != nil && merged_base != "" {
+    const from_base = staged_binaries(tools, dir, merged_base)
+    binary = from_base == nil ? nil : binary.filter({ p -> from_base.contains(p) }).to_list()
+  }
+  if binary == nil {
     return "its diff could not be read whole"
   }
-  const binary = split(counts.stdout, "\0").filter({ e -> starts_with(e, "-\t-\t") })
-    .map({ e -> regex_replace("^-\t-\t", "", e) })
   if len(binary) > 0 {
-    return "it adds binary content the credential scan cannot read: " + join(binary, ", ")
+    return "it changes binary content the credential scan cannot read: " + join(binary, ", ")
   }
   if len(got.stdout) > DIFF_CAP {
     return "its diff is over the ${DIFF_CAP}-byte cap"
@@ -869,6 +930,19 @@ fn signed(
 }
 
 /**
+ * Stage the agent's resolution onto GitHub's merge. The index takes the merge's tree first, so a
+ * base file under a cache path stays tracked instead of committing as a deletion.
+ */
+pub fn stage_resolution(harness: Harness, work: string, merge_oid: string, env: dict) {
+  const base = work + "/pristine"
+  sh(harness.tools, ["git", "fetch", "--quiet", "origin", merge_oid], env, base)
+  sh(harness.tools, ["git", "reset", "--quiet", "--mixed", merge_oid], env, base)
+  const refused = stage_repair(harness, work)
+  require refused == "", "nothing was published: " + refused
+  staged_clean(harness.tools, base, merge_oid)
+}
+
+/**
  * A resolved conflict lands as GitHub-signed commits built on a scratch branch: the base's
  * side of the conflicted files, GitHub's merge of the base, then the agent's resolution.
  * The pull request's head moves once, by fast-forward, only after every step succeeded.
@@ -923,11 +997,7 @@ fn publish_merge(
       "GitHub could not merge ${pr.baseRefName}: "
       + to_string(unwrap_err(merged)?.message)
     const merge_oid = unwrap(merged).oid
-    sh(harness.tools, ["git", "fetch", "--quiet", "origin", merge_oid], env, base)
-    // The index takes the merge's tree, so a base file the policy names stays tracked.
-    sh(harness.tools, ["git", "reset", "--quiet", "--mixed", merge_oid], env, base)
-    stage_repair(harness, work)
-    staged_clean(harness.tools, base, merge_oid)
+    stage_resolution(harness, work, merge_oid, env)
     resolved = signed(
       harness,
       opts,
@@ -986,7 +1056,8 @@ fn publish(
       pushed = publish_merge(harness, opts, work, repo, pr, job)
     } else {
       // The trusted clone's git reads the agent's files; nothing in the agent's own .git runs with the token.
-      stage_repair(harness, work)
+      const refused = stage_repair(harness, work)
+      require refused == "", "nothing was published: " + refused
       staged_clean(harness.tools, work + "/pristine", job.head)
       pushed = signed(
         harness,
