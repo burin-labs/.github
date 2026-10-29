@@ -267,11 +267,18 @@ fn release_lease(
 fn read(harness: Harness, opts: GithubClientOptions, repo: string, number: int) -> Repo {
   const [owner, name] = split(repo, "/")
   const vars = {owner: owner, name: name, number: number}
-  const body: Response = schema_expect(
-    gh(harness, opts, "/graphql", "POST", {query: QUERY, variables: vars}),
-    schema_of(Response),
-  )
-  return body.data.repository
+  // GitHub computes mergeability lazily after a push or a base move; a read starts it.
+  for wait in [0, 5000, 10000] {
+    harness.clock.sleep_ms(wait)
+    const body: Response = schema_expect(
+      gh(harness, opts, "/graphql", "POST", {query: QUERY, variables: vars}),
+      schema_of(Response),
+    )
+    if body.data.repository.pullRequest.mergeStateStatus != "UNKNOWN" || wait == 10000 {
+      return body.data.repository
+    }
+  }
+  throw "unreachable"
 }
 
 /**
