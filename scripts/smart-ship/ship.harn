@@ -424,9 +424,9 @@ pub fn checkout(
   base: string,
   dirty: bool,
 ) {
-  sh(tools, ["git", "clone", "--quiet", url, work + "/base"], env)
-  sh(tools, ["git", "checkout", "--quiet", "--detach", head], env, work + "/base")
-  sh(tools, ["git", "clone", "--quiet", "--shared", work + "/base", work + "/pr"])
+  sh(tools, ["git", "clone", "--quiet", url, work + "/pristine"], env)
+  sh(tools, ["git", "checkout", "--quiet", "--detach", head], env, work + "/pristine")
+  sh(tools, ["git", "clone", "--quiet", "--shared", work + "/pristine", work + "/pr"])
   sh(tools, ["git", "checkout", "--quiet", "--detach", head], {}, work + "/pr")
   const base_oid = sh(tools, ["git", "rev-parse", "origin/" + base], {}, work + "/pr")
   if !dirty {
@@ -469,6 +469,10 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
   const number = job.number
   const pr = r.pullRequest
   const env = auth(token)
+  // Leftovers are never deleted here: they may hold unconfirmed work. Only an occupied target stops us.
+  for dir in [work + "/pristine", work + "/pr"] {
+    require !harness.fs.exists(dir), "an earlier run left " + dir + "; not overwriting it"
+  }
   const tree = checkout(
     harness.tools,
     "${job.git_host}${repo}.git",
@@ -488,18 +492,18 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
       harness.tools,
       ["git", "fetch", "--quiet", "origin", "refs/smart-ship/wip/${number}"],
       env,
-      work + "/base",
+      work + "/pristine",
     )
   }
   const continuing = wip != "" && len(conflicted) == 0 && f.kept.contains(wip)
-    && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/base") == pr.headRefOid
+    && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/pristine") == pr.headRefOid
   if continuing {
     // The saved commit was fetched into the trusted clone; the agent's copy only sees its files.
     sh(
       harness.tools,
       [
         "git",
-        "--git-dir=" + work + "/base/.git",
+        "--git-dir=" + work + "/pristine/.git",
         "--work-tree=" + work + "/pr",
         "restore",
         "--source=" + wip,
@@ -603,7 +607,7 @@ fn save_wip(
   number: int,
   head: string,
 ) -> string {
-  const base = work + "/base"
+  const base = work + "/pristine"
   sh(
     harness.tools,
     ["git", "--git-dir=" + base + "/.git", "--work-tree=" + work + "/pr", "add", "-A"],
@@ -719,7 +723,7 @@ fn publish_merge(
   pr: Pull,
   job: dict,
 ) -> string {
-  const base = work + "/base"
+  const base = work + "/pristine"
   const env = auth(opts.installation_token ?? "")
   const staging = "harn-worktree-staging/smart-ship-merge-${pr.number}-"
     + substring(job.head, 0, 12)
@@ -828,15 +832,15 @@ fn publish(
       // The trusted clone's git reads the agent's files; nothing in the agent's own .git runs with the token.
       sh(
         harness.tools,
-        ["git", "--git-dir=" + work + "/base/.git", "--work-tree=" + work + "/pr", "add", "-A"],
+        ["git", "--git-dir=" + work + "/pristine/.git", "--work-tree=" + work + "/pr", "add", "-A"],
       )
-      staged_clean(harness.tools, work + "/base", job.head)
+      staged_clean(harness.tools, work + "/pristine", job.head)
       pushed = signed(
         harness,
         opts,
         repo,
         pr.headRefName,
-        work + "/base",
+        work + "/pristine",
         "Smart Ship repair for #${number}",
       )
     }
