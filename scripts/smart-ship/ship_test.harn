@@ -754,7 +754,7 @@ pipeline test_agent_text_cannot_post_a_marker_or_a_credential(harness: Harness) 
 }
 
 /** A local remote whose topic head and main both changed file.txt, so merging main conflicts. */
-fn divergent(harness: Harness) {
+fn divergent(harness: Harness, conflict: bool = true) {
   const dir = harness.fs.mkdtemp_in_workspace("smart-ship-divergent-")
   const remote = dir + "/o/r.git"
   harness.fs.mkdir(remote, true)
@@ -775,9 +775,18 @@ fn divergent(harness: Harness) {
   git(["commit", "--quiet", "-am", "topic"])
   const head = git(["rev-parse", "HEAD"])
   git(["checkout", "--quiet", "main"])
-  harness.fs.write_text(remote + "/file.txt", "base\n")
-  git(["commit", "--quiet", "-am", "base"])
-  return {dir: dir, remote: remote, git: git, head: head, base_oid: git(["rev-parse", "HEAD"])}
+  const moved = conflict ? "/file.txt" : "/other.txt"
+  harness.fs.write_text(remote + moved, "base\n")
+  git(["add", "."])
+  git(["commit", "--quiet", "-m", "base"])
+  return {
+    dir: dir,
+    remote: remote,
+    git: git,
+    head: head,
+    base_oid: git(["rev-parse", "HEAD"]),
+    state: conflict ? "DIRTY" : "CLEAN",
+  }
 }
 
 /**
@@ -800,7 +809,7 @@ fn divergent_look(
     red_check
       + {
         headRefOid: f.head,
-        mergeStateStatus: "DIRTY",
+        mergeStateStatus: f.state,
         comments: page(notes),
         commits: {nodes: [{commit: commit}]},
       },
@@ -868,9 +877,11 @@ fn divergent_look(
 /**
  * A conflicted head once threw its saved work away: the next look deleted the trusted same-head
  * WIP instead of restoring it. A WIP from another head, an untrusted note or another base goes.
+ * "base-moved" is work saved while the head was clean, before main moved into a conflict: laid
+ * over the new merge it would revert main's change, so it goes and the merge starts fresh.
  */
 pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harness) {
-  for c in ["trusted", "untrusted", "wrong-head", "other-base"] {
+  for c in ["trusted", "untrusted", "wrong-head", "other-base", "base-moved", "no-base"] {
     const f = divergent(harness)
     f.git(["checkout", "--quiet", "topic"])
     if c == "wrong-head" {
@@ -879,15 +890,16 @@ pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harn
     harness.fs.write_text(f.remote + "/file.txt", "saved unfinished resolution\n")
     harness.fs.write_text(f.remote + "/added.txt", "new saved file\n")
     f.git(["add", "file.txt", "added.txt"])
-    const merging = c == "other-base" ? "1" * 40 : f.base_oid
-    f.git(
-      [
-        "commit",
-        "--quiet",
-        "-m",
-        "Smart Ship unfinished repair for #9 at ${f.head}, merging ${merging}",
-      ],
-    )
+    const saved_on = if c == "other-base" {
+      "1" * 40
+    } else if c == "base-moved" {
+      f.git(["rev-parse", "main^"])
+    } else {
+      f.base_oid
+    }
+    const subject =
+      c == "no-base" ? "unfinished" : "Smart Ship unfinished repair for #9 at ${f.head}, on base ${saved_on}"
+    f.git(["commit", "--quiet", "-m", subject])
     const wip = f.git(["rev-parse", "HEAD"])
     f.git(["update-ref", "refs/smart-ship/wip/9", wip])
     f.git(["checkout", "--quiet", "main"])
@@ -912,10 +924,16 @@ pipeline test_a_conflicted_repair_resumes_only_its_own_saved_merge(harness: Harn
 
 /**
  * A timed-out repair of a conflicted head once kept nothing: only a clean head's tree was saved.
- * Its merge in progress is now committed as the WIP, named with the base it merged.
+ * Its merge in progress is now committed as the WIP; every saved tree names the base it was on.
  */
-pipeline test_a_timed_out_conflict_repair_saves_its_merge(harness: Harness) {
-  const f = divergent(harness)
+pipeline test_a_timed_out_repair_saves_its_tree_and_base(harness: Harness) {
+  for conflict in [true, false] {
+    timed_out_save(harness, conflict)
+  }
+}
+
+fn timed_out_save(harness: Harness, conflict: bool) {
+  const f = divergent(harness, conflict)
   assert_eq(divergent_look(harness, f, false, "", "", true).result.action, "repair")
   const pr_dir = f.dir + "/work/pr"
   harness.fs.write_text(pr_dir + "/file.txt", "half resolved\n")
@@ -931,8 +949,8 @@ pipeline test_a_timed_out_conflict_repair_saves_its_merge(harness: Harness) {
     },
   )
     .to_list()
-  assert_eq(len(commits), 1, "the merge in progress went to GitHub as the saved commit")
-  assert(contains(commits[0].body, "merging ${f.base_oid}"), commits[0].body)
+  assert_eq(len(commits), 1, "the unfinished tree went to GitHub as the saved commit")
+  assert(contains(commits[0].body, "on base ${f.base_oid}"), commits[0].body)
   assert(contains(commits[0].body, base64_encode("half resolved\n")), commits[0].body)
   // The fake GitHub answers the commit with a PR, so saving fails: that is publish_failed, not published.
   assert_eq(seen.result.action, "publish_failed")
