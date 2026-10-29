@@ -219,7 +219,7 @@ jobs:
       - name: Test immutable CI baseline bootstrap transport
         run: |
           node --version
-          node --test .github/actions/ci-latency-policy/read-baseline.test.mjs .github/actions/ci-latency-policy/action.test.mjs
+          node --test .github/actions/ci-latency-policy/read-baseline.test.mjs .github/actions/ci-latency-policy/read-origin.test.mjs .github/actions/ci-latency-policy/action.test.mjs
       - name: Test shell actions
         run: bash .github/actions/pr-title-check/check_test.sh
       - name: Require reusable package smoke

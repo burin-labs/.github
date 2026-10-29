@@ -28,7 +28,12 @@ fn main(harness: Harness) {
         throw "baseline decision is unmeasured; refusing policy validation"
       }
     }
-    check(policy, workflow, baseline, required(harness.env, "GITHUB_REPOSITORY"))
+    const caller = required(harness.env, "GITHUB_REPOSITORY")
+    const evidence = harness.env.get("EVIDENCE_REPOSITORY") ?? ""
+    if evidence != "" && baseline == nil {
+      throw "historical origin requires a measured immutable baseline"
+    }
+    check(policy, workflow, baseline, evidence == "" ? caller : evidence)
     harness.stdio.println(
       "CI latency policy: OK (" + to_string(len(policy.required.jobs)) + " required jobs, "
         + to_string(policy.required.critical_path_allowance_ms)

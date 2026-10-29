@@ -10,6 +10,7 @@ harn run --standalone \
   --grant baseline_sha=env:BASELINE_SHA,expose=BASELINE_SHA \
   --grant baseline_state=env:BASELINE_STATE,expose=BASELINE_STATE \
   --grant baseline_file=env:BASELINE_FILE,expose=BASELINE_FILE \
+  --grant evidence_repository=env:EVIDENCE_REPOSITORY,expose=EVIDENCE_REPOSITORY \
   --read-only-root "$package_root" \
   --read-only-root "${GITHUB_WORKSPACE:?}" \
   --read-only-root "${RUNNER_TEMP:?}" \
