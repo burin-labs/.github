@@ -141,6 +141,10 @@ jobs:
           # job.json an earlier job left on a persistent runner never matches.
           SHIP_NONCE="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
           export SHIP_NONCE
+          # This job owns its work dir only if it creates it; one already there is left alone.
+          mkdir -- "$SHIP_WORK"
+          printf '%s\n' "$SHIP_NONCE" > "$SHIP_WORK/.owner"
+          echo "nonce=$SHIP_NONCE" >> "$GITHUB_OUTPUT"
           harn install --locked
           harn run --no-sandbox ship.harn
           if [ -f "$SHIP_WORK/job.json" ] && [ "$(jq -r '.nonce // ""' "$SHIP_WORK/job.json")" = "$SHIP_NONCE" ]; then
@@ -180,8 +184,19 @@ jobs:
           set -euo pipefail
           harn run --no-sandbox ship.harn
       # A persistent owned runner keeps the workspace; the look's run records go with it.
+      - name: Remove Smart Ship's scripts
+        if: always()
+        run: rm -rf -- "$GITHUB_WORKSPACE/.smart-ship"
+      # Only the work dir this job created goes; one it found already there may hold someone's work.
       - name: Remove the checkouts
         if: always()
         env:
           SHIP_WORK: ${{ runner.temp }}/smart-ship-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pr }}
-        run: rm -rf -- "$SHIP_WORK" "$GITHUB_WORKSPACE/.smart-ship"
+          SHIP_NONCE: ${{ steps.look.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SHIP_NONCE:-}" ] && [ "$(cat -- "$SHIP_WORK/.owner" 2>/dev/null)" = "$SHIP_NONCE" ]; then
+            rm -rf -- "$SHIP_WORK"
+          elif [ -e "$SHIP_WORK" ]; then
+            echo "::warning::Left $SHIP_WORK in place: this job did not create it."
+          fi

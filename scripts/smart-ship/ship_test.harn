@@ -705,7 +705,8 @@ pipeline test_a_credential_deep_in_a_diff_is_never_published(harness: Harness) {
 
 /**
  * A failed token mint once skipped the look yet still ran the publish step, which then failed
- * starting in a checkout that was never made. Only a look that prepared a repair sets `prepared`.
+ * starting in a checkout that was never made. Only a look that prepared a repair sets `prepared`,
+ * and cleanup removes only the work dir this job's look created.
  */
 pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
   const steps = read_yaml(harness.fs, "../../.github/workflows/smart-ship.yml").jobs.ship.steps
@@ -719,6 +720,8 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
     "a prepared repair publishes even after the agent fails",
   )
   assert_eq(step("Remove the checkouts").if, "always()", "cleanup still runs after a failed mint")
+  assert_eq(step("Remove Smart Ship's scripts").if, "always()")
+  assert_eq(step("Remove the checkouts").env.SHIP_NONCE, "\${{ steps.look.outputs.nonce }}")
   // Each run, attempt and PR owns its checkouts: no leftover, and no other PR in the sweep, shares one.
   const per_run =
     "\${{ runner.temp }}/smart-ship-\${{ github.run_id }}-\${{ github.run_attempt }}-\${{ matrix.pr }}"
@@ -739,18 +742,23 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
       + "[ \"$LOOK\" = failed ] && exit 1\nexit 0\n",
   )
   assert(harness.process.run({program: "/bin/chmod", args: ["755", fake]}).success)
+  // [case, look succeeds, repair prepared, job owns the work dir]
   const cases = [
-    ["prepared", true, "prepared=true\n"],
-    ["stopped", true, ""],
-    ["failed", false, ""],
-    // A persistent runner kept an earlier job's job.json; a look that stops must not arm it.
-    ["stale", true, ""],
+    ["prepared", true, true, true],
+    ["stopped", true, false, true],
+    // A claimed attempt that then fails is still this job's to clean up.
+    ["failed", false, false, true],
+    // A persistent runner kept a dir with an earlier job's job.json: never armed, never deleted.
+    ["stale", false, false, false],
   ]
   for c in cases {
-    const work = dir + "/" + c[0]
-    harness.fs.mkdir(work)
-    harness.fs.write_text(work + "/output", "")
-    if c[0] == "stale" {
+    const name = to_string(c[0])
+    const home = dir + "/" + name
+    const work = home + "/work"
+    harness.fs.mkdir(home)
+    harness.fs.write_text(home + "/output", "")
+    if name == "stale" {
+      harness.fs.mkdir(work)
       harness.fs.write_text(
         work + "/job.json",
         "{\"nonce\":\"from-an-earlier-job\",\"head\":\"old\"}",
@@ -760,18 +768,44 @@ pipeline test_only_a_prepared_repair_runs_or_publishes(harness: Harness) {
       {
         program: "/bin/bash",
         args: ["-c", step("Look at the pull request").run],
-        cwd: work,
+        cwd: home,
         env: {
           PATH: dir + ":" + to_string(harness.env.get("PATH") ?? ""),
-          LOOK: c[0],
+          LOOK: name,
           SHIP_WORK: work,
-          GITHUB_OUTPUT: work + "/output",
+          GITHUB_OUTPUT: home + "/output",
         },
         timeout_ms: 30000,
       },
     )
-    assert_eq(ran.success, c[1], c[0] + ": " + ran.stderr)
-    assert_eq(harness.fs.read_text(work + "/output"), c[2], c[0])
+    assert_eq(ran.success, c[1], name + ": " + ran.stderr)
+    const outputs = split(trim(harness.fs.read_text(home + "/output")), "\n")
+    assert_eq(outputs.contains("prepared=true"), c[2], name)
+    const nonces = outputs.filter({ o -> contains(o, "nonce=") }).map(
+      { o -> replace(o, "nonce=", "") },
+    )
+      .to_list()
+    assert_eq(len(nonces) == 1, c[3], name + " claims the work dir")
+    // The real cleanup script, handed the nonce the look step published.
+    const cleaned = harness.process.run(
+      {
+        program: "/bin/bash",
+        args: ["-c", step("Remove the checkouts").run],
+        cwd: home,
+        env: {
+          PATH: to_string(harness.env.get("PATH") ?? ""),
+          SHIP_WORK: work,
+          SHIP_NONCE: len(nonces) == 1 ? nonces[0] : "",
+        },
+        timeout_ms: 30000,
+      },
+    )
+    assert(cleaned.success, name + ": " + cleaned.stderr)
+    assert_eq(harness.fs.exists(work), !c[3], name + ": only an owned work dir is removed")
+    if !c[3] {
+      assert(contains(cleaned.stdout, "did not create it"), name + ": " + cleaned.stdout)
+      assert(contains(harness.fs.read_text(work + "/job.json"), "from-an-earlier-job"), name)
+    }
   }
 }
 
