@@ -219,10 +219,13 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
   return {action: "repair", reason: "blocked", facts: f}
 }
 
+// No global or system git config: nothing the agent could have written outside its jail is read here.
+const GIT_ISOLATED = {GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null"}
+
 fn sh(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".") -> string {
   const r = command_run(
     tools,
-    {argv: argv, cwd: cwd, env_mode: "patch", env: env},
+    {argv: argv, cwd: cwd, env_mode: "patch", env: GIT_ISOLATED + env},
     {timeout_ms: 600000},
   )
   require r.success, join(argv[0:3], " ") + ": " + trim(r.stderr)
@@ -499,11 +502,12 @@ fn save_wip(
 }
 
 fn auth(token: string) -> dict {
-  return {
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
-    GIT_CONFIG_VALUE_0: "AUTHORIZATION: basic " + base64_encode("x-access-token:" + token),
-  }
+  return GIT_ISOLATED
+    + {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+      GIT_CONFIG_VALUE_0: "AUTHORIZATION: basic " + base64_encode("x-access-token:" + token),
+    }
 }
 
 /**

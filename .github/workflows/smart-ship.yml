@@ -142,10 +142,15 @@ jobs:
         run: |
           set -euo pipefail
           [ -f "$SHIP_WORK/pr/.git/ship-task.json" ] || exit 0
+          # The script runs from its own directory so the sandbox's write jail is only that copy and
+          # the checkout, never the Smart Ship scripts the publish step runs next.
+          mkdir -p "$SHIP_WORK/agent"
+          cp .smart-ship/scripts/smart-ship/repair.harn "$SHIP_WORK/agent/repair.harn"
           cd "$SHIP_WORK/pr"
           harn run --environment-policy granted \
             --grant "openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,to=in_process" \
-            "$GITHUB_WORKSPACE/.smart-ship/scripts/smart-ship/repair.harn"
+            --write-root "$SHIP_WORK/pr" \
+            "$SHIP_WORK/agent/repair.harn"
       - name: Publish the repair
         if: always() && inputs.repair
         working-directory: .smart-ship/scripts/smart-ship
