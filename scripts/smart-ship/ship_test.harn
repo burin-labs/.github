@@ -137,6 +137,33 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   }
 }
 
+pipeline test_signature_failure_names_the_signature_without_requesting_another_review() {
+  const head = pr().pullRequest.commits.nodes[0].commit
+  for fixture in [
+    {signature: {isValid: false, state: "UNKNOWN_KEY"}, state: "UNKNOWN_KEY"},
+    {signature: {isValid: false, state: "INVALID"}, state: "INVALID"},
+    {signature: {isValid: false}, state: "UNMEASURED"},
+    {signature: nil, state: "MISSING"},
+  ] {
+    const decision = decide(
+      pr({
+        reviewDecision: "APPROVED",
+        commits: {nodes: [{commit: {...head, signature: fixture.signature}}]},
+      }),
+      "clear",
+      false,
+    )
+    assert_eq(decision.action, "stop")
+    assert(decision.facts.approved)
+    assert(!decision.facts.signed)
+    assert_eq(decision.reason, "head signature is not verified (${fixture.state})")
+  }
+  const unreviewed = decide(pr({latestOpinionatedReviews: page([])}), "clear", false)
+  assert(unreviewed.facts.signed)
+  assert(!unreviewed.facts.approved)
+  assert_eq(unreviewed.reason, "green; waiting for a writer's approval of this head")
+}
+
 /** A superseded failure once held an approved, green head blocked on every look. */
 pipeline test_only_the_newest_attempt_of_a_check_counts(harness: Harness) {
   const run = { workflow, name, conclusion, id ->
