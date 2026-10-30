@@ -79,7 +79,11 @@ fn lockfile_script(fs: HarnessFs) -> string {
 
 fn audit_report(vulnerabilities: list, warnings: dict) -> string {
   return json_stringify(
-    {vulnerabilities: {found: len(vulnerabilities) > 0, list: vulnerabilities}, warnings: warnings},
+    {
+      database: {"advisory-count": 1},
+      vulnerabilities: {found: len(vulnerabilities) > 0, list: vulnerabilities},
+      warnings: warnings,
+    },
   )
 }
 
@@ -168,6 +172,12 @@ pipeline test_an_unreadable_report_is_not_a_clean_scan(harness: Harness) {
   assert_eq(result.exit_code, 3)
   assert(result.stderr.contains("cargo-audit report unreadable"), "says why")
   assert_eq(result.stdout.trim(), "", "no finding is invented for a tool failure")
+  const empty = json_stringify(
+    {database: {"advisory-count": 0}, vulnerabilities: {list: []}, warnings: {}},
+  )
+  const unmeasured = run_lockfile_scan(harness, "[advisories]\n", empty, "2026-10-24")
+  assert_eq(unmeasured.exit_code, 3)
+  assert(unmeasured.stderr.contains("advisory database census is missing or empty"))
 }
 
 pipeline test_only_pull_requests_downgrade_unmaintained_and_unsound(harness: Harness) {

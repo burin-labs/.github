@@ -219,6 +219,9 @@ jobs:
           try:
               with open(report_path, encoding="utf-8") as handle:
                   report = json.load(handle)
+              advisory_count = report["database"]["advisory-count"]
+              if type(advisory_count) is not int or advisory_count <= 0:
+                  raise ValueError("advisory database census is missing or empty")
               vulnerabilities = report["vulnerabilities"]["list"]
               # Unmaintained, unsound, and yanked entries are warnings. They
               # never fail here, but an ignore for one is still in use.
