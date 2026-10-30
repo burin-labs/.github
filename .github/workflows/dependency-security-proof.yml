@@ -1,0 +1,115 @@
+name: Dependency security proof (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      source-revision:
+        type: string
+        default: event
+      working-directory:
+        type: string
+        default: '.'
+      policy:
+        type: boolean
+        default: true
+    outputs:
+      source-revision:
+        value: ${{ jobs.scan.outputs.source-revision }}
+      advisory-database-revision:
+        value: ${{ jobs.scan.outputs.advisory-database-revision }}
+      proof-artifact-id:
+        value: ${{ jobs.proof.outputs.artifact_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/cargo-deny.yml
+    with:
+      source-revision: ${{ inputs.source-revision }}
+      working-directory: ${{ inputs.working-directory }}
+      policy: ${{ inputs.policy }}
+
+  # An audited workspace can contain Cargo build scripts. It never executes
+  # in this signer job, which consumes only the scanner's measured outputs.
+  proof:
+    name: Dependency security proof
+    needs: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Install the proof writer
+        uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808
+        with:
+          version: '0.10.181'
+      - name: Emit measured dependency security proof
+        env:
+          SCANNER_RESULT: ${{ needs.scan.result }}
+          MEASURED_SOURCE: ${{ needs.scan.outputs.source-revision }}
+          MEASURED_DATABASE: ${{ needs.scan.outputs.advisory-database-revision }}
+          SCANNED_DIRECTORY: ${{ inputs.working-directory }}
+          WORKFLOW_DIGEST: ${{ github.workflow_sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          project="$(mktemp -d "$RUNNER_TEMP/dependency-security-proof.XXXXXX")"
+          cd "$project"
+          harn init proof
+          cd proof
+          cat > main.harn <<'HARN'
+          fn required(env: HarnessEnv, name: string, pattern: string) -> string {
+            const value = env.get(name) ?? ""
+            if regex_match(pattern, value) == nil {
+              throw "Missing or invalid dependency security proof field: " + name
+            }
+            return value
+          }
+
+          fn main(harness: Harness) {
+            if harness.env.get("SCANNER_RESULT") != "success" {
+              throw "Dependency scanner did not succeed"
+            }
+            const proof = {
+              schemaVersion: "harn.dependency_security.v1",
+              sourceRevision: required(harness.env, "MEASURED_SOURCE", "^[0-9a-f]{40}$"),
+              advisoryDatabaseRevision: required(harness.env, "MEASURED_DATABASE", "^[0-9a-f]{40}$"),
+              workingDirectory: required(harness.env, "SCANNED_DIRECTORY", "^.{1,256}$"),
+              issuedAtMs: harness.clock.now_ms(),
+              producer: {
+                repository: required(harness.env, "GITHUB_REPOSITORY", "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"),
+                runId: required(harness.env, "GITHUB_RUN_ID", "^[1-9][0-9]*$"),
+                runAttempt: required(harness.env, "GITHUB_RUN_ATTEMPT", "^[1-9][0-9]*$"),
+                workflowRef: required(harness.env, "GITHUB_WORKFLOW_REF", "^.{1,512}$"),
+                sourceDigest: required(harness.env, "GITHUB_SHA", "^[0-9a-f]{40}$"),
+                eventHeadSha: required(harness.env, "EVENT_HEAD_SHA", "^[0-9a-f]{40}$"),
+                workflowDigest: required(harness.env, "WORKFLOW_DIGEST", "^[0-9a-f]{40}$"),
+              },
+            }
+            harness.stdio.println(json_stringify(proof))
+          }
+          HARN
+          harn run --no-sandbox main.harn > "$RUNNER_TEMP/dependency-security-proof.json"
+      - name: Attest the measured proof
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/dependency-security-proof.json
+          predicate-type: https://burin.dev/attestations/dependency-security/v1
+          predicate-path: ${{ runner.temp }}/dependency-security-proof.json
+      - name: Publish immutable dependency security proof
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-security-proof-${{ needs.scan.outputs.source-revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dependency-security-proof.json
+          if-no-files-found: error
+          retention-days: 7

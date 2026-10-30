@@ -1,0 +1,103 @@
+import { with_temp_dir } from "std/testing"
+
+fn workflow(fs: HarnessFs) -> dict {
+  return yaml_parse(
+    fs.read_text(path_join(fs.cwd(), "../../.github/workflows/dependency-security-proof.yml")),
+  )
+}
+
+fn writer(fs: HarnessFs) -> string {
+  const step = workflow(fs).jobs.proof.steps.filter(
+    { value -> value.name == "Emit measured dependency security proof" },
+  )
+    .to_list()
+  assert_eq(len(step), 1)
+  const run = step[0].run
+  const begin = run.index_of("<<'HARN'\n") + 9
+  const end = run.index_of("\nHARN\n")
+  assert(begin >= 9 && end > begin)
+  return run.substring(begin, end) + "\n"
+}
+
+fn run_writer(harness: Harness, changes: dict) -> dict {
+  let result = nil
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      harness.fs.write_text(
+        path_join(work, "harn.toml"),
+        "[package]\nname = \"proof\"\nversion = \"0.1.0\"\n",
+      )
+      harness.fs.write_text(path_join(work, "main.harn"), writer(harness.fs))
+      const fields = {
+        SCANNER_RESULT: "success",
+        MEASURED_SOURCE: "a".repeat(40),
+        MEASURED_DATABASE: "b".repeat(40),
+        SCANNED_DIRECTORY: ".",
+        GITHUB_REPOSITORY: "burin-labs/harn",
+        GITHUB_RUN_ID: "123",
+        GITHUB_RUN_ATTEMPT: "1",
+        GITHUB_WORKFLOW_REF:
+          "burin-labs/harn/.github/workflows/promote-release.yml@refs/heads/main",
+      GITHUB_SHA: "c".repeat(40),
+      EVENT_HEAD_SHA: "e".repeat(40),
+        WORKFLOW_DIGEST: "d".repeat(40),
+      }
+      let args: list<string> = []
+      for name in fields.keys() {
+        args = args + [name + "=" + (changes[name] ?? fields[name])]
+      }
+      const ran = harness.process.run(
+        {
+          program: "env",
+          args: args + ["harn", "run", "--no-sandbox", "main.harn"],
+          cwd: work,
+          timeout_ms: 30000,
+        },
+      )
+      result = {exit_code: ran.exit_code, stdout: ran.stdout, stderr: ran.stderr}
+    },
+  )
+  return result
+}
+
+pipeline test_proof_signer_is_isolated_from_the_audited_workspace(harness: Harness) {
+  const config = workflow(harness.fs)
+  assert_eq(config.jobs.scan.uses, "./.github/workflows/cargo-deny.yml")
+  assert_eq(config.jobs.proof.needs, "scan")
+  for step in config.jobs.proof.steps {
+    assert(!(step.uses ?? "").contains("checkout"))
+    assert(!step.has("continue-on-error"))
+  }
+  assert_eq(config.jobs.proof.permissions["id-token"], "write")
+  assert_eq(config.jobs.proof.permissions.attestations, "write")
+}
+
+pipeline test_proof_uses_measured_source_not_the_parent_run_head(harness: Harness) {
+  const ran = run_writer(harness, {})
+  assert_eq(ran.exit_code, 0, ran.stderr)
+  const proof = json_parse(ran.stdout)
+  assert_eq(proof.schemaVersion, "harn.dependency_security.v1")
+  assert_eq(proof.sourceRevision, "a".repeat(40))
+  assert_eq(proof.advisoryDatabaseRevision, "b".repeat(40))
+  assert_eq(proof.producer.sourceDigest, "c".repeat(40))
+  assert_eq(proof.producer.eventHeadSha, "e".repeat(40))
+  assert(proof.issuedAtMs > 0)
+}
+
+pipeline test_missing_or_unmeasured_scan_cannot_emit_a_proof(harness: Harness) {
+  for status in ["", "skipped", "failure", "cancelled"] {
+    const ran = run_writer(harness, {SCANNER_RESULT: status})
+    assert(ran.exit_code != 0)
+    assert_eq(ran.stdout, "")
+  }
+  for name in ["MEASURED_SOURCE", "MEASURED_DATABASE"] {
+    for value in ["", "main", "a".repeat(39)] {
+      let changes = {}
+      changes[name] = value
+      const ran = run_writer(harness, changes)
+      assert(ran.exit_code != 0)
+      assert_eq(ran.stdout, "")
+    }
+  }
+}
