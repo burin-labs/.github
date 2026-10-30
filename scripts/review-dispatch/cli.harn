@@ -1,6 +1,10 @@
 import { live_github } from "../merge-override/github.harn"
 import { Resolution, dispatch, ineligibility_code, resolve, resolve_target } from "./policy.harn"
 
+fn github_host(fs: HarnessFs, tools: HarnessTools) -> {fs: HarnessFs, tools: HarnessTools} {
+  return {fs: fs, tools: tools}
+}
+
 fn required(env: HarnessEnv, name: string) -> string {
   const value = trim(env.get(name) ?? "")
   if value == "" {
@@ -35,7 +39,7 @@ fn main(harness: Harness) {
   const number = to_int(number_text)
   const scratch = harness.fs.mkdtemp_in_workspace("review-dispatch-")
   const github = live_github(
-    pick(harness, ["fs", "tools"]),
+    github_host(harness.fs, harness.tools),
     required(harness.env, "GH_TOKEN"),
     scratch,
   )
