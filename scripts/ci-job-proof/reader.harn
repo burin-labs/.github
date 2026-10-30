@@ -25,8 +25,13 @@ import {
   sha,
 } from "./contract.harn"
 
-/** Artifact transport verifies the downloaded archive digest before decoding its registration. */
-pub type ProofSource = {json: fn(string) -> unknown, registration: fn(string, Artifact) -> unknown}
+/** Artifact transport verifies each downloaded archive before decoding its document. */
+pub type ProofSource = {
+  json: fn(string) -> unknown,
+  registration: fn(string, Artifact) -> unknown,
+  cache_publication?: fn(string, Artifact) -> unknown,
+  graphql?: fn(string) -> unknown,
+}
 
 pub type JobCensus = {declared: int, jobs: list<Job>}
 
@@ -106,7 +111,12 @@ pub fn job_census(source: ProofSource, repo: string, run: Run) -> JobCensus {
   throw "attempt job census exceeded its bound"
 }
 
-fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifact {
+pub fn run_artifact(
+  source: ProofSource,
+  repo: string,
+  run: Run,
+  expected_name: string,
+) -> Artifact {
   let artifacts: list<Artifact> = []
   let declared = -1
   for page in range(1, 102) {
@@ -126,12 +136,9 @@ fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifac
       throw "duplicate or excess artifact census"
     }
     if len(artifacts) == declared {
-      const named = artifacts.filter(
-        { artifact -> artifact.name == registration_artifact_name(run.id, run.run_attempt) },
-      )
-        .to_list()
+      const named = artifacts.filter({ artifact -> artifact.name == expected_name }).to_list()
       if len(named) != 1 {
-        throw "registration artifact missing or ambiguous"
+        throw "workflow artifact missing or ambiguous"
       }
       return named[0]
     }
@@ -140,6 +147,10 @@ fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifac
     }
   }
   throw "artifact census exceeded its bound"
+}
+
+fn registration_artifact(source: ProofSource, repo: string, run: Run) -> Artifact {
+  return run_artifact(source, repo, run, registration_artifact_name(run.id, run.run_attempt))
 }
 
 /** Inspect a producer under trusted policy without inventing a consumer workflow or run. */

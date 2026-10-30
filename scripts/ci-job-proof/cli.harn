@@ -1,5 +1,6 @@
 import { write_json } from "std/fs"
 import { gha_write_output } from "std/gha"
+import { resolve_cache } from "./cache_cli.harn"
 import {
   JobIdentity,
   ProofUniverse,
@@ -128,6 +129,7 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?
 
 fn main(harness: Harness) {
   harness.net.egress_policy({default: "allow", block_private: "private"})
+  resolve_cache(harness)
   output(harness, "reused", "[]")
   let decision: Decision = {
     discovery: {reason: "identities_unmeasured", probed: nil, reads: nil, budget: READ_BUDGET},

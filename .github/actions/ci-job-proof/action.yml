@@ -6,6 +6,10 @@ description: >-
   Unknown or unreadable proof runs the job.
 
 inputs:
+  skip-harn-setup:
+    description: Use the caller's already installed supported Harn instead of replacing its pinned runtime.
+    required: false
+    default: "false"
   proof-universe:
     description: >-
       Optional closed JSON generation and UTC notBefore. The resolver namespaces
@@ -55,6 +59,30 @@ inputs:
   github-token:
     description: Token with actions:read and pull-requests:read.
     required: true
+  docker-cache-package:
+    description: Optional isolated GHCR cache package; empty disables candidate cache custody.
+    required: false
+    default: ""
+  docker-cache-mode:
+    description: Resolve candidate custody, or publish a run-bound receipt after a successful image smoke test.
+    required: false
+    default: resolve
+  docker-cache-digest:
+    description: Immutable registry cache manifest digest, required only for publish mode.
+    required: false
+    default: ""
+  pull-request-number:
+    description: Current PR number; reauthenticated against the run and repository before candidate writes.
+    required: false
+    default: ""
+  default-branch:
+    description: Owning protected branch.
+    required: false
+    default: main
+  branch-name:
+    description: github.ref_name for exact main-push association.
+    required: false
+    default: ""
 
 outputs:
   registration:
@@ -69,11 +97,21 @@ outputs:
   discovery:
     description: Bounded discovery reason and probe and read counts.
     value: ${{ steps.resolve.outputs.discovery }}
+  cache-from:
+    description: Qualified immutable candidate cache reference, or empty to build from stable cache/source.
+    value: ${{ steps.resolve.outputs.cache-from }}
+  cache-to:
+    description: Isolated current-run candidate cache destination; never the stable shared reference.
+    value: ${{ steps.resolve.outputs.cache-to }}
+  cache-discovery:
+    description: Explicit cache custody decision and observed producer census.
+    value: ${{ steps.resolve.outputs.cache-discovery }}
 
 runs:
   using: composite
   steps:
     - name: Set up Harn
+      if: inputs.skip-harn-setup != 'true'
       uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
       with:
         version: "0.10.159"
@@ -93,6 +131,12 @@ runs:
         CI_JOB_PROOF_REGISTRAR_STEP: ${{ inputs.registrar-step }}
         CI_JOB_PROOF_RUN_ID: ${{ github.run_id }}
         CI_JOB_PROOF_ATTEMPT: ${{ github.run_attempt }}
+        CI_JOB_PROOF_CACHE_PACKAGE: ${{ inputs.docker-cache-package }}
+        CI_JOB_PROOF_CACHE_MODE: ${{ inputs.docker-cache-mode }}
+        CI_JOB_PROOF_CACHE_DIGEST: ${{ inputs.docker-cache-digest }}
+        CI_JOB_PROOF_PULL_REQUEST: ${{ inputs.pull-request-number }}
+        CI_JOB_PROOF_DEFAULT_BRANCH: ${{ inputs.default-branch }}
+        CI_JOB_PROOF_BRANCH: ${{ inputs.branch-name }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: bash "$GITHUB_ACTION_PATH/run.sh"
     - name: Register job input identities
@@ -111,3 +155,11 @@ runs:
         path: ${{ steps.resolve.outputs.receipt }}
         if-no-files-found: error
         retention-days: 7
+    - name: Preserve immutable Docker cache publication
+      if: ${{ steps.resolve.outputs.cache-publication != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: ${{ steps.resolve.outputs.cache-publication-name }}
+        path: ${{ steps.resolve.outputs.cache-publication }}
+        if-no-files-found: error
+        retention-days: 14

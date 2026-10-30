@@ -30,7 +30,9 @@ pub fn checkpoint_enrollment(
   if raw == "" || current.event != "workflow_dispatch" {
     return nil
   }
-  const expected = schema_expect(json_parse(raw), closed(schema_of(CheckpointEnrollment)))
+  const parsed = json_parse(raw)
+  schema_expect(parsed, closed(schema_of(CheckpointEnrollment)))
+  const expected = schema_expect(parsed, schema_of(CheckpointEnrollment))
   require expected.actorId > 0 && expected.actorLogin != "" && expected.headBranch != "",
     "checkpoint enrollment is incomplete"
   const run = schema_expect(
@@ -145,38 +147,52 @@ fn json(net: HarnessNet, token: string, endpoint: string) -> unknown {
   return json_parse(response.body)
 }
 
-/** Verify the actual GitHub archive bytes before reading its one closed typed document. */
-pub fn registration_from_archive(fs: HarnessFs, path: string, digest: string) -> unknown {
+/** Verify GitHub's compressed archive digest and require one named JSON document. */
+pub fn document_from_archive(
+  fs: HarnessFs,
+  path: string,
+  digest: string,
+  expected_path: string,
+) -> unknown {
   const archive = fs.read_bytes(path)
   if len(archive) == 0 || len(archive) > MAX_REGISTRATION_BYTES {
-    throw "registration archive exceeds its compressed byte bound"
+    throw "CI proof artifact exceeds its compressed byte bound"
   }
   if !regex_match("^sha256:[0-9a-f]{64}$", digest)
     || "sha256:" + sha256(archive) != digest {
-    throw "registration archive digest mismatch"
+    throw "CI proof artifact digest mismatch"
   }
   const entries = zip_extract(archive, {max_decompressed_bytes: MAX_REGISTRATION_BYTES})
-  if len(entries) != 1 || entries[0].path != "registration.json" {
-    throw "registration archive must contain exactly its typed document"
+  if len(entries) != 1 || entries[0].path != expected_path {
+    throw "CI proof artifact must contain exactly its named document"
   }
-  const raw = json_parse(bytes_to_string(entries[0].content))
+  return json_parse(bytes_to_string(entries[0].content))
+}
+
+/** Preserve the original typed registration boundary. */
+pub fn registration_from_archive(fs: HarnessFs, path: string, digest: string) -> unknown {
+  return registration_document(document_from_archive(fs, path, digest, "registration.json"))
+}
+
+fn registration_document(raw: unknown) -> unknown {
   schema_expect(raw, closed(schema_of(Registration)))
   return raw
 }
 
-fn download_registration(
+fn download_document(
   net: HarnessNet,
   fs: HarnessFs,
   token: string,
   repo: string,
   artifact: Artifact,
+  filename: string,
 ) -> unknown {
   if artifact.id <= 0 || artifact.expired || artifact.size_in_bytes <= 0
     || artifact.size_in_bytes > MAX_REGISTRATION_BYTES {
-    throw "registration artifact cannot be downloaded safely"
+    throw "CI artifact cannot be downloaded safely"
   }
-  const directory = fs.mkdtemp_in_workspace("ci-job-registration-")
-  const path = directory + "/registration.zip"
+  const directory = fs.mkdtemp_in_workspace("ci-job-artifact-")
+  const path = directory + "/document.zip"
   defer {
     fs.delete(directory)
   }
@@ -189,16 +205,35 @@ fn download_registration(
   )
   if !response.ok || response.bytes_written <= 0
     || response.bytes_written > MAX_REGISTRATION_BYTES {
-    throw "registration artifact download failed or exceeded its bound"
+    throw "CI artifact download failed or exceeded its bound"
   }
-  return registration_from_archive(fs, path, artifact.digest)
+  return document_from_archive(fs, path, artifact.digest, filename)
 }
 
 /** Bounded GitHub reads authenticate archive bytes before exposing registration data. */
 pub fn live_source(net: HarnessNet, fs: HarnessFs, token: string) -> ProofSource {
   return {
     json: fn(endpoint) { return json(net, token, endpoint) },
-    registration:
-      fn(repo, artifact) { return download_registration(net, fs, token, repo, artifact) },
+    registration: fn(repo, artifact) { return registration_document(
+      download_document(net, fs, token, repo, artifact, "registration.json"),
+    ) },
+    cache_publication: fn(repo, artifact) { return download_document(
+      net,
+      fs,
+      token,
+      repo,
+      artifact,
+      "cache-publication.json",
+    ) },
+    graphql: fn(query) {
+      const request_options = options(token, 1048576)
+      const response = net.post(
+        API_ROOT + "/graphql",
+        json_stringify({query: query}),
+        request_options + {headers: request_options.headers + {"Content-Type": "application/json"}},
+      )
+      require response.ok, "GitHub cache approval read failed"
+      return json_parse(response.body)
+    },
   }
 }
