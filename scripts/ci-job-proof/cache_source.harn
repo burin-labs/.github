@@ -48,8 +48,6 @@ type Pull = {
   head: {sha: string, repo: {full_name: string}?},
 }
 
-type Comparison = {status: string, ahead_by: int}
-
 type CommitPulls = list<Pull>
 
 type RunsPage = {total_count: int, workflow_runs: list<Run>}
@@ -124,8 +122,7 @@ fn source_for_main_commit(
     repo,
     matched.number,
     matched.head.sha,
-    current.commit,
-    default_branch,
+    {merge_commit: current.commit, default_branch: default_branch},
   ) {
     return nil
   }
@@ -154,19 +151,16 @@ fn source_for_open_pull(
   if mode == "candidate_write" && current.commit != source_sha {
     return nil
   }
-  if mode == "candidate_read" {
-    const compared = schema_expect(
-      source.json("/repos/${repo}/compare/${source_sha}...${sha(current.commit)}"),
-      schema_of(Comparison),
-    )
-    if !["ahead", "identical"].contains(compared.status) {
-      return nil
-    }
-  }
   // An unapproved same-repository PR may publish only its isolated candidate.
   // A merge-group consumer additionally needs the approval for this exact head.
   if mode == "candidate_read"
-    && !approved_cache_head(source, repo, pull.number, source_sha, nil, default_branch) {
+    && !approved_cache_head(
+      source,
+      repo,
+      pull.number,
+      source_sha,
+      {queue_commit: sha(current.commit), default_branch: default_branch},
+    ) {
     return nil
   }
   return cache_source(mode, repo, pull.number, source_sha)

@@ -20,6 +20,7 @@ fn source(
   declared: int? = nil,
   head: string = HEAD,
   branch: string = "main",
+  queue: dict? = nil,
 ) -> ProofSource {
   return {
     json: fn(_endpoint) {
@@ -32,12 +33,15 @@ fn source(
       data: {
         repository: {
           pullRequest: {
+            id: "PR_1",
+            number: 1,
             headRefOid: head,
             state: "OPEN",
             merged: false,
             baseRefName: branch,
             headRepository: {nameWithOwner: "acme/repo"},
             mergeCommit: nil,
+            mergeQueueEntry: queue,
             reviews: {
               nodes: nodes,
               totalCount: declared ?? len(nodes),
@@ -105,7 +109,67 @@ pipeline test_latest_writer_decisions_and_complete_census_are_required() {
 
 pipeline test_approval_uses_the_callers_protected_branch() {
   const trunk = source([review(1, "APPROVED")], false, nil, HEAD, "trunk")
-  assert(approved_cache_head(trunk, "acme/repo", 1, HEAD, nil, "trunk"))
+  assert(approved_cache_head(trunk, "acme/repo", 1, HEAD, {default_branch: "trunk"}))
   assert(!approved_cache_head(trunk, "acme/repo", 1, HEAD))
-  assert(!approved_cache_head(trunk, "acme/repo", 1, HEAD, nil, ""))
+  assert(!approved_cache_head(trunk, "acme/repo", 1, HEAD, {default_branch: ""}))
+}
+
+pipeline test_squash_queue_custody_requires_the_exact_live_queue_entry() {
+  const commit = "b".repeat(40)
+  const entry = {headCommit: {oid: commit}, pullRequest: {id: "PR_1", number: 1, headRefOid: HEAD}}
+  const context = {queue_commit: commit}
+  assert(
+    !approved_cache_head(
+      source([review(1, "APPROVED")], false, nil, HEAD, "main", entry),
+      "acme/repo",
+      1,
+      HEAD,
+      {queue_commit: commit, merge_commit: commit},
+    ),
+  )
+  assert(
+    approved_cache_head(
+      source([review(1, "APPROVED")], false, nil, HEAD, "main", entry),
+      "acme/repo",
+      1,
+      HEAD,
+      context,
+    ),
+  )
+  for bad_entry in [
+    nil,
+    entry + {headCommit: nil},
+    entry + {headCommit: {oid: "c".repeat(40)}},
+    entry + {pullRequest: {id: "PR_FOREIGN", number: 1, headRefOid: HEAD}},
+    entry + {pullRequest: {id: "PR_1", number: 2, headRefOid: HEAD}},
+    entry + {pullRequest: {id: "PR_1", number: 1, headRefOid: "c".repeat(40)}},
+  ] {
+    assert(
+      !approved_cache_head(
+        source([review(1, "APPROVED")], false, nil, HEAD, "main", bad_entry),
+        "acme/repo",
+        1,
+        HEAD,
+        context,
+      ),
+    )
+  }
+  assert(
+    !approved_cache_head(
+      source([], false, nil, HEAD, "main", entry),
+      "acme/repo",
+      1,
+      HEAD,
+      context,
+    ),
+  )
+  assert(
+    !approved_cache_head(
+      source([review(1, "APPROVED")], false, nil, "c".repeat(40), "main", entry),
+      "acme/repo",
+      1,
+      HEAD,
+      context,
+    ),
+  )
 }

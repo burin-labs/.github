@@ -12,16 +12,28 @@ type ReviewResponse = {
   data: {
     repository: {
       pullRequest: {
+        id: string,
+        number: int,
         headRefOid: string,
         state: string,
         merged: bool,
         baseRefName: string,
         headRepository: {nameWithOwner: string}?,
         mergeCommit: {oid: string}?,
+        mergeQueueEntry?: {
+          headCommit: {oid: string}?,
+          pullRequest: {id: string, number: int, headRefOid: string},
+        }?,
         reviews: {totalCount: int, pageInfo: {hasNextPage: bool}, nodes: list<Review>},
       },
     },
   },
+}
+
+pub type CacheApprovalContext = {
+  default_branch?: string,
+  merge_commit?: string,
+  queue_commit?: string,
 }
 
 /** Only the latest current-head decision from each writer can authorize a cache. */
@@ -30,19 +42,25 @@ pub fn approved_cache_head(
   repo: string,
   number: int,
   head_sha: string,
-  merge_commit: string? = nil,
-  default_branch: string = "main",
+  context: CacheApprovalContext = {},
 ) -> bool {
   if source.graphql == nil {
     return false
   }
   const parts = split(repository(repo), "/")
+  const default_branch = context.default_branch ?? "main"
+  const merge_commit = context.merge_commit
+  const queue_commit = context.queue_commit
+  if merge_commit != nil && queue_commit != nil {
+    return false
+  }
   const query =
-    "query { repository(owner: \"${parts[0]}\", name: \"${parts[1]}\") { pullRequest(number: ${number}) { headRefOid state merged baseRefName headRepository { nameWithOwner } mergeCommit { oid } reviews(first: 100) { totalCount pageInfo { hasNextPage } nodes { databaseId authorCanPushToRepository state commit { oid } author { login } } } } } }"
+    "query { repository(owner: \"${parts[0]}\", name: \"${parts[1]}\") { pullRequest(number: ${number}) { id number headRefOid state merged baseRefName headRepository { nameWithOwner } mergeCommit { oid } mergeQueueEntry { headCommit { oid } pullRequest { id number headRefOid } } reviews(first: 100) { totalCount pageInfo { hasNextPage } nodes { databaseId authorCanPushToRepository state commit { oid } author { login } } } } } }"
   const response = schema_expect(unwrap(source.graphql)(query), schema_of(ReviewResponse))
   const pull = response.data.repository.pullRequest
   const reviews = pull.reviews
-  if pull.headRefOid != head_sha || pull.headRepository?.nameWithOwner != repo
+  if pull.id == "" || pull.number != number || pull.headRefOid != head_sha
+    || pull.headRepository?.nameWithOwner != repo
     || default_branch == ""
     || pull.baseRefName != default_branch
     || (merge_commit == nil && (pull.state != "OPEN" || pull.merged))
@@ -52,9 +70,22 @@ pub fn approved_cache_head(
     || reviews.totalCount <= 0 {
     return false
   }
+  if queue_commit != nil {
+    const entry = pull.mergeQueueEntry
+    if entry == nil || entry.headCommit?.oid != queue_commit
+      || entry.pullRequest.id != pull.id
+      || entry.pullRequest.number != number
+      || entry.pullRequest.headRefOid != head_sha {
+      return false
+    }
+  }
+  return latest_writer_approval(reviews.nodes, head_sha)
+}
+
+fn latest_writer_approval(reviews: list<Review>, head_sha: string) -> bool {
   let decisions: dict<string, Review> = {}
   let seen: list<int> = []
-  for review in reviews.nodes {
+  for review in reviews {
     if review.databaseId <= 0 || seen.contains(review.databaseId) {
       return false
     }
