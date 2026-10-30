@@ -53,7 +53,7 @@ query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner
     comments(last: 100) { totalCount nodes { body viewerDidAuthor } }
     reviewThreads(first: 100) { totalCount nodes { isResolved path comments(first: 100) { totalCount nodes {
       databaseId body authorAssociation author { __typename } } } } }
-    commits(last: 1) { nodes { commit { oid signature { isValid } statusCheckRollup { contexts(first: 100) {
+    commits(last: 1) { nodes { commit { oid signature { isValid state } statusCheckRollup { contexts(first: 100) {
       ${CONTEXTS} } } } } } } } }
 """
 
@@ -111,7 +111,11 @@ pub type Pull = {
   reviewThreads: Page<{isResolved: bool, path: string?, comments: Page<Comment>}>,
   commits: {
     nodes: list<{
-      commit: {oid: string, signature: {isValid: bool}?, statusCheckRollup: {contexts: Checks}?},
+      commit: {
+        oid: string,
+        signature: {isValid: bool, state?: string?}?,
+        statusCheckRollup: {contexts: Checks}?,
+      },
     }>,
   },
 }
@@ -188,6 +192,7 @@ pub fn observe(pr: Pull, own: string = "") {
       && !reviews.any({ v -> v.state == "CHANGES_REQUESTED" })
       && reviews.any({ v -> v.state == "APPROVED" && v.commit?.oid == pr.headRefOid }),
     signed: head?.signature?.isValid ?? false,
+    signature_state: head?.signature?.state ?? (head?.signature == nil ? "MISSING" : "UNMEASURED"),
     no_checks: len(checks) == 0,
     failing: checks.filter({ c -> RED.contains(outcome(c)) }),
     rerun: checks.filter({ c -> RERUN.contains(outcome(c)) }).map({ c -> c.name }),
@@ -274,8 +279,11 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
     }
   }
   if !blocked {
-    if !f.approved || !f.signed {
-      return stop("green; waiting for a writer's approval of this signed head")
+    if !f.signed {
+      return stop("head signature is not verified (${f.signature_state})")
+    }
+    if !f.approved {
+      return stop("green; waiting for a writer's approval of this head")
     }
     if pr.mergeStateStatus == "BEHIND" {
       return {action: "update", reason: "behind its base", facts: f}
