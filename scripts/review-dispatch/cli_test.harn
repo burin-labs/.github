@@ -63,6 +63,34 @@ pipeline test_launcher_resolves_and_dispatches_with_its_actual_sandbox_grants(ha
       {ref: "main", inputs: {repository: repository, pr: "184", head_sha: head}},
     )
   }
+  const bot_repository = "burin-labs/smart-ship-sandbox"
+  harness.fs.write_text(
+    fixture,
+    json_stringify(
+      {
+        number: 184,
+        state: "open",
+        draft: false,
+        user: {type: "Bot", login: "harn-release-bot[bot]"},
+        base: {repo: {full_name: bot_repository}},
+        head: {sha: head, repo: {full_name: bot_repository}},
+      },
+    ),
+  )
+  harness.fs.write_text(output, "")
+  harness.fs.write_text(receipt, "")
+  const refused = harness.process.run(
+    {
+      program: "/bin/bash",
+      args: ["scripts/review-dispatch/run.sh", "resolve"],
+      cwd: root,
+      env: env + {TARGET_REPOSITORY: bot_repository, GH_TOKEN: "public-fixture-read"},
+      timeout_ms: 30000,
+    },
+  )
+  assert(refused.success, refused.stdout + refused.stderr)
+  assert_eq(harness.fs.read_text(output), "eligible=false\nreason=bot_author\n")
+  assert_eq(harness.fs.read_text(receipt), "", "ineligible bot-authored PRs must not dispatch")
 }
 
 pipeline test_launcher_fails_on_unavailable_target_permission_without_eligible_outputs(

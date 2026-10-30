@@ -1,5 +1,5 @@
 name: Request an automatic review
-description: Measure an eligible pull request head before dispatching the existing reviewer.
+description: Measure a pull request head and report whether an automatic review was dispatched.
 inputs:
   pull-request:
     description: Pull request number in the calling repository.
@@ -46,6 +46,15 @@ runs:
         TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
         PR_NUMBER: ${{ inputs.pull-request }}
       run: bash "$GITHUB_ACTION_PATH/../../../scripts/review-dispatch/run.sh" resolve
+    - name: Report an ineligible review target
+      id: ineligible
+      if: steps.request.outputs.eligible != 'true'
+      shell: bash
+      env:
+        REASON: ${{ steps.request.outputs.reason }}
+      run: |
+        echo "No automatic review was requested: target is ineligible (${REASON})." >> "$GITHUB_STEP_SUMMARY"
+        echo "::notice title=Automatic review not requested::Target is ineligible (${REASON})."
     - name: Mint a token that can only request reviews
       id: app
       if: steps.request.outputs.eligible == 'true'
