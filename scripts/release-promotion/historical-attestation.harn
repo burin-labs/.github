@@ -1,5 +1,20 @@
+pub type HistoricalAttestationIdentity = {
+  repository: string,
+  source: string,
+  policy: string,
+  run: string,
+  attempt: string,
+  file: string,
+  digest: string,
+  kind: string,
+  target: string,
+}
+
 /** Consume only records already cryptographically verified by gh. */
-pub fn historical_attestation_matches(records: list<unknown>, expected: dict) -> bool {
+pub fn historical_attestation_matches(
+  records: list<unknown>,
+  expected: HistoricalAttestationIdentity,
+) -> bool {
   const workflow = ".github/workflows/build-release-binaries.yml"
   const repository_url = "https://github.com/" + expected.repository
   const workflow_ref = expected.repository + "/" + workflow + "@refs/heads/main"
