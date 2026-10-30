@@ -199,7 +199,7 @@ pipeline test_the_tracking_issue_follows_the_default_branch_verdict(harness: Har
     "pull requests never touch the issue",
   )
   assert(
-    condition.contains("inputs.source-revision == ''"),
+    condition.contains("inputs.source-revision == 'event'"),
     "source-specific scans never alter the default-branch issue",
   )
   // A run that never reached the advisories step must not close the issue.
@@ -281,7 +281,8 @@ pipeline test_explicit_advisory_source_requires_an_immutable_identity_and_checko
   const sha = "a".repeat(40)
   const source = "Admit immutable advisory source"
   const unused_git = "#!/usr/bin/env bash\nexit 91\n"
-  for selected in ["", sha] {
+  assert_eq(workflow(harness.fs).on.workflow_call.inputs["source-revision"].default, "event")
+  for selected in ["event", sha] {
     const valid = run_source_step(
       harness,
       source,
@@ -291,14 +292,16 @@ pipeline test_explicit_advisory_source_requires_an_immutable_identity_and_checko
     assert(valid.success)
     assert_eq(valid.output, "revision=${sha}\n")
   }
-  const invalid = run_source_step(
-    harness,
-    source,
-    {SOURCE_REVISION: "main", EVENT_SHA: sha},
-    unused_git,
-  )
-  assert(!invalid.success)
-  assert_eq(invalid.output, "")
+  for selected in ["", "main"] {
+    const invalid = run_source_step(
+      harness,
+      source,
+      {SOURCE_REVISION: selected, EVENT_SHA: sha},
+      unused_git,
+    )
+    assert(!invalid.success)
+    assert_eq(invalid.output, "")
+  }
   for actual in [sha, "b".repeat(40)] {
     const checked = run_source_step(
       harness,

@@ -64,9 +64,9 @@ on:
         value: ${{ jobs.cargo-deny.outputs.advisory_database_revision }}
     inputs:
       source-revision:
-        description: "Optional immutable source commit to audit without changing the default-branch tracking issue"
+        description: "Full immutable source commit, or event to audit the workflow source and update its tracking issue"
         type: string
-        default: ""
+        default: "event"
         required: false
       working-directory:
         description: "Directory holding the workspace Cargo.lock and deny.toml"
@@ -95,7 +95,10 @@ jobs:
           EVENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          revision="${SOURCE_REVISION:-$EVENT_SHA}"
+          case "$SOURCE_REVISION" in
+            event) revision="$EVENT_SHA" ;;
+            *) revision="$SOURCE_REVISION" ;;
+          esac
           if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
             echo '::error::Advisory source must be a full immutable commit.'
             exit 1
@@ -290,7 +293,7 @@ jobs:
     # nothing about advisories, so it leaves the issue alone.
     if: >-
       ${{ always()
-      && inputs.source-revision == ''
+      && inputs.source-revision == 'event'
       && github.event_name != 'pull_request'
       && (needs.cargo-deny.outputs.advisories == 'success'
           || (needs.cargo-deny.outputs.advisories == 'failure' && needs.cargo-deny.outputs.findings != '')) }}
