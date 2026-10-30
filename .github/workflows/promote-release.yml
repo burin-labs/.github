@@ -149,7 +149,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: burin-labs/harn
-          ref: 94407392829a72a243b2e8d0fd3f18ebfd22e806
+          ref: 166bb6d6170486a098492bedaec56bdcbf18cabd
           path: .harn/promote-release/consumer-reader
           persist-credentials: false
 

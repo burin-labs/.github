@@ -136,7 +136,7 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     reader.with,
     {
       repository: "burin-labs/harn",
-      ref: "94407392829a72a243b2e8d0fd3f18ebfd22e806",
+      ref: "166bb6d6170486a098492bedaec56bdcbf18cabd",
       path: ".harn/promote-release/consumer-reader",
       "persist-credentials": false,
     },
