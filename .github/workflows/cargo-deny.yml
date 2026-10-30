@@ -55,7 +55,19 @@ name: cargo-deny (reusable)
 
 on:
   workflow_call:
+    outputs:
+      source-revision:
+        description: "Source commit actually checked out for the advisory scan"
+        value: ${{ jobs.cargo-deny.outputs.source_revision }}
+      advisory-database-revision:
+        description: "Fresh RustSec database commit used for the whole-lockfile scan"
+        value: ${{ jobs.cargo-deny.outputs.advisory_database_revision }}
     inputs:
+      source-revision:
+        description: "Optional immutable source commit to audit without changing the default-branch tracking issue"
+        type: string
+        default: ""
+        required: false
       working-directory:
         description: "Directory holding the workspace Cargo.lock and deny.toml"
         type: string
@@ -76,9 +88,36 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Admit immutable advisory source
+        id: source
+        env:
+          SOURCE_REVISION: ${{ inputs.source-revision }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          revision="${SOURCE_REVISION:-$EVENT_SHA}"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Advisory source must be a full immutable commit.'
+            exit 1
+          fi
+          printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ steps.source.outputs.revision }}
           persist-credentials: false
+      - name: Verify advisory source checkout
+        id: checked-source
+        env:
+          EXPECTED_SOURCE: ${{ steps.source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse --verify HEAD)"
+          if [[ "$actual" != "$EXPECTED_SOURCE" ]]; then
+            echo '::error::Advisory checkout differs from its admitted source.'
+            exit 1
+          fi
+          printf 'revision=%s\n' "$actual" >> "$GITHUB_OUTPUT"
+          printf 'advisory_source_revision=%s\n' "$actual"
       # A pinned, checksum-verified prebuilt binary: no Rust toolchain, no
       # compile. Bump VERSION and SHA256 together.
       - name: Install cargo-deny
@@ -126,11 +165,22 @@ jobs:
           install -m 0755 "${RUNNER_TEMP}/${slug}/cargo-audit" "${HOME}/.local/bin/cargo-audit"
           echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
           "${HOME}/.local/bin/cargo-audit" --version
+      - name: Refresh lockfile advisory database
+        id: advisory-db
+        run: |
+          set -euo pipefail
+          database="$(mktemp -d "$RUNNER_TEMP/lockfile-advisories.XXXXXX")"
+          git clone --quiet --depth=1 https://github.com/RustSec/advisory-db "$database"
+          revision="$(git -C "$database" rev-parse --verify HEAD)"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          printf 'path=%s\nrevision=%s\n' "$database" "$revision" >> "$GITHUB_OUTPUT"
+          printf 'lockfile_advisory_database_revision=%s\n' "$revision"
       - name: Security advisories
         id: advisories
         working-directory: ${{ inputs.working-directory }}
         env:
           ADVISORY_LINTS: ${{ github.event_name == 'pull_request' && '--warn unmaintained --warn unsound' || '' }}
+          LOCKFILE_ADVISORY_DATABASE: ${{ steps.advisory-db.outputs.path }}
         run: |
           set -uo pipefail
           # GitHub runs `bash -e`, and `set -uo` leaves -e on: the first failing
@@ -169,6 +219,9 @@ jobs:
           try:
               with open(report_path, encoding="utf-8") as handle:
                   report = json.load(handle)
+              advisory_count = report["database"]["advisory-count"]
+              if type(advisory_count) is not int or advisory_count <= 0:
+                  raise ValueError("advisory database census is missing or empty")
               vulnerabilities = report["vulnerabilities"]["list"]
               # Unmaintained, unsound, and yanked entries are warnings. They
               # never fail here, but an ignore for one is still in use.
@@ -206,7 +259,7 @@ jobs:
           sys.exit(1 if findings else 0)
           PY
           audit_json="${RUNNER_TEMP}/cargo-audit.json"
-          cargo-audit audit --json --file Cargo.lock > "${audit_json}"
+          cargo-audit audit --db "$LOCKFILE_ADVISORY_DATABASE" --no-fetch --json --file Cargo.lock > "${audit_json}"
           lockfile_findings="$(python3 -I "${RUNNER_TEMP}/lockfile-advisories.py" "$(date -u +%F)" "${audit_json}")"
           lockfile_status=$?
           if [ "${lockfile_status}" -ne 0 ]; then
@@ -223,6 +276,8 @@ jobs:
           fi
           exit "${status}"
     outputs:
+      source_revision: ${{ steps.checked-source.outputs.revision }}
+      advisory_database_revision: ${{ steps.advisory-db.outputs.revision }}
       advisories: ${{ steps.advisories.outcome }}
       findings: ${{ steps.advisories.outputs.findings }}
 
@@ -235,6 +290,7 @@ jobs:
     # nothing about advisories, so it leaves the issue alone.
     if: >-
       ${{ always()
+      && inputs.source-revision == ''
       && github.event_name != 'pull_request'
       && (needs.cargo-deny.outputs.advisories == 'success'
           || (needs.cargo-deny.outputs.advisories == 'failure' && needs.cargo-deny.outputs.findings != '')) }}
