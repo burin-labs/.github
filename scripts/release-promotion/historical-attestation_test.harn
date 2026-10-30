@@ -121,13 +121,40 @@ pipeline test_attestation_selects_one_signer_flag(_harness: Harness) {
 pipeline test_historical_release_files_bind_their_producing_attempt(_harness: Harness) {
   const archive = record()
   const predicate = archive.verificationResult.statement.predicate
+  const file_expected = expected() + {kind: "notes", file: "release-notes.md"}
+  const identity = {
+    file: file_expected.file,
+    kind: file_expected.kind,
+    sha256: file_expected.digest,
+  }
   const files = archive
     + {
       verificationResult: archive.verificationResult
-        + {statement: {predicate: predicate + {schemaVersion: "harn.release_files_provenance.v1"}}},
+        + {
+          statement: {
+            predicate: predicate
+              + {schemaVersion: "harn.release_files_provenance.v1", files: [identity]},
+          },
+        },
     }
-  const file_expected = expected() + {kind: "notes", file: "release-notes.md"}
   assert_eq(historical_attestation_matches([files], file_expected), true)
+  for changed in [
+    nil,
+    [],
+    [identity + {file: "SHA256SUMS"}],
+    [identity + {kind: "checksums"}],
+    [identity + {sha256: "c".repeat(64)}],
+    [identity, identity],
+  ] {
+    const wrong_file = files
+      + {
+        verificationResult: files.verificationResult
+          + {
+            statement: {predicate: files.verificationResult.statement.predicate + {files: changed}},
+          },
+      }
+    assert_eq(historical_attestation_matches([wrong_file], file_expected), false)
+  }
   const wrong = files
     + {
       verificationResult: files.verificationResult
