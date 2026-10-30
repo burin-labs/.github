@@ -47,7 +47,9 @@ pipeline test_advisories_always_run_and_the_lockfile_scan_owns_stale_ignores(har
     "cargo-deny must not judge staleness over a graph narrower than the lockfile",
   )
   assert(
-    advisories.run.contains("cargo-audit audit --json --file Cargo.lock"),
+    advisories.run.contains(
+      "cargo-audit audit --db \"$LOCKFILE_ADVISORY_DATABASE\" --no-fetch --json --file Cargo.lock",
+    ),
     "the whole lockfile is scanned",
   )
   assert(
@@ -186,6 +188,10 @@ pipeline test_the_tracking_issue_follows_the_default_branch_verdict(harness: Har
     condition.contains("github.event_name != 'pull_request'"),
     "pull requests never touch the issue",
   )
+  assert(
+    condition.contains("inputs.source-revision == ''"),
+    "source-specific scans never alter the default-branch issue",
+  )
   // A run that never reached the advisories step must not close the issue.
   assert(
     condition.contains("needs.cargo-deny.outputs.advisories == 'success'"),
@@ -217,4 +223,114 @@ pipeline test_both_checks_run_in_the_caller_directory(harness: Harness) {
     assert_eq(step(all, name)["working-directory"], expression("inputs.working-directory"), name)
   }
   assert_eq(workflow(harness.fs).on.workflow_call.inputs["working-directory"].default, ".")
+}
+
+fn run_source_step(harness: Harness, name: string, values: dict, fake_git: string) -> dict {
+  let result = nil
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const script = path_join(work, "step.sh")
+      const output = path_join(work, "output")
+      const calls = path_join(work, "calls")
+      const git = path_join(work, "git")
+      harness.fs.write_text(script, step(steps(harness.fs), name).run)
+      harness.fs.write_text(output, "")
+      harness.fs.write_text(calls, "")
+      harness.fs.write_text(git, fake_git)
+      assert(harness.process.run({program: "/bin/chmod", args: ["755", git]}).success)
+      const ran = harness.process.run(
+        {
+          program: "/bin/bash",
+          args: ["-e", "-o", "pipefail", script],
+          cwd: work,
+          env: {
+            ...values,
+            PATH: "${work}:${harness.env.get("PATH") ?? ""}",
+            GITHUB_OUTPUT: output,
+            RUNNER_TEMP: work,
+            GIT_CALLS: calls,
+          },
+          timeout_ms: 30000,
+        },
+      )
+      result = {
+        success: ran.success,
+        output: harness.fs.read_text(output),
+        calls: harness.fs.read_text(calls),
+        stderr: ran.stderr,
+      }
+    },
+  )
+  return result
+}
+
+pipeline test_explicit_advisory_source_requires_an_immutable_identity_and_checkout(
+  harness: Harness,
+) {
+  const sha = "a".repeat(40)
+  const source = "Admit immutable advisory source"
+  const unused_git = "#!/usr/bin/env bash\nexit 91\n"
+  for selected in ["", sha] {
+    const valid = run_source_step(
+      harness,
+      source,
+      {SOURCE_REVISION: selected, EVENT_SHA: sha},
+      unused_git,
+    )
+    assert(valid.success)
+    assert_eq(valid.output, "revision=${sha}\n")
+  }
+  const invalid = run_source_step(
+    harness,
+    source,
+    {SOURCE_REVISION: "main", EVENT_SHA: sha},
+    unused_git,
+  )
+  assert(!invalid.success)
+  assert_eq(invalid.output, "")
+  for actual in [sha, "b".repeat(40)] {
+    const checked = run_source_step(
+      harness,
+      "Verify advisory source checkout",
+      {EXPECTED_SOURCE: sha},
+      "#!/usr/bin/env bash\nprintf '%s\\n' '${actual}'\n",
+    )
+    assert_eq(checked.success, actual == sha)
+    assert_eq(
+      checked.output,
+      if actual == sha {
+        "revision=${sha}\n"
+      } else {
+        ""
+      },
+    )
+  }
+  assert_eq(steps(harness.fs)[1].with.ref, expression("steps.source.outputs.revision"))
+}
+
+pipeline test_advisory_refresh_cannot_pass_using_an_empty_or_failed_read(harness: Harness) {
+  const sha = "c".repeat(40)
+  const refresh = step(steps(harness.fs), "Refresh lockfile advisory database")
+  assert(!refresh.has("if"), "a source scan always refreshes the database")
+  for failed in ["0", "1", "empty"] {
+    const git =
+      "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$GIT_CALLS\"\nif [ \"$1\" = clone ] && [ \"$REFRESH_FAIL\" = 1 ]; then exit 91; fi\nif [ \"$1\" = -C ] && [ \"$REFRESH_FAIL\" != empty ]; then printf '%s\\n' '${sha}'; fi\n"
+    const result = run_source_step(
+      harness,
+      "Refresh lockfile advisory database",
+      {REFRESH_FAIL: failed},
+      git,
+    )
+    assert_eq(result.success, failed == "0")
+    assert(result.calls.contains("clone --quiet --depth=1 https://github.com/RustSec/advisory-db"))
+    if failed == "0" {
+      assert(
+        result.output.contains("revision=${sha}\n"),
+        "a successful refresh has a non-null database identity",
+      )
+    } else {
+      assert_eq(result.output, "", "a failed refresh cannot issue a clean database receipt")
+    }
+  }
 }
