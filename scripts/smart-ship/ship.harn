@@ -1,0 +1,1358 @@
+/**
+ * One look at one pull request. It lands an approved, green head, or prepares a
+ * repair that runs without credentials (repair.harn) and then publishes its result.
+ * Every rule that decides a landing lives here, in code, never in the prompt.
+ */
+import { command_run } from "std/command"
+import {
+  GithubClientOptions,
+  api_call,
+  github_merge_queue_enqueue,
+} from "harn-github-connector/default"
+import { github_merge_signed_staging } from "harn-github-connector/signed_merge"
+import { github_commit_worktree } from "harn-github-connector/worktree"
+
+const HOLDS = ["hold", "do-not-merge"]
+
+pub const MAX_ATTEMPTS = 3
+
+const MAX_RETAINED = 5
+
+const RED = ["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"]
+
+const RERUN = ["CANCELLED", "STALE"]
+
+const TRUSTED = ["OWNER", "MEMBER", "COLLABORATOR"]
+
+const MARK = "<!-- smart-ship head="
+
+const CONTINUE = "<!-- smart-ship continue="
+
+const REFUSED = "<!-- smart-ship refused="
+
+// An attempt's result was posted; it answers the head.
+const DONE = "<!-- smart-ship done="
+
+// An attempt died before any result; it does not answer the head.
+const ENDED = "<!-- smart-ship ended="
+
+const STORAGE_FULL = "<!-- smart-ship storage-full="
+
+const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
+  nodes { ... on CheckRun { name status conclusion databaseId
+      checkSuite { app { id } workflowRun { workflow { id name } } } }
+    ... on StatusContext { name: context state createdAt creator { login } } }"""
+
+const QUERY = """
+query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
+  nameWithOwner defaultBranchRef { name } mergeQueue { id }
+  pullRequest(number: $number) { id number title state isDraft isCrossRepository isInMergeQueue
+    headRefName headRefOid baseRefName baseRef { target { oid } } mergeStateStatus reviewDecision
+    labels(first: 100) { totalCount nodes { name } }
+    latestOpinionatedReviews(first: 100, writersOnly: true) { totalCount nodes { state commit { oid } } }
+    comments(last: 100) { totalCount nodes { body viewerDidAuthor } }
+    reviewThreads(first: 100) { totalCount nodes { isResolved path comments(first: 100) { totalCount nodes {
+      databaseId body authorAssociation author { __typename } } } } }
+    commits(last: 1) { nodes { commit { oid signature { isValid } statusCheckRollup { contexts(first: 100) {
+      ${CONTEXTS} } } } } } } } }
+"""
+
+// A large repository's head carries more than one page of checks; later pages are read by cursor.
+const MORE_CONTEXTS = """
+query($owner: String!, $name: String!, $oid: GitObjectID!, $after: String!) { repository(owner: $owner, name: $name) {
+  object(oid: $oid) { ... on Commit { statusCheckRollup { contexts(first: 100, after: $after) { ${CONTEXTS} } } } } } }
+"""
+
+pub type Check = {
+  name: string,
+  status?: string?,
+  conclusion?: string?,
+  state?: string?,
+  databaseId?: int?,
+  createdAt?: string?,
+  creator?: {login: string}?,
+  checkSuite?: {app?: {id: string}?, workflowRun?: {workflow: {id?: string?, name: string}}?}?,
+}
+
+type Comment = {
+  databaseId: int,
+  body: string,
+  authorAssociation: string,
+  author: {__typename: string}?,
+}
+
+type Page<T> = {totalCount: int, nodes: list<T>}
+
+type Checks = {
+  totalCount: int,
+  pageInfo: {hasNextPage: bool, endCursor?: string?},
+  nodes: list<Check>,
+}
+
+type MoreChecks = {data: {repository: {object: {statusCheckRollup: {contexts: Checks}?}?}}}
+
+pub type Pull = {
+  id: string,
+  number: int,
+  title: string,
+  state: string,
+  isDraft: bool,
+  isCrossRepository: bool,
+  isInMergeQueue: bool,
+  headRefName: string,
+  headRefOid: string,
+  baseRefName: string,
+  baseRef: {target: {oid: string}}?,
+  mergeStateStatus: string,
+  reviewDecision: string?,
+  labels: Page<{name: string}>,
+  latestOpinionatedReviews: Page<{state: string, commit: {oid: string}?}>,
+  comments: Page<{body: string, viewerDidAuthor?: bool}>,
+  reviewThreads: Page<{isResolved: bool, path: string?, comments: Page<Comment>}>,
+  commits: {
+    nodes: list<{
+      commit: {oid: string, signature: {isValid: bool}?, statusCheckRollup: {contexts: Checks}?},
+    }>,
+  },
+}
+
+pub type Repo = {
+  nameWithOwner: string,
+  defaultBranchRef: {name: string},
+  mergeQueue: {id: string}?,
+  pullRequest: Pull,
+}
+
+type Response = {data: {repository: Repo}}
+
+fn complete(page: Page<any>) -> bool {
+  return len(page.nodes) == page.totalCount
+}
+
+/**
+ * Who produced a check, by stable ids rather than display names: the app and workflow for a check
+ * run, the creator for a status. Nil when any part is unknown, and an unknown producer never collapses.
+ */
+fn producer(c: Check) -> string? {
+  if c.state != nil {
+    const creator = c.creator?.login
+    return creator == nil || c.createdAt == nil ? nil : "status\n${creator}\n${c.name}"
+  }
+  const app = c.checkSuite?.app?.id
+  const run = c.checkSuite?.workflowRun
+  const workflow = run == nil ? "" : run.workflow.id
+  return app == nil || workflow == nil || c.databaseId == nil ? nil : "check\n${app}\n${workflow}\n${c.name}"
+}
+
+/** Strictly newer; a tie never supersedes. */
+fn later(a: Check, b: Check) -> bool {
+  return a.state != nil ? a.createdAt > b.createdAt : a.databaseId > b.databaseId
+}
+
+/**
+ * A head keeps every attempt of a check, and re-running an old run replays its old workflow, so
+ * only the newest attempt from each producer speaks for it.
+ */
+fn newest(checks: list<Check>) -> list<Check> {
+  return checks.filter(
+    { c ->
+      const key = producer(c)
+      key == nil || !checks.any({ o -> producer(o) == key && later(o, c) })
+    },
+  )
+    .to_list()
+}
+
+/**
+ * What the head shows. A look never waits on, or repairs, the Smart Ship workflow running it,
+ * named by `own`: that workflow's node id, since any workflow may share its display name.
+ */
+pub fn observe(pr: Pull, own: string = "") {
+  const head = pr.commits.nodes[0]?.commit
+  const rollup = head?.statusCheckRollup?.contexts ?? {totalCount: 0, nodes: []}
+  const checks = newest(
+    rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.id != own }),
+  )
+  const reviews = pr.latestOpinionatedReviews.nodes
+  const outcome = { c -> c.conclusion ?? c.state ?? "" }
+  // Only Smart Ship's own comments count; anyone else's marker is text.
+  const own_notes = pr.comments.nodes.filter({ c -> c.viewerDidAuthor == true })
+  const at = { mark -> len(own_notes.filter({ c -> contains(c.body, mark + pr.headRefOid) })) }
+  return {
+    // Every census must be read whole; a page we did not read could hold the failure or the thread.
+    complete: complete(pr.labels) && complete(pr.latestOpinionatedReviews)
+      && complete(pr.reviewThreads)
+      && complete(rollup),
+    // Counted only from writers, and only for the head it reviewed.
+    approved: pr.reviewDecision != "CHANGES_REQUESTED" && pr.reviewDecision != "REVIEW_REQUIRED"
+      && !reviews.any({ v -> v.state == "CHANGES_REQUESTED" })
+      && reviews.any({ v -> v.state == "APPROVED" && v.commit?.oid == pr.headRefOid }),
+    signed: head?.signature?.isValid ?? false,
+    no_checks: len(checks) == 0,
+    failing: checks.filter({ c -> RED.contains(outcome(c)) }),
+    rerun: checks.filter({ c -> RERUN.contains(outcome(c)) }).map({ c -> c.name }),
+    pending: checks.filter(
+      { c ->
+        (c.status ?? "COMPLETED") != "COMPLETED" || ["PENDING", "EXPECTED"].contains(c.state ?? "")
+      },
+    )
+      .map({ c -> c.name }),
+    threads: pr.reviewThreads.nodes.filter({ t -> !t.isResolved }),
+    marks: complete(pr.comments) ? len(
+      own_notes.filter({ c -> contains(c.body, MARK) }),
+    ) : MAX_ATTEMPTS,
+    // A head is answered by an attempt's result; only a saved-work note reopens it.
+    answered: at(DONE) > at(CONTINUE),
+    // Attempts that died before any result: each still counts once, and a look closes it.
+    open: at(MARK) - at(DONE) - at(ENDED),
+    // The saved work a continue note names; a ref nobody named is never restored.
+    kept: own_notes.filter({ c -> contains(c.body, CONTINUE + pr.headRefOid + " wip=") }).map(
+      { c -> regex_captures("wip=([0-9a-f]{40})", c.body)[0]?.groups?.[0] ?? "" },
+    ),
+  }
+}
+
+/**
+ * A release cut holds the base through its lease: only its exact holder (repo, base, base
+ * commit, PR, head, squash) may land; any other or unparseable lease refuses.
+ */
+pub fn lease_admits(lease: string, slug: string, pr: Pull) -> bool {
+  if lease == "clear" {
+    return true
+  }
+  const rows = regex_captures(
+    "^release-merge-lease v2 repo=([^ ]+) base=([^ ]+) base_oid=([0-9a-fA-F]{40}) candidate_pr=([1-9][0-9]*) candidate_head=([0-9a-fA-F]{40}) generation=[^ ]+ tag=[^ ]+ merge_method=(merge|rebase|squash)$",
+    trim(lease),
+  )
+  const g = len(rows) == 1 ? rows[0].groups : []
+  return len(g) == 6 && lowercase(g[0]) == lowercase(slug) && g[1] == pr.baseRefName
+    && lowercase(g[2]) == lowercase(pr.baseRef?.target?.oid ?? "")
+    && g[3] == to_string(pr.number)
+    && lowercase(g[4]) == lowercase(pr.headRefOid)
+    && g[5] == "squash"
+}
+
+pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
+  const pr = repo.pullRequest
+  const seen = observe(pr, own)
+  const labels = pr.labels.nodes.map({ l -> l.name })
+  // Whether Smart Ship shepherds this PR at all; a PR it does not is never written to.
+  const admission = [
+    [pr.state != "OPEN" || !labels.contains("ship"), "not shepherded: closed, or not labeled ship"],
+    [
+      !seen.complete,
+      "too many labels, reviews, threads or checks to read completely; a person must land it",
+    ],
+    [HOLDS.any({ h -> labels.contains(h) }), "held by a label"],
+    [
+      pr.isCrossRepository || pr.isDraft || pr.baseRefName != repo.defaultBranchRef.name,
+      "not shepherded: a fork, a draft, or a non-default base",
+    ],
+  ]
+  const admitted = !admission.any({ g -> g[0] == true })
+  // Dead attempts the look closes: only for an admitted PR, and only from the whole comment
+  // census; a partial one closes nothing and already reads as attempts used up.
+  const f = seen + {close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0}
+  const stop = { why -> {action: "stop", reason: why, facts: f} }
+  const conflict = pr.mergeStateStatus == "DIRTY"
+  const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
+  // The first gate that holds stops the look, in this order.
+  const gates = admission
+    + [
+      [pr.isInMergeQueue, "already in the merge queue"],
+      // A conflicted head may never get checks; its repair does not wait on them.
+      [!conflict && f.no_checks, "waiting on checks to report"],
+      [!conflict && len(f.pending) > 0, "waiting on " + join(f.pending, ", ")],
+      [
+        !conflict && len(f.rerun) > 0,
+        "cancelled or stale checks need a fresh push: " + join(f.rerun, ", "),
+      ],
+    ]
+  for gate in gates {
+    if gate[0] {
+      return stop(gate[1])
+    }
+  }
+  if !blocked {
+    if !f.approved || !f.signed {
+      return stop("green; waiting for a writer's approval of this signed head")
+    }
+    if pr.mergeStateStatus == "BEHIND" {
+      return {action: "update", reason: "behind its base", facts: f}
+    }
+    // GitHub reads this look's own running check as UNSTABLE; with every other check green the merge enforces the rest.
+    if !["CLEAN", "UNSTABLE"].contains(pr.mergeStateStatus) {
+      return stop("waiting on GitHub: ${pr.mergeStateStatus}")
+    }
+    if !lease_admits(lease, repo.nameWithOwner, pr) {
+      return stop("a release merge lease holds ${pr.baseRefName}: ${lease}")
+    }
+    return {action: "merge", reason: "approved and green", facts: f}
+  }
+  const refusals = [
+    [f.answered, "already answered at this head"],
+    [f.marks >= MAX_ATTEMPTS, "repair attempts used up; a person needs to take it"],
+    [
+      f.threads.any({ t -> !complete(t.comments) }),
+      "a review thread is too long to read whole; a person needs to take it",
+    ],
+    [!can_repair, "blocked, and repair is off here"],
+    [labels.contains("no-auto-repair"), "blocked, and labeled no-auto-repair"],
+  ]
+  for gate in refusals {
+    if gate[0] {
+      return stop(gate[1])
+    }
+  }
+  return {action: "repair", reason: "blocked", facts: f}
+}
+
+// No global or system git config: nothing the agent could have written outside its jail is read here.
+const GIT_ISOLATED = {GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null"}
+
+// Captured output past this is cut off; a cut-off read refuses rather than judge part of it.
+const READ_CAP = 16777216
+
+fn run(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".") {
+  return command_run(
+    tools,
+    {argv: argv, cwd: cwd, env_mode: "patch", env: GIT_ISOLATED + env},
+    {timeout_ms: 600000, max_inline_bytes: READ_CAP},
+  )
+}
+
+/** A runner never starts another repair when its bounded recovery storage is full. */
+pub fn retention_has_space(tools: HarnessTools, root: string) -> bool {
+  require root != "", "the runner recovery directory is unmeasured"
+  require !run(tools, ["test", "-L", root]).success,
+    "the runner recovery directory is a symlink"
+  sh(tools, ["mkdir", "-p", root])
+  sh(tools, ["chmod", "700", root])
+  const listed = run(tools, ["ls", "-A", "-1", root])
+  require listed.success && !(listed?.stdout_truncated ?? false),
+    "the runner recovery directory could not be read whole"
+  return len(split(listed.stdout, "\n").filter({name -> name != "" })) < MAX_RETAINED
+}
+
+pub fn sh(tools: HarnessTools, argv: list<string>, env: dict = {}, cwd: string = ".") -> string {
+  const r = run(tools, argv, env, cwd)
+  require r.success, join(argv[0:3], " ") + ": " + trim(r.stderr)
+  require !(r?.stdout_truncated ?? false), join(argv[0:3], " ") + ": output too large to read whole"
+  return trim(r.stdout)
+}
+
+fn gh(
+  harness: Harness,
+  opts: GithubClientOptions,
+  path: string,
+  method: string = "GET",
+  body: unknown = nil,
+) {
+  const r = api_call(harness, {path: path, method: method, body: body, options: opts})
+  require is_ok(r), "${method} ${path}: " + to_string(unwrap_err(r)?.message)
+  return unwrap(r)
+}
+
+/**
+ * `clear`, or the lease headline; an unreadable lease throws, so the look stops before any landing.
+ */
+fn release_lease(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  base: string,
+) -> string {
+  const refs = gh(harness, opts, "/repos/${repo}/git/matching-refs/release-merge-lease/${base}")
+  const held = refs.filter({ r -> r?.ref == "refs/release-merge-lease/" + base })
+  return len(held) == 0 ? "clear" : split(
+    gh(harness, opts, "/repos/${repo}/git/commits/${held[0].object.sha}").message,
+    "\n",
+  )[0]
+}
+
+fn read(harness: Harness, opts: GithubClientOptions, repo: string, number: int) -> Repo {
+  const [owner, name] = split(repo, "/")
+  const vars = {owner: owner, name: name, number: number}
+  // GitHub computes mergeability lazily after a push or a base move; a read starts it.
+  for wait in [0, 5000, 10000] {
+    harness.clock.sleep_ms(wait)
+    const body: Response = schema_expect(
+      gh(harness, opts, "/graphql", "POST", {query: QUERY, variables: vars}),
+      schema_of(Response),
+    )
+    if body.data.repository.pullRequest.mergeStateStatus != "UNKNOWN" || wait == 10000 {
+      return all_checks(harness, opts, owner, name, body.data.repository)
+    }
+  }
+  throw "unreachable"
+}
+
+/** The repo with every page of the head's checks; a partial list still reads as incomplete. */
+fn all_checks(
+  harness: Harness,
+  opts: GithubClientOptions,
+  owner: string,
+  name: string,
+  repo: Repo,
+) -> Repo {
+  const head = repo.pullRequest.commits.nodes[0]?.commit
+  const first = head?.statusCheckRollup?.contexts
+  if first == nil {
+    return repo
+  }
+  let nodes = first.nodes
+  let info = first.pageInfo
+  // 50 pages is 5,000 checks; past that the count mismatch refuses the look.
+  let pages = 0
+  while pages < 50 && info.hasNextPage {
+    const vars = {owner: owner, name: name, oid: head.oid, after: info.endCursor}
+    const more: MoreChecks = schema_expect(
+      gh(harness, opts, "/graphql", "POST", {query: MORE_CONTEXTS, variables: vars}),
+      schema_of(MoreChecks),
+    )
+    const page = more.data.repository.object?.statusCheckRollup?.contexts
+    if page == nil {
+      break
+    }
+    nodes = nodes + page.nodes
+    info = page.pageInfo
+    pages = pages + 1
+  }
+  const contexts = {...first, pageInfo: info, nodes: nodes}
+  const commit = {...head, statusCheckRollup: {...head.statusCheckRollup, contexts: contexts}}
+  const pr = repo.pullRequest
+  return schema_expect(
+    {...repo, pullRequest: {...pr, commits: {nodes: [{...pr.commits.nodes[0], commit: commit}]}}},
+    schema_of(Repo),
+  )
+}
+
+/**
+ * Clone the head twice: a pristine copy the publish step trusts, and the agent's working copy,
+ * which shares its objects but cannot fetch. The clone is whole, not blobless, so any history the
+ * agent reads is there offline. A conflicted head gets the base merged in, conflicts left open.
+ */
+pub fn checkout(
+  tools: HarnessTools,
+  url: string,
+  env: dict,
+  work: string,
+  head: string,
+  base: string,
+  dirty: bool,
+) {
+  sh(tools, ["git", "clone", "--quiet", url, work + "/pristine"], env)
+  sh(tools, ["git", "checkout", "--quiet", "--detach", head], env, work + "/pristine")
+  sh(tools, ["git", "clone", "--quiet", "--shared", work + "/pristine", work + "/pr"])
+  sh(tools, ["git", "checkout", "--quiet", "--detach", head], {}, work + "/pr")
+  const base_oid = sh(tools, ["git", "rev-parse", "origin/" + base], {}, work + "/pr")
+  if !dirty {
+    return {base_oid: base_oid, conflicted: [], sides: ""}
+  }
+  // Merge the base locally, in the checkout the agent gets; nothing reaches GitHub until publish.
+  const merged = run(
+    tools,
+    [
+      "git",
+      "-c",
+      "user.name=Smart Ship",
+      "-c",
+      "user.email=smart-ship@users.noreply.github.com",
+      "merge",
+      "--no-ff",
+      "--no-commit",
+      base_oid,
+    ],
+    {},
+    work + "/pr",
+  )
+  const conflicted = split(
+    sh(tools, ["git", "diff", "--name-only", "--diff-filter=U"], {}, work + "/pr"),
+    "\n",
+  )
+    .filter({ p -> p != "" })
+  require !merged.success && len(conflicted) > 0,
+    "GitHub reports a conflict, but merging ${base} locally found none: "
+    + trim(merged.stderr)
+  const sides = join(split(sh(tools, ["git", "diff"], {}, work + "/pr"), "\n").slice(0, 400), "\n")
+  return {base_oid: base_oid, conflicted: conflicted, sides: sides}
+}
+
+/** Read the previous checkpoint whole before giving its bounded excerpt to the agent. */
+fn previous_patch(harness: Harness, work: string, head: string, wip: string, env: dict) -> string {
+  const diff = run(
+    harness.tools,
+    ["git", "diff", "--binary", "--no-renames", head, wip],
+    env,
+    work + "/pristine",
+  )
+  require diff.success && !(diff?.stdout_truncated ?? false) && len(diff.stdout) <= DIFF_CAP,
+    "the previous checkpoint could not be read whole; it was kept for recovery"
+  require regex_match(SECRET, diff.stdout) == nil,
+    "the previous checkpoint contains a credential-shaped value; it was kept for recovery"
+  harness.fs.write_text(work + "/pr/.git/ship-previous.diff", diff.stdout)
+  return join(split(diff.stdout, "\n").slice(0, 400), "\n")
+}
+
+/** Prepare one repair: the checkout, any saved work to continue, and the agent's task. */
+fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
+  const token = job.token
+  const work = job.work
+  const repo = job.repo
+  const number = job.number
+  const pr = r.pullRequest
+  const env = auth(token)
+  // Leftovers are never deleted here: they may hold unconfirmed work. Only an occupied target stops us.
+  for dir in [work + "/pristine", work + "/pr"] {
+    require !harness.fs.exists(dir), "an earlier run left " + dir + "; not overwriting it"
+  }
+  const tree = checkout(
+    harness.tools,
+    "${job.git_host}${repo}.git",
+    env,
+    work,
+    pr.headRefOid,
+    pr.baseRefName,
+    pr.mergeStateStatus == "DIRTY",
+  )
+  // Git's shared clone writes an absolute alternate. Set it while this fresh
+  // checkout is still trusted so the pair remains readable after retention.
+  harness.fs.write_text(work + "/pr/.git/objects/info/alternates", "../../../pristine/.git/objects\n")
+  const base_oid = tree.base_oid
+  const conflicted = tree.conflicted
+  const sides = tree.sides
+  // Saved work continues only from the same head, and only the commit Smart Ship's own note names.
+  const wip = wip_commit(harness, job.opts, repo, number)
+  if wip != "" {
+    sh(
+      harness.tools,
+      ["git", "fetch", "--quiet", "origin", "refs/smart-ship/wip/${number}"],
+      env,
+      work + "/pristine",
+    )
+  }
+  // A clean checkout contains no base merge and can continue on a newer base while still clean.
+  // A saved merge may not be laid over a different base or a checkout with no merge in progress.
+  const subject = wip == "" ? "" : sh(
+    harness.tools, ["git", "log", "-1", "--format=%s", wip], env, work + "/pristine",
+  )
+  const saved_on = regex_captures(
+    ", on base ([0-9a-f]{40})(, checkout (clean|merged))?$", subject,
+  )[0]?.groups?.[0] ?? ""
+  const saved_clean = regex_match(", checkout clean$", subject) != nil
+  const saved_merged = regex_match(", checkout merged$", subject) != nil
+  const trusted_wip = wip != "" && f.kept.contains(wip)
+    && sh(harness.tools, ["git", "rev-parse", wip + "^"], env, work + "/pristine") == pr.headRefOid
+  const safe_base = saved_on == base_oid
+    && ((!saved_clean && !saved_merged) || (saved_clean && len(conflicted) == 0)
+      || (saved_merged && len(conflicted) > 0))
+  const clean_rebase = saved_clean && len(conflicted) == 0
+  const continuing = trusted_wip && (safe_base || clean_rebase)
+  const previous = trusted_wip && !continuing
+  let previous_diff = ""
+  if previous {
+    // Do not overlay a saved merge onto a changed base. Give the agent the
+    // complete bounded patch to reconcile, and keep the original ref intact.
+    previous_diff = previous_patch(harness, work, pr.headRefOid, wip, env)
+  }
+  if continuing {
+    // The saved commit was fetched into the trusted clone; the agent's copy only sees its files,
+    // laid over this checkout (and its merge, conflicted or not) where the saved work changed them.
+    // Git paths may contain newlines or pathspec syntax. Keep their bytes in a
+    // NUL-delimited file and ask Git to treat every path literally.
+    const paths = work + "/wip-paths"
+    sh(
+      harness.tools,
+      ["git", "diff", "--name-only", "--no-renames", "-z", "--output=" + paths, pr.headRefOid, wip],
+      env,
+      work + "/pristine",
+    )
+    require run(harness.tools, ["test", "-s", paths]).success, "the saved work ${wip} changes nothing"
+    sh(
+      harness.tools,
+      [
+        "git",
+        "--literal-pathspecs",
+        "--git-dir=" + work + "/pristine/.git",
+        "--work-tree=" + work + "/pr",
+        "restore",
+        "--source=" + wip,
+        "--worktree",
+        "--pathspec-from-file=" + paths,
+        "--pathspec-file-nul",
+      ],
+      env,
+      work + "/pr",
+    )
+  } else if wip != "" && !previous {
+    gh(harness, job.opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
+  }
+  const tail = { id ->
+    const got = run(
+      harness.tools,
+      ["gh", "api", "--allow-escape-sequences", "repos/${repo}/actions/jobs/${id}/logs"],
+      {GH_TOKEN: token},
+    )
+    // A cut-off read holds the head of the log, not its end, so it is not passed off as the end.
+    return !got.success || (got?.stdout_truncated ?? false) ? "(the log could not be read whole)" : join(
+      split(regex_replace("\\x1b\\[[0-9;]*[A-Za-z]", "", got.stdout), "\n").slice(-120),
+      "\n",
+    )
+  }
+  const failing = f.failing.map(
+    { c -> {name: c.name, log: c.databaseId == nil ? "" : tail(c.databaseId)} },
+  )
+  // Only writers' words reach the agent; any unresolved thread still blocks the landing.
+  const threads = f.threads.map(
+    { t ->
+      {
+        id: t.comments.nodes[0]?.databaseId ?? 0,
+        path: t.path ?? "the pull request",
+        body: t.comments.nodes.filter(
+          { c -> TRUSTED.contains(c.authorAssociation) || c.author?.__typename == "Bot" },
+        )
+          .map({ c -> c.body })
+          .join("\n---\n"),
+      }
+    },
+  )
+    .filter({ t -> t.body != "" })
+  const task = harness.fs.render_prompt(
+    "repair.harn.prompt",
+    {
+      repo: repo,
+      number: number,
+      title: pr.title,
+      head: pr.headRefOid,
+      base: pr.baseRefName,
+      conflicted: join(conflicted, ", "),
+      sides: sides,
+      continuing: continuing,
+      previous_diff: previous_diff,
+      failing: failing,
+      threads: threads,
+      attempt: f.marks + 1,
+      max_attempts: MAX_ATTEMPTS,
+    },
+  )
+  // The agent reads its task inside its jail; what publish trusts stays outside it.
+  harness.fs.write_text(
+    work + "/pr/.git/ship-task.json",
+    json_stringify({turns: to_int(harness.env.get("SHIP_REPAIR_TURNS") ?? "60") ?? 60, task: task}),
+  )
+  harness.fs.write_text(
+    work + "/job.json",
+    json_stringify(
+      {
+        nonce: job.nonce,
+        head: pr.headRefOid,
+        base_oid: base_oid,
+        conflicted: conflicted,
+        preserve_previous: previous,
+        previous_wip: previous ? wip : "",
+        threads: threads.map({ t -> t.id }),
+      },
+    ),
+  )
+}
+
+const DIFF_CAP = 1048576
+
+const SECRET =
+  "ghs_[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+
+/** The saved work for this PR, fetched into the trusted clone, or "" when there is none. */
+fn wip_commit(harness: Harness, opts: GithubClientOptions, repo: string, number: int) -> string {
+  const refs = gh(harness, opts, "/repos/${repo}/git/matching-refs/smart-ship/wip/${number}")
+  const held = refs.filter({ r -> r?.ref == "refs/smart-ship/wip/${number}" })
+  return len(held) == 0 ? "" : held[0].object.sha
+}
+
+/** Preserve the old checkpoint before a fresh attempt replaces its WIP ref. */
+fn archive_previous(harness: Harness, opts: GithubClientOptions, repo: string, number: int, wip: string) -> string {
+  const ref = "refs/smart-ship/previous/${number}/${wip}"
+  const refs = gh(harness, opts, "/repos/${repo}/git/matching-refs/smart-ship/previous/${number}/${wip}")
+    .filter({r -> r?.ref == ref})
+    .to_list()
+  if len(refs) == 0 {
+    const made = gh(harness, opts, "/repos/${repo}/git/refs", "POST", {ref: ref, sha: wip})
+    require made?.ref == ref && made?.object?.sha == wip, "the earlier checkpoint archive was not confirmed"
+  } else {
+    require len(refs) == 1 && refs[0]?.object?.sha == wip, "the earlier checkpoint archive differs"
+  }
+  return ref
+}
+
+/**
+ * The saved subject records the original head, base and whether the checkout held a base merge.
+ */
+fn wip_headline(number: int, head: string, base_oid: string, merged: bool) -> string {
+  return "Smart Ship unfinished repair for #${number} at ${head}, on base ${base_oid}, checkout "
+    + (merged ? "merged" : "clean")
+}
+
+/**
+ * Keep an unfinished repair's tree on the private ref refs/smart-ship/wip/<PR>, its parent the
+ * head it started from. A diff over the size cap, or one holding anything shaped like a credential, is not kept.
+ * A conflicted repair's tree is its merge in progress, kept whole whatever its markers.
+ * The subject records the base and whether the checkout held a base merge, so a clean checkout
+ * may resume across base changes without overwriting newer base changes.
+ */
+fn save_wip(
+  harness: Harness,
+  opts: GithubClientOptions,
+  work: string,
+  repo: string,
+  number: int,
+  head: string,
+  base_oid: string,
+  merged: bool,
+) -> string {
+  const base = work + "/pristine"
+  const refused = stage_repair(harness, work, merged ? base_oid : "")
+  require refused == "", "The unfinished work was not kept: ${refused}."
+  // A merged checkout holds the base's changes too; only the repair's binaries are refused.
+  const why = diff_refusal(harness.tools, base, head, merged ? base_oid : "")
+  if why == "empty" {
+    return "No unfinished work to keep."
+  }
+  require why == "", "The unfinished work was not kept: ${why}."
+  const staging = "smart-ship/wip-${number}-" + substring(head, 0, 12)
+  let kept = ""
+  try {
+    kept = signed(harness, opts, repo, staging, base, wip_headline(number, head, base_oid, merged))
+    const ref = "refs/smart-ship/wip/${number}"
+    if wip_commit(harness, opts, repo, number) == "" {
+      gh(harness, opts, "/repos/${repo}/git/refs", "POST", {ref: ref, sha: kept})
+    } else {
+      gh(harness, opts, "/repos/${repo}/git/" + ref, "PATCH", {sha: kept, force: true})
+    }
+  } finally {
+    api_call(
+      harness,
+      {path: "/repos/${repo}/git/refs/heads/${staging}", method: "DELETE", options: opts},
+    )
+  }
+  return "The unfinished work is kept at ${kept}; the next attempt continues from it while the head stays ${head}. ${CONTINUE}${head} wip=${kept} -->"
+}
+
+/**
+ * New-file policy for a repair. `caches` are the exact shapes Harn and language tools leave
+ * behind, as consecutive path components; they are never committed. Any other new path under a
+ * `guarded` component, ending in a `guarded_suffixes` suffix, or named like an env file is
+ * ambiguous, so the repair stops and names it instead of committing or dropping it.
+ */
+pub const GENERATED = {
+  caches: [[".harn", "state"], ["__pycache__"], ["node_modules", ".cache"]],
+  guarded: [".harn", "__pycache__", "node_modules"],
+  guarded_suffixes: [".pyc", ".pyo"],
+}
+
+fn under(parts: list<string>, shape: list<string>) -> bool {
+  for i in 0..(len(parts) - len(shape) + 1) {
+    if parts.slice(i, i + len(shape)) == shape {
+      return true
+    }
+  }
+  return false
+}
+
+/** "cache", "ambiguous" or "new" for one untracked path. */
+fn new_file_kind(path: string) -> string {
+  const parts = split(path, "/")
+  const name = parts[len(parts) - 1]
+  const compiled = GENERATED.guarded_suffixes.any({ s -> ends_with(name, s) })
+  if under(parts, [".harn", "state"]) || under(parts, ["node_modules", ".cache"])
+    || (compiled && len(parts) > 1 && parts[len(parts) - 2] == "__pycache__") {
+    return "cache"
+  }
+  const dirs = parts.slice(0, len(parts) - 1)
+  if dirs.any({ d -> GENERATED.guarded.contains(d) }) || compiled
+    || name == ".env" || starts_with(name, ".env.") {
+    return "ambiguous"
+  }
+  return "new"
+}
+
+/** Staged deletions against `against`; NUL-delimited, so any path bytes survive. */
+fn staged_deletions(tools: HarnessTools, git: list<string>, dir: string, against: string) -> list<string> {
+  const names = sh(tools, git + ["diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=D", against], {}, dir)
+  return split(names, "\0").filter({ p -> p != "" }).to_list()
+}
+
+/**
+ * Stage the repair into the trusted clone's index: every change to a tracked file and every new
+ * file, leaving out only GENERATED caches. Returns why it refused, or "" once staged. It refuses
+ * an ambiguous new path, a nested repository, and a tracked deletion beside a cache file. With a
+ * `merged_base`, a deletion the base merge made is the base's, not the repair's.
+ * Paths stay NUL-delimited and literal, whatever bytes they hold.
+ */
+pub fn stage_repair(harness: Harness, work: string, merged_base: string = "") -> string {
+  const tools = harness.tools
+  const pr = work + "/pr"
+  const git = ["git", "--literal-pathspecs", "--git-dir=" + work + "/pristine/.git", "--work-tree=" + pr]
+  sh(tools, git + ["add", "--update"], {}, pr)
+  const listed = run(tools, git + ["ls-files", "-z", "--others", "--exclude-standard"], {}, pr)
+  require listed.success && !(listed?.stdout_truncated ?? false), "the new files could not be listed whole"
+  const untracked = split(listed.stdout, "\0").filter({ p -> p != "" })
+  const nested = untracked.filter({ p -> ends_with(p, "/") })
+  if len(nested) > 0 {
+    return "the repair left a nested repository, which is not committed: " + join(nested, ", ")
+  }
+  const ambiguous = untracked.filter({ p -> new_file_kind(p) == "ambiguous" })
+  if len(ambiguous) > 0 {
+    return "the repair left new files the policy cannot classify, so nothing was committed: "
+      + join(ambiguous, ", ")
+  }
+  const caches = untracked.filter({ p -> new_file_kind(p) == "cache" })
+  // A tracked file moved into a cache, edited or not, would commit as a bare deletion. Content
+  // cannot tell a move from a coincidence, so any deletion beside a cache file stops the repair.
+  let deleted = staged_deletions(tools, git, pr, "HEAD")
+  if merged_base != "" && len(deleted) > 0 {
+    const own = staged_deletions(tools, git, pr, merged_base)
+    deleted = deleted.filter({ p -> own.contains(p) }).to_list()
+  }
+  if len(deleted) > 0 && len(caches) > 0 {
+    return "the repair deleted tracked files while leaving cache files, so a move cannot be ruled out: deleted "
+      + join(deleted, ", ") + "; cache " + join(caches, ", ")
+  }
+  const fresh = untracked.filter({ p -> new_file_kind(p) == "new" })
+  if len(fresh) > 0 {
+    const paths = work + "/stage-paths"
+    harness.fs.write_text(paths, join(fresh, "\0") + "\0")
+    sh(tools, git + ["add", "--pathspec-from-file=" + paths, "--pathspec-file-nul"], {}, pr)
+  }
+  return ""
+}
+
+// Read diffs under no repository attributes, so a `diff` or textconv attribute cannot turn
+// binary content into text the credential scan misreads.
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+/**
+ * Paths whose staged content differs from `against` and holds a NUL anywhere, read from the blob
+ * itself: Git's own binary test samples only the start of a file. nil when a blob cannot be read.
+ */
+fn staged_binaries(tools: HarnessTools, dir: string, against: string) -> list<string>? {
+  const raw = run(
+    tools,
+    ["git", "diff", "--cached", "--raw", "--no-abbrev", "-z", "--no-renames", "--diff-filter=d", against],
+    {},
+    dir,
+  )
+  if !raw.success || (raw?.stdout_truncated ?? false) {
+    return nil
+  }
+  // Each entry is ":<old mode> <new mode> <old oid> <new oid> <status>" then its path.
+  const entries = split(raw.stdout, "\0")
+  let binary = []
+  for i in 0..len(entries) {
+    const meta = split(entries[i], " ")
+    if !starts_with(entries[i], ":") || len(meta) < 5 || meta[1] == "160000" {
+      continue
+    }
+    const blob = run(tools, ["git", "cat-file", "blob", meta[3]], {}, dir)
+    if !blob.success || (blob?.stdout_truncated ?? false) {
+      return nil
+    }
+    if contains(blob.stdout, "\0") {
+      binary = binary + [entries[i + 1]]
+    }
+  }
+  return binary
+}
+
+/**
+ * Why the staged diff against `against` may not leave the runner, or "" when it may: read whole,
+ * under the size cap, holding nothing shaped like a credential, and no binary content, whose
+ * encoded or compressed bytes the credential scan cannot read. With a `merged_base`, a binary the
+ * base merge brought in unchanged is the base's own content, not the repair's.
+ */
+pub fn diff_refusal(tools: HarnessTools, dir: string, against: string, merged_base: string = "") -> string {
+  const got = run(tools, ["git", "--attr-source=" + EMPTY_TREE, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary", against], {}, dir)
+  if !got.success || (got?.stdout_truncated ?? false) {
+    return "its diff could not be read whole"
+  }
+  if trim(got.stdout) == "" {
+    return "empty"
+  }
+  let binary = staged_binaries(tools, dir, against)
+  if binary != nil && merged_base != "" {
+    const from_base = staged_binaries(tools, dir, merged_base)
+    binary = from_base == nil ? nil : binary.filter({ p -> from_base.contains(p) }).to_list()
+  }
+  if binary == nil {
+    return "its diff could not be read whole"
+  }
+  if len(binary) > 0 {
+    return "it changes binary content the credential scan cannot read: " + join(binary, ", ")
+  }
+  if len(got.stdout) > DIFF_CAP {
+    return "its diff is over the ${DIFF_CAP}-byte cap"
+  }
+  return regex_match(SECRET, got.stdout) == nil ? "" : "its diff holds something shaped like a credential"
+}
+
+/** What gets published holds no conflict markers and passes `diff_refusal`. */
+fn staged_clean(tools: HarnessTools, dir: string, against: string) {
+  sh(tools, ["git", "diff", "--cached", "--check"], {}, dir)
+  const why = diff_refusal(tools, dir, against)
+  require why == "", "nothing was published: " + why
+}
+
+/** Agent text posted as Smart Ship: no comment markers and nothing shaped like a credential. */
+pub fn quiet(text: string) -> string {
+  return regex_replace(SECRET, "[redacted]", replace(text, "<!--", "&lt;!--"))
+}
+
+fn auth(token: string) -> dict {
+  return GIT_ISOLATED
+    + {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+      GIT_CONFIG_VALUE_0: "AUTHORIZATION: basic " + base64_encode("x-access-token:" + token),
+    }
+}
+
+/**
+ * Commit the trusted clone's index onto `branch` as one GitHub-signed commit; a moved branch refuses.
+ */
+fn signed(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  branch: string,
+  dir: string,
+  headline: string,
+) -> string {
+  const owner: string = split(repo, "/")[0]
+  const name: string = split(repo, "/")[1]
+  const sent = github_commit_worktree(
+    harness,
+    {
+      owner: owner,
+      repo: name,
+      branch: branch,
+      headline: headline,
+      repo_dir: dir,
+      source: "index",
+      options: opts,
+    },
+  )
+  require is_ok(sent), "signed publication failed: " + to_string(unwrap_err(sent)?.message)
+  return unwrap(sent).commit_oid
+}
+
+/**
+ * Stage the agent's resolution onto GitHub's merge. The index takes the merge's tree first, so a
+ * base file under a cache path stays tracked instead of committing as a deletion.
+ */
+pub fn stage_resolution(harness: Harness, work: string, merge_oid: string, env: dict) {
+  const base = work + "/pristine"
+  sh(harness.tools, ["git", "fetch", "--quiet", "origin", merge_oid], env, base)
+  sh(harness.tools, ["git", "reset", "--quiet", "--mixed", merge_oid], env, base)
+  const refused = stage_repair(harness, work)
+  require refused == "", "nothing was published: " + refused
+  staged_clean(harness.tools, base, merge_oid)
+}
+
+/**
+ * A resolved conflict lands as GitHub-signed commits built on a scratch branch: the base's
+ * side of the conflicted files, GitHub's merge of the base, then the agent's resolution.
+ * The pull request's head moves once, by fast-forward, only after every step succeeded.
+ */
+fn publish_merge(
+  harness: Harness,
+  opts: GithubClientOptions,
+  work: string,
+  repo: string,
+  pr: Pull,
+  job: dict,
+) -> string {
+  const base = work + "/pristine"
+  const env = auth(opts.installation_token ?? "")
+  const staging = "harn-worktree-staging/smart-ship-merge-${pr.number}-"
+    + substring(job.head, 0, 12)
+  let resolved = ""
+  try {
+    for p in job.conflicted {
+      const taken = command_run(
+        harness.tools,
+        {argv: ["git", "checkout", job.base_oid, "--", p], cwd: base, env_mode: "patch", env: env},
+        {timeout_ms: 600000},
+      )
+      if !taken.success {
+        sh(harness.tools, ["git", "rm", "--quiet", "--cached", "--", p], env, base)
+      }
+    }
+    const side = signed(
+      harness,
+      opts,
+      repo,
+      staging,
+      base,
+      "Take ${pr.baseRefName}'s side of the conflicted files",
+    )
+    const owner: string = split(repo, "/")[0]
+    const name: string = split(repo, "/")[1]
+    const merged = github_merge_signed_staging(
+      harness,
+      {
+        owner: owner,
+        repo: name,
+        staging_branch: staging,
+        expected_head_oid: side,
+        base_oid: job.base_oid,
+        message: "Merge ${pr.baseRefName} into ${pr.headRefName}",
+        options: opts,
+      },
+    )
+    require is_ok(merged),
+      "GitHub could not merge ${pr.baseRefName}: "
+      + to_string(unwrap_err(merged)?.message)
+    const merge_oid = unwrap(merged).oid
+    stage_resolution(harness, work, merge_oid, env)
+    resolved = signed(
+      harness,
+      opts,
+      repo,
+      staging,
+      base,
+      "Resolve the conflicts with ${pr.baseRefName}",
+    )
+    // force: false is a fast-forward only; GitHub refuses if the head moved during the repair.
+    gh(
+      harness,
+      opts,
+      "/repos/${repo}/git/refs/heads/${pr.headRefName}",
+      "PATCH",
+      {sha: resolved, force: false},
+    )
+  } finally {
+    api_call(
+      harness,
+      {path: "/repos/${repo}/git/refs/heads/${staging}", method: "DELETE", options: opts},
+    )
+  }
+  return resolved
+}
+
+/** After the credential-free repair: re-check the PR, then publish the agent's tree once. */
+fn publish(
+  harness: Harness,
+  opts: GithubClientOptions,
+  work: string,
+  repo: string,
+  number: int,
+  r: Repo,
+) -> string {
+  // The look step wrote job.json outside the agent's jail; the agent's own report is only text.
+  const job = json_parse(harness.fs.read_text(work + "/job.json"))
+  const result = work + "/pr/.git/ship-result.json"
+  const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {
+    outcome: "timeout",
+    summary: "The repair stopped without a result; its unfinished work was checked for a checkpoint.",
+    spend: "unknown",
+  }
+  require ["fixed", "timeout", "stuck", "unrelated"].contains(out.outcome),
+    "The repair reported an unknown outcome; its work was kept for recovery."
+  const pr = r.pullRequest
+  const labels = pr.labels.nodes.map({ l -> l.name })
+  let note = quiet(to_string(out.summary ?? "")) + "\n\nRepair model spend: "
+    + quiet(to_string(out.spend ?? "unknown"))
+    + "."
+  require pr.headRefOid == job.head && pr.state == "OPEN" && labels.contains("ship")
+    && !HOLDS.any({ h -> labels.contains(h) }),
+    "The pull request moved, closed or was held during the repair; nothing was published."
+  if out.outcome == "fixed" {
+    let pushed = ""
+    if len(job.conflicted) > 0 {
+      pushed = publish_merge(harness, opts, work, repo, pr, job)
+    } else {
+      // The trusted clone's git reads the agent's files; nothing in the agent's own .git runs with the token.
+      const refused = stage_repair(harness, work)
+      require refused == "", "nothing was published: " + refused
+      staged_clean(harness.tools, work + "/pristine", job.head)
+      pushed = signed(
+        harness,
+        opts,
+        repo,
+        pr.headRefName,
+        work + "/pristine",
+        "Smart Ship repair for #${number}",
+      )
+    }
+    note = "Pushed ${pushed}. " + note
+    if wip_commit(harness, opts, repo, number) != "" {
+      gh(harness, opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
+    }
+  } else if out.outcome == "timeout" {
+    let earlier_note = ""
+    if job?.preserve_previous ?? false {
+      const earlier = to_string(job?.previous_wip ?? "")
+      require earlier != "" && wip_commit(harness, opts, repo, number) == earlier,
+        "the earlier checkpoint moved; unfinished work was kept for recovery"
+      earlier_note = "Earlier checkpoint retained at " + archive_previous(harness, opts, repo, number, earlier) + ". "
+    }
+    note = earlier_note + save_wip(harness, opts, work, repo, number, job.head, to_string(job.base_oid), len(job.conflicted) > 0) + " "
+      + note
+  } else if out.outcome == "stuck" {
+    throw "The repair could not continue: " + quiet(to_string(out.summary ?? ""))
+  }
+  for reply in out.replies ?? [] {
+    if job.threads.contains(reply?.id) {
+      gh(
+        harness,
+        opts,
+        "/repos/${repo}/pulls/${number}/comments/${reply.id}/replies",
+        "POST",
+        {body: quiet(to_string(reply?.body))},
+      )
+    }
+  }
+  return note
+}
+
+/**
+ * Squash-merge the exact judged head with no merge queue; "" on success, else GitHub's reason.
+ * GitHub refuses when the head moved, and applies the base's rules server side.
+ */
+fn merge_now(harness: Harness, opts: GithubClientOptions, pr: Pull) -> string {
+  const sent = api_call(
+    harness,
+    {
+      path: "/graphql",
+      method: "POST",
+      body: {
+        query:
+          "mutation($id: ID!, $head: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head, mergeMethod: SQUASH}) { pullRequest { state } } }",
+        variables: {id: pr.id, head: pr.headRefOid},
+      },
+      options: opts,
+    },
+  )
+  if !is_ok(sent) {
+    return to_string(unwrap_err(sent)?.message)
+  }
+  const body = unwrap(sent)
+  const errors = body?.errors ?? []
+  if len(errors) > 0 {
+    return join(errors.map({ e -> to_string(e?.message) }), "; ")
+  }
+  const state = body?.data?.mergePullRequest?.pullRequest?.state
+  return state == "MERGED" ? "" : "GitHub left it ${state}"
+}
+
+/**
+ * The node id of the workflow running this look, which its checks carry. On any failure it is "",
+ * which excludes nothing, so every check counts, including Smart Ship's own.
+ */
+fn own_workflow(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  run_id: string,
+) -> string {
+  const unresolved = { why ->
+    harness.stdio.println("smart-ship: own workflow unresolved (${why}); counting every check")
+    ""
+  }
+  if run_id == "" {
+    return unresolved("no GITHUB_RUN_ID")
+  }
+  const run = api_call(
+    harness,
+    {path: "/repos/${repo}/actions/runs/${run_id}", method: "GET", options: opts},
+  )
+  const workflow_id = is_ok(run) ? unwrap(run)?.workflow_id : nil
+  if workflow_id == nil {
+    return unresolved(
+      "run ${run_id}: " + to_string(is_ok(run) ? "no workflow_id" : unwrap_err(run)?.message),
+    )
+  }
+  const workflow = api_call(
+    harness,
+    {path: "/repos/${repo}/actions/workflows/${workflow_id}", method: "GET", options: opts},
+  )
+  const id = is_ok(workflow) ? unwrap(workflow)?.node_id ?? "" : ""
+  if id == "" {
+    return unresolved(
+      "workflow ${workflow_id}: "
+        + to_string(is_ok(workflow) ? "no node_id" : unwrap_err(workflow)?.message),
+    )
+  }
+  return id
+}
+
+type Started = {head: string}
+
+/**
+ * One look's inputs. `main` reads them from the job; a test supplies a fake GitHub and git host.
+ */
+pub type Look = {
+  repo: string,
+  number: int,
+  token: string,
+  work: string,
+  publish: bool,
+  repair: bool,
+  run_id: string,
+  opts: GithubClientOptions,
+  git_host: string,
+  // The look step's nonce, echoed into the job so the step can tell this look's job from a stale one.
+  nonce: string,
+  retention?: string,
+}
+
+fn main(harness: Harness) {
+  const repo = harness.env.get("REPO") ?? ""
+  const number = to_int(harness.env.get("PR") ?? "") ?? 0
+  const token = harness.env.get("GH_TOKEN") ?? ""
+  const run_id = harness.env.get("GITHUB_RUN_ID") ?? ""
+  const retention = harness.env.get("SHIP_RETAIN_ROOT") ?? ""
+  require harness.env.get("SHIP_REPAIR") != "true" || retention != "",
+    "the runner recovery directory is unmeasured"
+  // Actions masks only the token's literal value; mask the derived git header before any use.
+  const header = base64_encode("x-access-token:" + token)
+  harness.stdio.println("::add-mask::" + header)
+  // Digests let a log audit look for the token, the header and a printed canary without holding them.
+  const canary = "smartship-canary-" + substring(sha256(run_id + repo + to_string(number)), 0, 16)
+  const digest = { s -> substring(sha256(s), 0, 16) }
+  harness.stdio.println("smart-ship log canary: ${canary} ${base64_encode(canary)}")
+  harness.stdio.println(
+    "smart-ship digests: token=${digest(token)} header=${digest(header)} canary=${digest(canary)} canary64=${digest(base64_encode(canary))}",
+  )
+  const d = look(
+    harness,
+    {
+      repo: repo,
+      number: number,
+      token: token,
+      work: harness.env.get("SHIP_WORK") ?? "",
+      publish: harness.env.get("SHIP_MODE") == "publish",
+      repair: harness.env.get("SHIP_REPAIR") == "true",
+      run_id: run_id,
+      opts: {installation_token: token},
+      git_host: "https://github.com/",
+      nonce: harness.env.get("SHIP_NONCE") ?? "",
+      retention: retention,
+    },
+  )
+  // The note and marker are posted; the step still fails so a lost repair is not read as landed.
+  require d.action != "publish_failed", "publishing the repair failed: " + to_string(d?.error)
+}
+
+/** One look at one pull request; returns what it decided. */
+pub fn look(harness: Harness, job: Look) {
+  const repo = job.repo
+  const number = job.number
+  const work = job.work
+  const opts = job.opts
+  const r = read(harness, opts, repo, number)
+  const pr = r.pullRequest
+  const say = { body ->
+    gh(
+      harness,
+      opts,
+      "/repos/${repo}/issues/${number}/comments",
+      "POST",
+      {body: "**Smart Ship:** " + body},
+    )
+  }
+  if job.publish {
+    // The head the attempt started from, which its result answers even if the PR moved since.
+    const begun: Started = schema_expect(
+      json_parse(harness.fs.read_text(work + "/job.json")),
+      schema_of(Started),
+    )
+    const started = begun.head
+    let failure = ""
+    const note = try {
+      publish(harness, opts, work, repo, number, r)
+    } catch (e) {
+      failure = quiet(to_string(e))
+      // The spend is reported even when publishing fails.
+      const result = work + "/pr/.git/ship-result.json"
+      const out = harness.fs.exists(result) ? json_parse(harness.fs.read_text(result)) : {}
+      const spent = out?.spend
+      "Publishing the repair failed: " + failure + "\n\nRepair model spend: "
+        + quiet(to_string(spent ?? "unknown"))
+        + "."
+    }
+    // The attempt is answered either way, so it counts once; a failure still shows red.
+    say("${note}\n\n${DONE}${started} -->")
+    const action = failure == "" ? "published" : "publish_failed"
+    harness.stdio.println("${repo}#${number}: ${action}: ${note}")
+    return {action: action, reason: note, error: failure}
+  }
+  const lease = release_lease(harness, opts, repo, pr.baseRefName)
+  const d = decide(r, lease, job.repair, own_workflow(harness, opts, repo, job.run_id))
+  // Looks on one PR never overlap, so an attempt still open now died; it is closed, not repeated.
+  for _ in 0..d.facts.close {
+    say(
+      "the repair attempt at ${pr.headRefOid} ended without a result; it counts as one of ${MAX_ATTEMPTS} attempts.\n\n${ENDED}${pr.headRefOid} -->",
+    )
+  }
+  let note = d.reason
+  if d.action == "merge" {
+    // The exact head is the lease: GitHub refuses if it moved since it was judged. Branch rules still apply server side.
+    const req = {
+      owner: split(repo, "/")[0],
+      repo: split(repo, "/")[1],
+      pull_number: number,
+      expected_head_oid: pr.headRefOid,
+      options: opts,
+    }
+    let refusal = ""
+    if r.mergeQueue != nil {
+      const queued = github_merge_queue_enqueue(harness, req)
+      refusal = is_ok(queued) ? "" : to_string(unwrap_err(queued)?.message)
+    } else {
+      refusal = merge_now(harness, opts, pr)
+    }
+    note = refusal == "" ? "landing at ${pr.headRefOid}" : "merge refused at ${pr.headRefOid}: "
+      + refusal
+    // A refusal is said once per head on the PR, not only in the log.
+    const said = pr.comments.nodes.any(
+      { c -> c.viewerDidAuthor == true && contains(c.body, REFUSED + pr.headRefOid) },
+    )
+    if refusal != "" && !said {
+      say("${note}\n\n${REFUSED}${pr.headRefOid} -->")
+    }
+  }
+  if d.action == "update" {
+    gh(
+      harness,
+      opts,
+      "/repos/${repo}/pulls/${number}/update-branch",
+      "PUT",
+      {expected_head_sha: pr.headRefOid},
+    )
+  }
+  if d.action == "repair" {
+    if (job.retention ?? "") != "" && !retention_has_space(harness.tools, job.retention ?? "") {
+      const reason = "runner recovery storage is full; no repair was started"
+      const said = pr.comments.nodes.any(
+        {c -> c.viewerDidAuthor == true && contains(c.body, STORAGE_FULL + pr.headRefOid)},
+      )
+      if !said {
+        say("${reason}\n\n${STORAGE_FULL}${pr.headRefOid} -->")
+      }
+      return {action: "stop", reason: reason, facts: d.facts}
+    }
+    // The attempt is recorded before any spend; if the marker cannot post, nothing is repaired.
+    say(
+      "repairing at ${pr.headRefOid} (attempt ${d.facts.marks + 1} of ${MAX_ATTEMPTS}).\n\n${MARK}${pr.headRefOid} -->",
+    )
+    try {
+      prepare(harness, job, r, d.facts)
+    } catch (e) {
+      say(
+        "the repair attempt at ${pr.headRefOid} could not start: ${quiet(to_string(e))}\n\n${ENDED}${pr.headRefOid} -->",
+      )
+      throw e
+    }
+  }
+  harness.stdio.println("${repo}#${number}: ${d.action}: ${note}")
+  return d
+}

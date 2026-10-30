@@ -134,13 +134,28 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
     publishes: 0,
     tags: 0,
     fault_fired: false,
+    draft_reads: 0,
+    sleeps: [],
   }
   const forged = options?.forged ?? []
   const stored_override = options?.stored ?? {}
   const github = {
+    sleep_ms: fn(ms) { state.sleeps = state.sleeps + [ms] },
     json: fn(endpoint) {
       state.requests = state.requests + [endpoint]
+      if endpoint == "/repos/${REPO}/releases/7" && len(state.drafts) > 0 {
+        state.draft_reads = state.draft_reads + 1
+        if state.draft_reads <= (options?.draft_visibility_reads ?? 0) {
+          return nil
+        }
+        return visible_release(state.drafts[0], state.published)
+          + (options?.by_id_fields ?? {})
+      }
       if endpoint.starts_with("/repos/" + REPO + "/releases?per_page=100") {
+        if (options?.hide_draft_list ?? false)
+          || state.draft_reads <= (options?.draft_visibility_reads ?? -1) {
+          return []
+        }
         return release_listing(options, state.drafts, state.published, endpoint.contains("&page="))
       }
       if endpoint.starts_with("/repos/" + REPO + "/releases/7/assets?") {
@@ -227,10 +242,10 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
         state.fault_fired = true
         throw "connection lost after draft creation"
       }
-      return nil
+      return 7
     },
-    upload_assets: fn(tag, paths) {
-      assert_eq(tag, state.drafts[0].tag_name)
+    upload_assets: fn(release_id, paths) {
+      assert_eq(release_id, state.drafts[0].id)
       let assets = state.drafts[0].assets
       for path in paths {
         const name = basename(path)
@@ -271,6 +286,61 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
   // Closures share the captured state; the fixture record holds a copy, so
   // tests read release state through this getter.
   return {github: github, state: fn() { return state }}
+}
+
+pipeline test_created_draft_retries_visibility_without_repeating_any_write(harness: Harness) {
+  const directory = harness.fs.mkdtemp_in_workspace("publication-delayed-draft-")
+  const world = fixture(harness.fs, {draft_visibility_reads: 3, hide_draft_list: true})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  const run = verify_run(world.github, request())
+  assert_eq(publish_candidate(world.github, harness.fs, request(), run, directory).tag, TAG)
+  assert_eq(world.state().sleeps, [1000, 2000, 4000])
+  assert_eq(world.state().draft_reads, 6)
+  assert_eq(world.state().creates, 1)
+  assert_eq(world.state().tags, 1)
+  assert_eq(world.state().publishes, 1)
+  assert(len(world.state().uploaded) > 0)
+}
+
+pipeline test_missing_created_draft_exhausts_the_bound_without_uploading_or_tagging(
+  harness: Harness,
+) {
+  const directory = harness.fs.mkdtemp_in_workspace("publication-missing-draft-")
+  const world = fixture(harness.fs, {draft_visibility_reads: 100, hide_draft_list: true})
+  verify_candidate(world.github, harness.fs, request(), directory)
+  const run = verify_run(world.github, request())
+  assert_error_contains(
+    fn() { publish_candidate(world.github, harness.fs, request(), run, directory) },
+    "candidate draft 7 is still missing after 6 read-back attempts",
+  )
+  assert_eq(world.state().sleeps, [1000, 2000, 4000, 8000, 16000])
+  assert_eq(world.state().draft_reads, 6)
+  assert_eq(world.state().creates, 1)
+  assert_eq(world.state().uploaded, [])
+  assert_eq(world.state().tags, 0)
+  assert_eq(world.state().publishes, 0)
+}
+
+pipeline test_created_draft_conflicts_fail_before_retry_or_asset_writes(harness: Harness) {
+  for changed in [{id: 8}, {target_commitish: OTHER_SHA}, {draft: false}, {body: "other notes"}] {
+    const directory = harness.fs.mkdtemp_in_workspace("publication-conflicting-draft-")
+    const world = fixture(harness.fs, {by_id_fields: changed})
+    verify_candidate(world.github, harness.fs, request(), directory)
+    const run = verify_run(world.github, request())
+    assert(
+      is_err(
+        try {
+          publish_candidate(world.github, harness.fs, request(), run, directory)
+        },
+      ),
+    )
+    assert_eq(world.state().creates, 1)
+    assert_eq(world.state().draft_reads, 1)
+    assert_eq(world.state().sleeps, [])
+    assert_eq(world.state().uploaded, [])
+    assert_eq(world.state().tags, 0)
+    assert_eq(world.state().publishes, 0)
+  }
 }
 
 pipeline test_resume_preserves_every_accepted_publication_effect(harness: Harness) {
@@ -314,7 +384,7 @@ pipeline test_inspection_reuses_sealed_intent_without_reaching_mutations(harness
       create_draft: fn(_release) {
         throw "inspection reached create"
       },
-      upload_assets: fn(_tag, _paths) {
+      upload_assets: fn(_release_id, _paths) {
         throw "inspection reached upload"
       },
       create_tag: fn(_tag, _sha, _message) {
