@@ -362,6 +362,30 @@ pipeline test_protected_consumer_requires_exact_successful_immutable_producer() 
     CACHE_PACKAGE,
     true,
   )
+  const other_workflow = producer() + {path: ".github/workflows/image.yml"}
+  assert(
+    qualified_cache(
+      publication(source),
+      source,
+      other_workflow,
+      "docker-cache-81-2",
+      CACHE_PACKAGE,
+      true,
+      "image.yml",
+    )
+      != nil,
+  )
+  assert_eq(
+    qualified_cache(
+      publication(source),
+      source,
+      other_workflow,
+      "docker-cache-81-2",
+      CACHE_PACKAGE,
+      true,
+    ),
+    nil,
+  )
   assert_eq(
     valid,
     {

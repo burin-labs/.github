@@ -19,6 +19,7 @@ fn source(
   more: bool = false,
   declared: int? = nil,
   head: string = HEAD,
+  branch: string = "main",
 ) -> ProofSource {
   return {
     json: fn(_endpoint) {
@@ -34,7 +35,7 @@ fn source(
             headRefOid: head,
             state: "OPEN",
             merged: false,
-            baseRefName: "main",
+            baseRefName: branch,
             headRepository: {nameWithOwner: "acme/repo"},
             mergeCommit: nil,
             reviews: {
@@ -100,4 +101,11 @@ pipeline test_latest_writer_decisions_and_complete_census_are_required() {
       HEAD,
     ),
   )
+}
+
+pipeline test_approval_uses_the_callers_protected_branch() {
+  const trunk = source([review(1, "APPROVED")], false, nil, HEAD, "trunk")
+  assert(approved_cache_head(trunk, "acme/repo", 1, HEAD, nil, "trunk"))
+  assert(!approved_cache_head(trunk, "acme/repo", 1, HEAD))
+  assert(!approved_cache_head(trunk, "acme/repo", 1, HEAD, nil, ""))
 }

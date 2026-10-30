@@ -31,6 +31,7 @@ pub fn approved_cache_head(
   number: int,
   head_sha: string,
   merge_commit: string? = nil,
+  default_branch: string = "main",
 ) -> bool {
   if source.graphql == nil {
     return false
@@ -42,7 +43,8 @@ pub fn approved_cache_head(
   const pull = response.data.repository.pullRequest
   const reviews = pull.reviews
   if pull.headRefOid != head_sha || pull.headRepository?.nameWithOwner != repo
-    || pull.baseRefName != "main"
+    || default_branch == ""
+    || pull.baseRefName != default_branch
     || (merge_commit == nil && (pull.state != "OPEN" || pull.merged))
     || (merge_commit != nil && (!pull.merged || pull.mergeCommit?.oid != merge_commit))
     || reviews.pageInfo.hasNextPage

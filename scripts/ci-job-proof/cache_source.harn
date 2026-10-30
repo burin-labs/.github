@@ -119,7 +119,14 @@ fn source_for_main_commit(
     return nil
   }
   const matched = matches[0]
-  if !approved_cache_head(source, repo, matched.number, matched.head.sha, current.commit) {
+  if !approved_cache_head(
+    source,
+    repo,
+    matched.number,
+    matched.head.sha,
+    current.commit,
+    default_branch,
+  ) {
     return nil
   }
   return cache_source("candidate_read", repo, matched.number, matched.head.sha)
@@ -159,7 +166,7 @@ fn source_for_open_pull(
   // An unapproved same-repository PR may publish only its isolated candidate.
   // A merge-group consumer additionally needs the approval for this exact head.
   if mode == "candidate_read"
-    && !approved_cache_head(source, repo, pull.number, source_sha) {
+    && !approved_cache_head(source, repo, pull.number, source_sha, nil, default_branch) {
     return nil
   }
   return cache_source(mode, repo, pull.number, source_sha)
@@ -183,6 +190,7 @@ pub fn qualified_cache(
   artifact_name: string,
   cache_package: string,
   docker_job_passed: bool,
+  workflow_file: string = "ci.yml",
 ) -> QualifiedCache? {
   schema_expect(raw, closed(schema_of(CachePublication)))
   const publication = schema_expect(raw, schema_of(CachePublication))
@@ -193,7 +201,7 @@ pub fn qualified_cache(
     || publication.producer_run_id != producer.id
     || publication.producer_attempt != producer.run_attempt
     || producer.event != "pull_request"
-    || producer.path != ".github/workflows/ci.yml"
+    || producer.path != ".github/workflows/${workflow(workflow_file)}"
     || producer.status != "completed"
     || producer.conclusion != "success"
     || producer.repository.full_name != source.repository
@@ -318,5 +326,13 @@ fn producer_cache(
   const artifact = run_artifact(source, cache_source.repository, producer, artifact_name)
   qualified_named_artifact(artifact, producer, artifact_name)
   const publication = unwrap(source.cache_publication)(cache_source.repository, artifact)
-  return qualified_cache(publication, cache_source, producer, artifact_name, cache_package, true)
+  return qualified_cache(
+    publication,
+    cache_source,
+    producer,
+    artifact_name,
+    cache_package,
+    true,
+    workflow_file,
+  )
 }
