@@ -2,6 +2,7 @@ import { command_output_tail, command_run } from "std/command"
 import { complete_command_result } from "../captured-command.harn"
 import { ReadRecovery } from "./authorization.harn"
 import { download_bound_manifest } from "./bound-manifest.harn"
+import { historical_attestation_matches } from "./historical-attestation.harn"
 import { GitHub } from "./promotion.harn"
 
 pub type ConsumerRecoveryConfig = {
@@ -130,6 +131,23 @@ fn api_json(net: HarnessNet, token: string, endpoint: string) -> unknown {
   throw "GitHub API request " + endpoint + " failed after 3 attempts: " + last_error
 }
 
+/** Build the verifier arguments without combining mutually exclusive signer flags. */
+pub fn attestation_args(path: string, expect: dict) -> list<string> {
+  return ["attestation", "verify", path, "--repo", expect.repository]
+    + (expect?.historical == nil ? ["--signer-repo", expect.repository] : [
+      "--signer-workflow",
+      "github.com/burin-labs/harn/.github/workflows/build-release-binaries.yml",
+    ])
+    + [
+      "--predicate-type",
+      expect.predicate_type,
+      "--source-digest",
+      expect.source_digest,
+      "--format",
+      "json",
+    ]
+}
+
 /**
  * Build the production adapter for one repository. gh keeps its config and
  * caches under scratch, inside the sandbox's write roots.
@@ -190,25 +208,7 @@ pub fn live_github(
       return nil
     },
     attest: fn(path, expect) {
-      const result = gh(
-        tools,
-        env,
-        [
-          "attestation",
-          "verify",
-          path,
-          "--repo",
-          expect.repository,
-          "--signer-repo",
-          expect.repository,
-          "--predicate-type",
-          expect.predicate_type,
-          "--source-digest",
-          expect.source_digest,
-          "--format",
-          "json",
-        ],
-      )
+      const result = gh(tools, env, attestation_args(path, expect))
       if !result.success {
         return diagnostic(tools, result)
       }
@@ -218,6 +218,10 @@ pub fn live_github(
       }
       if !is_ok(parsed) || type_of(unwrap(parsed)) != "list" || len(unwrap(parsed)) == 0 {
         return "gh attestation verify reported success without a verified attestation"
+      }
+      if expect?.historical != nil
+        && !historical_attestation_matches(unwrap(parsed), expect.historical) {
+        return "no verified attestation binds the historical source and producing workflow"
       }
       return nil
     },

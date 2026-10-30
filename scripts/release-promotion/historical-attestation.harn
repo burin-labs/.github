@@ -1,0 +1,55 @@
+pub type HistoricalAttestationIdentity = {
+  repository: string,
+  source: string,
+  policy: string,
+  run: string,
+  attempt: string,
+  file: string,
+  digest: string,
+  kind: string,
+  target: string,
+}
+
+/** Consume only records already cryptographically verified by gh. */
+pub fn historical_attestation_matches(
+  records: list<unknown>,
+  expected: HistoricalAttestationIdentity,
+) -> bool {
+  const workflow = ".github/workflows/build-release-binaries.yml"
+  const repository_url = "https://github.com/" + expected.repository
+  const workflow_ref = expected.repository + "/" + workflow + "@refs/heads/main"
+  const invocation = repository_url + "/actions/runs/" + expected.run + "/attempts/"
+    + expected.attempt
+  for record in records {
+    const certificate = record?.verificationResult?.signature?.certificate
+    const predicate = record?.verificationResult?.statement?.predicate
+    if certificate?.sourceRepositoryURI != repository_url
+      || certificate?.sourceRepositoryDigest != expected.policy
+      || certificate?.sourceRepositoryRef != "refs/heads/main"
+      || certificate?.buildSignerDigest != expected.policy
+      || certificate?.buildTrigger != "workflow_dispatch"
+      || certificate?.buildConfigURI != "https://github.com/" + workflow_ref
+      || certificate?.runInvocationURI != invocation
+      || predicate?.repository != expected.repository
+      || predicate?.phase != "candidate"
+      || predicate?.sourceCommit != expected.source
+      || predicate?.workflow?.runId != expected.run
+      || predicate?.workflow?.runAttempt != expected.attempt {
+      continue
+    }
+    if expected.kind == "archive" {
+      if predicate?.schemaVersion == "harn.release_archive_provenance.v1"
+        && predicate?.archive == expected.file
+        && predicate?.sha256 == expected.digest
+        && predicate?.target == expected.target
+        && predicate?.buildPolicy?.workflow == workflow
+        && predicate?.buildPolicy?.ref == workflow_ref
+        && predicate?.buildPolicy?.revision == expected.policy {
+        return true
+      }
+    } else if predicate?.schemaVersion == "harn.release_files_provenance.v1" {
+      return true
+    }
+  }
+  return false
+}
