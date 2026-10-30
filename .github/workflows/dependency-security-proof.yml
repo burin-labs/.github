@@ -59,6 +59,7 @@ jobs:
           MEASURED_DATABASE: ${{ needs.scan.outputs.advisory-database-revision }}
           SCANNED_DIRECTORY: ${{ inputs.working-directory }}
           WORKFLOW_DIGEST: ${{ github.workflow_sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
           project="$(mktemp -d "$RUNNER_TEMP/dependency-security-proof.XXXXXX")"
@@ -90,6 +91,7 @@ jobs:
                 runAttempt: required(harness.env, "GITHUB_RUN_ATTEMPT", "^[1-9][0-9]*$"),
                 workflowRef: required(harness.env, "GITHUB_WORKFLOW_REF", "^.{1,512}$"),
                 sourceDigest: required(harness.env, "GITHUB_SHA", "^[0-9a-f]{40}$"),
+                eventHeadSha: required(harness.env, "EVENT_HEAD_SHA", "^[0-9a-f]{40}$"),
                 workflowDigest: required(harness.env, "WORKFLOW_DIGEST", "^[0-9a-f]{40}$"),
               },
             }

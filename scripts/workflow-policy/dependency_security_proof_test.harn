@@ -39,7 +39,8 @@ fn run_writer(harness: Harness, changes: dict) -> dict {
         GITHUB_RUN_ATTEMPT: "1",
         GITHUB_WORKFLOW_REF:
           "burin-labs/harn/.github/workflows/promote-release.yml@refs/heads/main",
-        GITHUB_SHA: "c".repeat(40),
+      GITHUB_SHA: "c".repeat(40),
+      EVENT_HEAD_SHA: "e".repeat(40),
         WORKFLOW_DIGEST: "d".repeat(40),
       }
       let args: list<string> = []
@@ -80,6 +81,7 @@ pipeline test_proof_uses_measured_source_not_the_parent_run_head(harness: Harnes
   assert_eq(proof.sourceRevision, "a".repeat(40))
   assert_eq(proof.advisoryDatabaseRevision, "b".repeat(40))
   assert_eq(proof.producer.sourceDigest, "c".repeat(40))
+  assert_eq(proof.producer.eventHeadSha, "e".repeat(40))
   assert(proof.issuedAtMs > 0)
 }
 
