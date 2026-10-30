@@ -1,0 +1,37 @@
+pipeline test_real_cache_resolver_emits_only_authenticated_publications(harness: Harness) {
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const temporary = harness.fs.mkdtemp_in_workspace("cache-cli-test-")
+  for scenario in ["valid", "bad_digest", "fork"] {
+    const output = path_join(temporary, scenario)
+    harness.fs.write_text(output, "")
+    const result = harness.process.run(
+      {
+        program: "harn",
+        args: ["test", ".github/fixtures/docker-cache-custody.harn"],
+        cwd: root,
+        env: {
+          PATH: harness.env.get("PATH") ?? "",
+          GH_TOKEN: "fixture-token",
+          GITHUB_OUTPUT: output,
+          CI_JOB_PROOF_CACHE_PACKAGE: "ghcr.io/burin-labs/harn-cloud-build-cache",
+          CI_JOB_PROOF_CACHE_MODE: "publish",
+          CI_JOB_PROOF_EVENT: "pull_request",
+          CI_JOB_PROOF_COMMIT: "a".repeat(40),
+          CI_JOB_PROOF_REPOSITORY: "burin-labs/harn-cloud",
+          CI_JOB_PROOF_WORKFLOW: "ci.yml",
+          CI_JOB_PROOF_RUN_ID: "81",
+          CI_JOB_PROOF_ATTEMPT: "2",
+          CI_JOB_PROOF_REGISTRAR_JOB: "Docker image",
+          CI_JOB_PROOF_REGISTRAR_STEP: "Publish run-bound Docker cache custody",
+          CI_JOB_PROOF_PULL_REQUEST: "2259",
+          CI_JOB_PROOF_CACHE_DIGEST: scenario == "bad_digest" ? "malformed" : "sha256:"
+            + "f".repeat(64),
+          CACHE_FIXTURE_FORK: scenario == "fork" ? "true" : "false",
+        },
+        timeout_ms: 30000,
+      },
+    )
+    assert(result.success, "${scenario}: ${result.stdout}${result.stderr}")
+    assert(!result.stdout.contains("fixture-token"))
+  }
+}
