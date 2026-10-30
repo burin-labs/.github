@@ -1,0 +1,73 @@
+import { ProofSource, repository } from "./reader.harn"
+
+type Review = {
+  databaseId: int,
+  authorCanPushToRepository: bool,
+  state: string,
+  commit: {oid: string},
+  author: {login: string}?,
+}
+
+type ReviewResponse = {
+  data: {
+    repository: {
+      pullRequest: {
+        headRefOid: string,
+        state: string,
+        merged: bool,
+        baseRefName: string,
+        headRepository: {nameWithOwner: string}?,
+        mergeCommit: {oid: string}?,
+        reviews: {totalCount: int, pageInfo: {hasNextPage: bool}, nodes: list<Review>},
+      },
+    },
+  },
+}
+
+/** Only the latest current-head decision from each writer can authorize a cache. */
+pub fn approved_cache_head(
+  source: ProofSource,
+  repo: string,
+  number: int,
+  head_sha: string,
+  merge_commit: string? = nil,
+) -> bool {
+  if source.graphql == nil {
+    return false
+  }
+  const parts = split(repository(repo), "/")
+  const query =
+    "query { repository(owner: \"${parts[0]}\", name: \"${parts[1]}\") { pullRequest(number: ${number}) { headRefOid state merged baseRefName headRepository { nameWithOwner } mergeCommit { oid } reviews(first: 100) { totalCount pageInfo { hasNextPage } nodes { databaseId authorCanPushToRepository state commit { oid } author { login } } } } } }"
+  const response = schema_expect(unwrap(source.graphql)(query), schema_of(ReviewResponse))
+  const pull = response.data.repository.pullRequest
+  const reviews = pull.reviews
+  if pull.headRefOid != head_sha || pull.headRepository?.nameWithOwner != repo
+    || pull.baseRefName != "main"
+    || (merge_commit == nil && (pull.state != "OPEN" || pull.merged))
+    || (merge_commit != nil && (!pull.merged || pull.mergeCommit?.oid != merge_commit))
+    || reviews.pageInfo.hasNextPage
+    || reviews.totalCount != len(reviews.nodes)
+    || reviews.totalCount <= 0 {
+    return false
+  }
+  let decisions: dict<string, Review> = {}
+  let seen: list<int> = []
+  for review in reviews.nodes {
+    if review.databaseId <= 0 || seen.contains(review.databaseId) {
+      return false
+    }
+    seen = seen + [review.databaseId]
+    if review.commit.oid != head_sha || !review.authorCanPushToRepository
+      || review.author == nil
+      || !["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].contains(review.state) {
+      continue
+    }
+    const actor = unwrap(review.author).login
+    const previous = decisions[actor]
+    if previous == nil || unwrap(previous).databaseId < review.databaseId {
+      decisions[actor] = review
+    }
+  }
+  const states = values(decisions).map({ review -> review.state }).to_list()
+  return states.contains("APPROVED") && !states.contains("CHANGES_REQUESTED")
+}

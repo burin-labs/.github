@@ -3,6 +3,12 @@ set -euo pipefail
 
 export CI_JOB_PROOF_CHECKPOINT_ENROLLMENT="${CI_JOB_PROOF_CHECKPOINT_ENROLLMENT:-}"
 export CI_JOB_PROOF_UNIVERSE="${CI_JOB_PROOF_UNIVERSE:-}"
+export CI_JOB_PROOF_CACHE_PACKAGE="${CI_JOB_PROOF_CACHE_PACKAGE:-}"
+export CI_JOB_PROOF_CACHE_MODE="${CI_JOB_PROOF_CACHE_MODE:-resolve}"
+export CI_JOB_PROOF_CACHE_DIGEST="${CI_JOB_PROOF_CACHE_DIGEST:-}"
+export CI_JOB_PROOF_PULL_REQUEST="${CI_JOB_PROOF_PULL_REQUEST:-}"
+export CI_JOB_PROOF_DEFAULT_BRANCH="${CI_JOB_PROOF_DEFAULT_BRANCH:-main}"
+export CI_JOB_PROOF_BRANCH="${CI_JOB_PROOF_BRANCH:-}"
 
 package_root="$(cd "${GITHUB_ACTION_PATH:?GITHUB_ACTION_PATH is required}/../../.." && pwd)"
 readonly package_root
@@ -31,6 +37,12 @@ GITHUB_OUTPUT="$staged_output" harn run \
   --grant registrar_step=env:CI_JOB_PROOF_REGISTRAR_STEP,expose=CI_JOB_PROOF_REGISTRAR_STEP \
   --grant run_id=env:CI_JOB_PROOF_RUN_ID,expose=CI_JOB_PROOF_RUN_ID \
   --grant attempt=env:CI_JOB_PROOF_ATTEMPT,expose=CI_JOB_PROOF_ATTEMPT \
+  --grant cache_package=env:CI_JOB_PROOF_CACHE_PACKAGE,expose=CI_JOB_PROOF_CACHE_PACKAGE \
+  --grant cache_mode=env:CI_JOB_PROOF_CACHE_MODE,expose=CI_JOB_PROOF_CACHE_MODE \
+  --grant cache_digest=env:CI_JOB_PROOF_CACHE_DIGEST,expose=CI_JOB_PROOF_CACHE_DIGEST \
+  --grant pull_request=env:CI_JOB_PROOF_PULL_REQUEST,expose=CI_JOB_PROOF_PULL_REQUEST \
+  --grant default_branch=env:CI_JOB_PROOF_DEFAULT_BRANCH,expose=CI_JOB_PROOF_DEFAULT_BRANCH \
+  --grant branch=env:CI_JOB_PROOF_BRANCH,expose=CI_JOB_PROOF_BRANCH \
   --grant github_output=env:GITHUB_OUTPUT,expose=GITHUB_OUTPUT \
   --grant github_workspace=env:GITHUB_WORKSPACE,expose=GITHUB_WORKSPACE \
   --read-only-root "$package_root" \

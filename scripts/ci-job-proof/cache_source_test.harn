@@ -1,0 +1,540 @@
+import {
+  CacheSource,
+  cache_from_history,
+  candidate_cache_reference,
+  qualified_cache,
+  source_for_cache,
+} from "./cache_source.harn"
+import { Artifact } from "./contract.harn"
+import { ProofSource } from "./reader.harn"
+
+const REPO = "burin-labs/harn-cloud"
+
+const PR_SHA = "a".repeat(40)
+
+const MERGED_SHA = "b".repeat(40)
+
+const QUEUE_SHA = "c".repeat(40)
+
+const CACHE_DIGEST = "sha256:" + "f".repeat(64)
+
+const CACHE_PACKAGE = "ghcr.io/burin-labs/harn-cloud-build-cache"
+
+fn context(event: string, commit: string) {
+  return {
+    repository: REPO,
+    workflow: "ci.yml",
+    event: event,
+    commit: commit,
+    runId: 42,
+    attempt: 1,
+    registrarJob: "Repository checks and change detection",
+    registrarStep: "Register CI job proofs",
+  }
+}
+
+fn pull(head_sha: string = PR_SHA, merged: bool = false, merge_commit_sha: string? = nil) {
+  return {
+    number: 2259,
+    state: merged ? "closed" : "open",
+    merged: merged,
+    merged_at: merged ? "2026-10-30T07:26:03Z" : nil,
+    merge_commit_sha: merge_commit_sha,
+    base: {ref: "main"},
+    head: {sha: head_sha, repo: {full_name: REPO}},
+  }
+}
+
+fn source_for(
+  pull_value: unknown,
+  reviews: list<dict>,
+  comparison: dict? = nil,
+  associated_merge_commit: string? = MERGED_SHA,
+) -> ProofSource {
+  const json: fn(string) -> unknown = fn(endpoint) {
+    if endpoint == "/repos/${REPO}/pulls/2259" {
+      return pull_value
+    }
+    if endpoint == "/repos/${REPO}/pulls/2259/reviews?per_page=100&page=1" {
+      return reviews
+    }
+    if endpoint == "/repos/${REPO}/compare/${PR_SHA}...${QUEUE_SHA}" {
+      return comparison ?? {status: "ahead", ahead_by: 2}
+    }
+    if endpoint == "/repos/${REPO}/commits/${MERGED_SHA}/pulls?per_page=100" {
+      return [pull(PR_SHA, true, associated_merge_commit)]
+    }
+    throw "unexpected cache source endpoint: " + endpoint
+  }
+  const registration: fn(string, Artifact) -> unknown = fn(_repo, _artifact) {
+    throw "cache source does not read artifacts"
+  }
+  const graphql: fn(string) -> unknown = fn(_query) {
+    let nodes: list<dict> = []
+    for index in range(0, len(reviews)) {
+      const review = reviews[index]
+      nodes = nodes
+        + [
+          {
+            databaseId: index + 1,
+            state: review.state,
+            commit: {oid: review.commit_id},
+            authorCanPushToRepository: true,
+            author: {login: "writer"},
+          },
+        ]
+    }
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            headRefOid: PR_SHA,
+            state: pull_value.state == "closed" ? "CLOSED" : "OPEN",
+            merged: pull_value.state == "closed",
+            baseRefName: "main",
+            headRepository: {nameWithOwner: REPO},
+            mergeCommit: pull_value.state == "closed" ? {oid: associated_merge_commit} : nil,
+            reviews: {totalCount: len(nodes), pageInfo: {hasNextPage: false}, nodes: nodes},
+          },
+        },
+      },
+    }
+  }
+  return {json: json, registration: registration, graphql: graphql}
+}
+
+fn producer(head_sha: string = PR_SHA, conclusion: string? = "success", repository: string = REPO) {
+  return {
+    id: 81,
+    run_attempt: 2,
+    head_sha: head_sha,
+    event: "pull_request",
+    path: ".github/workflows/ci.yml",
+    status: "completed",
+    conclusion: conclusion,
+    repository: {full_name: repository},
+    head_repository: {full_name: repository},
+  }
+}
+
+fn publication(
+  source: CacheSource,
+  run_id: int = 81,
+  attempt: int = 2,
+  cache_ref: string? = nil,
+  digest: string = CACHE_DIGEST,
+) {
+  return {
+    schema: "burin.docker_cache_publication.v1",
+    pull_request: source.pull_request,
+    head_sha: source.head_sha,
+    producer_run_id: run_id,
+    producer_attempt: attempt,
+    cache_ref: cache_ref
+      ?? "${CACHE_PACKAGE}:candidate-${source.pull_request}-${source.head_sha}-${run_id}-${attempt}",
+    cache_digest: digest,
+  }
+}
+
+fn cache_history_source(
+  docker_conclusion: string,
+  published: unknown,
+  job_changes: dict = {},
+  history_changes: dict = {},
+) -> ProofSource {
+  const attempt_jobs = [
+    {
+      id: 101,
+      run_id: 81,
+      run_attempt: 2,
+      head_sha: PR_SHA,
+      name: "Repository checks and change detection",
+      status: "completed",
+      conclusion: "success",
+      started_at: "2026-10-30T00:00:00Z",
+      completed_at: "2026-10-30T00:00:01Z",
+      steps: [{name: "Register", status: "completed", conclusion: "success"}],
+    },
+    {
+      id: 102,
+      run_id: 81,
+      run_attempt: 2,
+      head_sha: PR_SHA,
+      name: "Docker image",
+      status: "completed",
+      conclusion: docker_conclusion,
+      started_at: "2026-10-30T00:00:00Z",
+      completed_at: "2026-10-30T00:00:01Z",
+      steps: [
+        {name: "docker build", status: "completed", conclusion: docker_conclusion},
+        {name: "boot smoke", status: "completed", conclusion: docker_conclusion},
+        {
+          name: "Publish run-bound Docker cache custody",
+          status: "completed",
+          conclusion: docker_conclusion,
+        },
+      ],
+    }
+      + job_changes,
+  ]
+  const artifact: Artifact = {
+    id: 103,
+    name: "docker-cache-81-2",
+    size_in_bytes: 1024,
+    expired: false,
+    digest: "sha256:" + "1".repeat(64),
+    created_at: "2026-10-30T00:00:02Z",
+    workflow_run: {id: 81, head_sha: PR_SHA},
+  }
+  const json: fn(string) -> unknown = fn(endpoint) {
+    if endpoint
+      == "/repos/${REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha=${PR_SHA}&status=completed&per_page=5" {
+      return {total_count: 1, workflow_runs: [producer()]} + history_changes
+    }
+    if endpoint == "/repos/${REPO}/actions/runs/81/attempts/2/jobs?per_page=30&page=1" {
+      return {total_count: 2, jobs: attempt_jobs}
+    }
+    if endpoint == "/repos/${REPO}/actions/runs/81/artifacts?per_page=100&page=1" {
+      return {total_count: 1, artifacts: [artifact]}
+    }
+    throw "unexpected cache history endpoint: " + endpoint
+  }
+  const registration: fn(string, Artifact) -> unknown = fn(_repo, _artifact) {
+    throw "cache history does not read a CI job registration"
+  }
+  const cache_publication: fn(string, Artifact) -> unknown =
+    fn(_repo, _artifact) { return published }
+  return {json: json, registration: registration, cache_publication: cache_publication}
+}
+
+pipeline test_unapproved_same_repository_pull_can_only_name_its_isolated_candidate() {
+  const resolved = source_for_cache(
+    source_for(pull(), []),
+    context("pull_request", PR_SHA),
+    2259,
+    "",
+    "main",
+    "",
+  )
+  assert_eq(
+    resolved,
+    {
+      schema: "burin.ci_cache_source.v1",
+      repository: REPO,
+      mode: "candidate_write",
+      pull_request: 2259,
+      head_sha: PR_SHA,
+    },
+  )
+}
+
+pipeline test_one_candidate_source_flows_from_pr_to_merge_group_to_exact_main_merge() {
+  const pr_source = source_for_cache(
+    source_for(pull(), []),
+    context("pull_request", PR_SHA),
+    2259,
+    "",
+    "main",
+    "",
+  )
+  const merge_group_source = source_for_cache(
+    source_for(pull(), [{state: "APPROVED", commit_id: PR_SHA}]),
+    context("merge_group", QUEUE_SHA),
+    nil,
+    "refs/heads/gh-readonly-queue/main/pr-2259-${QUEUE_SHA}",
+    "main",
+    "",
+  )
+  const main_source = source_for_cache(
+    source_for(pull(PR_SHA, true, MERGED_SHA), [{state: "APPROVED", commit_id: PR_SHA}]),
+    context("push", MERGED_SHA),
+    nil,
+    "",
+    "main",
+    "main",
+  )
+  assert_eq(unwrap(pr_source).mode, "candidate_write")
+  assert_eq(unwrap(merge_group_source).mode, "candidate_read")
+  assert_eq(unwrap(main_source).mode, "candidate_read")
+  assert_eq(unwrap(pr_source).head_sha, PR_SHA)
+  assert_eq(unwrap(merge_group_source).head_sha, PR_SHA)
+  assert_eq(unwrap(main_source).head_sha, PR_SHA)
+  assert_eq(
+    candidate_cache_reference(unwrap(pr_source), context("pull_request", PR_SHA), CACHE_PACKAGE),
+    "${CACHE_PACKAGE}:candidate-2259-${PR_SHA}-42-1",
+  )
+}
+
+pipeline test_merge_group_requires_current_approval_and_source_ancestry() {
+  const source_ok = source_for(pull(), [{state: "APPROVED", commit_id: PR_SHA}])
+  const resolved = source_for_cache(
+    source_ok,
+    context("merge_group", QUEUE_SHA),
+    nil,
+    "refs/heads/gh-readonly-queue/main/pr-2259-${"d".repeat(40)}",
+    "main",
+    "",
+  )
+  assert_eq(resolved?.pull_request, 2259)
+  assert_eq(resolved?.head_sha, PR_SHA)
+  const unapproved = source_for_cache(
+    source_for(pull(), [{state: "CHANGES_REQUESTED", commit_id: PR_SHA}]),
+    context("merge_group", QUEUE_SHA),
+    nil,
+    "refs/heads/gh-readonly-queue/main/pr-2259-${"d".repeat(40)}",
+    "main",
+    "",
+  )
+  assert_eq(unapproved, nil)
+  const dismissed = source_for_cache(
+    source_for(
+      pull(),
+      [{state: "APPROVED", commit_id: PR_SHA}, {state: "DISMISSED", commit_id: PR_SHA}],
+    ),
+    context("merge_group", QUEUE_SHA),
+    nil,
+    "refs/heads/gh-readonly-queue/main/pr-2259-${"d".repeat(40)}",
+    "main",
+    "",
+  )
+  assert_eq(dismissed, nil)
+  const unrelated = source_for(
+    pull(),
+    [{state: "APPROVED", commit_id: PR_SHA}],
+    {status: "diverged", ahead_by: 0},
+  )
+  assert_eq(
+    source_for_cache(
+      unrelated,
+      context("merge_group", QUEUE_SHA),
+      nil,
+      "refs/heads/gh-readonly-queue/main/pr-2259-${"d".repeat(40)}",
+      "main",
+      "",
+    ),
+    nil,
+  )
+}
+
+pipeline test_main_source_requires_the_exact_merged_commit() {
+  const resolved = source_for_cache(
+    source_for(pull(PR_SHA, true, MERGED_SHA), [{state: "APPROVED", commit_id: PR_SHA}]),
+    context("push", MERGED_SHA),
+    nil,
+    "",
+    "main",
+    "main",
+  )
+  assert_eq(resolved?.pull_request, 2259)
+  assert_eq(resolved?.head_sha, PR_SHA)
+  assert_eq(resolved?.mode, "candidate_read")
+  const wrong_merge = source_for(pull(PR_SHA, true, MERGED_SHA), [], nil, "e".repeat(40))
+  assert_eq(
+    source_for_cache(wrong_merge, context("push", MERGED_SHA), nil, "", "main", "main"),
+    nil,
+  )
+  assert_eq(
+    source_for_cache(
+      source_for(pull(PR_SHA, true, MERGED_SHA), []),
+      context("push", MERGED_SHA),
+      nil,
+      "",
+      "main",
+      "feature",
+    ),
+    nil,
+  )
+}
+
+pipeline test_protected_consumer_requires_exact_successful_immutable_producer() {
+  const source: CacheSource = {
+    schema: "burin.ci_cache_source.v1",
+    repository: REPO,
+    mode: "candidate_read",
+    pull_request: 2259,
+    head_sha: PR_SHA,
+  }
+  const valid = qualified_cache(
+    publication(source),
+    source,
+    producer(),
+    "docker-cache-81-2",
+    CACHE_PACKAGE,
+    true,
+  )
+  assert_eq(
+    valid,
+    {
+      reference: "${CACHE_PACKAGE}:candidate-2259-${PR_SHA}-81-2@${CACHE_DIGEST}",
+      producer_run_id: 81,
+      producer_attempt: 2,
+    },
+  )
+  assert_eq(
+    qualified_cache(
+      publication(source) + {head_sha: "d".repeat(40)},
+      source,
+      producer(),
+      "docker-cache-81-2",
+      CACHE_PACKAGE,
+      true,
+    ),
+    nil,
+  )
+  assert_eq(
+    qualified_cache(
+      publication(source),
+      source,
+      producer(PR_SHA, "failure"),
+      "docker-cache-81-2",
+      CACHE_PACKAGE,
+      true,
+    ),
+    nil,
+  )
+  assert_eq(
+    qualified_cache(
+      publication(source, 81, 2, "${CACHE_PACKAGE}:candidate-2259-${PR_SHA}-81-3"),
+      source,
+      producer(),
+      "docker-cache-81-2",
+      CACHE_PACKAGE,
+      true,
+    ),
+    nil,
+  )
+  assert_eq(
+    qualified_cache(
+      publication(source, 81, 2, nil, "sha256:bad"),
+      source,
+      producer(),
+      "docker-cache-81-2",
+      CACHE_PACKAGE,
+      true,
+    ),
+    nil,
+  )
+  assert_eq(
+    qualified_cache(
+      publication(source),
+      source,
+      producer(PR_SHA, "success", "outside/fork"),
+      "docker-cache-81-2",
+      CACHE_PACKAGE,
+      true,
+    ),
+    nil,
+  )
+}
+
+pipeline test_candidate_reader_authenticates_the_producer_job_and_artifact() {
+  const source: CacheSource = {
+    schema: "burin.ci_cache_source.v1",
+    repository: REPO,
+    mode: "candidate_read",
+    pull_request: 2259,
+    head_sha: PR_SHA,
+  }
+  assert_eq(
+    cache_from_history(
+      cache_history_source("success", publication(source)),
+      source,
+      "ci.yml",
+      CACHE_PACKAGE,
+    ),
+    {
+      candidate: {
+        reference: "${CACHE_PACKAGE}:candidate-2259-${PR_SHA}-81-2@${CACHE_DIGEST}",
+        producer_run_id: 81,
+        producer_attempt: 2,
+      },
+      producer_runs_observed: 1,
+      producer_runs_declared: 1,
+      reason: "qualified_candidate",
+    },
+  )
+  assert_eq(
+    cache_from_history(
+      cache_history_source("failure", publication(source)),
+      source,
+      "ci.yml",
+      CACHE_PACKAGE,
+    ),
+    {
+      candidate: nil,
+      producer_runs_observed: 1,
+      producer_runs_declared: 1,
+      reason: "no_qualified_candidate_in_bounded_window",
+    },
+  )
+  assert_eq(
+    cache_from_history(
+      cache_history_source("success", publication(source) + {head_sha: "d".repeat(40)}),
+      source,
+      "ci.yml",
+      CACHE_PACKAGE,
+    ),
+    {
+      candidate: nil,
+      producer_runs_observed: 1,
+      producer_runs_declared: 1,
+      reason: "no_qualified_candidate_in_bounded_window",
+    },
+  )
+}
+
+pipeline test_candidate_reader_refuses_other_attempt_jobs_and_unreached_publication() {
+  const source: CacheSource = {
+    schema: "burin.ci_cache_source.v1",
+    repository: REPO,
+    mode: "candidate_read",
+    pull_request: 2259,
+    head_sha: PR_SHA,
+  }
+  for change in [
+    {run_id: 82},
+    {run_attempt: 3},
+    {head_sha: "d".repeat(40)},
+    {status: "in_progress"},
+    {steps: [{name: "boot smoke", status: "completed", conclusion: "success"}]},
+    {
+      steps: [
+        {
+          name: "Publish run-bound Docker cache custody",
+          status: "completed",
+          conclusion: "success",
+        },
+      ],
+    },
+  ] {
+    const history = cache_from_history(
+      cache_history_source("success", publication(source), change),
+      source,
+      "ci.yml",
+      CACHE_PACKAGE,
+    )
+    assert_eq(history.candidate, nil)
+    assert_eq(history.producer_runs_observed, 1)
+  }
+}
+
+pipeline test_candidate_reader_refuses_partial_or_duplicate_history() {
+  const source: CacheSource = {
+    schema: "burin.ci_cache_source.v1",
+    repository: REPO,
+    mode: "candidate_read",
+    pull_request: 2259,
+    head_sha: PR_SHA,
+  }
+  for history in [{total_count: 2}, {total_count: 2, workflow_runs: [producer(), producer()]}] {
+    const result = try {
+      cache_from_history(
+        cache_history_source("success", publication(source), {}, history),
+        source,
+        "ci.yml",
+        CACHE_PACKAGE,
+      )
+    }
+    assert(is_err(result))
+  }
+}

@@ -95,3 +95,32 @@ The [CI workflow](../.github/workflows/ci.yml) runs the actual action with a
 nonempty identity, uploads its record, then reads back both source fields.
 Its smoke identity proves registration transport; it grants no reused CI
 verdict.
+
+## Docker candidate cache custody
+
+Set `docker-cache-package` to a separate GHCR package to enable candidate cache
+handoff. The action authenticates the current run before producing any cache
+reference. A same-repository pull request can export only
+`candidate-<pr>-<head>-<run>-<attempt>` in that package, before review. Forks
+cannot qualify as writers. This reference never replaces the stable cache.
+
+After the image boot smoke succeeds, invoke the action with
+`docker-cache-mode: publish` and the registry manifest's SHA-256 digest. It
+uploads `docker-cache-<run>-<attempt>` containing one `cache-publication.json`.
+The publication binds the PR head, run attempt, candidate reference and digest.
+The caller must read the original manifest bytes and verify that the computed
+digest resolves unchanged before supplying it.
+
+For merge groups, the queue reference, current same-repository PR head and
+source ancestry must agree. For main pushes, the associated merged PR's exact
+GraphQL `mergeCommit.oid` must equal the push SHA. Both consumers require a
+complete current-head review census with writer approval. The action then
+checks the successful PR run, exact Docker job and boot/publication steps,
+complete artifact census, archive digest and closed publication document.
+`cache-from` names the manifest by digest, so retagging cannot substitute its
+bytes. A missing or unqualified candidate returns an explicit discovery reason
+and leaves the caller on stable cache or a fresh build. It never skips a job.
+
+The caller owns candidate-package retention. Keep this package separate from
+production images, preserve current PR heads and active consumers, and refuse
+deletion when the inventory is incomplete. The action does not delete caches.

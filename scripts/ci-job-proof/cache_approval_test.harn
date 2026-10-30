@@ -1,0 +1,103 @@
+import { approved_cache_head } from "./cache_approval.harn"
+import { Artifact } from "./contract.harn"
+import { ProofSource } from "./reader.harn"
+
+const HEAD = "a".repeat(40)
+
+fn review(id: int, state: string, actor: string = "writer", writer: bool = true) -> dict {
+  return {
+    databaseId: id,
+    state: state,
+    author: {login: actor},
+    authorCanPushToRepository: writer,
+    commit: {oid: HEAD},
+  }
+}
+
+fn source(
+  nodes: list<dict>,
+  more: bool = false,
+  declared: int? = nil,
+  head: string = HEAD,
+) -> ProofSource {
+  return {
+    json: fn(_endpoint) {
+      throw "approval uses the typed GraphQL boundary"
+    },
+    registration: fn(_repo: string, _artifact: Artifact) {
+      throw "not an artifact read"
+    },
+    graphql: fn(_query) { return {
+      data: {
+        repository: {
+          pullRequest: {
+            headRefOid: head,
+            state: "OPEN",
+            merged: false,
+            baseRefName: "main",
+            headRepository: {nameWithOwner: "acme/repo"},
+            mergeCommit: nil,
+            reviews: {
+              nodes: nodes,
+              totalCount: declared ?? len(nodes),
+              pageInfo: {hasNextPage: more},
+            },
+          },
+        },
+      },
+    } },
+  }
+}
+
+pipeline test_only_current_writer_approval_authorizes_candidate_consumption() {
+  assert(approved_cache_head(source([review(1, "APPROVED")]), "acme/repo", 1, HEAD))
+  assert(!approved_cache_head(source([]), "acme/repo", 1, HEAD))
+  assert(
+    !approved_cache_head(source([review(1, "APPROVED", "outside", false)]), "acme/repo", 1, HEAD),
+  )
+  assert(
+    !approved_cache_head(
+      source([review(1, "APPROVED")], false, nil, "b".repeat(40)),
+      "acme/repo",
+      1,
+      HEAD,
+    ),
+  )
+}
+
+pipeline test_latest_writer_decisions_and_complete_census_are_required() {
+  assert(
+    !approved_cache_head(
+      source([review(1, "APPROVED"), review(2, "CHANGES_REQUESTED")]),
+      "acme/repo",
+      1,
+      HEAD,
+    ),
+  )
+  assert(
+    approved_cache_head(
+      source([review(1, "CHANGES_REQUESTED"), review(2, "APPROVED")]),
+      "acme/repo",
+      1,
+      HEAD,
+    ),
+  )
+  assert(
+    !approved_cache_head(
+      source([review(1, "APPROVED"), review(2, "DISMISSED")]),
+      "acme/repo",
+      1,
+      HEAD,
+    ),
+  )
+  assert(!approved_cache_head(source([review(1, "APPROVED")], true), "acme/repo", 1, HEAD))
+  assert(!approved_cache_head(source([review(1, "APPROVED")], false, 2), "acme/repo", 1, HEAD))
+  assert(
+    !approved_cache_head(
+      source([review(1, "APPROVED"), review(1, "APPROVED")]),
+      "acme/repo",
+      1,
+      HEAD,
+    ),
+  )
+}
