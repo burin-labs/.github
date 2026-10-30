@@ -2,6 +2,19 @@ import { GitHub } from "../merge-override/github.harn"
 
 pub type Request = {repository: string, number: int, head_sha: string}
 
+pub enum IneligibilityReason {
+  Closed
+  Draft
+  Fork
+  AuthorUnverified
+  BotAuthor
+}
+
+pub enum Resolution {
+  Eligible(Request)
+  Ineligible(IneligibilityReason)
+}
+
 /** A trusted caller may request the first review for another repository in its own organization. */
 pub type Target = {repository: string, owner: string, name: string, cross_repository: bool}
 
@@ -26,7 +39,7 @@ pub fn resolve_target(caller: string, requested: string) -> Target {
 }
 
 /** Refuse unread, closed, fork, draft, and bot-authored heads before minting a token. */
-pub fn resolve(repository: string, number: int, pull: unknown) -> Request? {
+pub fn resolve(repository: string, number: int, pull: unknown) -> Resolution {
   if !regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repository) || number <= 0 {
     throw "invalid review request identity"
   }
@@ -34,18 +47,36 @@ pub fn resolve(repository: string, number: int, pull: unknown) -> Request? {
     || pull?.base?.repo?.full_name != repository {
     throw "review request could not be measured"
   }
-  if pull?.state != "open" || pull?.draft != false
-    || pull?.head?.repo?.full_name != repository
-    || pull?.user?.type != "User"
-    || trim(pull?.user?.login ?? "") == ""
-    || (pull?.user?.login ?? "").ends_with("[bot]") {
-    return nil
+  if pull?.state != "open" {
+    return Resolution.Ineligible(IneligibilityReason.Closed)
+  }
+  if pull?.draft != false {
+    return Resolution.Ineligible(IneligibilityReason.Draft)
+  }
+  if pull?.head?.repo?.full_name != repository {
+    return Resolution.Ineligible(IneligibilityReason.Fork)
+  }
+  if pull?.user?.type == "Bot" || (pull?.user?.login ?? "").ends_with("[bot]") {
+    return Resolution.Ineligible(IneligibilityReason.BotAuthor)
+  }
+  if pull?.user?.type != "User" || trim(pull?.user?.login ?? "") == "" {
+    return Resolution.Ineligible(IneligibilityReason.AuthorUnverified)
   }
   const head = pull?.head?.sha
   if type_of(head) != "string" || !regex_match("^[0-9a-f]{40}$", head) {
     throw "review request has no usable head SHA"
   }
-  return {repository: repository, number: number, head_sha: head}
+  return Resolution.Eligible({repository: repository, number: number, head_sha: head})
+}
+
+pub fn ineligibility_code(reason: IneligibilityReason) -> string {
+  return match reason {
+    IneligibilityReason.Closed -> { return "closed" }
+    IneligibilityReason.Draft -> { return "draft" }
+    IneligibilityReason.Fork -> { return "fork" }
+    IneligibilityReason.AuthorUnverified -> { return "author_unverified" }
+    IneligibilityReason.BotAuthor -> { return "bot_author" }
+  }
 }
 
 /** The receiver owns admission, deduplication, and all model spending limits. */

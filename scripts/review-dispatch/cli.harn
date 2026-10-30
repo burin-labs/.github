@@ -1,5 +1,9 @@
 import { live_github } from "../merge-override/github.harn"
-import { dispatch, resolve, resolve_target } from "./policy.harn"
+import { Resolution, dispatch, ineligibility_code, resolve, resolve_target } from "./policy.harn"
+
+fn github_host(fs: HarnessFs, tools: HarnessTools) -> {fs: HarnessFs, tools: HarnessTools} {
+  return {fs: fs, tools: tools}
+}
 
 fn required(env: HarnessEnv, name: string) -> string {
   const value = trim(env.get(name) ?? "")
@@ -35,22 +39,28 @@ fn main(harness: Harness) {
   const number = to_int(number_text)
   const scratch = harness.fs.mkdtemp_in_workspace("review-dispatch-")
   const github = live_github(
-    {fs: harness.fs, tools: harness.tools},
+    github_host(harness.fs, harness.tools),
     required(harness.env, "GH_TOKEN"),
     scratch,
   )
   if argv == ["resolve"] {
-    const request = resolve(
+    const resolution = resolve(
       repository,
       number,
       github.read("repos/" + repository + "/pulls/" + number_text),
     )
     const output = required(harness.env, "GITHUB_OUTPUT")
-    harness.fs.append(
-      output,
-      request == nil ? "eligible=false\n" : "eligible=true\nhead_sha=" + request.head_sha + "\n",
-    )
-    harness.stdio.println(json_stringify({eligible: request != nil, request: request}))
+    match resolution {
+      Resolution.Eligible(request) -> {
+        harness.fs.append(output, "eligible=true\nhead_sha=" + request.head_sha + "\n")
+        harness.stdio.println(json_stringify({eligible: true, request: request}))
+      }
+      Resolution.Ineligible(reason) -> {
+        const code = ineligibility_code(reason)
+        harness.fs.append(output, "eligible=false\nreason=" + code + "\n")
+        harness.stdio.println(json_stringify({eligible: false, reason: code}))
+      }
+    }
   } else if argv == ["dispatch"] {
     const head = required(harness.env, "HEAD_SHA")
     if !regex_match("^[0-9a-f]{40}$", head) {
