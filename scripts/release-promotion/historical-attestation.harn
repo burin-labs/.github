@@ -48,7 +48,14 @@ pub fn historical_attestation_matches(
         return true
       }
     } else if predicate?.schemaVersion == "harn.release_files_provenance.v1" {
-      return true
+      if type_of(predicate?.files) != "list" {
+        continue
+      }
+      const files = predicate.files.filter({ file -> file?.file == expected.file }).to_list()
+      if len(files) == 1 && files[0]?.kind == expected.kind
+        && files[0]?.sha256 == expected.digest {
+        return true
+      }
     }
   }
   return false
