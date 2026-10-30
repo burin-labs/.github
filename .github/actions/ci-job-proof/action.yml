@@ -6,6 +6,10 @@ description: >-
   Unknown or unreadable proof runs the job.
 
 inputs:
+  skip-harn-setup:
+    description: Use the caller's already installed supported Harn instead of replacing its pinned runtime.
+    required: false
+    default: "false"
   proof-universe:
     description: >-
       Optional closed JSON generation and UTC notBefore. The resolver namespaces
@@ -107,6 +111,7 @@ runs:
   using: composite
   steps:
     - name: Set up Harn
+      if: inputs.skip-harn-setup != 'true'
       uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
       with:
         version: "0.10.159"
