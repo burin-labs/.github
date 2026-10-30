@@ -40,7 +40,7 @@ pub fn repository_check_environment(env: HarnessEnv) -> dict<string, string> {
   return execution_environment(capture_outer_execution_context(fn(name) { env.get(name) }))
 }
 
-fn runtime_environment(env: HarnessEnv) -> dict<string, string> {
+pub fn repository_runtime_environment(get: fn(string) -> string?) -> dict<string, string> {
   let result: dict<string, string> = {}
   for name in [
     "PATH",
@@ -64,9 +64,26 @@ fn runtime_environment(env: HarnessEnv) -> dict<string, string> {
     "TERM",
     "NO_COLOR",
   ] {
-    const value = env.get(name)
+    const value = get(name)
     if value != nil {
       result = result + {[name]: value ?? ""}
+    }
+  }
+  return result
+}
+
+pub fn repository_offline_environment(get: fn(string) -> string?) -> dict<string, string> {
+  let result: dict<string, string> = {}
+  // These values only narrow package and source acquisition. Never forward
+  // arbitrary npm configuration or an ambient value that relaxes them.
+  for entry in [
+    {name: "npm_config_manage_package_manager_versions", value: "false"},
+    {name: "npm_config_package_manager_strict_version", value: "true"},
+    {name: "npm_config_offline", value: "true"},
+    {name: "BURIN_HARN_SOURCE_OFFLINE", value: "1"},
+  ] {
+    if get(entry.name) == entry.value {
+      result = result + {[entry.name]: entry.value}
     }
   }
   return result
@@ -176,7 +193,8 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
               program: argv[0],
               args: argv[1:len(argv)],
               cwd: path_join(options.root, check.directory),
-              env: runtime_environment(harness.env)
+              env_mode: "replace",
+              env: repository_runtime_environment(fn(env_name) { harness.env.get(env_name) })
                 + check.environment
                 + execution_environment(options.outer_execution_context)
                 + {
@@ -185,7 +203,8 @@ pub fn run_checks(harness: Harness, plan: Plan, options: RunOptions) -> CheckRep
                   GIT_CONFIG_GLOBAL: global_config,
                   GIT_CONFIG_NOSYSTEM: "1",
                   CI: "true",
-                },
+                }
+                + repository_offline_environment(fn(env_name) { harness.env.get(env_name) }),
               timeout_ms: check.timeout_ms,
             },
           )
