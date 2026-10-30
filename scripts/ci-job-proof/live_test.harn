@@ -193,7 +193,7 @@ pipeline test_actual_archive_digest_and_closed_document_are_required(harness: Ha
   harness.fs.write_bytes(path, unrelated)
   assert_error_contains(
     fn() { registration_from_archive(harness.fs, path, "sha256:" + sha256(unrelated)) },
-    "exactly its typed document",
+    "exactly its named document",
   )
   const oversized = zip_create([{path: "registration.json", content: "x".repeat(1048577)}])
   assert(len(oversized) < 1048576)

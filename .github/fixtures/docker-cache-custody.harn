@@ -1,0 +1,70 @@
+import { resolve_cache } from "../../scripts/ci-job-proof/cache_cli.harn"
+
+pipeline test_actual_cache_resolver_outputs_and_publication(harness: Harness) {
+  const head = "a".repeat(40)
+  const repo = "burin-labs/harn-cloud"
+  const fork = harness.env.get("CACHE_FIXTURE_FORK") == "true"
+  harness.testing.http_mock(
+    "GET",
+    "https://api.github.com/repos/${repo}/actions/runs/81/attempts/2",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          id: 81,
+          run_attempt: 2,
+          head_sha: head,
+          event: "pull_request",
+          path: ".github/workflows/ci.yml",
+          status: "in_progress",
+          conclusion: nil,
+          repository: {full_name: repo},
+          head_repository: {full_name: repo},
+        },
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    "https://api.github.com/repos/${repo}/pulls/2259",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          number: 2259,
+          state: "open",
+          merged: false,
+          base: {ref: "main"},
+          head: {sha: head, repo: {full_name: fork ? "outside/fork" : repo}},
+        },
+      ),
+    },
+  )
+  resolve_cache(harness)
+  const output = harness.fs.read_text(unwrap(harness.env.get("GITHUB_OUTPUT")))
+  const lines = output.split("\n")
+  // Outputs use unpredictable delimiters; find the nonempty publication value
+  // by its field marker rather than depending on delimiter generation.
+  let publication = ""
+  for index in range(0, len(lines)) {
+    if lines[index].starts_with("cache-publication<<") && lines[index + 1] != "" {
+      publication = lines[index + 1]
+    }
+  }
+  const valid = !fork && harness.env.get("CI_JOB_PROOF_CACHE_DIGEST") == "sha256:" + "f".repeat(64)
+  if !valid {
+    assert_eq(publication, "")
+    return
+  }
+  assert(publication != "", "actual resolver never emitted a publication")
+  const record = json_parse(harness.fs.read_text(publication))
+  assert_eq(record.producer_run_id, 81)
+  assert_eq(record.producer_attempt, 2)
+  assert_eq(record.head_sha, head)
+  assert_eq(
+    record.cache_ref,
+    "ghcr.io/burin-labs/harn-cloud-build-cache:candidate-2259-${head}-81-2",
+  )
+  assert_eq(record.cache_digest, "sha256:" + "f".repeat(64))
+  assert(output.contains(record.cache_ref), "actual resolver never authorized the candidate writer")
+}

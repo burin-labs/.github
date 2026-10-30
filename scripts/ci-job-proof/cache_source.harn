@@ -1,0 +1,338 @@
+import { approved_cache_head } from "./cache_approval.harn"
+import { Run, RunContext, closed, qualified_named_artifact, sha } from "./contract.harn"
+import {
+  ProofSource,
+  job_census,
+  merge_group_pull,
+  repository,
+  run_artifact,
+  workflow,
+} from "./reader.harn"
+
+pub type CacheMode = "candidate_write" | "candidate_read"
+
+pub type CacheSource = {
+  schema: string,
+  repository: string,
+  mode: CacheMode,
+  pull_request: int,
+  head_sha: string,
+}
+
+pub type CachePublication = {
+  schema: string,
+  pull_request: int,
+  head_sha: string,
+  producer_run_id: int,
+  producer_attempt: int,
+  cache_ref: string,
+  cache_digest: string,
+}
+
+pub type QualifiedCache = {reference: string, producer_run_id: int, producer_attempt: int}
+
+pub type CacheHistory = {
+  candidate: QualifiedCache?,
+  producer_runs_observed: int,
+  producer_runs_declared: int,
+  reason: string,
+}
+
+type Pull = {
+  number: int,
+  state: string,
+  merged?: bool,
+  merged_at?: string?,
+  merge_commit_sha?: string?,
+  base: {ref: string},
+  head: {sha: string, repo: {full_name: string}?},
+}
+
+type Comparison = {status: string, ahead_by: int}
+
+type CommitPulls = list<Pull>
+
+type RunsPage = {total_count: int, workflow_runs: list<Run>}
+
+/** One source identity is shared by PR, queue, and exact merged-commit runs. */
+pub fn source_for_cache(
+  source: ProofSource,
+  current: RunContext,
+  pull_request: int?,
+  merge_group_head_ref: string,
+  default_branch: string,
+  branch_name: string,
+) -> CacheSource? {
+  const repo = repository(current.repository)
+  if current.event == "merge_group" {
+    const number = merge_group_pull(merge_group_head_ref)
+    if number == nil {
+      return nil
+    }
+    return source_for_open_pull(
+      source,
+      current,
+      repo,
+      unwrap(number),
+      default_branch,
+      "candidate_read",
+    )
+  }
+  if current.event == "pull_request" {
+    if pull_request == nil || unwrap(pull_request) <= 0 {
+      return nil
+    }
+    return source_for_open_pull(
+      source,
+      current,
+      repo,
+      unwrap(pull_request),
+      default_branch,
+      "candidate_write",
+    )
+  }
+  if current.event != "push" || default_branch == "" || branch_name != default_branch {
+    return nil
+  }
+  return source_for_main_commit(source, current, repo, default_branch)
+}
+
+fn source_for_main_commit(
+  source: ProofSource,
+  current: RunContext,
+  repo: string,
+  default_branch: string,
+) -> CacheSource? {
+  const associated = schema_expect(
+    source.json("/repos/${repo}/commits/${sha(current.commit)}/pulls?per_page=100"),
+    schema_of(CommitPulls),
+  )
+  const matches = associated.filter(
+    { pull ->
+      pull.state == "closed" && pull.merged_at != nil
+        && pull.base.ref == default_branch
+        && pull.head.repo?.full_name == repo
+    },
+  )
+    .to_list()
+  if len(associated) >= 100 || len(matches) != 1 {
+    return nil
+  }
+  const matched = matches[0]
+  if !approved_cache_head(
+    source,
+    repo,
+    matched.number,
+    matched.head.sha,
+    current.commit,
+    default_branch,
+  ) {
+    return nil
+  }
+  return cache_source("candidate_read", repo, matched.number, matched.head.sha)
+}
+
+fn source_for_open_pull(
+  source: ProofSource,
+  current: RunContext,
+  repo: string,
+  number: int,
+  default_branch: string,
+  mode: CacheMode,
+) -> CacheSource? {
+  const pull = schema_expect(
+    source.json("/repos/${repo}/pulls/${to_string(number)}"),
+    schema_of(Pull),
+  )
+  if pull.number != number || pull.state != "open"
+    || (pull.merged ?? false)
+    || pull.base.ref != default_branch
+    || pull.head.repo?.full_name != repo {
+    return nil
+  }
+  const source_sha = sha(pull.head.sha)
+  if mode == "candidate_write" && current.commit != source_sha {
+    return nil
+  }
+  if mode == "candidate_read" {
+    const compared = schema_expect(
+      source.json("/repos/${repo}/compare/${source_sha}...${sha(current.commit)}"),
+      schema_of(Comparison),
+    )
+    if !["ahead", "identical"].contains(compared.status) {
+      return nil
+    }
+  }
+  // An unapproved same-repository PR may publish only its isolated candidate.
+  // A merge-group consumer additionally needs the approval for this exact head.
+  if mode == "candidate_read"
+    && !approved_cache_head(source, repo, pull.number, source_sha, nil, default_branch) {
+    return nil
+  }
+  return cache_source(mode, repo, pull.number, source_sha)
+}
+
+fn cache_source(mode: CacheMode, repo: string, number: int, source_sha: string) -> CacheSource {
+  return {
+    schema: "burin.ci_cache_source.v1",
+    repository: repo,
+    mode: mode,
+    pull_request: number,
+    head_sha: sha(source_sha),
+  }
+}
+
+/** Bind an immutable cache manifest to its successful, same-repo source run. */
+pub fn qualified_cache(
+  raw: unknown,
+  source: CacheSource,
+  producer: Run,
+  artifact_name: string,
+  cache_package: string,
+  docker_job_passed: bool,
+  workflow_file: string = "ci.yml",
+) -> QualifiedCache? {
+  schema_expect(raw, closed(schema_of(CachePublication)))
+  const publication = schema_expect(raw, schema_of(CachePublication))
+  if source.schema != "burin.ci_cache_source.v1" || source.mode != "candidate_read"
+    || publication.schema != "burin.docker_cache_publication.v1"
+    || publication.pull_request != source.pull_request
+    || publication.head_sha != source.head_sha
+    || publication.producer_run_id != producer.id
+    || publication.producer_attempt != producer.run_attempt
+    || producer.event != "pull_request"
+    || producer.path != ".github/workflows/${workflow(workflow_file)}"
+    || producer.status != "completed"
+    || producer.conclusion != "success"
+    || producer.repository.full_name != source.repository
+    || producer.head_repository.full_name != source.repository
+    || producer.head_sha != source.head_sha
+    || producer.run_attempt <= 0
+    || !docker_job_passed {
+    return nil
+  }
+  const expected_ref = cache_package
+    + ":candidate-${publication.pull_request}-${publication.head_sha}-${publication.producer_run_id}-${publication.producer_attempt}"
+  if !regex_match("^ghcr\\.io/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", cache_package)
+    || publication.cache_ref != expected_ref
+    || !regex_match("^sha256:[0-9a-f]{64}$", publication.cache_digest)
+    || artifact_name
+      != "docker-cache-${publication.producer_run_id}-${publication.producer_attempt}" {
+    return nil
+  }
+  return {
+    reference: publication.cache_ref + "@" + publication.cache_digest,
+    producer_run_id: producer.id,
+    producer_attempt: producer.run_attempt,
+  }
+}
+
+/** Read a bounded successful PR producer and its run-bound immutable cache receipt. */
+pub fn cache_from_history(
+  source: ProofSource,
+  cache_source: CacheSource,
+  workflow_file: string,
+  cache_package: string,
+) -> CacheHistory {
+  if cache_source.mode != "candidate_read" || source.cache_publication == nil {
+    return {
+      candidate: nil,
+      producer_runs_observed: 0,
+      producer_runs_declared: 0,
+      reason: "source_not_readable",
+    }
+  }
+  const runs = schema_expect(
+    source.json(
+      "/repos/${repository(cache_source.repository)}/actions/workflows/${workflow(workflow_file)}/runs?event=pull_request&head_sha=${sha(cache_source.head_sha)}&status=completed&per_page=5",
+    ),
+    schema_of(RunsPage),
+  )
+  const observed_ids = runs.workflow_runs.map({ run -> run.id }).unique()
+  if runs.total_count < 0 || len(runs.workflow_runs) != min(runs.total_count, 5)
+    || len(observed_ids) != len(runs.workflow_runs) {
+    throw "cache producer history census is malformed"
+  }
+  for producer in runs.workflow_runs {
+    const candidate = try {
+      producer_cache(source, cache_source, producer, workflow_file, cache_package)
+    }
+    if is_ok(candidate) && unwrap(candidate) != nil {
+      return {
+        candidate: unwrap(candidate),
+        producer_runs_observed: len(runs.workflow_runs),
+        producer_runs_declared: runs.total_count,
+        reason: "qualified_candidate",
+      }
+    }
+  }
+  return {
+    candidate: nil,
+    producer_runs_observed: len(runs.workflow_runs),
+    producer_runs_declared: runs.total_count,
+    reason: "no_qualified_candidate_in_bounded_window",
+  }
+}
+
+pub fn candidate_cache_reference(
+  source: CacheSource,
+  current: RunContext,
+  cache_package: string,
+) -> string {
+  require source.schema == "burin.ci_cache_source.v1" && source.mode == "candidate_write"
+    && source.pull_request > 0
+    && current.runId > 0
+    && current.attempt > 0
+    && regex_match("^ghcr\\.io/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", cache_package) != nil,
+    "candidate cache writer identity is malformed"
+  return cache_package
+    + ":candidate-${source.pull_request}-${source.head_sha}-${current.runId}-${current.attempt}"
+}
+
+fn producer_cache(
+  source: ProofSource,
+  cache_source: CacheSource,
+  producer: Run,
+  workflow_file: string,
+  cache_package: string,
+) -> QualifiedCache? {
+  if producer.event != "pull_request" || producer.status != "completed"
+    || producer.conclusion != "success"
+    || producer.path != ".github/workflows/${workflow(workflow_file)}"
+    || producer.repository.full_name != cache_source.repository
+    || producer.head_repository.full_name != cache_source.repository
+    || producer.head_sha != cache_source.head_sha {
+    return nil
+  }
+  const census = job_census(source, cache_source.repository, producer)
+  const docker_jobs = census.jobs.filter({ job -> job.name == "Docker image" }).to_list()
+  if len(docker_jobs) != 1 || docker_jobs[0]?.conclusion != "success" {
+    return nil
+  }
+  const docker = unwrap(docker_jobs[0])
+  if docker.id <= 0 || docker.run_id != producer.id || docker.run_attempt != producer.run_attempt
+    || docker.head_sha != producer.head_sha
+    || docker.status != "completed" {
+    return nil
+  }
+  for required in ["boot smoke", "Publish run-bound Docker cache custody"] {
+    const reached = docker.steps.filter({ step -> step.name == required }).to_list()
+    if len(reached) != 1 || reached[0]?.status != "completed"
+      || reached[0]?.conclusion != "success" {
+      return nil
+    }
+  }
+  const artifact_name = "docker-cache-${producer.id}-${producer.run_attempt}"
+  const artifact = run_artifact(source, cache_source.repository, producer, artifact_name)
+  qualified_named_artifact(artifact, producer, artifact_name)
+  const publication = unwrap(source.cache_publication)(cache_source.repository, artifact)
+  return qualified_cache(
+    publication,
+    cache_source,
+    producer,
+    artifact_name,
+    cache_package,
+    true,
+    workflow_file,
+  )
+}

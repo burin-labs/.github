@@ -251,15 +251,24 @@ pub fn leg_of(names: list<string>, job_name: string) -> bool {
 }
 
 pub fn qualified_artifact(artifact: Artifact, producer: Run) {
+  return qualified_named_artifact(
+    artifact,
+    producer,
+    registration_artifact_name(producer.id, producer.run_attempt),
+  )
+}
+
+/** A run-bound named artifact has complete bytes, current identity and a valid digest. */
+pub fn qualified_named_artifact(artifact: Artifact, producer: Run, expected_name: string) {
   if artifact.id <= 0
-    || artifact.name != registration_artifact_name(producer.id, producer.run_attempt)
+    || artifact.name != expected_name
     || artifact.expired
     || artifact.size_in_bytes <= 0
     || artifact.size_in_bytes > 1048576
     || !regex_match("^sha256:[0-9a-f]{64}$", artifact.digest)
     || artifact.workflow_run.id != producer.id
     || artifact.workflow_run.head_sha != producer.head_sha {
-    throw "unqualified registration artifact"
+    throw "unqualified workflow artifact"
   }
 }
 

@@ -163,7 +163,7 @@ pipeline test_reader_reaches_actual_archive_and_job_proof(harness: Harness) {
   }
   assert_error_contains(
     fn() { inspect_original_run(dispatch_transport, policy, dispatch + {run_attempt: 3}) },
-    "registration artifact missing or ambiguous",
+    "workflow artifact missing or ambiguous",
   )
   assert_error_contains(
     fn() { inspect_original_run(dispatch_transport, policy, dispatch + {status: "in_progress"}) },

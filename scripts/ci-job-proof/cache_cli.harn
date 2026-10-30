@@ -1,0 +1,105 @@
+import { write_json } from "std/fs"
+import { gha_write_output } from "std/gha"
+import {
+  cache_from_history,
+  candidate_cache_reference,
+  source_for_cache,
+} from "./cache_source.harn"
+import { current_run, live_source } from "./live.harn"
+
+fn output(harness: Harness, name: string, value: unknown) {
+  require gha_write_output(harness, name, value), "could not write Docker cache output"
+}
+
+/** Cache absence never authorizes job-proof reuse or changes a build's inputs. */
+pub fn resolve_cache(harness: Harness) {
+  const package = trim(harness.env.get("CI_JOB_PROOF_CACHE_PACKAGE") ?? "")
+  if package == "" {
+    return
+  }
+  output(harness, "cache-from", "")
+  output(harness, "cache-to", "")
+  output(harness, "cache-publication", "")
+  try {
+    resolve_measured_cache(harness, package)
+  } catch (_error) {
+    output(
+      harness,
+      "cache-discovery",
+      json_stringify(
+        {
+          reason: "cache_custody_unqualified",
+          pending: 1,
+          producer_runs_observed: nil,
+          producer_runs_declared: nil,
+        },
+      ),
+    )
+    harness.stdio.println(
+      "Docker candidate cache is unqualified; build from the stable cache or source.",
+    )
+  }
+}
+
+fn resolve_measured_cache(harness: Harness, package: string) {
+  const mode = harness.env.get("CI_JOB_PROOF_CACHE_MODE") ?? "resolve"
+  require ["resolve", "publish"].contains(mode), "unknown Docker cache custody operation"
+  const source = live_source(harness.net, harness.fs, harness.env.get("GH_TOKEN") ?? "")
+  const current = current_run(harness.env, source)
+  const raw_pull = trim(harness.env.get("CI_JOB_PROOF_PULL_REQUEST") ?? "")
+  const pull = raw_pull == "" ? nil : to_int(raw_pull)
+  const identity = source_for_cache(
+    source,
+    current,
+    pull,
+    harness.env.get("CI_JOB_PROOF_MERGE_GROUP_HEAD_REF") ?? "",
+    harness.env.get("CI_JOB_PROOF_DEFAULT_BRANCH") ?? "main",
+    harness.env.get("CI_JOB_PROOF_BRANCH") ?? "",
+  )
+  if identity == nil {
+    output(
+      harness,
+      "cache-discovery",
+      json_stringify({reason: "source_not_authorized", pending: 0}),
+    )
+    return
+  }
+  const qualified = unwrap(identity)
+  if qualified.mode == "candidate_read" {
+    const history = cache_from_history(source, qualified, current.workflow, package)
+    output(harness, "cache-from", history.candidate?.reference ?? "")
+    output(harness, "cache-discovery", json_stringify(history))
+    return
+  }
+  const reference = candidate_cache_reference(qualified, current, package)
+  output(harness, "cache-to", reference)
+  output(
+    harness,
+    "cache-discovery",
+    json_stringify({reason: "isolated_candidate_writer", pending: 0}),
+  )
+  if mode != "publish" {
+    return
+  }
+  const digest = harness.env.get("CI_JOB_PROOF_CACHE_DIGEST") ?? ""
+  require regex_match("^sha256:[0-9a-f]{64}$", digest) != nil,
+    "cache publication requires its immutable registry manifest digest"
+  const directory = harness.fs.mkdtemp_in_workspace("ci-docker-cache-")
+  const path = "${directory}/cache-publication.json"
+  write_json(
+    harness.fs,
+    path,
+    {
+      schema: "burin.docker_cache_publication.v1",
+      pull_request: qualified.pull_request,
+      head_sha: qualified.head_sha,
+      producer_run_id: current.runId,
+      producer_attempt: current.attempt,
+      cache_ref: reference,
+      cache_digest: digest,
+    },
+    {pretty: true, trailing_newline: true},
+  )
+  output(harness, "cache-publication", path)
+  output(harness, "cache-publication-name", "docker-cache-${current.runId}-${current.attempt}")
+}
