@@ -47,6 +47,11 @@ name: runner-availability (reusable)
 on:
   workflow_call:
     inputs:
+      owned_only:
+        description: "Queue the probe on owned Linux capacity without a hosted fallback"
+        type: boolean
+        default: false
+        required: false
       minimum_online:
         description: "Minimum online runners in a shared pool before offering self-hosted capacity"
         type: number
@@ -245,9 +250,10 @@ jobs:
   detect:
     name: Detect self-hosted runner availability
     # This first probe must run before callers can select owned capacity.
-    # Use the established standard hosted bootstrap independently of its
-    # own output; an unallocated slim probe stranded idle owned runners.
-    runs-on: ubuntu-24.04
+    # Public callers retain the standard hosted bootstrap. Owned-only callers
+    # queue directly on the registered light pool, independently of this
+    # probe's output, so a busy pool cannot select a paid hosted fallback.
+    runs-on: ${{ inputs.owned_only && fromJSON('["self-hosted", "Linux", "X64", "harn-ci-light"]') || 'ubuntu-24.04' }}
     timeout-minutes: 5
     env:
       # Promote to job env so step-level `if:` can gate on secret presence; the
