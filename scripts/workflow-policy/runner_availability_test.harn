@@ -22,7 +22,6 @@ fn runner(name: string, busy: bool, producer: bool) -> any {
 
 pipeline test_optional_linux_pool_reports_its_physical_host_load(harness: Harness) {
   const bootstrap = workflow(harness.fs).jobs.detect
-  assert_eq(bootstrap["runs-on"], "ubuntu-24.04")
   assert(bootstrap?.needs == nil, "the first probe cannot depend on its own capacity measurement")
   const detect = bootstrap.steps.find({ item -> item?.id == "detect" }).run
   const temporary = harness.fs.mkdtemp_in_workspace("runner-availability-hosts")
@@ -81,6 +80,29 @@ pipeline test_optional_linux_pool_reports_its_physical_host_load(harness: Harnes
   const capacity = json_parse(line.substring(len("capacity=")))
   assert_eq(capacity.linux_probe.hosts, {"hetzner-1": {online: 10, busy: 9, idle_big: 1}})
   assert_eq(capacity.linux_fetch.hosts, {"hetzner-1": {online: 10, busy: 9, idle_big: 1}})
+}
+
+pipeline test_probe_bootstrap_has_an_explicit_owned_only_route(harness: Harness) {
+  const source = workflow(harness.fs)
+  assert_eq(
+    source.on.workflow_call.inputs.owned_only,
+    {
+      description: "Queue the probe on owned Linux capacity without a hosted fallback",
+      type: "boolean",
+      default: false,
+      required: false,
+    },
+  )
+  assert_eq(
+    source.jobs.detect["runs-on"],
+    "$"
+      + "{{ inputs.owned_only && fromJSON('[\"self-hosted\", \"Linux\", \"X64\", \"harn-ci-light\"]') || 'ubuntu-24.04' }}",
+    "owned-only dispatch must use a nonempty label array without consulting capacity or hosted fallback policy",
+  )
+  assert(
+    source.jobs.detect?.needs == nil,
+    "bootstrap routing must not wait for its own measurement",
+  )
 }
 
 pipeline test_required_measurement_fails_the_probe_job_itself(harness: Harness) {
