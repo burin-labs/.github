@@ -225,6 +225,19 @@ pipeline test_actual_archive_digest_and_closed_document_are_required(harness: Ha
 pipeline test_composite_projects_identities_and_persists_attempt_bound_receipts(harness: Harness) {
   const action = read_yaml(harness.fs, "../../.github/actions/ci-job-proof/action.yml", nil)
   const steps = action.runs.steps
+  const uploads = steps.filter(
+    { step -> (step.uses ?? "").starts_with("actions/upload-artifact@") },
+  )
+    .to_list()
+  assert_eq(len(uploads), 3)
+  assert_eq(
+    uploads.map({ step -> step["with"]["retention-days"] }).to_list(),
+    [
+      "$" + "{{ inputs.checkpoint-enrollment != '' && 1 || 7 }}",
+      "$" + "{{ inputs.checkpoint-enrollment != '' && 1 || 7 }}",
+      "$" + "{{ inputs.checkpoint-enrollment != '' && 1 || 14 }}",
+    ],
+  )
   assert_eq(
     steps[0].uses,
     "burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f",
