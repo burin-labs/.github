@@ -214,19 +214,91 @@ pub type HistoricalJob = {id: string, digest: string, provenance: Provenance, jo
 /** Restored original jobs and explicitly unresolved logical job identities. */
 pub type HistoricalReuse = {jobs: list<HistoricalJob>, pending: list<string>}
 
+pub type HistoricalRequest = {id: int, attempt: int}
+
+pub type HistoricalRead = {request: HistoricalRequest, producer: Run?, result: HistoricalReuse?}
+
+/** One bounded history page shares its API snapshot and immutable registration archives. */
+pub fn historical_reuse_batch(
+  source: ProofSource,
+  current: RunContext,
+  requests: list<HistoricalRequest>,
+  now: fn() -> int,
+  names: list<string>? = nil,
+) -> list<HistoricalRead> {
+  require len(requests) > 0 && len(requests) <= 48
+    && requests.all({ request -> request.id > 0 && request.attempt > 0 })
+    && len(requests.map({ request -> "${request.id}:${request.attempt}" }).unique())
+      == len(requests),
+    "historical proof batch is malformed"
+  let json_cache = {}
+  let archive_cache = {}
+  const shared: ProofSource = {
+    ...source,
+    json: fn(endpoint) {
+      if json_cache[endpoint] != nil {
+        return json_cache[endpoint]
+      }
+      const value = source.json(endpoint)
+      json_cache = json_cache + {[endpoint]: value}
+      return value
+    },
+    registration: fn(repo, artifact) {
+      const key = "${repo}:${artifact.id}:${artifact.digest}"
+      if archive_cache[key] != nil {
+        return archive_cache[key]
+      }
+      const value = source.registration(repo, artifact)
+      archive_cache = archive_cache + {[key]: value}
+      return value
+    },
+  }
+  return requests.map(
+    { request ->
+      const measured = try {
+        const producer = schema_expect(
+          shared.json(
+            "/repos/${repository(current.repository)}/actions/runs/${request.id}/attempts/${request.attempt}",
+          ),
+          schema_of(Run),
+        )
+        require producer.id == request.id && producer.run_attempt == request.attempt,
+          "historical proof request identity changed"
+        {producer: producer, result: historical_reuse(shared, current, producer, now, names)}
+      }
+      if is_err(measured) {
+        return {request: request, producer: nil, result: nil}
+      }
+      const value = unwrap(measured)
+      return {request: request, producer: value.producer, result: value.result}
+    },
+  )
+    .to_list()
+}
+
 /** Resolve a main run's skipped jobs through the same input-bound admission owner. */
 pub fn historical_reuse(
   source: ProofSource,
   current: RunContext,
   producer: Run,
   now: fn() -> int,
+  names: list<string>? = nil,
 ) -> HistoricalReuse {
+  if names != nil {
+    require len(names) <= 256 && len(names.unique()) == len(names)
+      && names.all({ name -> name.trim() != "" && len(name) <= 512 }),
+      "historical proof job names are malformed"
+    if len(names) == 0 {
+      return {jobs: [], pending: []}
+    }
+  }
   const bounded = bounded_source(source, now)
   const root = inspect_run(bounded.source, current, producer)
   const wanted = root.requested.filter(
     { identity ->
       const matches = root.census.jobs.filter({ job -> leg_of(identity.names, job.name) }).to_list()
-      return root.admission.deferred.any({ pointer -> pointer.id == identity.id })
+      return (names == nil || names.any({ name -> leg_of(identity.names, name) }))
+        && root.admission.deferred.any({ pointer -> pointer.id == identity.id })
         && len(matches) > 0
         && matches.all({ job -> job.conclusion == "skipped" })
     },
