@@ -3,6 +3,10 @@
 This repository owns shared GitHub Actions workflows and organization policy.
 Keep policy in typed contracts and verify every projection that consumes it.
 
+For a temporary shipping pause, keep `ship` and use `hold` or `do-not-merge`.
+Before changing a shipping control label, post the reason and the condition for
+resuming on the PR. See [Pause Smart Ship](docs/pause-smart-ship.md).
+
 ## Script language
 
 - Use Harn for every script that runs after `setup-harn`.
