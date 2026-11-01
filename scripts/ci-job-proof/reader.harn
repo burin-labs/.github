@@ -231,24 +231,17 @@ pub fn historical_reuse_batch(
     && len(requests.map({ request -> "${request.id}:${request.attempt}" }).unique())
       == len(requests),
     "historical proof batch is malformed"
-  let json_cache = {}
+  const bounded = bounded_source(source, now, READ_BUDGET * len(requests))
   let archive_cache = {}
   const shared: ProofSource = {
     ...source,
-    json: fn(endpoint) {
-      if json_cache[endpoint] != nil {
-        return json_cache[endpoint]
-      }
-      const value = source.json(endpoint)
-      json_cache = json_cache + {[endpoint]: value}
-      return value
-    },
+    json: bounded.source.json,
     registration: fn(repo, artifact) {
       const key = "${repo}:${artifact.id}:${artifact.digest}"
       if archive_cache[key] != nil {
         return archive_cache[key]
       }
-      const value = source.registration(repo, artifact)
+      const value = bounded.source.registration(repo, artifact)
       archive_cache = archive_cache + {[key]: value}
       return value
     },
