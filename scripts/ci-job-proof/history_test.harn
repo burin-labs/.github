@@ -1,6 +1,6 @@
 import { Registration, Run } from "./contract.harn"
 import { registration_from_archive } from "./live.harn"
-import { ProofSource, historical_reuse } from "./reader.harn"
+import { ProofSource, historical_reuse, historical_reuse_batch } from "./reader.harn"
 
 fn fixture(
   fs: HarnessFs,
@@ -164,6 +164,93 @@ pipeline test_unreported_transport_cannot_supply_historical_reuse(harness: Harne
     is_err(
       try {
         historical_reuse(denied, case.current, case.main, { -> 0 })
+      },
+    ),
+  )
+  harness.fs.delete(case.directory)
+}
+
+pipeline test_selected_history_does_not_resolve_unrelated_originals(harness: Harness) {
+  const case = fixture(harness.fs, "skipped", "success", "a".repeat(64))
+  let originals = 0
+  let censuses = 0
+  const measured: ProofSource = {
+    ...case.source,
+    json: fn(endpoint) {
+      if endpoint.contains("/jobs?") {
+        censuses = censuses + 1
+      }
+      if endpoint.contains("/runs/10/") {
+        originals = originals + 1
+      }
+      return case.source.json(endpoint)
+    },
+  }
+  const unrelated = historical_reuse(measured, case.current, case.main, { -> 0 }, ["Other"])
+  assert_eq(unrelated, {jobs: [], pending: []})
+  assert_eq(originals, 0)
+  assert_eq(censuses, 0)
+  const selected = historical_reuse(measured, case.current, case.main, { -> 0 }, ["Calibration"])
+  assert_eq(len(selected.jobs), 1)
+  assert_eq(selected.jobs[0].job.id, 12)
+  assert(originals > 0)
+  assert(censuses > 0)
+  harness.fs.delete(case.directory)
+}
+
+pipeline test_selected_failure_stays_pending_and_malformed_selection_refuses(harness: Harness) {
+  const case = fixture(harness.fs, "skipped", "failure", "a".repeat(64))
+  const selected = historical_reuse(case.source, case.current, case.main, { -> 0 }, ["Calibration"])
+  assert_eq(selected, {jobs: [], pending: ["calibration"]})
+  for names in [[""], ["Calibration", "Calibration"], ["x".repeat(513)]] {
+    assert(
+      is_err(
+        try {
+          historical_reuse(case.source, case.current, case.main, { -> 0 }, names)
+        },
+      ),
+    )
+  }
+  harness.fs.delete(case.directory)
+}
+
+pipeline test_history_batch_shares_reads_and_preserves_original_qualification(harness: Harness) {
+  const case = fixture(harness.fs, "skipped", "success", "a".repeat(64))
+  let original_reads = 0
+  let archives = 0
+  const measured: ProofSource = {
+    ...case.source,
+    json: fn(endpoint) {
+      if endpoint == "/repos/acme/product/actions/runs/10/attempts/1" {
+        original_reads = original_reads + 1
+      }
+      return case.source.json(endpoint)
+    },
+    registration: fn(repo, artifact) {
+      archives = archives + 1
+      return case.source.registration(repo, artifact)
+    },
+  }
+  const requests = [{id: 20, attempt: 1}, {id: 10, attempt: 1}]
+  const batch = historical_reuse_batch(measured, case.current, requests, { -> 0 }, ["Calibration"])
+  assert_eq(len(batch), 2)
+  assert_eq(batch[0].result?.jobs[0].job.id, 12)
+  assert_eq(batch[0].producer?.id, 20)
+  assert_eq(batch[1].result, {jobs: [], pending: []})
+  assert_eq(original_reads, 1)
+  assert_eq(archives, 2)
+  const denied: ProofSource = {
+    ...measured,
+    json: fn(_endpoint) {
+      throw "unmeasured"
+    },
+  }
+  const failed = historical_reuse_batch(denied, case.current, requests, { -> 0 }, ["Calibration"])
+  assert_eq(failed.map({ reading -> reading.result }), [nil, nil])
+  assert(
+    is_err(
+      try {
+        historical_reuse_batch(measured, case.current, [requests[0], requests[0]], { -> 0 })
       },
     ),
   )

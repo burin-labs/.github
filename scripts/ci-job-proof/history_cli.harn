@@ -1,12 +1,32 @@
 import { Run } from "./contract.harn"
 import { current_run, live_source } from "./live.harn"
-import { historical_reuse } from "./reader.harn"
+import { HistoricalRequest, historical_reuse, historical_reuse_batch } from "./reader.harn"
+
+type JobNames = list<string>
+
+type Requests = list<HistoricalRequest>
 
 fn main(harness: Harness) {
   const source = live_source(harness.net, harness.fs, harness.env.get("GH_TOKEN") ?? "")
   const current = current_run(harness.env, source)
+  if (argv[0] ?? "") == "batch" {
+    const requests = schema_expect(json_parse(argv[1] ?? "null"), schema_of(Requests))
+    const names = len(argv) > 2 ? schema_expect(json_parse(argv[2]), schema_of(JobNames)) : nil
+    const reads = historical_reuse_batch(
+      source,
+      current,
+      requests,
+      { -> harness.clock.now_ms() },
+      names,
+    )
+    harness.stdio.println(
+      json_stringify({schema: "burin.ci_historical_job_proof_batch.v1", reads: reads}),
+    )
+    return
+  }
   const id = to_int(argv[0] ?? "0")
   const attempt = to_int(argv[1] ?? "0")
+  const names = len(argv) > 2 ? schema_expect(json_parse(argv[2]), schema_of(JobNames)) : nil
   if id <= 0 || attempt <= 0 {
     throw "historical run and attempt are required"
   }
@@ -18,7 +38,7 @@ fn main(harness: Harness) {
     ),
     schema_of(Run),
   )
-  const restored = historical_reuse(source, current, producer, { -> harness.clock.now_ms() })
+  const restored = historical_reuse(source, current, producer, { -> harness.clock.now_ms() }, names)
   harness.stdio.println(
     json_stringify(
       {
