@@ -10,7 +10,7 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: JSON runner label, or list of labels, for each look.
+        description: JSON runner label, or list of labels, for the sweep and each look.
         type: string
         default: '"ubuntu-24.04"'
       repair:
@@ -44,7 +44,9 @@ permissions:
 jobs:
   sweep:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '')
-    runs-on: ubuntu-24.04
+    # The caller's runner, so a caller on a cheaper or owned pool keeps its
+    # scheduled sweeps there too.
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     outputs:
       prs: ${{ steps.list.outputs.prs }}
