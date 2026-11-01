@@ -173,9 +173,13 @@ pipeline test_unreported_transport_cannot_supply_historical_reuse(harness: Harne
 pipeline test_selected_history_does_not_resolve_unrelated_originals(harness: Harness) {
   const case = fixture(harness.fs, "skipped", "success", "a".repeat(64))
   let originals = 0
+  let censuses = 0
   const measured: ProofSource = {
     ...case.source,
     json: fn(endpoint) {
+      if endpoint.contains("/jobs?") {
+        censuses = censuses + 1
+      }
       if endpoint.contains("/runs/10/") {
         originals = originals + 1
       }
@@ -185,10 +189,12 @@ pipeline test_selected_history_does_not_resolve_unrelated_originals(harness: Har
   const unrelated = historical_reuse(measured, case.current, case.main, { -> 0 }, ["Other"])
   assert_eq(unrelated, {jobs: [], pending: []})
   assert_eq(originals, 0)
+  assert_eq(censuses, 0)
   const selected = historical_reuse(measured, case.current, case.main, { -> 0 }, ["Calibration"])
   assert_eq(len(selected.jobs), 1)
   assert_eq(selected.jobs[0].job.id, 12)
   assert(originals > 0)
+  assert(censuses > 0)
   harness.fs.delete(case.directory)
 }
 
