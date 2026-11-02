@@ -188,7 +188,11 @@ pub fn validate_candidate_manifest(raw: unknown) -> CandidateManifest {
 }
 
 /** The identity a caller expects a manifest to carry; nil fields are not checked. */
-pub type ManifestIdentity = {repository: string?, source_commit: string?, run_id: string?}
+pub type CandidateManifestExpectation = {
+  repository: string?,
+  source_commit: string?,
+  run_id: string?,
+}
 
 /**
  * Refuse a valid manifest that names a different repository, commit, or run
@@ -196,7 +200,7 @@ pub type ManifestIdentity = {repository: string?, source_commit: string?, run_id
  */
 pub fn expect_manifest_identity(
   manifest: CandidateManifest,
-  expected: ManifestIdentity,
+  expected: CandidateManifestExpectation,
 ) -> CandidateManifest {
   if expected.repository != nil && manifest.repository != expected.repository {
     throw "manifest repository is " + manifest.repository + ", not " + expected.repository

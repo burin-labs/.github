@@ -51,6 +51,21 @@ on:
         description: Id of the calling repository's workflow run that built and tested the files.
         required: true
         type: string
+      expected-attempt:
+        description: Producer attempt bound to the caller's consumer qualification.
+        required: false
+        default: ''
+        type: string
+      expected-manifest-id:
+        description: Candidate manifest artifact id bound to consumer qualification.
+        required: false
+        default: ''
+        type: string
+      expected-manifest-digest:
+        description: SHA-256 digest of the bound manifest artifact.
+        required: false
+        default: ''
+        type: string
       tag:
         description: Release tag as vX.Y.Z or package/vX.Y.Z. A version suffix marks a prerelease; namespaced tags never change repository latest.
         required: true
@@ -182,6 +197,9 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_EXPECTED_ATTEMPT: ${{ inputs.expected-attempt }}
+          PROMOTE_EXPECTED_MANIFEST_ID: ${{ inputs.expected-manifest-id }}
+          PROMOTE_EXPECTED_MANIFEST_DIGEST: ${{ inputs.expected-manifest-digest }}
           PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
           PROMOTE_CONSUMER_REPAIR: ${{ inputs.consumer-repair }}
           PROMOTE_STANDALONE_HARN: ${{ inputs.standalone-harn && 'true' || 'false' }}
@@ -233,6 +251,9 @@ jobs:
           PROMOTE_REPOSITORY: ${{ github.repository }}
           PROMOTE_SHA: ${{ inputs.sha }}
           PROMOTE_RUN_ID: ${{ inputs.run-id }}
+          PROMOTE_EXPECTED_ATTEMPT: ${{ inputs.expected-attempt }}
+          PROMOTE_EXPECTED_MANIFEST_ID: ${{ inputs.expected-manifest-id }}
+          PROMOTE_EXPECTED_MANIFEST_DIGEST: ${{ inputs.expected-manifest-digest }}
           PROMOTE_ORIGINAL_CONSUMER_CONTEXT: ${{ inputs.original-consumer-context }}
           PROMOTE_CONSUMER_REPAIR: ${{ inputs.consumer-repair }}
           PROMOTE_STANDALONE_HARN: ${{ inputs.standalone-harn && 'true' || 'false' }}

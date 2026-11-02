@@ -130,6 +130,7 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
     requests: [],
     attested: [],
     bound_downloads: 0,
+    run_reads: 0,
     creates: 0,
     publishes: 0,
     tags: 0,
@@ -143,6 +144,13 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
     sleep_ms: fn(ms) { state.sleeps = state.sleeps + [ms] },
     json: fn(endpoint) {
       state.requests = state.requests + [endpoint]
+      if endpoint == "/repos/" + REPO + "/actions/runs/" + RUN_ID {
+        state.run_reads = state.run_reads + 1
+        if ((options?.rerun_after_first_read ?? false) && state.run_reads > 1)
+          || (options?.rerun_after_reads != nil && state.run_reads > options.rerun_after_reads) {
+          return run_record({run_attempt: 2, status: "in_progress", conclusion: nil})
+        }
+      }
       if endpoint == "/repos/${REPO}/releases/7" && len(state.drafts) > 0 {
         state.draft_reads = state.draft_reads + 1
         if state.draft_reads <= (options?.draft_visibility_reads ?? 0) {
@@ -286,6 +294,81 @@ fn fixture(fs: HarnessFs, options: dict = {}) -> dict {
   // Closures share the captured state; the fixture record holds a copy, so
   // tests read release state through this getter.
   return {github: github, state: fn() { return state }}
+}
+
+pipeline test_promotion_refuses_a_producer_attempt_changed_during_verification(harness: Harness) {
+  const world = fixture(harness.fs, {rerun_after_first_read: true})
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-attempt-")
+  assert_error_contains(
+    fn() { verify_candidate(world.github, harness.fs, request(), directory) },
+    "producer attempt changed",
+  )
+}
+
+pipeline test_promotion_requires_the_manifest_from_the_settled_attempt(harness: Harness) {
+  const older = fixture(harness.fs, {run: {run_attempt: 2}})
+  const old_directory = harness.fs.mkdtemp_in_workspace("promotion-old-attempt-")
+  assert_error_contains(
+    fn() { verify_candidate(older.github, harness.fs, request(), old_directory) },
+    "earlier than the run's attempt",
+  )
+  const current_manifest = candidate(harness.fs).manifest + {runAttempt: "2"}
+  const current = fixture(harness.fs, {run: {run_attempt: 2}, manifest: current_manifest})
+  const current_directory = harness.fs.mkdtemp_in_workspace("promotion-current-attempt-")
+  const verified = verify_candidate(current.github, harness.fs, request(), current_directory)
+  assert_eq(verified.manifest.runAttempt, "2")
+}
+
+pipeline test_promotion_refuses_a_changed_attempt_before_publication(harness: Harness) {
+  const world = fixture(harness.fs, {rerun_after_reads: 3})
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-publish-attempt-")
+  verify_candidate(world.github, harness.fs, request(), directory)
+  const run = verify_run(world.github, request())
+  assert_error_contains(
+    fn() { publish_candidate(world.github, harness.fs, request(), run, directory) },
+    "producer attempt changed",
+  )
+  assert_eq(world.state().creates, 0)
+  assert_eq(world.state().tags, 0)
+  assert_eq(world.state().publishes, 0)
+}
+
+pipeline test_consumer_qualified_manifest_and_attempt_bind_the_download(harness: Harness) {
+  const binding = {id: 9, digest: "sha256:" + sha256("manifest archive")}
+  const bound = parse_request(
+    {
+      repository: REPO,
+      sha: SHA,
+      run_id: RUN_ID,
+      tag: TAG,
+      expected_attempt: "1",
+      expected_manifest_id: to_string(binding.id),
+      expected_manifest_digest: binding.digest,
+    },
+  )
+  const world = fixture(harness.fs)
+  const directory = harness.fs.mkdtemp_in_workspace("promotion-bound-attempt-")
+  verify_candidate(world.github, harness.fs, bound, directory)
+  assert_eq(world.state().bound_downloads, 1)
+  const moved = fixture(harness.fs, {run: {run_attempt: 2}})
+  assert_error_contains(
+    fn() { verify_candidate(moved.github, harness.fs, bound, directory) },
+    "producer attempt changed since consumer qualification",
+  )
+  assert_error_contains(
+    fn() { verify_run(
+      world.github,
+      bound,
+      fn(_attempt: int) { return {id: 10, digest: binding.digest} },
+    ) },
+    "manifest identity differs from consumer qualification",
+  )
+  assert_error_contains(
+    fn() { parse_request(
+      {repository: REPO, sha: SHA, run_id: RUN_ID, tag: TAG, expected_attempt: "1"},
+    ) },
+    "manifest artifact id must be a positive integer",
+  )
 }
 
 pipeline test_created_draft_retries_visibility_without_repeating_any_write(harness: Harness) {
