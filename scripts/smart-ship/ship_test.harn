@@ -34,6 +34,10 @@ fn checks(nodes: list, total: int = -1) {
 
 const GREEN = {name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}
 
+type ObservedReviewQuery = {query: string}
+
+type ObservedReviewMerge = {variables: {head: string}}
+
 fn red() {
   return checks([{name: "CI status", status: "COMPLETED", conclusion: "FAILURE", databaseId: 7}])
 }
@@ -54,7 +58,9 @@ fn pr(over: dict = {}) -> Repo {
     mergeStateStatus: "CLEAN",
     reviewDecision: nil,
     labels: page([{name: "ship"}]),
-    latestOpinionatedReviews: page([{state: "APPROVED", commit: {oid: "abc"}}]),
+    latestOpinionatedReviews: page([
+      {state: "APPROVED", body: author_receipt("abc"), author: {type: "Bot", login: "reviewer"}},
+    ]),
     comments: page([]),
     reviewThreads: page([]),
   }
@@ -134,6 +140,128 @@ pipeline test_only_an_approved_green_open_labeled_head_merges(harness: Harness) 
   ]
   for over in refusals {
     assert(decide(pr(over), "clear", true).action != "merge", to_string(over))
+  }
+}
+
+fn author_receipt(head: string, repository: string = "o/r", number: int = 9) -> string {
+  const receipt = {
+    schema: "review.author_evidence.v1",
+    repository_digest: sha256_hex(repository),
+    pr: number,
+    head_sha: head,
+    replies: [],
+  }
+  return "<!-- automated-review-author-evidence: ${json_stringify(receipt)} -->"
+}
+
+pipeline test_rebound_automated_approvals_cannot_supply_reviewed_source_identity() {
+  for aggregate in [nil, "APPROVED"] {
+    for body in [
+      author_receipt("previous-source"),
+      author_receipt("abc", "other/repository"),
+      author_receipt("abc", "o/r", 10),
+      "",
+      "<!-- automated-review-author-evidence: { -->",
+    ] {
+      const decision = decide(
+        pr({
+          reviewDecision: aggregate,
+          latestOpinionatedReviews: page([
+            {
+              state: "APPROVED",
+              commit: {oid: "abc"},
+              author: {type: "Bot", login: "reviewer"},
+              body: body,
+            },
+          ]),
+        }),
+        "clear",
+        false,
+      )
+      assert(!decision.facts.approved, "mutable provider commit identity must not bind this body")
+      assert(decision.action != "merge", "the real observation-to-decision path must refuse")
+    }
+  }
+}
+
+pipeline test_legitimate_human_approval_uses_the_protected_policy_decision() {
+  const decision = decide(
+    pr({
+      reviewDecision: "APPROVED",
+      latestOpinionatedReviews: page([
+        {
+          state: "APPROVED",
+          commit: {oid: "earlier-source"},
+          author: {type: "User", login: "human-reviewer"},
+          body: "Looks good.",
+        },
+      ]),
+    }),
+    "clear",
+    false,
+  )
+  assert(decision.facts.approved, "GitHub's actual protected-review policy admits this human review")
+  assert_eq(decision.action, "merge")
+  assert_eq(decision.facts.review_evidence.policy_bound, 1)
+  assert_eq(decision.facts.review_evidence.source_bound, 0)
+}
+
+pipeline test_unknown_review_authority_and_explicit_policy_vetoes_stay_visible() {
+  for author in [nil, {type: "Organization", login: "unknown"}, {type: "User", login: "human"}] {
+    const decision = decide(pr({
+      latestOpinionatedReviews: page([{state: "APPROVED", author: author, body: author_receipt("abc")}]),
+    }), "clear", false)
+    assert_eq(decision.action, "stop")
+    assert_eq(decision.facts.review_evidence.approvals_seen, 1)
+    assert_eq(len(decision.facts.review_evidence.unbound), 1)
+  }
+  for aggregate in ["REVIEW_REQUIRED", "CHANGES_REQUESTED", "UNRECOGNIZED"] {
+    const decision = decide(pr({reviewDecision: aggregate}), "clear", false)
+    assert_eq(decision.action, "stop")
+    assert(decision.facts.review_evidence.vetoed)
+    assert_eq(decision.facts.review_evidence.source_bound, 1)
+  }
+  const empty = decide(pr({latestOpinionatedReviews: page([])}), "clear", false)
+  assert_eq(empty.facts.review_evidence.approvals_seen, 0)
+  assert_eq(empty.action, "stop")
+}
+
+pipeline test_actual_look_fetches_source_evidence_and_refuses_rebound_bot_reviews(harness: Harness) {
+  const api = "https://api.github.com"
+  const work = harness.fs.mkdtemp_in_workspace("review-source-look-")
+  const fixtures = [
+    {author: {type: "Bot", login: "reviewer"}, body: author_receipt("previous-source"), aggregate: "APPROVED", action: "stop"},
+    {author: {type: "Bot", login: "reviewer"}, body: author_receipt("abc"), aggregate: nil, action: "merge"},
+    {author: {type: "User", login: "human"}, body: "Looks good.", aggregate: "APPROVED", action: "merge"},
+  ]
+  for fixture in fixtures {
+    harness.testing.http_mock_clear()
+    const state = pr({
+      reviewDecision: fixture.aggregate,
+      latestOpinionatedReviews: page([{
+        state: "APPROVED", body: fixture.body, author: fixture.author, commit: {oid: "abc"},
+      }]),
+    })
+    harness.testing.http_mock("POST", api + "/graphql", {responses: [
+      {status: 200, body: json_stringify({data: {repository: state}})},
+      {status: 200, body: json_stringify({data: {mergePullRequest: {pullRequest: {state: "MERGED"}}}})},
+    ]})
+    harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/release-merge-lease/main", {status: 200, body: "[]"})
+    const decision = look(harness, {
+      repo: "o/r", number: 9, token: "fixture-token", work: work, publish: false,
+      repair: false, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file:///nonexistent-smart-ship-host/", nonce: "",
+    })
+    assert_eq(decision.action, fixture.action)
+    const calls = harness.testing.http_mock_calls({include_sensitive: true})
+    const query = schema_expect(json_parse(calls[0].body), schema_of(ObservedReviewQuery)).query
+    assert(query.contains("state body author { type: __typename login }"), "the actual read requests actor and authored evidence")
+    const merges = calls.filter({ call -> call.method == "POST" && call.body.contains("mergePullRequest") })
+    assert_eq(len(merges), fixture.action == "merge" ? 1 : 0)
+    if fixture.action == "merge" {
+      const request = schema_expect(json_parse(merges[0].body), schema_of(ObservedReviewMerge))
+      assert_eq(request.variables.head, "abc", "the actual merge is still bound to the observed head")
+    }
   }
 }
 
@@ -305,7 +433,12 @@ pipeline test_a_release_lease_holds_every_other_merge(harness: Harness) {
     fn(repo, base, base_oid, number, sha, method) { return "release-merge-lease v2 repo=${repo} base=${base} base_oid=${base_oid} candidate_pr=${number} candidate_head=${sha} generation=g tag=v1 merge_method=${method}" }
   const base = "1" * 40
   const holder = pr(
-    {headRefOid: head, latestOpinionatedReviews: page([{state: "APPROVED", commit: {oid: head}}])},
+    {
+      headRefOid: head,
+      latestOpinionatedReviews: page([
+        {state: "APPROVED", body: author_receipt(head), author: {type: "Bot", login: "reviewer"}},
+      ]),
+    },
   )
   assert_eq(
     decide(holder, lease("o/r", "main", base, 9, head, "squash"), false).action,

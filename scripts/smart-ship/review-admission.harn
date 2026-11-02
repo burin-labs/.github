@@ -1,0 +1,61 @@
+/** Source evidence belongs to the reviewer; protected-policy authority belongs to GitHub. */
+import {
+  GithubReviewSourceIdentity,
+  read_github_review_author_evidence,
+} from "harn-github-connector/review_evidence"
+
+pub type WriterReview = {state: string, body?: string, author?: {type: string, login: string}?}
+
+type ReviewAdmission = {actor: string, authority: string, refusal: string}
+
+fn admit(
+  review: WriterReview,
+  source: GithubReviewSourceIdentity,
+  aggregate: string?,
+) -> ReviewAdmission {
+  const actor = review.author?.login ?? "unknown reviewer"
+  if review.author?.type == "User" && aggregate == "APPROVED" {
+    return {actor: actor, authority: "protected_policy", refusal: ""}
+  }
+  if review.author?.type != "Bot" {
+    return {actor: actor, authority: "unknown", refusal: "actor or protected policy is unmeasured"}
+  }
+  const receipt = read_github_review_author_evidence(review.body ?? "", source)
+  return is_ok(receipt) ? {actor: actor, authority: "reviewer_source_evidence", refusal: ""} : {
+    actor: actor,
+    authority: "unknown",
+    refusal: unwrap_err(receipt),
+  }
+}
+
+/** No mutable provider review commit field is an input to this decision. */
+pub fn review_admission(
+  reviews: list<WriterReview>,
+  source: GithubReviewSourceIdentity,
+  aggregate: string?,
+) {
+  const approvals = reviews.filter({ review -> review.state == "APPROVED" }).map(
+    { review -> admit(review, source, aggregate) },
+  )
+  const source_bound = approvals.filter(
+    { review -> review.authority == "reviewer_source_evidence" },
+  )
+  const policy_bound = approvals.filter({ review -> review.authority == "protected_policy" })
+  const unbound = approvals.filter({ review -> review.authority == "unknown" }).map(
+    { review -> "${review.actor}: ${review.refusal}" },
+  )
+  const known_aggregate = aggregate == nil
+    || ["APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"].contains(aggregate)
+  const vetoed = !known_aggregate
+    || ["CHANGES_REQUESTED", "REVIEW_REQUIRED"].contains(aggregate ?? "")
+    || reviews.any({ review -> review.state == "CHANGES_REQUESTED" })
+  return {
+    approved: !vetoed && len(source_bound) + len(policy_bound) > 0,
+    aggregate: aggregate ?? "UNREPORTED",
+    vetoed: vetoed,
+    approvals_seen: len(approvals),
+    source_bound: len(source_bound),
+    policy_bound: len(policy_bound),
+    unbound: unbound,
+  }
+}
