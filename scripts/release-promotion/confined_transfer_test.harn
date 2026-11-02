@@ -7,6 +7,7 @@ fn capture_path(stdout: string) -> string {
   return rows[0]!.split("capture_path=")[1]!
 }
 
+// Keep the fresh control capture in the ephemeral runner's OS temp directory.
 pipeline test_production_launcher_allocates_binary_captures_inside_its_existing_scope(
   harness: Harness,
 ) {
@@ -69,6 +70,9 @@ pipeline test_production_launcher_allocates_binary_captures_inside_its_existing_
         PROMOTE_REPOSITORY: "acme/fixture",
         PROMOTE_SHA: "a".repeat(40),
         PROMOTE_RUN_ID: "100",
+        PROMOTE_EXPECTED_ATTEMPT: "2",
+        PROMOTE_EXPECTED_MANIFEST_ID: "9",
+        PROMOTE_EXPECTED_MANIFEST_DIGEST: "sha256:" + "a".repeat(64),
         PROMOTE_TAG: "v1.0.0",
         PROMOTE_DIRECTORY: path_join(work, "candidate"),
         TMPDIR: outside,
@@ -86,7 +90,8 @@ pipeline test_production_launcher_allocates_binary_captures_inside_its_existing_
       require command_run(
         harness.tools,
         ["chmod", "+x", path_join(failure_bin, "mktemp"), path_join(failure_bin, "harn")],
-      ).success, "failure control setup failed"
+      ).success,
+        "failure control setup failed"
       let failed_env = env
       failed_env.PATH = failure_bin + ":" + env.PATH
       failed_env.FIXTURE_CALLED = invoked
@@ -117,7 +122,6 @@ pipeline test_production_launcher_allocates_binary_captures_inside_its_existing_
       require new_path.starts_with(path_join(work, ".harn/promote-release/capture.")),
         "the new capture escaped its existing workspace authority"
       require sha256(harness.fs.read_bytes(new_path)) == expected, "new capture changed ZIP bytes"
-      // Keep the fresh control capture in the ephemeral runner's OS temp directory.
     },
   )
 }

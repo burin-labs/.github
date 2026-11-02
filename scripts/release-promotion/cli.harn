@@ -32,6 +32,9 @@ fn main(harness: Harness) {
       sha: required_env(harness.env, "PROMOTE_SHA"),
       run_id: required_env(harness.env, "PROMOTE_RUN_ID"),
       tag: required_env(harness.env, "PROMOTE_TAG"),
+      expected_attempt: harness.env.get("PROMOTE_EXPECTED_ATTEMPT") ?? "",
+      expected_manifest_id: harness.env.get("PROMOTE_EXPECTED_MANIFEST_ID") ?? "",
+      expected_manifest_digest: harness.env.get("PROMOTE_EXPECTED_MANIFEST_DIGEST") ?? "",
     },
   )
   const directory = required_env(harness.env, "PROMOTE_DIRECTORY")

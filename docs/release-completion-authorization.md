@@ -15,6 +15,14 @@ source. Harn may also provide `original-consumer-context` when its original
 consumer observer reached its deadline and the exact admitted child later
 completed successfully with a reached product pass.
 
+A caller with a consumer-qualified producer supplies `expected-attempt`,
+`expected-manifest-id` and `expected-manifest-digest` together. Promotion
+requires that attempt and downloads the manifest by the supplied artifact ID
+and digest in both verification and publication. An omitted tuple preserves
+the generic workflow's existing interface and does not bind a caller's earlier
+consumer decision to the manifest; callers must adopt the tuple for that proof.
+The producer must remain at the verified attempt through each qualification.
+
 An explicit `standalone-harn` call qualifies Harn publication separately from
 downstream adoption. It runs the immutable Harn source-CI/native reader and
 archive-producer reader, requiring measured complete source proof and every

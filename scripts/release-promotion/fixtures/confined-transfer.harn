@@ -2,6 +2,10 @@ import { command_run } from "std/command"
 import { download_bound_manifest } from "../bound-manifest.harn"
 
 fn main(harness: Harness) {
+  require harness.env.get("PROMOTE_EXPECTED_ATTEMPT") == "2"
+    && harness.env.get("PROMOTE_EXPECTED_MANIFEST_ID") == "9"
+    && harness.env.get("PROMOTE_EXPECTED_MANIFEST_DIGEST") == "sha256:" + "a".repeat(64),
+    "the producer identity did not cross the confined launcher"
   const output = unwrap(harness.env.get("PROMOTE_DIRECTORY"))
   const work = dirname(output)
   const archive = path_join(work, "fixture.zip")

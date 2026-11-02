@@ -40,14 +40,29 @@ pub type PromotionRequest = {
   tag: string,
   namespace: string?,
   prerelease: bool,
+  expected_attempt: int?,
+  expected_manifest: ManifestIdentity?,
 }
 
 /** The run facts promotion relies on after it has checked them. */
 pub type VerifiedRun = {
   url: string,
   attempt: int,
+  head_sha: string,
+  status: string,
+  conclusion: string?,
   manifest_identity?: ManifestIdentity?,
   policy_sha?: string?,
+}
+
+type ProducerSnapshot = {
+  id: int,
+  run_attempt: int,
+  head_sha: string,
+  status: string,
+  conclusion: string?,
+  repository: {full_name: string},
+  head_repository: {full_name: string},
 }
 
 /** Internal authenticated completion reader, never a caller-provided verdict. */
@@ -69,12 +84,29 @@ fn expect_format(value: string, pattern: string, message: string) -> string {
 
 /** Validate the caller's inputs once, at the boundary. */
 pub fn parse_request(
-  input: {repository: string, sha: string, run_id: string, tag: string},
+  input: {
+    repository: string,
+    sha: string,
+    run_id: string,
+    tag: string,
+    expected_attempt?: string,
+    expected_manifest_id?: string,
+    expected_manifest_digest?: string,
+  },
 ) -> PromotionRequest {
   const {repository, sha, run_id, tag} = input
   expect_format(repository, "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "repository must be owner/name")
   expect_format(sha, "^[0-9a-f]{40}$", "sha must be a full 40-character lowercase commit SHA")
   expect_format(run_id, "^[1-9][0-9]*$", "run-id must be a workflow run id")
+  const attempt = input.expected_attempt ?? ""
+  const manifest_id = input.expected_manifest_id ?? ""
+  const digest = input.expected_manifest_digest ?? ""
+  const has_binding = attempt != "" || manifest_id != "" || digest != ""
+  if has_binding {
+    expect_format(attempt, "^[1-9][0-9]*$", "producer attempt must be a positive integer")
+    expect_format(manifest_id, "^[1-9][0-9]*$", "manifest artifact id must be a positive integer")
+    expect_format(digest, "^sha256:[0-9a-f]{64}$", "manifest digest must be a SHA-256 digest")
+  }
   const parts = tag.split("/")
   require len(parts) == 1 || len(parts) == 2, "tag must have at most one package namespace"
   const namespace = if len(parts) == 2 {
@@ -103,6 +135,8 @@ pub fn parse_request(
     tag: tag,
     namespace: namespace,
     prerelease: version.contains("-"),
+    expected_attempt: has_binding ? to_int(attempt) : nil,
+    expected_manifest: has_binding ? {id: to_int(manifest_id), digest: digest} : nil,
   }
 }
 
@@ -176,7 +210,16 @@ pub fn verify_run(
   if type_of(attempt) != "int" || attempt < 1 {
     throw run_label(request) + " reported no run attempt"
   }
-  const identity = authorize_completion == nil ? nil : authorize_completion(attempt)
+  if request.expected_attempt != nil && request.expected_attempt != attempt {
+    throw "producer attempt changed since consumer qualification"
+  }
+  let identity = authorize_completion == nil ? nil : authorize_completion(attempt)
+  if request.expected_manifest != nil {
+    if identity != nil && identity != request.expected_manifest {
+      throw "manifest identity differs from consumer qualification"
+    }
+    identity = request.expected_manifest
+  }
   if historical {
     if identity == nil {
       throw "historical source requires an authenticated repair manifest"
@@ -191,9 +234,26 @@ pub fn verify_run(
   return {
     url: to_string(run?.html_url),
     attempt: attempt,
+    head_sha: to_string(run.head_sha),
+    status: to_string(run.status),
+    conclusion: run.conclusion == nil ? nil : to_string(run.conclusion),
     manifest_identity: identity,
     policy_sha: historical ? run.head_sha : nil,
   }
+}
+
+fn require_same_producer(github: GitHub, request: PromotionRequest, verified: VerifiedRun) {
+  const current = schema_expect(
+    github.json("/repos/" + request.repository + "/actions/runs/" + to_string(request.run_id)),
+    schema_of(ProducerSnapshot),
+  )
+  require current.id == request.run_id && current.run_attempt == verified.attempt
+    && current.head_sha == verified.head_sha
+    && current.status == verified.status
+    && current.conclusion == verified.conclusion
+    && current.repository.full_name == request.repository
+    && current.head_repository.full_name == request.repository,
+    "producer attempt changed during release qualification"
 }
 
 fn download_manifest(
@@ -251,6 +311,10 @@ fn load_manifest(
   }
   if run.manifest_identity != nil && to_int(manifest.runAttempt) != run.attempt {
     throw "consumer repair manifest must name the authenticated producing attempt"
+  }
+  if to_int(manifest.runAttempt) < run.attempt {
+    throw "manifest runAttempt " + manifest.runAttempt + " is earlier than the run's attempt "
+      + to_string(run.attempt)
   }
   return manifest
 }
@@ -345,6 +409,7 @@ pub fn verify_candidate(
   if len(refused) > 0 {
     throw "build attestation did not verify for " + join(refused, "; ")
   }
+  require_same_producer(github, request, run)
   fs.write_text(
     path_join(directory, "publication-intent.json"),
     json_stringify(publication_intent(fs, request, candidate)),
@@ -467,5 +532,6 @@ pub fn publish_candidate(
   directory: string,
 ) -> {tag: string, url: string} {
   const sealed = sealed_publication(github, fs, request, run, directory)
+  require_same_producer(github, request, run)
   return reconcile_publication(github, sealed.plan)
 }

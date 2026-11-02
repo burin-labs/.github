@@ -24,6 +24,9 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
     keys(call.inputs).sorted(),
     [
       "consumer-repair",
+      "expected-attempt",
+      "expected-manifest-digest",
+      "expected-manifest-id",
       "inspect-only",
       "original-consumer-context",
       "run-id",
@@ -36,7 +39,13 @@ pipeline test_promotion_is_callable_only_with_the_minimum_inputs(harness: Harnes
     assert_eq(call.inputs[name].required, true)
     assert_eq(call.inputs[name].type, "string")
   }
-  for name in ["original-consumer-context", "consumer-repair"] {
+  for name in [
+    "original-consumer-context",
+    "consumer-repair",
+    "expected-attempt",
+    "expected-manifest-id",
+    "expected-manifest-digest",
+  ] {
     assert_eq(call.inputs[name].required, false)
     assert_eq(call.inputs[name].type, "string")
     assert_eq(call.inputs[name].default, "")
@@ -168,6 +177,9 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     "PROMOTE_REPOSITORY",
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
+    "PROMOTE_EXPECTED_ATTEMPT",
+    "PROMOTE_EXPECTED_MANIFEST_ID",
+    "PROMOTE_EXPECTED_MANIFEST_DIGEST",
     "PROMOTE_ORIGINAL_CONSUMER_CONTEXT",
     "PROMOTE_CONSUMER_REPAIR",
     "PROMOTE_STANDALONE_HARN",
@@ -183,6 +195,12 @@ pipeline test_promotion_verifies_before_it_can_write_and_never_builds(harness: H
     assert_eq(verify.env[name], publish.env[name])
   }
   assert_eq(verify.env.PROMOTE_REPOSITORY, expression("github.repository"))
+  assert_eq(verify.env.PROMOTE_EXPECTED_ATTEMPT, expression("inputs.expected-attempt"))
+  assert_eq(verify.env.PROMOTE_EXPECTED_MANIFEST_ID, expression("inputs.expected-manifest-id"))
+  assert_eq(
+    verify.env.PROMOTE_EXPECTED_MANIFEST_DIGEST,
+    expression("inputs.expected-manifest-digest"),
+  )
   assert_eq(
     verify.env.PROMOTE_ORIGINAL_CONSUMER_CONTEXT,
     expression("inputs.original-consumer-context"),
@@ -223,6 +241,9 @@ pipeline test_promotion_bootstrap_only_dispatches_harn(harness: Harness) {
     "PROMOTE_REPOSITORY",
     "PROMOTE_SHA",
     "PROMOTE_RUN_ID",
+    "PROMOTE_EXPECTED_ATTEMPT",
+    "PROMOTE_EXPECTED_MANIFEST_ID",
+    "PROMOTE_EXPECTED_MANIFEST_DIGEST",
     "PROMOTE_ORIGINAL_CONSUMER_CONTEXT",
     "PROMOTE_CONSUMER_REPAIR",
     "PROMOTE_CONSUMER_TOKEN",
