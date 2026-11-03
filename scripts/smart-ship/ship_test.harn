@@ -413,6 +413,83 @@ pipeline test_only_the_same_known_producer_supersedes(harness: Harness) {
   }
 }
 
+/** One CI run on head abc, shaped like burin-labs/harn#10987's two runs of its CI workflow. */
+fn ci_run(
+  suite: string,
+  run_id: int,
+  names: list,
+  conclusion: string,
+  over: dict = {},
+  total: int = -1,
+) -> list {
+  const shape = {
+    id: suite,
+    status: "COMPLETED",
+    conclusion: conclusion,
+    commit: {oid: "abc"},
+    checkRuns: {totalCount: total < 0 ? len(names) : total},
+    app: {id: "MDM6QXBwMTUzNjg="},
+    workflowRun: {databaseId: run_id, event: "pull_request", workflow: {id: "W_ci", name: "CI"}},
+  }
+    + over
+  return names.map(
+    { name ->
+      {
+        name: name,
+        status: "COMPLETED",
+        conclusion: conclusion,
+        databaseId: run_id * 1000,
+        checkSuite: shape,
+      }
+    },
+  )
+    .to_list()
+}
+
+/**
+ * A run cancelled before its matrix expanded leaves a check named `matrix.name` that no later
+ * run reuses. Only a newer run of the same workflow, head and event that finished green, with
+ * every check it reports read and terminal, sets that placeholder aside.
+ */
+pipeline test_a_newer_whole_green_run_supersedes_a_cancelled_placeholder() {
+  const jobs = ["build", "lint", "test (linux)", "test (macos)", "CI status"]
+  const cancelled = ci_run("CS_old", 41568316925, jobs + ["matrix.name"], "CANCELLED")
+  const fresh = { over, total ->
+    checks(cancelled + ci_run("CS_new", 41568644189, jobs, "SUCCESS", over, total))
+  }
+  assert_eq(
+    decide(pr(fresh({}, -1)), "clear", false).action,
+    "merge",
+    "the real case: a placeholder from a cancelled run under a whole green rerun",
+  )
+  const run = { id, event, workflow ->
+    {workflowRun: {databaseId: id, event: event, workflow: {id: workflow, name: "CI"}}}
+  }
+  const refusals = [
+    ["the newer run is still finishing", {status: "IN_PROGRESS", conclusion: nil}, -1],
+    ["the newer run reports a check nobody read", {}, len(jobs) + 1],
+    ["the newer run is on another head", {commit: {oid: "def"}}, -1],
+    ["the newer run is another workflow", run(41568644189, "pull_request", "W_other"), -1],
+    ["the newer run answers another event", run(41568644189, "push", "W_ci"), -1],
+    ["the green run is the older one", run(41568316924, "pull_request", "W_ci"), -1],
+    ["the green run's app is unknown", {app: nil}, -1],
+  ]
+  for row in refusals {
+    const seen = decide(pr(fresh(row[1], row[2])), "clear", false)
+    assert_eq(seen.action, "stop", row[0])
+    assert(contains(seen.reason, "need a fresh push: ") && contains(seen.reason, "matrix.name"), row[0])
+  }
+  const green = cancelled + ci_run("CS_new", 41568644189, jobs, "SUCCESS")
+  const failing = green + [{name: "docs", status: "COMPLETED", conclusion: "FAILURE", databaseId: 9}]
+  assert_eq(
+    decide(pr(checks(failing)), "clear", false).reason,
+    "blocked, and repair is off here",
+    "a current failure still blocks",
+  )
+  const pending = green + [{name: "late", status: "IN_PROGRESS", databaseId: 9}]
+  assert_eq(decide(pr(checks(pending)), "clear", false).reason, "waiting on late")
+}
+
 pipeline test_a_page_it_did_not_read_refuses(harness: Harness) {
   const unread = [
     checks([GREEN], 2),
