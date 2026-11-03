@@ -315,13 +315,42 @@ fn compared(status: string, ahead: int, behind: int, files: list) {
   }
 }
 
+fn tree_of(commit: string) -> string {
+  return sha256_hex("tree " + commit)[0:40]
+}
+
+fn blob(name: string) -> string {
+  return sha256_hex("blob " + name)[0:40]
+}
+
+/** One item of a recursive git tree, as `GET /repos/o/r/git/trees/{sha}?recursive=1` lists it. */
+fn entry(path: string, mode: string = "100644", kind: string = "blob", sha: string = "") {
+  return {path: path, mode: mode, type: kind, sha: sha == "" ? blob(path) : sha, size: 120, url: "https://api.github.com/repos/o/r/git/blobs/x"}
+}
+
+/**
+ * The whole tree of `commit`. Main changed README.md between the approved head and the live
+ * head; the PR's own files are the same blobs at both unless `over` replaces them.
+ */
+fn tree_at(commit: string, over: list = [], truncated: bool = false) {
+  const readme = entry("README.md", "100644", "blob", blob(commit == APPROVED ? "README old" : "README new"))
+  const items = [readme, entry("src", "040000", "tree"), entry("src/parse.rs"), entry("tests", "040000", "tree"), entry("tests/parse.rs")]
+  const paths = over.map({ o -> o.path }).to_list()
+  return {
+    sha: tree_of(commit),
+    url: "https://api.github.com/repos/o/r/git/trees/" + tree_of(commit),
+    tree: items.filter({ i -> !paths.contains(i.path) }).to_list() + over.filter({ o -> o.mode != "" }).to_list(),
+    truncated: truncated,
+  }
+}
+
 /** A git data commit, `GET /repos/o/r/git/commits/{sha}`. */
 fn git_commit(sha: string, parents: list) {
   return {
     sha: sha,
     node_id: "C_" + sha[0:8],
     message: len(parents) == 2 ? "Merge branch 'main' into b" : "Tighten parsing",
-    tree: {sha: "f6" * 20},
+    tree: {sha: tree_of(sha), url: "https://api.github.com/repos/o/r/git/trees/" + tree_of(sha)},
     parents: parents.map({ p -> {sha: p, url: "https://api.github.com/repos/o/r/git/commits/" + p} }).to_list(),
     verification: {verified: true, reason: "valid"},
   }
@@ -365,14 +394,19 @@ fn carried_look(harness: Harness, rest: dict, over: dict = {}) {
 }
 
 /** The REST reads of a live head that merged the base once into the approved head. */
-fn one_base_merge(at_live: list? = nil) -> dict {
+fn one_base_merge(at_live: list? = nil, live_tree: list = []) -> dict {
   return {
     ["/repos/o/r/git/commits/${MERGED}"]: git_commit(MERGED, [APPROVED, BASE_TIP]),
+    ["/repos/o/r/git/commits/${APPROVED}"]: git_commit(APPROVED, [FORK_POINT]),
     ["/repos/o/r/compare/${BASE_TIP}...${BASE_TIP}"]: compared("identical", 0, 0, []),
     ["/repos/o/r/compare/${BASE_TIP}...${APPROVED}"]: compared("diverged", 1, 4, pr_files()),
     ["/repos/o/r/compare/${BASE_TIP}...${MERGED}"]: compared("ahead", 2, 0, at_live ?? pr_files()),
+    [TREE_PATH + tree_of(APPROVED) + "?recursive=1"]: tree_at(APPROVED),
+    [TREE_PATH + tree_of(MERGED) + "?recursive=1"]: tree_at(MERGED, live_tree),
   }
 }
+
+const TREE_PATH = "/repos/o/r/git/trees/"
 
 /**
  * Merging main into a PR branch moves its head and once voided the approval, so every PR waited
@@ -389,9 +423,12 @@ pipeline test_an_approval_carries_across_a_clean_merge_of_the_base(harness: Harn
   const line = seen.decision.evidence_line
   assert(line.contains("approved=true"), line)
   assert(
-    line.contains("carried=yes (approved head ${APPROVED} to live head ${MERGED} across base merges ${MERGED}; 2 PR file patches compared identical)"),
+    line.contains("carried=yes (approved head ${APPROVED} to live head ${MERGED} across base merges ${MERGED}; 2 PR paths' mode, type and blob identical)"),
     line,
   )
+  // A binary file has no patch in a compare; its tree entry still decides.
+  const binary = carried_look(harness, one_base_merge([changed("src/parse.rs", "modified", nil), pr_files()[1]]))
+  assert_eq(binary.decision.action, "merge", binary.decision.evidence_line)
   // Main moved twice: the first-parent chain is two base merges, each bringing in base history.
   const twice = one_base_merge() + {
     ["/repos/o/r/git/commits/${MERGED}"]: git_commit(MERGED, [OTHER, BASE_TIP]),
@@ -409,11 +446,45 @@ pipeline test_an_approval_does_not_carry_past_anything_else(harness: Harness) {
   const commit_path = "/repos/o/r/git/commits/${MERGED}"
   const lots = range(0, 300).map({ i -> changed("src/gen/m${i}.rs", "added", "@@ -0,0 +1 @@\n+// ${i}") }).to_list()
   const rows = [
-    ["a merge that rewrites a PR patch", one_base_merge([edited, pr_files()[1]]), "patch for src/parse.rs differs"],
+    [
+      "a merge that rewrites a PR file",
+      one_base_merge([edited, pr_files()[1]], [entry("src/parse.rs", "100644", "blob", blob("resolved"))]),
+      "entry for src/parse.rs differs",
+    ],
     [
       "a merge that also edits a file the PR does not change",
-      one_base_merge(pr_files() + [changed("README.md", "modified", "@@ -1 +1 @@\n-a\n+b")]),
-      "changes 2 files at the approved head and 3 at the live head",
+      one_base_merge(pr_files() + [changed("README.md", "modified", "@@ -1 +1 @@\n-a\n+b")], [entry("README.md", "100644", "blob", blob("README edited"))]),
+      "entry for README.md differs",
+    ],
+    [
+      "a merge that makes a PR file executable, hunks unchanged",
+      one_base_merge(nil, [entry("src/parse.rs", "100755")]),
+      "entry for src/parse.rs differs",
+    ],
+    [
+      "a merge that turns a PR file into a symlink, hunks unchanged",
+      one_base_merge(nil, [entry("src/parse.rs", "120000")]),
+      "entry for src/parse.rs differs",
+    ],
+    [
+      "a merge that turns a PR file into a submodule pointer, hunks unchanged",
+      one_base_merge(nil, [entry("src/parse.rs", "160000", "commit", OTHER)]),
+      "entry for src/parse.rs differs",
+    ],
+    [
+      "a PR file present at the approved head and absent at the live head",
+      one_base_merge(nil, [entry("tests/parse.rs", "")]),
+      "entry for tests/parse.rs differs",
+    ],
+    [
+      "a truncated tree at the live head",
+      one_base_merge() + {[TREE_PATH + tree_of(MERGED) + "?recursive=1"]: tree_at(MERGED, [], true)},
+      "is truncated",
+    ],
+    [
+      "an unreadable tree at the approved head",
+      one_base_merge() + {[TREE_PATH + tree_of(APPROVED) + "?recursive=1"]: nil},
+      "Not Found",
     ],
     [
       "a non-merge commit after the approved head",
@@ -463,11 +534,6 @@ pipeline test_an_approval_does_not_carry_past_anything_else(harness: Harness) {
       "a compare that may be cut off at 300 files",
       one_base_merge(lots),
       "may be cut off at 300 files",
-    ],
-    [
-      "a file whose patch GitHub left out",
-      one_base_merge([changed("src/parse.rs", "modified", nil), pr_files()[1]]),
-      "no readable patch for src/parse.rs",
     ],
     [
       "a compare that lists no files",

@@ -233,7 +233,7 @@ fn superseded(c: Check, checks: list<Check>, head: string) -> bool {
 /**
  * An approval of an earlier head carried to the live head, or why it was not. `from` is the head
  * the approval's author evidence names; `merges` are the base merges between, newest first; `files`
- * is how many of the PR's own file patches were compared and found identical at both heads.
+ * is how many paths the PR touches whose tree entries were compared and found identical.
  */
 pub type Carry = {from: string, to: string, merges: list<string>, files: int, refusal: string}
 
@@ -495,9 +495,13 @@ fn release_lease(
   )[0]
 }
 
-type GitCommit = {sha: string, parents: list<{sha: string}>}
+type GitCommit = {sha: string, tree: {sha: string}, parents: list<{sha: string}>}
 
-type CompareFile = {filename: string, status: string, patch?: string?, previous_filename?: string?}
+type CompareFile = {filename: string, status: string, previous_filename?: string?}
+
+type TreeItem = {path: string, mode: string, type: string, sha: string}
+
+type GitTree = {sha: string, tree: list<TreeItem>, truncated: bool}
 
 type Compare = {status: string, ahead_by: int, behind_by: int, files?: list<CompareFile>?}
 
@@ -518,46 +522,55 @@ fn compare(harness: Harness, opts: GithubClientOptions, slug: string, from: stri
   )
 }
 
-/** The PR's own per-file patches at `head`, against its merge base with `base`, read whole. */
-fn own_patches(
+fn git_commit(harness: Harness, opts: GithubClientOptions, slug: string, sha: string) -> GitCommit {
+  const commit: GitCommit = schema_expect(gh(harness, opts, "/repos/${slug}/git/commits/${sha}"), schema_of(GitCommit))
+  require commit.sha == sha, "reading ${sha} returned ${commit.sha}"
+  return commit
+}
+
+/** Every path the PR touches at `head`, against its merge base with `base`, from a whole file list. */
+fn own_paths(
   harness: Harness,
   opts: GithubClientOptions,
   slug: string,
   base: string,
   head: string,
-) -> list<CompareFile> {
+) -> list<string> {
   const files = compare(harness, opts, slug, base, head).files
   require files != nil, "the diff at ${head} lists no files"
   require len(files) > 0, "the diff at ${head} is empty"
   require len(files) < COMPARE_FILE_CAP, "the diff at ${head} may be cut off at ${COMPARE_FILE_CAP} files"
+  let paths: list<string> = []
   for f in files {
-    require f.patch != nil, "the diff at ${head} has no readable patch for ${f.filename}"
+    paths = paths + [f.filename] + (f.previous_filename == nil ? [] : [f.previous_filename ?? ""])
   }
-  return files.sorted_by({ f -> f.filename })
+  return paths
 }
 
-/** Why the two patch sets differ, or "" when they are byte-identical file by file. */
-fn patch_difference(before: list<CompareFile>, after: list<CompareFile>) -> string {
-  if len(before) != len(after) {
-    return "the PR changes ${len(before)} files at the approved head and ${len(after)} at the live head"
+/**
+ * Each path's git entry, `mode type blob`, in the commit's whole tree. A compare patch carries no
+ * mode, so only the tree tells an executable, a symlink or a submodule pointer from a plain file.
+ */
+fn tree_entries(harness: Harness, opts: GithubClientOptions, slug: string, commit: GitCommit) -> dict {
+  const read: GitTree = schema_expect(
+    gh(harness, opts, "/repos/${slug}/git/trees/${commit.tree.sha}?recursive=1"),
+    schema_of(GitTree),
+  )
+  require read.sha == commit.tree.sha, "reading the tree of ${commit.sha} returned ${read.sha}"
+  require !read.truncated, "the tree of ${commit.sha} is truncated"
+  let entries = {}
+  for item in read.tree {
+    entries = entries + {[item.path]: "${item.mode} ${item.type} ${item.sha}"}
   }
-  for i in 0..len(after) {
-    const a = before[i]
-    const b = after[i]
-    if a.filename != b.filename || a.status != b.status
-      || a.previous_filename != b.previous_filename
-      || a.patch != b.patch {
-      return "the PR's patch for ${b.filename} differs between the approved and live heads"
-    }
-  }
-  return ""
+  return entries
 }
 
 /**
  * Whether a writer bot's approval of an earlier head carries to the live head. It carries only
  * when the live head's first-parent chain reaches the approved head through two-parent merges
- * whose incoming side is the base branch's history, and the PR's own patches are byte-identical
- * at both heads. Any unread, partial or unexpected data refuses; a refusal never stops the look.
+ * whose incoming side is the base branch's history, and every path the PR touches at either head
+ * has the same mode, type and blob at both heads, or is absent at both. Any unread, partial or
+ * unexpected data refuses; a refusal never stops the look.
  */
 pub fn approval_carry(harness: Harness, opts: GithubClientOptions, repo: Repo) -> Carry {
   const pr = repo.pullRequest
@@ -577,13 +590,13 @@ pub fn approval_carry(harness: Harness, opts: GithubClientOptions, repo: Repo) -
   }
   const slug = repo.nameWithOwner
   return try {
+    const tip = git_commit(harness, opts, slug, live)
     let at = live
     let merges = []
     while at != approved {
       require len(merges) < MAX_CARRIED_MERGES,
         "the approved head ${approved} is not within ${MAX_CARRIED_MERGES} base merges of the live head"
-      const commit: GitCommit = schema_expect(gh(harness, opts, "/repos/${slug}/git/commits/${at}"), schema_of(GitCommit))
-      require commit.sha == at, "reading ${at} returned ${commit.sha}"
+      const commit = at == live ? tip : git_commit(harness, opts, slug, at)
       require len(commit.parents) == 2,
         "${at} is not a two-parent merge, and the approved head ${approved} is not reached first"
       const incoming = commit.parents[1]?.sha ?? ""
@@ -593,10 +606,20 @@ pub fn approval_carry(harness: Harness, opts: GithubClientOptions, repo: Repo) -
       merges = merges + [at]
       at = commit.parents[0]?.sha ?? ""
     }
-    const after = own_patches(harness, opts, slug, base, live)
-    const differs = patch_difference(own_patches(harness, opts, slug, base, approved), after)
-    require differs == "", differs
-    {from: approved, to: live, merges: merges, files: len(after), refusal: ""}
+    let paths: list<string> = []
+    for p in own_paths(harness, opts, slug, base, approved) + own_paths(harness, opts, slug, base, live) {
+      if !paths.contains(p) {
+        paths = paths + [p]
+      }
+    }
+    const before = tree_entries(harness, opts, slug, git_commit(harness, opts, slug, approved))
+    const after = tree_entries(harness, opts, slug, tip)
+    for p in paths {
+      const was = before[p] ?? "absent"
+      const now = after[p] ?? "absent"
+      require was == now, "the PR's entry for ${p} differs between the approved and live heads (${was}; ${now})"
+    }
+    {from: approved, to: live, merges: merges, files: len(paths), refusal: ""}
   } catch (e) {
     none(quiet(to_string(e)))
   }
@@ -607,7 +630,7 @@ fn carry_note(evidence: dict) -> string {
   if evidence.carried {
     return "yes (approved head ${c.from} to live head ${c.to} across base merges "
       + join(c.merges, ", ")
-      + "; ${c.files} PR file patches compared identical)"
+      + "; ${c.files} PR paths' mode, type and blob identical)"
   }
   if c == nil {
     return "no (not attempted)"
