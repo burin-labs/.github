@@ -41,7 +41,9 @@ const STORAGE_FULL = "<!-- smart-ship storage-full="
 
 const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
   nodes { ... on CheckRun { name status conclusion databaseId
-      checkSuite { app { id } workflowRun { workflow { id name } } } }
+      checkSuite { id status conclusion commit { oid } app { id }
+        checkRuns(first: 1, filterBy: {checkType: LATEST}) { totalCount }
+        workflowRun { databaseId event workflow { id name } } } }
     ... on StatusContext { name: context state createdAt creator { login } } }"""
 
 const QUERY = """
@@ -73,7 +75,15 @@ pub type Check = {
   databaseId?: int?,
   createdAt?: string?,
   creator?: {login: string}?,
-  checkSuite?: {app?: {id: string}?, workflowRun?: {workflow: {id?: string?, name: string}}?}?,
+  checkSuite?: {
+    id?: string?,
+    status?: string?,
+    conclusion?: string?,
+    commit?: {oid: string}?,
+    app?: {id: string}?,
+    checkRuns?: {totalCount: int}?,
+    workflowRun?: {databaseId?: int?, event?: string?, workflow: {id?: string?, name: string}}?,
+  }?,
 }
 
 type Comment = {
@@ -159,14 +169,65 @@ fn later(a: Check, b: Check) -> bool {
  * A head keeps every attempt of a check, and re-running an old run replays its old workflow, so
  * only the newest attempt from each producer speaks for it.
  */
-fn newest(checks: list<Check>) -> list<Check> {
-  return checks.filter(
+fn newest(checks: list<Check>, head: string) -> list<Check> {
+  const latest = checks.filter(
     { c ->
       const key = producer(c)
       key == nil || !checks.any({ o -> producer(o) == key && later(o, c) })
     },
   )
     .to_list()
+  return latest.filter({ c -> !superseded(c, latest, head) }).to_list()
+}
+
+/** Which workflow, head and event a check run answers, by stable ids; nil when any part is unknown. */
+fn generation(c: Check, head: string) -> string? {
+  const suite = c.checkSuite
+  const run = suite?.workflowRun
+  const app = suite?.app?.id
+  const workflow = run?.workflow?.id
+  const event = run?.event
+  if c.state != nil || suite?.id == nil || run?.databaseId == nil || app == nil || workflow == nil
+    || event == nil
+    || suite.commit?.oid != head {
+    return nil
+  }
+  return "${app}\n${workflow}\n${head}\n${event}"
+}
+
+fn run_id(c: Check) -> int {
+  return c.checkSuite?.workflowRun?.databaseId ?? 0
+}
+
+/** A run that finished green, every check it reports read and terminal. */
+fn whole_green(c: Check, checks: list<Check>) -> bool {
+  const suite = c.checkSuite
+  if suite?.status != "COMPLETED" || suite?.conclusion != "SUCCESS" {
+    return false
+  }
+  const read = checks.filter({ o -> o.checkSuite?.id == suite.id }).to_list()
+  return len(read) == (suite.checkRuns?.totalCount ?? -1) && read.all(
+    { o -> o.status == "COMPLETED" && ["SUCCESS", "NEUTRAL", "SKIPPED"].contains(o.conclusion ?? "") },
+  )
+}
+
+/**
+ * A run cancelled before its matrix expanded leaves a check, such as `matrix.name`, that no later
+ * run reuses the name of. It is set aside only for a newer run of the same workflow, head and
+ * event that finished green whole.
+ */
+fn superseded(c: Check, checks: list<Check>, head: string) -> bool {
+  const key = generation(c, head)
+  if key == nil || c.status != "COMPLETED" || !RERUN.contains(c.conclusion ?? "") {
+    return false
+  }
+  return checks.any(
+    { o ->
+      generation(o, head) == key
+        && run_id(o) > run_id(c)
+        && whole_green(o, checks)
+    },
+  )
 }
 
 /**
@@ -179,6 +240,7 @@ pub fn observe(repo: Repo, own: string = "") {
   const rollup = head?.statusCheckRollup?.contexts ?? {totalCount: 0, nodes: []}
   const checks = newest(
     rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.id != own }),
+    pr.headRefOid,
   )
   const approval = review_admission(
     pr.latestOpinionatedReviews.nodes,
