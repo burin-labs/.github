@@ -265,6 +265,375 @@ pipeline test_actual_look_fetches_source_evidence_and_refuses_rebound_bot_review
   }
 }
 
+// The approved head, the base tip, a base merge on top of the approved head, and other commits.
+const APPROVED = "a1" * 20
+
+const BASE_TIP = "b2" * 20
+
+const MERGED = "c3" * 20
+
+const OTHER = "d4" * 20
+
+const FORK_POINT = "e5" * 20
+
+const LIB_PATCH = "@@ -10,6 +10,9 @@ pub fn parse(input: &str) -> Result<Ast> {\n     let tokens = lex(input)?;\n+    if tokens.is_empty() {\n+        return Err(Error::Empty);\n+    }\n     build(tokens)\n }"
+
+const TEST_PATCH = "@@ -0,0 +1,4 @@\n+#[test]\n+fn empty_input_is_an_error() {\n+    assert!(parse(\"\").is_err());\n+}"
+
+/** One entry of a REST compare `files` list, as GitHub returns it. */
+fn changed(filename: string, status: string, patch: string?) {
+  const file = {
+    sha: sha256_hex(filename + (patch ?? ""))[0:40],
+    filename: filename,
+    status: status,
+    additions: 3,
+    deletions: 0,
+    changes: 3,
+    blob_url: "https://github.com/o/r/blob/x/" + filename,
+    raw_url: "https://github.com/o/r/raw/x/" + filename,
+    contents_url: "https://api.github.com/repos/o/r/contents/" + filename,
+  }
+  return patch == nil ? file : file + {patch: patch}
+}
+
+/** The PR's own files at the approved head. */
+fn pr_files() -> list {
+  return [changed("src/parse.rs", "modified", LIB_PATCH), changed("tests/parse.rs", "added", TEST_PATCH)]
+}
+
+/** A REST compare response, `GET /repos/o/r/compare/{base}...{head}`. */
+fn compared(status: string, ahead: int, behind: int, files: list) {
+  return {
+    url: "https://api.github.com/repos/o/r/compare/x...y",
+    status: status,
+    ahead_by: ahead,
+    behind_by: behind,
+    total_commits: ahead,
+    merge_base_commit: {sha: FORK_POINT},
+    commits: [],
+    files: files,
+  }
+}
+
+fn tree_of(commit: string) -> string {
+  return sha256_hex("tree " + commit)[0:40]
+}
+
+fn blob(name: string) -> string {
+  return sha256_hex("blob " + name)[0:40]
+}
+
+/** One item of a recursive git tree, as `GET /repos/o/r/git/trees/{sha}?recursive=1` lists it. */
+fn entry(path: string, mode: string = "100644", kind: string = "blob", sha: string = "") {
+  return {path: path, mode: mode, type: kind, sha: sha == "" ? blob(path) : sha, size: 120, url: "https://api.github.com/repos/o/r/git/blobs/x"}
+}
+
+/**
+ * The whole tree of `commit`. Main changed README.md between the approved head and the live
+ * head; the PR's own files are the same blobs at both unless `over` replaces them.
+ */
+fn tree_at(commit: string, over: list = [], truncated: bool = false) {
+  const readme = entry("README.md", "100644", "blob", blob(commit == APPROVED ? "README old" : "README new"))
+  const items = [readme, entry("src", "040000", "tree"), entry("src/parse.rs"), entry("tests", "040000", "tree"), entry("tests/parse.rs")]
+  const paths = over.map({ o -> o.path }).to_list()
+  return {
+    sha: tree_of(commit),
+    url: "https://api.github.com/repos/o/r/git/trees/" + tree_of(commit),
+    tree: items.filter({ i -> !paths.contains(i.path) }).to_list() + over.filter({ o -> o.mode != "" }).to_list(),
+    truncated: truncated,
+  }
+}
+
+/** A git data commit, `GET /repos/o/r/git/commits/{sha}`. */
+fn git_commit(sha: string, parents: list) {
+  return {
+    sha: sha,
+    node_id: "C_" + sha[0:8],
+    message: len(parents) == 2 ? "Merge branch 'main' into b" : "Tighten parsing",
+    tree: {sha: tree_of(sha), url: "https://api.github.com/repos/o/r/git/trees/" + tree_of(sha)},
+    parents: parents.map({ p -> {sha: p, url: "https://api.github.com/repos/o/r/git/commits/" + p} }).to_list(),
+    verification: {verified: true, reason: "valid"},
+  }
+}
+
+/**
+ * A whole look at a green, signed live head whose only writer approval names APPROVED. `rest`
+ * maps a REST path to its response body; a path it leaves out answers 404, as GitHub does.
+ */
+fn carried_look(harness: Harness, rest: dict, over: dict = {}) {
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  const live = {
+    headRefOid: MERGED,
+    baseRef: {target: {oid: BASE_TIP}},
+    mergeStateStatus: "CLEAN",
+    latestOpinionatedReviews: page([
+      {state: "APPROVED", body: "Approved.\n" + author_receipt(APPROVED), author: {type: "Bot", login: "burin-control"}},
+    ]),
+  }
+    + checks([GREEN])
+  harness.testing.http_mock("POST", api + "/graphql", {responses: [
+    {status: 200, body: json_stringify({data: {repository: pr(live + over)}})},
+    {status: 200, body: json_stringify({data: {mergePullRequest: {pullRequest: {state: "MERGED"}}}})},
+  ]})
+  for base in ["main", "release"] {
+    harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/release-merge-lease/" + base, {status: 200, body: "[]"})
+  }
+  for {key: path, value: body} in rest.entries() {
+    harness.testing.http_mock("GET", api + path, body == nil ? {status: 404, body: "{\"message\":\"Not Found\"}"} : {status: 200, body: json_stringify(body)})
+  }
+  const decision = look(harness, {
+    repo: "o/r", number: 9, token: "fixture-token", work: harness.fs.mkdtemp_in_workspace("carry-look-"),
+    publish: false, repair: false, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file:///nonexistent-smart-ship-host/", nonce: "",
+  })
+  const calls = harness.testing.http_mock_calls({include_sensitive: true})
+  const merges = calls.filter({ c -> c.method == "POST" && c.body.contains("mergePullRequest") }).to_list()
+  const compares = calls.filter({ c -> c.url.contains("/compare/") }).to_list()
+  return {decision: decision, merges: merges, compares: len(compares)}
+}
+
+/** The REST reads of a live head that merged the base once into the approved head. */
+fn one_base_merge(at_live: list? = nil, live_tree: list = [], at_approved: list? = nil, approved_tree: list = []) -> dict {
+  return {
+    ["/repos/o/r/git/commits/${MERGED}"]: git_commit(MERGED, [APPROVED, BASE_TIP]),
+    ["/repos/o/r/git/commits/${APPROVED}"]: git_commit(APPROVED, [FORK_POINT]),
+    ["/repos/o/r/compare/${BASE_TIP}...${BASE_TIP}"]: compared("identical", 0, 0, []),
+    ["/repos/o/r/compare/${BASE_TIP}...${APPROVED}"]: compared("diverged", 1, 4, at_approved ?? pr_files()),
+    ["/repos/o/r/compare/${BASE_TIP}...${MERGED}"]: compared("ahead", 2, 0, at_live ?? pr_files()),
+    [TREE_PATH + tree_of(APPROVED) + "?recursive=1"]: tree_at(APPROVED, approved_tree),
+    [TREE_PATH + tree_of(MERGED) + "?recursive=1"]: tree_at(MERGED, live_tree),
+  }
+}
+
+const TREE_PATH = "/repos/o/r/git/trees/"
+
+/**
+ * Merging main into a PR branch moves its head and once voided the approval, so every PR waited
+ * for a person to approve again. A writer's approval now carries across merges of the base when
+ * the PR's own patches are unchanged, and the decision log says so.
+ */
+pipeline test_an_approval_carries_across_a_clean_merge_of_the_base(harness: Harness) {
+  const seen = carried_look(harness, one_base_merge())
+  assert_eq(seen.decision.action, "merge", seen.decision.evidence_line)
+  assert_eq(len(seen.merges), 1)
+  const merged = schema_expect(json_parse(seen.merges[0].body), schema_of(ObservedReviewMerge))
+  assert_eq(merged.variables.head, MERGED, "the merge is bound to the live head")
+  assert(seen.decision.facts.review_evidence.carried)
+  const line = seen.decision.evidence_line
+  assert(line.contains("approved=true"), line)
+  assert(
+    line.contains("carried=yes (approved head ${APPROVED} to live head ${MERGED} across base merges ${MERGED}; 2 PR files compared, diff and tree entries identical)"),
+    line,
+  )
+  // Main moved twice: the first-parent chain is two base merges, each bringing in base history.
+  const twice = one_base_merge() + {
+    ["/repos/o/r/git/commits/${MERGED}"]: git_commit(MERGED, [OTHER, BASE_TIP]),
+    ["/repos/o/r/git/commits/${OTHER}"]: git_commit(OTHER, [APPROVED, FORK_POINT]),
+    ["/repos/o/r/compare/${BASE_TIP}...${FORK_POINT}"]: compared("behind", 0, 6, []),
+  }
+  const again = carried_look(harness, twice)
+  assert_eq(again.decision.action, "merge", again.decision.evidence_line)
+  assert(again.decision.evidence_line.contains("across base merges ${MERGED}, ${OTHER};"), again.decision.evidence_line)
+}
+
+/** Anything but a clean merge of the base, or anything unread, keeps the wait for approval. */
+pipeline test_an_approval_does_not_carry_past_anything_else(harness: Harness) {
+  const edited = changed("src/parse.rs", "modified", replace(LIB_PATCH, "Error::Empty", "Error::Blank"))
+  const commit_path = "/repos/o/r/git/commits/${MERGED}"
+  const lots = range(0, 300).map({ i -> changed("src/gen/m${i}.rs", "added", "@@ -0,0 +1 @@\n+// ${i}") }).to_list()
+  const rows = [
+    [
+      "a merge that rewrites a PR file",
+      one_base_merge([edited, pr_files()[1]], [entry("src/parse.rs", "100644", "blob", blob("resolved"))]),
+      "diff for src/parse.rs differs",
+    ],
+    [
+      "a merge that also edits a file the PR does not change",
+      one_base_merge(pr_files() + [changed("README.md", "modified", "@@ -1 +1 @@\n-a\n+b")], [entry("README.md", "100644", "blob", blob("README edited"))]),
+      "diff for README.md differs",
+    ],
+    [
+      // `git merge -s ours main`: the live README is the approved head's blob, so the trees agree,
+      // but the PR's diff now reverts main's README change and the squash would land the revert.
+      "a merge that keeps the PR side of a file main changed",
+      one_base_merge(
+        pr_files() + [changed("README.md", "modified", "@@ -1 +1 @@\n-README new\n+README old")],
+        [entry("README.md", "100644", "blob", blob("README old"))],
+      ),
+      "diff for README.md differs",
+    ],
+    [
+      // Main also edited src/parse.rs; the merge kept the PR's version whole, reverting main's edit.
+      "a merge that keeps the PR's version of a file main also changed",
+      one_base_merge([changed("src/parse.rs", "modified", LIB_PATCH + "\n@@ -40,1 +43,1 @@\n-    main_fix();\n+    old_call();"), pr_files()[1]]),
+      "diff for src/parse.rs differs",
+    ],
+    [
+      // The PR set the binary to B; main then edited it and the merge kept B. Both compares show
+      // `modified` with no patch and both trees hold B, so only refusing a patchless file is sound.
+      "a binary the PR modified and main edited after the fork",
+      one_base_merge(
+        [changed("assets/logo.png", "modified", nil), pr_files()[1]],
+        [entry("assets/logo.png", "100644", "blob", blob("logo B"))],
+        [changed("assets/logo.png", "modified", nil), pr_files()[1]],
+        [entry("assets/logo.png", "100644", "blob", blob("logo B"))],
+      ),
+      "file has no patch to compare: assets/logo.png",
+    ],
+    [
+      // The PR removed a binary that main later edited (fork-point blob differs from the base tip's).
+      "a patchless removal of a file main edited",
+      one_base_merge(
+        [changed("assets/old.bin", "removed", nil), pr_files()[1]],
+        [],
+        [changed("assets/old.bin", "removed", nil), pr_files()[1]],
+      ),
+      "file has no patch to compare: assets/old.bin",
+    ],
+    [
+      "a patchless pure rename of a file main edited under its old name",
+      one_base_merge(
+        [changed("assets/new.bin", "renamed", nil) + {previous_filename: "assets/old.bin"}, pr_files()[1]],
+        [entry("assets/new.bin", "100644", "blob", blob("old bin at fork"))],
+        [changed("assets/new.bin", "renamed", nil) + {previous_filename: "assets/old.bin"}, pr_files()[1]],
+        [entry("assets/new.bin", "100644", "blob", blob("old bin at fork"))],
+      ),
+      "file has no patch to compare: assets/new.bin",
+    ],
+    [
+      "a mode-only change GitHub reports with an empty patch",
+      one_base_merge(
+        [changed("scripts/run.sh", "modified", ""), pr_files()[1]],
+        [entry("scripts/run.sh", "100755")],
+        [changed("scripts/run.sh", "modified", ""), pr_files()[1]],
+        [entry("scripts/run.sh", "100755")],
+      ),
+      "file has no patch to compare: scripts/run.sh",
+    ],
+    [
+      "a path the diff names as modified that neither tree holds",
+      one_base_merge(
+        pr_files() + [changed("docs/parse.md", "modified", "@@ -1 +1 @@\n-a\n+b")],
+        [],
+        pr_files() + [changed("docs/parse.md", "modified", "@@ -1 +1 @@\n-a\n+b")],
+      ),
+      "does not match the diff for docs/parse.md",
+    ],
+    [
+      "a merge that makes a PR file executable, hunks unchanged",
+      one_base_merge(nil, [entry("src/parse.rs", "100755")]),
+      "entry for src/parse.rs differs",
+    ],
+    [
+      "a merge that turns a PR file into a symlink, hunks unchanged",
+      one_base_merge(nil, [entry("src/parse.rs", "120000")]),
+      "entry for src/parse.rs differs",
+    ],
+    [
+      "a merge that turns a PR file into a submodule pointer, hunks unchanged",
+      one_base_merge(nil, [entry("src/parse.rs", "160000", "commit", OTHER)]),
+      "entry for src/parse.rs differs",
+    ],
+    [
+      "a PR file present at the approved head and absent at the live head",
+      one_base_merge(nil, [entry("tests/parse.rs", "")]),
+      "does not match the diff for tests/parse.rs",
+    ],
+    [
+      "a truncated tree at the live head",
+      one_base_merge() + {[TREE_PATH + tree_of(MERGED) + "?recursive=1"]: tree_at(MERGED, [], true)},
+      "is truncated",
+    ],
+    [
+      "an unreadable tree at the approved head",
+      one_base_merge() + {[TREE_PATH + tree_of(APPROVED) + "?recursive=1"]: nil},
+      "Not Found",
+    ],
+    [
+      "a non-merge commit after the approved head",
+      one_base_merge() + {[commit_path]: git_commit(MERGED, [APPROVED])},
+      "is not a two-parent merge",
+    ],
+    [
+      "a non-merge commit beneath a base merge",
+      one_base_merge() + {
+        [commit_path]: git_commit(MERGED, [OTHER, BASE_TIP]),
+        ["/repos/o/r/git/commits/${OTHER}"]: git_commit(OTHER, [APPROVED]),
+      },
+      "${OTHER} is not a two-parent merge",
+    ],
+    [
+      "a merge of a branch other than the base",
+      one_base_merge() + {
+        [commit_path]: git_commit(MERGED, [APPROVED, OTHER]),
+        ["/repos/o/r/compare/${BASE_TIP}...${OTHER}"]: compared("diverged", 3, 1, []),
+      },
+      "brings in ${OTHER}, which is not main history",
+    ],
+    [
+      "a base-merge history whose first parent is the base, not the PR branch",
+      one_base_merge() + {[commit_path]: git_commit(MERGED, [BASE_TIP, APPROVED])},
+      "brings in ${APPROVED}, which is not main history",
+    ],
+    [
+      "an approved head that is not an ancestor",
+      one_base_merge() + {
+        [commit_path]: git_commit(MERGED, [OTHER, BASE_TIP]),
+        ["/repos/o/r/git/commits/${OTHER}"]: git_commit(OTHER, [FORK_POINT]),
+      },
+      "approved head ${APPROVED} is not reached first",
+    ],
+    [
+      "a failed compare of the live head",
+      one_base_merge() + {["/repos/o/r/compare/${BASE_TIP}...${MERGED}"]: nil},
+      "Not Found",
+    ],
+    [
+      "an unreadable merge commit",
+      one_base_merge() + {[commit_path]: nil},
+      "Not Found",
+    ],
+    [
+      "a compare that may be cut off at 300 files",
+      one_base_merge(lots),
+      "may be cut off at 300 files",
+    ],
+    [
+      "a compare that lists no files",
+      one_base_merge() + {["/repos/o/r/compare/${BASE_TIP}...${MERGED}"]: compared("ahead", 2, 0, []) + {files: nil}},
+      "lists no files",
+    ],
+  ]
+  for row in rows {
+    const seen = carried_look(harness, row[1])
+    assert_eq(seen.decision.action, "stop", row[0])
+    assert_eq(seen.decision.reason, "green; waiting for a writer's approval of this head", row[0])
+    assert_eq(len(seen.merges), 0, row[0])
+    assert(!seen.decision.facts.review_evidence.carried, row[0])
+    const line = seen.decision.evidence_line
+    assert(line.contains("approved=false") && line.contains("carried=no (") && line.contains(row[2]), "${row[0]}: ${line}")
+  }
+  const reviewer = {type: "Bot", login: "burin-control"}
+  const reviews = [
+    ["a dismissed approval", [{state: "DISMISSED", body: author_receipt(APPROVED), author: reviewer}]],
+    ["a newer change request by the writer", [{state: "CHANGES_REQUESTED", body: "Not yet.", author: reviewer}]],
+    ["an approval bound to another PR", [{state: "APPROVED", body: author_receipt(APPROVED, "o/r", 10), author: reviewer}]],
+    ["a person's approval with no protected decision", [{state: "APPROVED", body: author_receipt(APPROVED), author: {type: "User", login: "h"}}]],
+  ]
+  for row in reviews {
+    const seen = carried_look(harness, one_base_merge(), {latestOpinionatedReviews: page(row[1])})
+    assert_eq(seen.decision.action, "stop", row[0])
+    assert_eq(len(seen.merges), 0, row[0])
+    assert_eq(seen.compares, 0, "${row[0]}: nothing names an earlier head, so no history is read")
+  }
+  for over in [{isCrossRepository: true}, {baseRefName: "release"}] {
+    const seen = carried_look(harness, one_base_merge(), over)
+    assert_eq(seen.decision.action, "stop", to_string(over))
+    assert_eq(seen.compares, 0, "a fork or a non-default base never reads history to carry")
+  }
+}
+
 pipeline test_signature_failure_names_the_signature_without_requesting_another_review() {
   const head = pr().pullRequest.commits.nodes[0].commit
   for fixture in [

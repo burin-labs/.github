@@ -231,10 +231,46 @@ fn superseded(c: Check, checks: list<Check>, head: string) -> bool {
 }
 
 /**
+ * An approval of an earlier head carried to the live head, or why it was not. `from` is the head
+ * the approval's author evidence names; `merges` are the base merges between, newest first; `files`
+ * is how many PR files had identical diffs and tree entries at both heads.
+ */
+pub type Carry = {from: string, to: string, merges: list<string>, files: int, refusal: string}
+
+type NamedHead = {head_sha: string}
+
+/** The heads, other than the live one, that a writer bot's approval binds to this PR. */
+fn approved_earlier_heads(repo: Repo) -> list<string> {
+  const pr = repo.pullRequest
+  let heads: list<string> = []
+  for review in pr.latestOpinionatedReviews.nodes {
+    if review.state != "APPROVED" || review.author?.type != "Bot" {
+      continue
+    }
+    const lines = split(trim(review.body ?? ""), "\n")
+    const line = lines[len(lines) - 1] ?? ""
+    const named = regex_captures("^<!-- [a-z][a-z0-9_-]*-review-author-evidence: (\\{.*\\}) -->$", line)[0]?.groups?.[0] ?? ""
+    const decoded = json_decode(named, schema_of(NamedHead))
+    const head = is_ok(decoded) ? unwrap(decoded).head_sha : ""
+    // The parsed head is only a hint; the receipt must bind to it under the same admission rules.
+    const binds = head != "" && review_admission(
+      [review],
+      {repository: repo.nameWithOwner, pr: pr.number, head_sha: head},
+      nil,
+    )
+      .source_bound == 1
+    if binds && head != pr.headRefOid && !heads.contains(head) {
+      heads = heads + [head]
+    }
+  }
+  return heads
+}
+
+/**
  * What the head shows. A look never waits on, or repairs, the Smart Ship workflow running it,
  * named by `own`: that workflow's node id, since any workflow may share its display name.
  */
-pub fn observe(repo: Repo, own: string = "") {
+pub fn observe(repo: Repo, own: string = "", carry: Carry? = nil) {
   const pr = repo.pullRequest
   const head = pr.commits.nodes[0]?.commit
   const rollup = head?.statusCheckRollup?.contexts ?? {totalCount: 0, nodes: []}
@@ -242,11 +278,22 @@ pub fn observe(repo: Repo, own: string = "") {
     rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.id != own }),
     pr.headRefOid,
   )
-  const approval = review_admission(
+  const live = review_admission(
     pr.latestOpinionatedReviews.nodes,
     {repository: repo.nameWithOwner, pr: pr.number, head_sha: pr.headRefOid},
     pr.reviewDecision,
   )
+  // An earlier head's approval counts only through a verified carry to exactly this head, and
+  // only under every admission rule for the head it names.
+  const verified = carry != nil && carry.refusal == "" && carry.from != ""
+    && carry.to == pr.headRefOid
+  const earlier = verified ? review_admission(
+    pr.latestOpinionatedReviews.nodes,
+    {repository: repo.nameWithOwner, pr: pr.number, head_sha: carry.from},
+    pr.reviewDecision,
+  ) : live
+  const carried = verified && !live.approved && earlier.approved && earlier.source_bound > 0
+  const approval = (carried ? earlier : live) + {carried: carried, carry: carry}
   const outcome = { c -> c.conclusion ?? c.state ?? "" }
   // Only Smart Ship's own comments count; anyone else's marker is text.
   const own_notes = pr.comments.nodes.filter({ c -> c.viewerDidAuthor == true })
@@ -304,9 +351,12 @@ pub fn lease_admits(lease: string, slug: string, pr: Pull) -> bool {
     && g[5] == "squash"
 }
 
-pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
+// The stop that a carried approval can answer; a look gathers carry evidence only after it.
+const AWAITING_APPROVAL = "green; waiting for a writer's approval of this head"
+
+pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", carry: Carry? = nil) {
   const pr = repo.pullRequest
-  const seen = observe(repo, own)
+  const seen = observe(repo, own, carry)
   const labels = pr.labels.nodes.map({ l -> l.name })
   // Whether Smart Ship shepherds this PR at all; a PR it does not is never written to.
   const admission = [
@@ -350,7 +400,7 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "") {
       return stop("head signature is not verified (${f.signature_state})")
     }
     if !f.approved {
-      return stop("green; waiting for a writer's approval of this head")
+      return stop(AWAITING_APPROVAL)
     }
     if pr.mergeStateStatus == "BEHIND" {
       return {action: "update", reason: "behind its base", facts: f}
@@ -443,6 +493,208 @@ fn release_lease(
     gh(harness, opts, "/repos/${repo}/git/commits/${held[0].object.sha}").message,
     "\n",
   )[0]
+}
+
+type GitCommit = {sha: string, tree: {sha: string}, parents: list<{sha: string}>}
+
+type CompareFile = {filename: string, status: string, patch?: string?, previous_filename?: string?}
+
+type TreeItem = {path: string, mode: string, type: string, sha: string}
+
+type GitTree = {sha: string, tree: list<TreeItem>, truncated: bool}
+
+type Compare = {status: string, ahead_by: int, behind_by: int, files?: list<CompareFile>?}
+
+// A compare lists at most this many files; a list this long may be cut off.
+const COMPARE_FILE_CAP = 300
+
+// Base merges walked back from the live head before the approved head must have been reached.
+const MAX_CARRIED_MERGES = 20
+
+fn full_sha(s: string) -> bool {
+  return regex_match("^[0-9a-f]{40}$", s) != nil
+}
+
+fn compare(harness: Harness, opts: GithubClientOptions, slug: string, from: string, to: string) -> Compare {
+  return schema_expect(
+    gh(harness, opts, "/repos/${slug}/compare/${from}...${to}"),
+    schema_of(Compare),
+  )
+}
+
+fn git_commit(harness: Harness, opts: GithubClientOptions, slug: string, sha: string) -> GitCommit {
+  const commit: GitCommit = schema_expect(gh(harness, opts, "/repos/${slug}/git/commits/${sha}"), schema_of(GitCommit))
+  require commit.sha == sha, "reading ${sha} returned ${commit.sha}"
+  return commit
+}
+
+/** The PR's own diff at `head`, against its merge base with `base`, from a whole file list. */
+fn own_files(
+  harness: Harness,
+  opts: GithubClientOptions,
+  slug: string,
+  base: string,
+  head: string,
+) -> list<CompareFile> {
+  const files = compare(harness, opts, slug, base, head).files
+  require files != nil, "the diff at ${head} lists no files"
+  require len(files) > 0, "the diff at ${head} is empty"
+  require len(files) < COMPARE_FILE_CAP, "the diff at ${head} may be cut off at ${COMPARE_FILE_CAP} files"
+  // A file with no patch (binary, too large, a pure rename or mode change) shows only its new
+  // blob, and an identical new blob cannot tell whether the merge reverted the base's edit to it.
+  for f in files ?? [] {
+    require (f.patch ?? "") != "", "file has no patch to compare: ${f.filename}"
+  }
+  return files ?? []
+}
+
+/**
+ * Why the PR's own diff differs between two heads, or "" when it lists the same files with the
+ * same status, old name and patch text.
+ */
+fn diff_difference(before: list<CompareFile>, after: list<CompareFile>) -> string {
+  const record = { files ->
+    let rows = {}
+    for f in files {
+      rows = rows + {[f.filename]: json_stringify({status: f.status, previous_filename: f.previous_filename, patch: f.patch})}
+    }
+    rows
+  }
+  const was = record(before)
+  const now = record(after)
+  require len(was) == len(before) && len(now) == len(after), "a diff lists one file twice"
+  for f in before + after {
+    if was[f.filename] != now[f.filename] {
+      return "the PR's diff for ${f.filename} differs between the approved and live heads"
+    }
+  }
+  return ""
+}
+
+/**
+ * Every path `files` names at `head`, after checking the tree agrees with the diff: a file is in
+ * the tree unless the diff removed it, and a renamed file's old name is gone. An absent path is
+ * accepted only when the diff says why it is absent.
+ */
+fn tree_agrees(files: list<CompareFile>, entries: dict, head: string) -> list<string> {
+  let paths: list<string> = []
+  for f in files {
+    require (entries[f.filename] == nil) == (f.status == "removed"),
+      "the tree at ${head} does not match the diff for ${f.filename}"
+    paths = paths + [f.filename]
+    if f.previous_filename != nil {
+      const old = f.previous_filename ?? ""
+      require entries[old] == nil, "the tree at ${head} still holds ${old}, which the diff renamed"
+      paths = paths + [old]
+    }
+  }
+  return paths
+}
+
+/**
+ * Each path's git entry, `mode type blob`, in the commit's whole tree. A compare patch carries no
+ * mode, so only the tree tells an executable, a symlink or a submodule pointer from a plain file.
+ */
+fn tree_entries(harness: Harness, opts: GithubClientOptions, slug: string, commit: GitCommit) -> dict {
+  const read: GitTree = schema_expect(
+    gh(harness, opts, "/repos/${slug}/git/trees/${commit.tree.sha}?recursive=1"),
+    schema_of(GitTree),
+  )
+  require read.sha == commit.tree.sha, "reading the tree of ${commit.sha} returned ${read.sha}"
+  require !read.truncated, "the tree of ${commit.sha} is truncated"
+  let entries = {}
+  for item in read.tree {
+    entries = entries + {[item.path]: "${item.mode} ${item.type} ${item.sha}"}
+  }
+  return entries
+}
+
+/**
+ * Whether a writer bot's approval of an earlier head carries to the live head. It carries only
+ * when the live head's first-parent chain reaches the approved head through two-parent merges
+ * whose incoming side is the base branch's history, the PR's own diff lists the same files with
+ * the same status and patch at both heads, and every path it names has the same mode, type and
+ * blob at both heads. Any unread, partial or unexpected data refuses; a refusal never stops the look.
+ */
+pub fn approval_carry(harness: Harness, opts: GithubClientOptions, repo: Repo) -> Carry {
+  const pr = repo.pullRequest
+  const live = pr.headRefOid
+  const none = { why -> {from: "", to: live, merges: [], files: 0, refusal: why} }
+  if pr.isCrossRepository || pr.baseRefName != repo.defaultBranchRef.name {
+    return none("a fork or a non-default base never carries")
+  }
+  const heads = approved_earlier_heads(repo)
+  if len(heads) != 1 {
+    return none(len(heads) == 0 ? "no writer's approval names an earlier head" : "approvals name more than one earlier head")
+  }
+  const approved = heads[0] ?? ""
+  const base = pr.baseRef?.target?.oid ?? ""
+  if !full_sha(approved) || !full_sha(live) || !full_sha(base) {
+    return none("a head or base is not a full commit id")
+  }
+  const slug = repo.nameWithOwner
+  return try {
+    const tip = git_commit(harness, opts, slug, live)
+    let at = live
+    let merges = []
+    while at != approved {
+      require len(merges) < MAX_CARRIED_MERGES,
+        "the approved head ${approved} is not within ${MAX_CARRIED_MERGES} base merges of the live head"
+      const commit = at == live ? tip : git_commit(harness, opts, slug, at)
+      require len(commit.parents) == 2,
+        "${at} is not a two-parent merge, and the approved head ${approved} is not reached first"
+      const incoming = commit.parents[1]?.sha ?? ""
+      const side = compare(harness, opts, slug, base, incoming)
+      require side.ahead_by == 0 && ["behind", "identical"].contains(side.status),
+        "merge ${at} brings in ${incoming}, which is not ${pr.baseRefName} history"
+      merges = merges + [at]
+      at = commit.parents[0]?.sha ?? ""
+    }
+    // Both must hold: the same diff (a merge that keeps the PR's side of a file the base changed
+    // adds it to the diff), and the same tree entries (a patch shows no mode or object type).
+    const was = own_files(harness, opts, slug, base, approved)
+    const now = own_files(harness, opts, slug, base, live)
+    const differs = diff_difference(was, now)
+    require differs == "", differs
+    const before = tree_entries(harness, opts, slug, git_commit(harness, opts, slug, approved))
+    const after = tree_entries(harness, opts, slug, tip)
+    let paths: list<string> = []
+    for p in tree_agrees(was, before, approved) + tree_agrees(now, after, live) {
+      if !paths.contains(p) {
+        paths = paths + [p]
+      }
+    }
+    for p in paths {
+      require before[p] == after[p],
+        "the PR's entry for ${p} differs between the approved and live heads (${before[p] ?? "absent"}; ${after[p] ?? "absent"})"
+    }
+    {from: approved, to: live, merges: merges, files: len(now), refusal: ""}
+  } catch (e) {
+    none(quiet(to_string(e)))
+  }
+}
+
+fn carry_note(evidence: dict) -> string {
+  const c = evidence.carry
+  if evidence.carried {
+    return "yes (approved head ${c.from} to live head ${c.to} across base merges "
+      + join(c.merges, ", ")
+      + "; ${c.files} PR files compared, diff and tree entries identical)"
+  }
+  if c == nil {
+    return "no (not attempted)"
+  }
+  return c.refusal != "" ? "no (${c.refusal})" : "no (the approval of ${c.from} is not admitted here)"
+}
+
+/** The decision's review evidence, as the look logs it. */
+fn evidence_line(pr: Pull, evidence: dict) -> string {
+  return "Review evidence: approved=${evidence.approved} aggregate=${evidence.aggregate} "
+    + "writers_read=${len(pr.latestOpinionatedReviews.nodes)}/${pr.latestOpinionatedReviews.totalCount} "
+    + "source_bound=${evidence.source_bound} protected_policy=${evidence.policy_bound} "
+    + "unbound=${len(evidence.unbound)} vetoed=${evidence.vetoed} "
+    + "refusals=[${evidence.unbound.join("; ")}] "
+    + "carried=${carry_note(evidence)}."
 }
 
 fn read(harness: Harness, opts: GithubClientOptions, repo: string, number: int) -> Repo {
@@ -1361,15 +1613,14 @@ pub fn look(harness: Harness, job: Look) {
     return {action: action, reason: note, error: failure}
   }
   const lease = release_lease(harness, opts, repo, pr.baseRefName)
-  const d = decide(r, lease, job.repair, own_workflow(harness, opts, repo, job.run_id))
-  const evidence = d.facts.review_evidence
-  harness.stdio.println(
-    "Review evidence: approved=${evidence.approved} aggregate=${evidence.aggregate} "
-      + "writers_read=${len(pr.latestOpinionatedReviews.nodes)}/${pr.latestOpinionatedReviews.totalCount} "
-      + "source_bound=${evidence.source_bound} protected_policy=${evidence.policy_bound} "
-      + "unbound=${len(evidence.unbound)} vetoed=${evidence.vetoed} "
-      + "refusals=[${evidence.unbound.join("; ")}].",
-  )
+  const own = own_workflow(harness, opts, repo, job.run_id)
+  let d = decide(r, lease, job.repair, own)
+  // Only a green, signed head that waits on approval reads the history for a carried approval.
+  if d.action == "stop" && d.reason == AWAITING_APPROVAL {
+    d = decide(r, lease, job.repair, own, approval_carry(harness, opts, r))
+  }
+  const logged = evidence_line(pr, d.facts.review_evidence)
+  harness.stdio.println(logged)
   // Looks on one PR never overlap, so an attempt still open now died; it is closed, not repeated.
   for _ in 0..d.facts.close {
     say(
@@ -1437,5 +1688,5 @@ pub fn look(harness: Harness, job: Look) {
     }
   }
   harness.stdio.println("${repo}#${number}: ${d.action}: ${note}")
-  return d
+  return d + {evidence_line: logged}
 }
