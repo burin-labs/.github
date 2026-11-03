@@ -426,10 +426,6 @@ pipeline test_an_approval_carries_across_a_clean_merge_of_the_base(harness: Harn
     line.contains("carried=yes (approved head ${APPROVED} to live head ${MERGED} across base merges ${MERGED}; 2 PR files compared, diff and tree entries identical)"),
     line,
   )
-  // A binary file has no patch in a compare at either head; its tree entry still decides.
-  const unpatched = [changed("src/parse.rs", "modified", nil), pr_files()[1]]
-  const binary = carried_look(harness, one_base_merge(unpatched, [], unpatched))
-  assert_eq(binary.decision.action, "merge", binary.decision.evidence_line)
   // Main moved twice: the first-parent chain is two base merges, each bringing in base history.
   const twice = one_base_merge() + {
     ["/repos/o/r/git/commits/${MERGED}"]: git_commit(MERGED, [OTHER, BASE_TIP]),
@@ -472,6 +468,48 @@ pipeline test_an_approval_does_not_carry_past_anything_else(harness: Harness) {
       "a merge that keeps the PR's version of a file main also changed",
       one_base_merge([changed("src/parse.rs", "modified", LIB_PATCH + "\n@@ -40,1 +43,1 @@\n-    main_fix();\n+    old_call();"), pr_files()[1]]),
       "diff for src/parse.rs differs",
+    ],
+    [
+      // The PR set the binary to B; main then edited it and the merge kept B. Both compares show
+      // `modified` with no patch and both trees hold B, so only refusing a patchless file is sound.
+      "a binary the PR modified and main edited after the fork",
+      one_base_merge(
+        [changed("assets/logo.png", "modified", nil), pr_files()[1]],
+        [entry("assets/logo.png", "100644", "blob", blob("logo B"))],
+        [changed("assets/logo.png", "modified", nil), pr_files()[1]],
+        [entry("assets/logo.png", "100644", "blob", blob("logo B"))],
+      ),
+      "file has no patch to compare: assets/logo.png",
+    ],
+    [
+      // The PR removed a binary that main later edited (fork-point blob differs from the base tip's).
+      "a patchless removal of a file main edited",
+      one_base_merge(
+        [changed("assets/old.bin", "removed", nil), pr_files()[1]],
+        [],
+        [changed("assets/old.bin", "removed", nil), pr_files()[1]],
+      ),
+      "file has no patch to compare: assets/old.bin",
+    ],
+    [
+      "a patchless pure rename of a file main edited under its old name",
+      one_base_merge(
+        [changed("assets/new.bin", "renamed", nil) + {previous_filename: "assets/old.bin"}, pr_files()[1]],
+        [entry("assets/new.bin", "100644", "blob", blob("old bin at fork"))],
+        [changed("assets/new.bin", "renamed", nil) + {previous_filename: "assets/old.bin"}, pr_files()[1]],
+        [entry("assets/new.bin", "100644", "blob", blob("old bin at fork"))],
+      ),
+      "file has no patch to compare: assets/new.bin",
+    ],
+    [
+      "a mode-only change GitHub reports with an empty patch",
+      one_base_merge(
+        [changed("scripts/run.sh", "modified", ""), pr_files()[1]],
+        [entry("scripts/run.sh", "100755")],
+        [changed("scripts/run.sh", "modified", ""), pr_files()[1]],
+        [entry("scripts/run.sh", "100755")],
+      ),
+      "file has no patch to compare: scripts/run.sh",
     ],
     [
       "a path the diff names as modified that neither tree holds",

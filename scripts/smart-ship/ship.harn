@@ -540,13 +540,17 @@ fn own_files(
   require files != nil, "the diff at ${head} lists no files"
   require len(files) > 0, "the diff at ${head} is empty"
   require len(files) < COMPARE_FILE_CAP, "the diff at ${head} may be cut off at ${COMPARE_FILE_CAP} files"
+  // A file with no patch (binary, too large, a pure rename or mode change) shows only its new
+  // blob, and an identical new blob cannot tell whether the merge reverted the base's edit to it.
+  for f in files ?? [] {
+    require (f.patch ?? "") != "", "file has no patch to compare: ${f.filename}"
+  }
   return files ?? []
 }
 
 /**
  * Why the PR's own diff differs between two heads, or "" when it lists the same files with the
- * same status, old name and patch text. A file GitHub gives no patch for, such as a binary,
- * matches only another with no patch; its tree entry then decides.
+ * same status, old name and patch text.
  */
 fn diff_difference(before: list<CompareFile>, after: list<CompareFile>) -> string {
   const record = { files ->
