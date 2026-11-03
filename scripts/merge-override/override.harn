@@ -454,9 +454,15 @@ pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int)
 pub const AUTHORIZE_STEP = "Authorize CI status override"
 
 /**
- * Only main's copy of this dispatcher runs on `pull_request_target`, so a pull request cannot forge its run.
+ * GitHub runs a `pull_request_target` workflow from the default branch's copy
+ * whatever the pull request's base, so neither the pull request nor a retargeted
+ * base can forge this run. Probed 2026-11-03: a pull request based on a branch
+ * carrying its own copy ran main's copy with `GITHUB_REF=refs/heads/main`.
  */
 pub const DISPATCH_WORKFLOW = ".github/workflows/merge-override-dispatch.yml"
+
+/** The file that owns the `CI status` job an override re-runs. */
+pub const MAIN_CI_PATH = ".github/workflows/ci.yml"
 
 fn field_items(pages: list, field: string) -> list {
   let items = []
@@ -479,10 +485,12 @@ fn field_items(pages: list, field: string) -> list {
  */
 pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
   const repo = "repos/" + input.repository
+  // Only CI's own file: a pull request may add any workflow with a job named `CI status`.
   const runs = field_items(
     gh.pages(repo + "/actions/runs?head_sha=" + input.head_sha + "&per_page=100"),
     "workflow_runs",
   )
+    .filter({ run -> run?.path == MAIN_CI_PATH })
     .sort_by({ run -> run.id })
   let newest = nil
   for run in runs {

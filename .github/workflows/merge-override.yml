@@ -63,7 +63,6 @@ permissions:
   pull-requests: write
   # PR labels, comments, and their actor-bearing issue events use the Issues API.
   issues: write
-  checks: write
   actions: write
 
 # GitHub retains the active and newest pending member of a concurrency group.

@@ -688,9 +688,12 @@ The re-run passes only because the repository's `CI status` job calls
 `.github/actions/merge-override-verdict` when a dependency failed. The action
 passes only when a `pull_request_target` run of main's
 `merge-override-dispatch.yml` succeeded at its `Authorize CI status override`
-step for the same pull request and head. A pull request's own copy of the
-dispatcher runs on `pull_request`, so it cannot authorize itself, and the
-action never reads check runs, which any workflow can create under any name.
+step for the same pull request and head. GitHub runs a `pull_request_target`
+workflow from the default branch's copy, never from the pull request's or its
+base branch's copy, so a pull request cannot authorize itself. The action never
+reads check runs, which any workflow can create under any name. The re-run
+targets only the `CI status` job of `.github/workflows/ci.yml`, so a workflow a
+pull request adds with a job of that name cannot redirect it.
 Publishing a second passing `CI status` does not work: GitHub keeps counting
 the failed one, and it refuses any edit to a check run's conclusion outside
 Actions itself.

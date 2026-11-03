@@ -1,25 +1,29 @@
 # Project into .github/workflows/merge-override-dispatch.yml and replace
 # <full-commit-sha> with the burin-labs/.github commit that owns
 # merge-override.yml.
+#
+# pull_request_target runs the default branch's copy of this file, never a pull
+# request's or its base's, so a `CI status` aggregator can trust this
+# workflow's runs as the override's authorization. The reusable workflow reads
+# the pull request through the API and never checks out its code.
 
 name: Merge override dispatch
 
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled]
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
-  checks: write
   actions: write
 
 jobs:
   override:
     name: Dispatch merge override
     if: >-
-      github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request_target' &&
       contains(fromJSON('["bypass-ci", "bypass-merge-queue", "force-merge"]'), github.event.label.name)
     uses: burin-labs/.github/.github/workflows/merge-override.yml@<full-commit-sha>
     with:

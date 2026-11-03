@@ -978,6 +978,8 @@ pipeline test_a_merge_waits_while_the_rerun_ci_status_runs(harness: Harness) {
 
 const HEAD_RUNS = REPO + "/actions/runs?head_sha=" + HEAD + "&per_page=100"
 
+const CI_PATH = ".github/workflows/ci.yml"
+
 fn job(id: int, name: string, status: string, conclusion: string?, steps: list = []) -> dict {
   return {id: id, name: name, status: status, conclusion: conclusion, steps: steps}
 }
@@ -991,9 +993,19 @@ fn jobs_of(run: int) -> string {
  * request blocked, so the override re-runs CI's own failed job, the newest one.
  */
 pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harness) {
+  // Run 40 is a workflow the pull request added with its own `CI status` job; only CI's file counts.
   const failed = fake(
     {
-      [HEAD_RUNS]: [{workflow_runs: [{id: 30}, {id: 10}, {id: 20}]}],
+      [HEAD_RUNS]: [
+        {
+          workflow_runs: [
+            {id: 30, path: ".github/workflows/smart-ship.yml"},
+            {id: 10, path: CI_PATH},
+            {id: 20, path: CI_PATH},
+            {id: 40, path: ".github/workflows/forged.yml"},
+          ],
+        },
+      ],
       [jobs_of(10)]: [{jobs: [job(101, "CI status", "completed", "success")]}],
       [jobs_of(20)]: [
         {
@@ -1004,6 +1016,7 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
         },
       ],
       [jobs_of(30)]: [{jobs: [job(301, "Smart Ship", "completed", "cancelled")]}],
+      [jobs_of(40)]: [{jobs: [job(401, "CI status", "completed", "failure")]}],
     },
   )
   assert_eq(rerun_required_check(failed.gh, INPUT), 202)
@@ -1013,7 +1026,7 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
   )
   const green = fake(
     {
-      [HEAD_RUNS]: [{workflow_runs: [{id: 10}]}],
+      [HEAD_RUNS]: [{workflow_runs: [{id: 10, path: CI_PATH}]}],
       [jobs_of(10)]: [{jobs: [job(101, "CI status", "completed", "success")]}],
     },
   )
@@ -1021,8 +1034,8 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
   assert_eq(green.sent(), [])
   const none = fake(
     {
-      [HEAD_RUNS]: [{workflow_runs: [{id: 30}]}],
-      [jobs_of(30)]: [{jobs: [job(301, "Smart Ship", "completed", "cancelled")]}],
+      [HEAD_RUNS]: [{workflow_runs: [{id: 40, path: ".github/workflows/forged.yml"}]}],
+      [jobs_of(40)]: [{jobs: [job(401, "CI status", "completed", "failure")]}],
     },
   )
   assert_error_contains({ -> rerun_required_check(none.gh, INPUT) }, "nothing to re-run")
