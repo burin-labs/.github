@@ -1,24 +1,31 @@
 # Thin dispatcher for the organization .github repository itself.
 # Product repositories copy this file and pin the reusable workflow SHA.
+#
+# pull_request_target runs main's copy of this file, never a pull request's or
+# its base's (probed 2026-11-03), so
+# a `CI status` aggregator can trust this workflow's runs as the override's
+# authorization. The reusable workflow reads the pull request through the API
+# and never checks out its code.
 
 name: Merge override dispatch
 
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled]
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
-  checks: write
+  # The decision reads the head's check runs; private repositories refuse that without it.
+  checks: read
   actions: write
 
 jobs:
   override:
     name: Dispatch merge override
     if: >-
-      github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request_target' &&
       contains(fromJSON('["bypass-ci", "bypass-merge-queue", "force-merge"]'), github.event.label.name)
     uses: ./.github/workflows/merge-override.yml
     with:

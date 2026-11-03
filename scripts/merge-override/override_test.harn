@@ -1,11 +1,13 @@
 import { assert_error_contains } from "std/testing"
 import {
   append_log,
+  authorized_override,
   cancel_competing,
   draft_record,
   finish_record,
   measure,
   merge_pull,
+  rerun_required_check,
 } from "./override.harn"
 import {
   NO_REASON,
@@ -540,7 +542,7 @@ pipeline test_a_merge_does_not_retry_other_refusals(harness: Harness) {
   assert_eq(world.slept(), [])
 }
 
-pipeline test_a_merge_keeps_retrying_for_three_minutes_before_giving_up(harness: Harness) {
+pipeline test_a_merge_keeps_retrying_for_eight_minutes_before_giving_up(harness: Harness) {
   let failures = []
   for _ in range(40) {
     failures = failures + [BASE_MOVED_ERROR]
@@ -548,8 +550,8 @@ pipeline test_a_merge_keeps_retrying_for_three_minutes_before_giving_up(harness:
   const world = merging(failures)
   assert_error_contains({ -> merge(world) }, "Base branch was modified")
   const total = world.slept().reduce(0, { sum, ms -> sum + ms })
-  assert(total >= 180000)
-  assert(total - world.slept()[len(world.slept()) - 1] < 180000)
+  assert(total >= 480000)
+  assert(total - world.slept()[len(world.slept()) - 1] < 480000)
   assert_eq(world.windows()[len(world.windows()) - 1], [0, 30000])
   assert_eq(world.attempts(), len(world.slept()) + 1)
 }
@@ -963,4 +965,182 @@ pipeline test_a_reviewer_that_did_not_finish_on_the_head_allows_the_override(har
   // An unreadable review list is unmeasured, never an incident.
   const outage = world(calm({[PR_REVIEWS]: OUTAGE}))
   assert_eq(decided(outage).record.incident.reviewer_down.state, "unmeasured")
+}
+
+const STATUS_PENDING_ERROR =
+  "PUT repos/burin-labs/example/pulls/42/merge failed: gh: Required status check \"CI status\" is expected. (HTTP 405)"
+
+pipeline test_a_merge_waits_while_the_rerun_ci_status_runs(harness: Harness) {
+  const world = merging([STATUS_PENDING_ERROR, STATUS_PENDING_ERROR])
+  assert_eq(merge(world), "abc123")
+  assert_eq(world.attempts(), 3)
+}
+
+const HEAD_RUNS = REPO + "/actions/runs?head_sha=" + HEAD + "&per_page=100"
+
+const CI_PATH = ".github/workflows/ci.yml"
+
+/** A run of CI for this pull request unless `overrides` says otherwise. */
+fn ci_run(id: int, overrides: dict = {}) -> dict {
+  return {id: id, path: CI_PATH, event: "pull_request", pull_requests: [{number: INPUT.pr}]}
+    + overrides
+}
+
+fn job(id: int, name: string, status: string, conclusion: string?, steps: list = []) -> dict {
+  return {id: id, name: name, status: status, conclusion: conclusion, steps: steps}
+}
+
+fn jobs_of(run: int) -> string {
+  return REPO + "/actions/runs/" + to_string(run) + "/jobs?per_page=100"
+}
+
+/**
+ * burin-code#13148 on 2026-11-03: a published second `CI status` left the pull
+ * request blocked, so the override re-runs CI's own failed job, the newest one.
+ */
+pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harness) {
+  // Runs 40-60 each carry a newer failed `CI status` that is not this pull
+  // request's CI: a workflow the pull request added, a dispatched CI run, and
+  // CI run for another pull request on the same commit.
+  const failed = fake(
+    {
+      [HEAD_RUNS]: [
+        {
+          workflow_runs: [
+            ci_run(30, {path: ".github/workflows/smart-ship.yml"}),
+            ci_run(10),
+            ci_run(20),
+            ci_run(40, {path: ".github/workflows/forged.yml"}),
+            ci_run(50, {event: "workflow_dispatch", pull_requests: []}),
+            ci_run(60, {pull_requests: [{number: 41}]}),
+          ],
+        },
+      ],
+      [jobs_of(10)]: [{jobs: [job(101, "CI status", "completed", "success")]}],
+      [jobs_of(20)]: [
+        {
+          jobs: [
+            job(201, "lint", "completed", "failure"),
+            job(202, "CI status", "completed", "failure"),
+          ],
+        },
+      ],
+      [jobs_of(30)]: [{jobs: [job(301, "Smart Ship", "completed", "cancelled")]}],
+      [jobs_of(40)]: [{jobs: [job(401, "CI status", "completed", "failure")]}],
+      [jobs_of(50)]: [{jobs: [job(501, "CI status", "completed", "failure")]}],
+      [jobs_of(60)]: [{jobs: [job(601, "CI status", "completed", "failure")]}],
+    },
+  )
+  assert_eq(rerun_required_check(failed.gh, INPUT), 202)
+  assert_eq(
+    failed.sent().map({ call -> call.method + " " + call.path }),
+    ["POST " + REPO + "/actions/jobs/202/rerun"],
+  )
+  const green = fake(
+    {
+      [HEAD_RUNS]: [{workflow_runs: [ci_run(10)]}],
+      [jobs_of(10)]: [{jobs: [job(101, "CI status", "completed", "success")]}],
+    },
+  )
+  assert_eq(rerun_required_check(green.gh, INPUT), 0)
+  assert_eq(green.sent(), [])
+  const none = fake(
+    {
+      [HEAD_RUNS]: [{workflow_runs: [ci_run(40, {path: ".github/workflows/forged.yml"})]}],
+      [jobs_of(40)]: [{jobs: [job(401, "CI status", "completed", "failure")]}],
+    },
+  )
+  assert_error_contains({ -> rerun_required_check(none.gh, INPUT) }, "nothing to re-run")
+  assert_eq(none.sent(), [])
+}
+
+const DISPATCH_RUNS = REPO
+  + "/actions/workflows/merge-override-dispatch.yml/runs?event=pull_request_target&head_sha="
+  + HEAD
+  + "&per_page=100"
+
+fn override_run(id: int, overrides: dict = {}) -> dict {
+  return {
+    id: id,
+    html_url: "https://github.com/burin-labs/example/actions/runs/" + to_string(id),
+    path: ".github/workflows/merge-override-dispatch.yml",
+    event: "pull_request_target",
+    repository: {full_name: "burin-labs/example"},
+    head_repository: {full_name: "burin-labs/example"},
+    head_sha: HEAD,
+    pull_requests: [{number: 42}],
+  }
+    + overrides
+}
+
+fn override_jobs(run: int, authorize: string) -> dict {
+  return {
+    [REPO + "/actions/runs/" + to_string(run) + "/jobs?filter=all&per_page=100"]: [
+      {
+        jobs: [
+          job(
+            run * 10,
+            "Dispatch merge override / Apply merge override",
+            "completed",
+            "success",
+            [
+              {name: "Decide override", conclusion: "success"},
+              {name: "Authorize CI status override", conclusion: authorize},
+            ],
+          ),
+        ],
+      },
+    ],
+  }
+}
+
+fn verdict(runs: list, jobs: dict) -> string? {
+  return authorized_override(
+    fake({[DISPATCH_RUNS]: [{workflow_runs: runs}]} + jobs).gh,
+    "burin-labs/example",
+    42,
+    HEAD,
+  )
+}
+
+pipeline test_ci_status_trusts_only_an_authorized_override_run_of_mains_dispatcher(
+  harness: Harness,
+) {
+  assert_eq(
+    verdict([override_run(5)], override_jobs(5, "success")),
+    "https://github.com/burin-labs/example/actions/runs/5",
+  )
+  // A refused override skips the authorize step.
+  assert_eq(verdict([override_run(5)], override_jobs(5, "skipped")), nil)
+  // A pull request's own copy of the dispatcher runs on pull_request, not pull_request_target.
+  assert_eq(verdict([override_run(5, {event: "pull_request"})], override_jobs(5, "success")), nil)
+  // Another workflow that names its step the same way is not the dispatcher.
+  assert_eq(
+    verdict([override_run(5, {path: ".github/workflows/forged.yml"})], override_jobs(5, "success")),
+    nil,
+  )
+  // An override of another head or another pull request authorizes nothing here.
+  assert_eq(
+    verdict(
+      [override_run(5, {head_sha: "2222222222222222222222222222222222222222"})],
+      override_jobs(5, "success"),
+    ),
+    nil,
+  )
+  assert_eq(
+    verdict([override_run(5, {pull_requests: [{number: 41}]})], override_jobs(5, "success")),
+    nil,
+  )
+  // A run from another repository, or for a fork's head, authorizes nothing here.
+  for side in ["repository", "head_repository"] {
+    assert_eq(
+      verdict(
+        [override_run(5, {[side]: {full_name: "someone/example"}})],
+        override_jobs(5, "success"),
+      ),
+      nil,
+      side,
+    )
+  }
+  assert_eq(verdict([], {}), nil)
 }

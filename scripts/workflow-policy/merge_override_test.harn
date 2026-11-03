@@ -30,7 +30,8 @@ fn condition(steps: list, name: string) -> string {
 
 const SIDE_EFFECTS = [
   "Cancel competing workflow runs",
-  "Publish successful CI status check",
+  "Authorize CI status override",
+  "Re-run CI status",
   "Mint release-app token for privileged merge",
   "Squash-merge pull request",
 ]
@@ -44,7 +45,7 @@ pipeline test_the_decision_precedes_and_gates_every_side_effect(harness: Harness
   // A refused or crashed decision fails its step, so nothing chained from it runs.
   for side_effect in [
     "Cancel competing workflow runs",
-    "Publish successful CI status check",
+    "Authorize CI status override",
     "Mint release-app token for privileged merge",
   ] {
     assert(
@@ -53,8 +54,11 @@ pipeline test_the_decision_precedes_and_gates_every_side_effect(harness: Harness
     )
   }
   assert_eq(condition(steps, "Squash-merge pull request"), "steps.app-token.outcome == 'success'")
+  // Only an authorized override re-runs CI's own CI status job.
+  assert_eq(condition(steps, "Re-run CI status"), "steps.authorize.outcome == 'success'")
+  assert_eq(step(steps, "Re-run CI status").id, "publish")
   // A failed cancellation must not race a published status or a merge.
-  for later in ["Publish successful CI status check", "Mint release-app token for privileged merge"] {
+  for later in ["Authorize CI status override", "Mint release-app token for privileged merge"] {
     assert(condition(steps, later).contains("steps.cancel.outcome != 'failure'"), later)
   }
 }
@@ -81,6 +85,45 @@ pipeline test_every_attempt_is_recorded_after_its_side_effects(harness: Harness)
     )
   }
   assert(record.env.OVERRIDE_LOG_TOKEN.contains("steps.log-token.outputs.token"))
+}
+
+/**
+ * A `CI status` aggregator trusts the authorize step only from a
+ * pull_request_target run of main's dispatcher; renaming either side, or moving
+ * the dispatcher to an event a pull request's own copy can fire, would make
+ * every override silently unauthorized or forgeable.
+ */
+pipeline test_the_ci_status_trust_anchor_matches_the_workflows(harness: Harness) {
+  const steps = apply_steps(harness.fs)
+  const authorize = step(steps, "Authorize CI status override")
+  assert_eq(authorize.id, "authorize")
+  const source = read(harness.fs, "scripts/merge-override/override.harn")
+  assert(source.contains("pub const AUTHORIZE_STEP = \"" + authorize.name + "\""))
+  assert(
+    source.contains(
+      "pub const DISPATCH_WORKFLOW = \".github/workflows/merge-override-dispatch.yml\"",
+    ),
+  )
+  const dispatch = yaml_parse(read(harness.fs, ".github/workflows/merge-override-dispatch.yml"))
+  assert_eq(keys(dispatch.on), ["pull_request_target"])
+  const action = read(harness.fs, ".github/actions/merge-override-verdict/action.yml")
+  assert(action.contains("scripts/merge-override/run.sh\" verdict"))
+}
+
+/**
+ * The decision reads the head's check runs with the run's token, which a
+ * private repository refuses without `checks: read`; nothing here writes one.
+ * The fakes and this public repository cannot see that refusal, so pin it.
+ */
+pipeline test_every_override_workflow_reads_check_runs_and_writes_none(harness: Harness) {
+  for path in [
+    ".github/workflows/merge-override.yml",
+    ".github/workflows/merge-override-dispatch.yml",
+    "templates/merge-override-dispatch.yml",
+  ] {
+    const permissions = yaml_parse(read(harness.fs, path)).permissions
+    assert_eq(permissions.checks, "read", path)
+  }
 }
 
 pipeline test_the_bootstrap_only_dispatches_harn_with_every_variable_granted(harness: Harness) {

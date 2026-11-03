@@ -195,7 +195,7 @@ pipeline test_override_waits_for_competing_runs_before_publishing(harness: Harne
   const steps = workflow(harness, "merge-override").jobs.apply.steps
   const names = steps.map({ item -> item?.name ?? "" })
   const cancel = "Cancel competing workflow runs"
-  const publish = "Publish successful CI status check"
+  const publish = "Authorize CI status override"
   assert(names.contains(cancel) && names.contains(publish))
   assert(names.index_of(cancel) < names.index_of(publish))
   // cancel_competing in scripts/merge-override waits for every cancelled run to complete.
