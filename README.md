@@ -676,13 +676,24 @@ wrong tool for a rare, time-sensitive land. Labels are the trigger; organization
 or repository admin is the authority. The workflow acts with the
 `harn-release-bot` installation token (a ruleset bypass actor).
 
-- `bypass-ci`: cancel competing runs for the head SHA and publish a successful
-  `CI status` check after those runs stop. Does not merge. If GitHub cannot
-  stop a run within two minutes, the override fails instead of racing that
-  run's final status.
+- `bypass-ci`: cancel competing runs for the head SHA, then re-run CI's own
+  `CI status` job once they stop. Does not merge. If GitHub cannot stop a run
+  within two minutes, the override fails instead of racing that run's final
+  status.
 - `bypass-merge-queue`: squash-merge the green head now, without the merge queue.
-- `force-merge`: cancel competing runs, publish a successful `CI status`, and
-  squash-merge now.
+- `force-merge`: cancel competing runs, re-run `CI status`, and squash-merge
+  once it passes.
+
+The re-run passes only because the repository's `CI status` job calls
+`.github/actions/merge-override-verdict` when a dependency failed. The action
+passes only when a `pull_request_target` run of main's
+`merge-override-dispatch.yml` succeeded at its `Authorize CI status override`
+step for the same pull request and head. A pull request's own copy of the
+dispatcher runs on `pull_request`, so it cannot authorize itself, and the
+action never reads check runs, which any workflow can create under any name.
+Publishing a second passing `CI status` does not work: GitHub keeps counting
+the failed one, and it refuses any edit to a check run's conclusion outside
+Actions itself.
 
 ### What refuses an override
 

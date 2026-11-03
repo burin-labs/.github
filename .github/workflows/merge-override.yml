@@ -115,11 +115,22 @@ jobs:
           OVERRIDE_RUN_ID: ${{ github.run_id }}
         run: bash scripts/merge-override/run.sh cancel
 
-      - name: Publish successful CI status check
-        id: publish
+      # The trust anchor for each repository's `CI status` aggregator: it passes
+      # failed dependencies only when this step succeeded in a pull_request_target
+      # run of main's merge-override-dispatch.yml for the same pull request and
+      # head (scripts/merge-override `authorized_override`). Keep the name.
+      - name: Authorize CI status override
+        id: authorize
         if: >-
           steps.decide.outcome == 'success' && steps.decide.outputs.publish_ci_status == 'true' &&
           steps.cancel.outcome != 'failure'
+        run: echo "An admin override authorizes CI status on ${OVERRIDE_HEAD_SHA}."
+
+      # Re-run CI's own `CI status` job rather than add a second check beside the
+      # failed one, which the branch rule would still count as failing.
+      - name: Re-run CI status
+        id: publish
+        if: steps.authorize.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           OVERRIDE_RECORD: ${{ steps.decide.outputs.record }}

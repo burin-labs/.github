@@ -347,7 +347,7 @@ pub fn finish_record(draft: dict, steps: dict, effects: dict, now: string) -> di
     actions = actions + ["cancelled " + effects.cancelled + " competing workflow run(s)"]
   }
   if steps?.publish == "success" {
-    actions = actions + ["published a successful `" + REQUIRED_CHECK + "` check"]
+    actions = actions + ["re-ran `" + REQUIRED_CHECK + "` under the override"]
   }
   if (effects?.merge_commit ?? "") != "" {
     actions = actions + ["squash-merged without the merge queue"]
@@ -450,33 +450,114 @@ pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int)
   return selection.pending_count
 }
 
-pub fn publish_status(gh: GitHub, input: Input, record: dict) {
-  gh.send(
-    "POST",
-    "repos/" + input.repository + "/check-runs",
-    {
-      name: REQUIRED_CHECK,
-      head_sha: input.head_sha,
-      status: "completed",
-      conclusion: "success",
-      output: {
-        title: "Merge override",
-        summary: "Published by merge override `" + record.label + "` requested by "
-          + join(record.actors.map({ login -> "@" + login }), ", ")
-          + ". Reason: "
-          + record.reason,
-      },
-    },
+/** The step whose success marks a run as an admin's authorized override of the head's CI status. */
+pub const AUTHORIZE_STEP = "Authorize CI status override"
+
+/**
+ * Only main's copy of this dispatcher runs on `pull_request_target`, so a pull request cannot forge its run.
+ */
+pub const DISPATCH_WORKFLOW = ".github/workflows/merge-override-dispatch.yml"
+
+fn field_items(pages: list, field: string) -> list {
+  let items = []
+  for page in pages {
+    const values = page?.[field]
+    if type_of(values) != "list" {
+      throw "paginated page carried no " + field + " array"
+    }
+    items = items + values
+  }
+  return items
+}
+
+/**
+ * Re-run CI's own `CI status` job on the head. A second passing check beside a
+ * failed one never satisfies the branch rule, so the override replaces the
+ * failed run instead; the re-run passes because `authorized_override` finds this
+ * run's authorize step. Returns the re-run job's id, or 0 when the newest
+ * `CI status` already passed.
+ */
+pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
+  const repo = "repos/" + input.repository
+  const runs = field_items(
+    gh.pages(repo + "/actions/runs?head_sha=" + input.head_sha + "&per_page=100"),
+    "workflow_runs",
   )
+    .sort_by({ run -> run.id })
+  let newest = nil
+  for run in runs {
+    const jobs = field_items(
+      gh.pages(repo + "/actions/runs/" + to_string(run.id) + "/jobs?per_page=100"),
+      "jobs",
+    )
+    for job in jobs.filter({ job -> job?.name == REQUIRED_CHECK }) {
+      newest = job
+    }
+  }
+  if newest == nil {
+    throw "no `" + REQUIRED_CHECK + "` job ran on " + input.head_sha
+      + ", so there is nothing to re-run"
+  }
+  if newest.status != "completed" {
+    throw "`" + REQUIRED_CHECK + "` job " + to_string(newest.id) + " is still " + newest.status
+  }
+  if newest.conclusion == "success" {
+    return 0
+  }
+  gh.send("POST", repo + "/actions/jobs/" + to_string(newest.id) + "/rerun", {})
+  return newest.id
+}
+
+/**
+ * The URL of a run that authorized an override of `head_sha` on pull request
+ * `pr`, or nil. Trusted only from a `pull_request_target` run of main's
+ * dispatcher whose authorize step succeeded; check runs are never read, since
+ * any workflow with `checks: write` can create one under any name.
+ */
+pub fn authorized_override(gh: GitHub, repository: string, pr: int, head_sha: string) -> string? {
+  const repo = "repos/" + repository
+  const runs = field_items(
+    gh.pages(
+      repo
+        + "/actions/workflows/merge-override-dispatch.yml/runs?event=pull_request_target&head_sha="
+        + head_sha
+        + "&per_page=100",
+    ),
+    "workflow_runs",
+  )
+  for run in runs {
+    const bound = run?.path == DISPATCH_WORKFLOW && run?.event == "pull_request_target"
+      && run?.head_sha == head_sha
+      && (run?.pull_requests ?? []).any({ pull -> pull?.number == pr })
+    if !bound {
+      continue
+    }
+    const jobs = field_items(
+      gh.pages(repo + "/actions/runs/" + to_string(run.id) + "/jobs?filter=all&per_page=100"),
+      "jobs",
+    )
+    for job in jobs {
+      if (job?.steps ?? []).any(
+        { step -> step?.name == AUTHORIZE_STEP && step?.conclusion == "success" },
+      ) {
+        return to_string(run.html_url)
+      }
+    }
+  }
+  return nil
 }
 
 /**
  * Squash-merge the exact labeled head (`sha`), so a retry can never land another commit.
- * Concurrent overrides each get 405 "Base branch was modified" as siblings land; full jitter spreads them out.
+ * Concurrent overrides each get 405 "Base branch was modified" as siblings land, and
+ * 405 "Required status check ... is expected" while the re-run `CI status` runs;
+ * full jitter spreads the retries out. Any other refusal is final.
  */
 const BASE_MOVED = "Base branch was modified"
 
-const RETRY_BUDGET_MS = 180000
+const STATUS_PENDING = "Required status check"
+
+const RETRY_BUDGET_MS = 480000
 
 const RETRY_FIRST_MS = 2000
 
@@ -536,7 +617,9 @@ pub fn merge_pull(
       }
       sha = to_string(merged)
     } catch (error) {
-      if !contains(to_string(error), BASE_MOVED) || waited >= RETRY_BUDGET_MS {
+      const transient = contains(to_string(error), BASE_MOVED)
+        || contains(to_string(error), STATUS_PENDING)
+      if !transient || waited >= RETRY_BUDGET_MS {
         throw error
       }
       // The one-second floor bounds the attempt count however the draws fall.

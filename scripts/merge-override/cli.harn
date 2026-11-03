@@ -9,6 +9,7 @@ import { live_github } from "./github.harn"
 import {
   Input,
   append_log,
+  authorized_override,
   cancel_competing,
   comment_on_pull,
   draft_record,
@@ -16,8 +17,8 @@ import {
   finish_record,
   measure,
   merge_pull,
-  publish_status,
   remove_consumed_labels,
+  rerun_required_check,
 } from "./override.harn"
 import { record_markdown } from "./policy.harn"
 
@@ -109,7 +110,33 @@ fn cancel_step(harness: Harness) {
 }
 
 fn publish_step(harness: Harness) {
-  publish_status(github(harness, "GH_TOKEN"), input(harness), draft(harness.env))
+  const job = rerun_required_check(github(harness, "GH_TOKEN"), input(harness))
+  harness.stdio.println(
+    job == 0 ? "The newest CI status already passed; nothing to re-run" : "Re-ran CI status job "
+      + to_string(job),
+  )
+}
+
+/**
+ * A `CI status` aggregator's question: did an admin override authorize this
+ * pull request head? Exits 1 unless one did, so the aggregator stays red.
+ */
+fn verdict_step(harness: Harness) {
+  const vars = harness.env
+  const pr = to_int(required(vars, "OVERRIDE_PR"))
+  const head = required(vars, "OVERRIDE_HEAD_SHA")
+  const url = authorized_override(
+    github(harness, "GH_TOKEN"),
+    required(vars, "OVERRIDE_REPOSITORY"),
+    pr,
+    head,
+  )
+  if url == nil {
+    gha_error(harness.stdio, "no merge override authorized " + head + " on #" + to_string(pr))
+    harness.runtime.exit(1)
+  }
+  output(harness, "authorized", to_string(url))
+  harness.stdio.println("Merge override authorized " + head + ": " + to_string(url))
 }
 
 fn merge_step(harness: Harness) {
@@ -192,6 +219,8 @@ fn main(harness: Harness) {
     cancel_step(harness)
   } else if step == "publish" {
     publish_step(harness)
+  } else if step == "verdict" {
+    verdict_step(harness)
   } else if step == "merge" {
     merge_step(harness)
   } else if step == "cleanup" {
