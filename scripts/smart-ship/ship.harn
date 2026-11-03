@@ -233,7 +233,7 @@ fn superseded(c: Check, checks: list<Check>, head: string) -> bool {
 /**
  * An approval of an earlier head carried to the live head, or why it was not. `from` is the head
  * the approval's author evidence names; `merges` are the base merges between, newest first; `files`
- * is how many paths the PR touches whose tree entries were compared and found identical.
+ * is how many PR files had identical diffs and tree entries at both heads.
  */
 pub type Carry = {from: string, to: string, merges: list<string>, files: int, refusal: string}
 
@@ -497,7 +497,7 @@ fn release_lease(
 
 type GitCommit = {sha: string, tree: {sha: string}, parents: list<{sha: string}>}
 
-type CompareFile = {filename: string, status: string, previous_filename?: string?}
+type CompareFile = {filename: string, status: string, patch?: string?, previous_filename?: string?}
 
 type TreeItem = {path: string, mode: string, type: string, sha: string}
 
@@ -528,21 +528,61 @@ fn git_commit(harness: Harness, opts: GithubClientOptions, slug: string, sha: st
   return commit
 }
 
-/** Every path the PR touches at `head`, against its merge base with `base`, from a whole file list. */
-fn own_paths(
+/** The PR's own diff at `head`, against its merge base with `base`, from a whole file list. */
+fn own_files(
   harness: Harness,
   opts: GithubClientOptions,
   slug: string,
   base: string,
   head: string,
-) -> list<string> {
+) -> list<CompareFile> {
   const files = compare(harness, opts, slug, base, head).files
   require files != nil, "the diff at ${head} lists no files"
   require len(files) > 0, "the diff at ${head} is empty"
   require len(files) < COMPARE_FILE_CAP, "the diff at ${head} may be cut off at ${COMPARE_FILE_CAP} files"
+  return files ?? []
+}
+
+/**
+ * Why the PR's own diff differs between two heads, or "" when it lists the same files with the
+ * same status, old name and patch text. A file GitHub gives no patch for, such as a binary,
+ * matches only another with no patch; its tree entry then decides.
+ */
+fn diff_difference(before: list<CompareFile>, after: list<CompareFile>) -> string {
+  const record = { files ->
+    let rows = {}
+    for f in files {
+      rows = rows + {[f.filename]: json_stringify({status: f.status, previous_filename: f.previous_filename, patch: f.patch})}
+    }
+    rows
+  }
+  const was = record(before)
+  const now = record(after)
+  require len(was) == len(before) && len(now) == len(after), "a diff lists one file twice"
+  for f in before + after {
+    if was[f.filename] != now[f.filename] {
+      return "the PR's diff for ${f.filename} differs between the approved and live heads"
+    }
+  }
+  return ""
+}
+
+/**
+ * Every path `files` names at `head`, after checking the tree agrees with the diff: a file is in
+ * the tree unless the diff removed it, and a renamed file's old name is gone. An absent path is
+ * accepted only when the diff says why it is absent.
+ */
+fn tree_agrees(files: list<CompareFile>, entries: dict, head: string) -> list<string> {
   let paths: list<string> = []
   for f in files {
-    paths = paths + [f.filename] + (f.previous_filename == nil ? [] : [f.previous_filename ?? ""])
+    require (entries[f.filename] == nil) == (f.status == "removed"),
+      "the tree at ${head} does not match the diff for ${f.filename}"
+    paths = paths + [f.filename]
+    if f.previous_filename != nil {
+      const old = f.previous_filename ?? ""
+      require entries[old] == nil, "the tree at ${head} still holds ${old}, which the diff renamed"
+      paths = paths + [old]
+    }
   }
   return paths
 }
@@ -568,9 +608,9 @@ fn tree_entries(harness: Harness, opts: GithubClientOptions, slug: string, commi
 /**
  * Whether a writer bot's approval of an earlier head carries to the live head. It carries only
  * when the live head's first-parent chain reaches the approved head through two-parent merges
- * whose incoming side is the base branch's history, and every path the PR touches at either head
- * has the same mode, type and blob at both heads, or is absent at both. Any unread, partial or
- * unexpected data refuses; a refusal never stops the look.
+ * whose incoming side is the base branch's history, the PR's own diff lists the same files with
+ * the same status and patch at both heads, and every path it names has the same mode, type and
+ * blob at both heads. Any unread, partial or unexpected data refuses; a refusal never stops the look.
  */
 pub fn approval_carry(harness: Harness, opts: GithubClientOptions, repo: Repo) -> Carry {
   const pr = repo.pullRequest
@@ -606,20 +646,25 @@ pub fn approval_carry(harness: Harness, opts: GithubClientOptions, repo: Repo) -
       merges = merges + [at]
       at = commit.parents[0]?.sha ?? ""
     }
+    // Both must hold: the same diff (a merge that keeps the PR's side of a file the base changed
+    // adds it to the diff), and the same tree entries (a patch shows no mode or object type).
+    const was = own_files(harness, opts, slug, base, approved)
+    const now = own_files(harness, opts, slug, base, live)
+    const differs = diff_difference(was, now)
+    require differs == "", differs
+    const before = tree_entries(harness, opts, slug, git_commit(harness, opts, slug, approved))
+    const after = tree_entries(harness, opts, slug, tip)
     let paths: list<string> = []
-    for p in own_paths(harness, opts, slug, base, approved) + own_paths(harness, opts, slug, base, live) {
+    for p in tree_agrees(was, before, approved) + tree_agrees(now, after, live) {
       if !paths.contains(p) {
         paths = paths + [p]
       }
     }
-    const before = tree_entries(harness, opts, slug, git_commit(harness, opts, slug, approved))
-    const after = tree_entries(harness, opts, slug, tip)
     for p in paths {
-      const was = before[p] ?? "absent"
-      const now = after[p] ?? "absent"
-      require was == now, "the PR's entry for ${p} differs between the approved and live heads (${was}; ${now})"
+      require before[p] == after[p],
+        "the PR's entry for ${p} differs between the approved and live heads (${before[p] ?? "absent"}; ${after[p] ?? "absent"})"
     }
-    {from: approved, to: live, merges: merges, files: len(paths), refusal: ""}
+    {from: approved, to: live, merges: merges, files: len(now), refusal: ""}
   } catch (e) {
     none(quiet(to_string(e)))
   }
@@ -630,7 +675,7 @@ fn carry_note(evidence: dict) -> string {
   if evidence.carried {
     return "yes (approved head ${c.from} to live head ${c.to} across base merges "
       + join(c.merges, ", ")
-      + "; ${c.files} PR paths' mode, type and blob identical)"
+      + "; ${c.files} PR files compared, diff and tree entries identical)"
   }
   if c == nil {
     return "no (not attempted)"

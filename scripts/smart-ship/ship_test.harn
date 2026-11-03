@@ -394,14 +394,14 @@ fn carried_look(harness: Harness, rest: dict, over: dict = {}) {
 }
 
 /** The REST reads of a live head that merged the base once into the approved head. */
-fn one_base_merge(at_live: list? = nil, live_tree: list = []) -> dict {
+fn one_base_merge(at_live: list? = nil, live_tree: list = [], at_approved: list? = nil, approved_tree: list = []) -> dict {
   return {
     ["/repos/o/r/git/commits/${MERGED}"]: git_commit(MERGED, [APPROVED, BASE_TIP]),
     ["/repos/o/r/git/commits/${APPROVED}"]: git_commit(APPROVED, [FORK_POINT]),
     ["/repos/o/r/compare/${BASE_TIP}...${BASE_TIP}"]: compared("identical", 0, 0, []),
-    ["/repos/o/r/compare/${BASE_TIP}...${APPROVED}"]: compared("diverged", 1, 4, pr_files()),
+    ["/repos/o/r/compare/${BASE_TIP}...${APPROVED}"]: compared("diverged", 1, 4, at_approved ?? pr_files()),
     ["/repos/o/r/compare/${BASE_TIP}...${MERGED}"]: compared("ahead", 2, 0, at_live ?? pr_files()),
-    [TREE_PATH + tree_of(APPROVED) + "?recursive=1"]: tree_at(APPROVED),
+    [TREE_PATH + tree_of(APPROVED) + "?recursive=1"]: tree_at(APPROVED, approved_tree),
     [TREE_PATH + tree_of(MERGED) + "?recursive=1"]: tree_at(MERGED, live_tree),
   }
 }
@@ -423,11 +423,12 @@ pipeline test_an_approval_carries_across_a_clean_merge_of_the_base(harness: Harn
   const line = seen.decision.evidence_line
   assert(line.contains("approved=true"), line)
   assert(
-    line.contains("carried=yes (approved head ${APPROVED} to live head ${MERGED} across base merges ${MERGED}; 2 PR paths' mode, type and blob identical)"),
+    line.contains("carried=yes (approved head ${APPROVED} to live head ${MERGED} across base merges ${MERGED}; 2 PR files compared, diff and tree entries identical)"),
     line,
   )
-  // A binary file has no patch in a compare; its tree entry still decides.
-  const binary = carried_look(harness, one_base_merge([changed("src/parse.rs", "modified", nil), pr_files()[1]]))
+  // A binary file has no patch in a compare at either head; its tree entry still decides.
+  const unpatched = [changed("src/parse.rs", "modified", nil), pr_files()[1]]
+  const binary = carried_look(harness, one_base_merge(unpatched, [], unpatched))
   assert_eq(binary.decision.action, "merge", binary.decision.evidence_line)
   // Main moved twice: the first-parent chain is two base merges, each bringing in base history.
   const twice = one_base_merge() + {
@@ -449,12 +450,37 @@ pipeline test_an_approval_does_not_carry_past_anything_else(harness: Harness) {
     [
       "a merge that rewrites a PR file",
       one_base_merge([edited, pr_files()[1]], [entry("src/parse.rs", "100644", "blob", blob("resolved"))]),
-      "entry for src/parse.rs differs",
+      "diff for src/parse.rs differs",
     ],
     [
       "a merge that also edits a file the PR does not change",
       one_base_merge(pr_files() + [changed("README.md", "modified", "@@ -1 +1 @@\n-a\n+b")], [entry("README.md", "100644", "blob", blob("README edited"))]),
-      "entry for README.md differs",
+      "diff for README.md differs",
+    ],
+    [
+      // `git merge -s ours main`: the live README is the approved head's blob, so the trees agree,
+      // but the PR's diff now reverts main's README change and the squash would land the revert.
+      "a merge that keeps the PR side of a file main changed",
+      one_base_merge(
+        pr_files() + [changed("README.md", "modified", "@@ -1 +1 @@\n-README new\n+README old")],
+        [entry("README.md", "100644", "blob", blob("README old"))],
+      ),
+      "diff for README.md differs",
+    ],
+    [
+      // Main also edited src/parse.rs; the merge kept the PR's version whole, reverting main's edit.
+      "a merge that keeps the PR's version of a file main also changed",
+      one_base_merge([changed("src/parse.rs", "modified", LIB_PATCH + "\n@@ -40,1 +43,1 @@\n-    main_fix();\n+    old_call();"), pr_files()[1]]),
+      "diff for src/parse.rs differs",
+    ],
+    [
+      "a path the diff names as modified that neither tree holds",
+      one_base_merge(
+        pr_files() + [changed("docs/parse.md", "modified", "@@ -1 +1 @@\n-a\n+b")],
+        [],
+        pr_files() + [changed("docs/parse.md", "modified", "@@ -1 +1 @@\n-a\n+b")],
+      ),
+      "does not match the diff for docs/parse.md",
     ],
     [
       "a merge that makes a PR file executable, hunks unchanged",
@@ -474,7 +500,7 @@ pipeline test_an_approval_does_not_carry_past_anything_else(harness: Harness) {
     [
       "a PR file present at the approved head and absent at the live head",
       one_base_merge(nil, [entry("tests/parse.rs", "")]),
-      "entry for tests/parse.rs differs",
+      "does not match the diff for tests/parse.rs",
     ],
     [
       "a truncated tree at the live head",
