@@ -24,7 +24,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install the Smart Ship runtime
-        uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808 # supports compressed release archives
+        uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c # supports compressed release archives
         with:
           version: "0.10.180"
       - name: Check and test the landing gate
@@ -65,13 +65,13 @@ jobs:
           harn test scripts/review-dispatch
           bash .github/actions/local-workflow-checks/run_test.sh
       - name: Set up the runtime evidence consumer's Harn version
-        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c
         with:
           version: "0.10.177"
       - name: Test runtime evidence on the consumer runtime
         run: harn test scripts/ci-runtime-evidence
       - name: Set up the CI job proof runtime
-        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c
         with:
           version: "0.10.159"
       - name: Test CI job proof reuse
@@ -158,7 +158,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Run the relay tests
@@ -191,7 +191,7 @@ jobs:
           baseline-sha: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
           github-token: ${{ github.token }}
       - name: Markdown lint
-        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
+        uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34 # v25.0.0
         with:
           globs: "**/*.md"
       - name: Install actionlint
@@ -248,7 +248,7 @@ jobs:
           ruby .github/workflows/runner-availability_test.rb
           ruby scripts/reusable_pin_drift_test.rb
       - name: Set up checker test runtime
-        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c
         with:
           version: "0.10.170"
       - name: Test Dependabot configuration owner

@@ -49,7 +49,7 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Install the proof writer
-        uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808
+        uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c
         with:
           version: '0.10.181'
       - name: Emit measured dependency security proof
