@@ -17,6 +17,8 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  # The decision reads the head's check runs; private repositories refuse that without it.
+  checks: read
   actions: write
 
 jobs:

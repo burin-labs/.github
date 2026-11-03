@@ -980,6 +980,12 @@ const HEAD_RUNS = REPO + "/actions/runs?head_sha=" + HEAD + "&per_page=100"
 
 const CI_PATH = ".github/workflows/ci.yml"
 
+/** A run of CI for this pull request unless `overrides` says otherwise. */
+fn ci_run(id: int, overrides: dict = {}) -> dict {
+  return {id: id, path: CI_PATH, event: "pull_request", pull_requests: [{number: INPUT.pr}]}
+    + overrides
+}
+
 fn job(id: int, name: string, status: string, conclusion: string?, steps: list = []) -> dict {
   return {id: id, name: name, status: status, conclusion: conclusion, steps: steps}
 }
@@ -993,16 +999,20 @@ fn jobs_of(run: int) -> string {
  * request blocked, so the override re-runs CI's own failed job, the newest one.
  */
 pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harness) {
-  // Run 40 is a workflow the pull request added with its own `CI status` job; only CI's file counts.
+  // Runs 40-60 each carry a newer failed `CI status` that is not this pull
+  // request's CI: a workflow the pull request added, a dispatched CI run, and
+  // CI run for another pull request on the same commit.
   const failed = fake(
     {
       [HEAD_RUNS]: [
         {
           workflow_runs: [
-            {id: 30, path: ".github/workflows/smart-ship.yml"},
-            {id: 10, path: CI_PATH},
-            {id: 20, path: CI_PATH},
-            {id: 40, path: ".github/workflows/forged.yml"},
+            ci_run(30, {path: ".github/workflows/smart-ship.yml"}),
+            ci_run(10),
+            ci_run(20),
+            ci_run(40, {path: ".github/workflows/forged.yml"}),
+            ci_run(50, {event: "workflow_dispatch", pull_requests: []}),
+            ci_run(60, {pull_requests: [{number: 41}]}),
           ],
         },
       ],
@@ -1017,6 +1027,8 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
       ],
       [jobs_of(30)]: [{jobs: [job(301, "Smart Ship", "completed", "cancelled")]}],
       [jobs_of(40)]: [{jobs: [job(401, "CI status", "completed", "failure")]}],
+      [jobs_of(50)]: [{jobs: [job(501, "CI status", "completed", "failure")]}],
+      [jobs_of(60)]: [{jobs: [job(601, "CI status", "completed", "failure")]}],
     },
   )
   assert_eq(rerun_required_check(failed.gh, INPUT), 202)
@@ -1026,7 +1038,7 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
   )
   const green = fake(
     {
-      [HEAD_RUNS]: [{workflow_runs: [{id: 10, path: CI_PATH}]}],
+      [HEAD_RUNS]: [{workflow_runs: [ci_run(10)]}],
       [jobs_of(10)]: [{jobs: [job(101, "CI status", "completed", "success")]}],
     },
   )
@@ -1034,7 +1046,7 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
   assert_eq(green.sent(), [])
   const none = fake(
     {
-      [HEAD_RUNS]: [{workflow_runs: [{id: 40, path: ".github/workflows/forged.yml"}]}],
+      [HEAD_RUNS]: [{workflow_runs: [ci_run(40, {path: ".github/workflows/forged.yml"})]}],
       [jobs_of(40)]: [{jobs: [job(401, "CI status", "completed", "failure")]}],
     },
   )
@@ -1053,6 +1065,8 @@ fn override_run(id: int, overrides: dict = {}) -> dict {
     html_url: "https://github.com/burin-labs/example/actions/runs/" + to_string(id),
     path: ".github/workflows/merge-override-dispatch.yml",
     event: "pull_request_target",
+    repository: {full_name: "burin-labs/example"},
+    head_repository: {full_name: "burin-labs/example"},
     head_sha: HEAD,
     pull_requests: [{number: 42}],
   }
@@ -1117,5 +1131,16 @@ pipeline test_ci_status_trusts_only_an_authorized_override_run_of_mains_dispatch
     verdict([override_run(5, {pull_requests: [{number: 41}]})], override_jobs(5, "success")),
     nil,
   )
+  // A run from another repository, or for a fork's head, authorizes nothing here.
+  for side in ["repository", "head_repository"] {
+    assert_eq(
+      verdict(
+        [override_run(5, {[side]: {full_name: "someone/example"}})],
+        override_jobs(5, "success"),
+      ),
+      nil,
+      side,
+    )
+  }
   assert_eq(verdict([], {}), nil)
 }

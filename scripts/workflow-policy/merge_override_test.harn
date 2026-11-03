@@ -110,6 +110,22 @@ pipeline test_the_ci_status_trust_anchor_matches_the_workflows(harness: Harness)
   assert(action.contains("scripts/merge-override/run.sh\" verdict"))
 }
 
+/**
+ * The decision reads the head's check runs with the run's token, which a
+ * private repository refuses without `checks: read`; nothing here writes one.
+ * The fakes and this public repository cannot see that refusal, so pin it.
+ */
+pipeline test_every_override_workflow_reads_check_runs_and_writes_none(harness: Harness) {
+  for path in [
+    ".github/workflows/merge-override.yml",
+    ".github/workflows/merge-override-dispatch.yml",
+    "templates/merge-override-dispatch.yml",
+  ] {
+    const permissions = yaml_parse(read(harness.fs, path)).permissions
+    assert_eq(permissions.checks, "read", path)
+  }
+}
+
 pipeline test_the_bootstrap_only_dispatches_harn_with_every_variable_granted(harness: Harness) {
   const bootstrap = read(harness.fs, "scripts/merge-override/run.sh")
   assert(bootstrap.contains("scripts/merge-override/cli.harn\" -- \"$@\""))

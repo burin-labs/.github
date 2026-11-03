@@ -485,12 +485,19 @@ fn field_items(pages: list, field: string) -> list {
  */
 pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
   const repo = "repos/" + input.repository
-  // Only CI's own file: a pull request may add any workflow with a job named `CI status`.
+  // Only CI's own file, run for this pull request: a pull request may add any
+  // workflow with a job named `CI status`, and a dispatched or fork run of CI at
+  // the same commit is not the run the branch rule reads.
   const runs = field_items(
     gh.pages(repo + "/actions/runs?head_sha=" + input.head_sha + "&per_page=100"),
     "workflow_runs",
   )
-    .filter({ run -> run?.path == MAIN_CI_PATH })
+    .filter(
+      { run ->
+        run?.path == MAIN_CI_PATH && run?.event == "pull_request"
+          && (run?.pull_requests ?? []).any({ pull -> pull?.number == input.pr })
+      },
+    )
     .sort_by({ run -> run.id })
   let newest = nil
   for run in runs {
@@ -520,7 +527,10 @@ pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
  * The URL of a run that authorized an override of `head_sha` on pull request
  * `pr`, or nil. Trusted only from a `pull_request_target` run of main's
  * dispatcher whose authorize step succeeded; check runs are never read, since
- * any workflow with `checks: write` can create one under any name.
+ * any workflow with `checks: write` can create one under any name. A fork's
+ * head never authorizes, so the run must belong to this repository on both
+ * sides. `filter=all` lets an earlier attempt of the run count; the head pin
+ * keeps that attempt bound to the same commit.
  */
 pub fn authorized_override(gh: GitHub, repository: string, pr: int, head_sha: string) -> string? {
   const repo = "repos/" + repository
@@ -535,6 +545,8 @@ pub fn authorized_override(gh: GitHub, repository: string, pr: int, head_sha: st
   )
   for run in runs {
     const bound = run?.path == DISPATCH_WORKFLOW && run?.event == "pull_request_target"
+      && run?.repository?.full_name == repository
+      && run?.head_repository?.full_name == repository
       && run?.head_sha == head_sha
       && (run?.pull_requests ?? []).any({ pull -> pull?.number == pr })
     if !bound {
