@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
+require "fileutils"
+require "json"
 require "open3"
+require "tmpdir"
 require "yaml"
 require_relative "reusable_pin_contract"
 
@@ -128,6 +131,16 @@ unless references == [{
 }]
   abort "reusable output reference projection is wrong: #{references.inspect}"
 end
+
+# burin-code folds long references onto the next line; the census died on it.
+folded = <<~YAML
+  jobs:
+    runner-availability:
+      uses:
+        burin-labs/.github/.github/workflows/runner-availability.yml@#{FULL_SHA}
+YAML
+folded_refs = ReusablePinContract.references(folded, org: "burin-labs", policy_repo: ".github")
+abort "a folded uses: reference must resolve to its key line: #{folded_refs.inspect}" unless folded_refs.map { |r| r[:line] } == [3]
 
 callee = <<~YAML
   on:
@@ -282,7 +295,7 @@ end
 # propagate the failing printf under `set -e`, because errexit is not reliably
 # inherited into a command substitution used in an assignment. Only a check on
 # the body itself can stop a truncated report from being published.
-REQUIRED_REPORT_FIELDS = ["- Target:", "- Workflow files scanned:", "- Actionable:"].freeze
+REQUIRED_REPORT_FIELDS = ["- Target:", "- Workflow files scanned:", "- Actionable:", "- Stale pins:"].freeze
 
 unless code_lines.any? { |_, line| line.include?("require_report_fields") && line.include?("body") }
   abort "#{script}: the rendered body must be checked by require_report_fields before it is published"
@@ -300,6 +313,208 @@ REQUIRED_REPORT_FIELDS.each do |field|
   next if code_lines.any? { |_, line| line.include?("printf -- '#{field}") }
 
   abort "#{script}: render_markdown must emit `#{field}` via `printf --`"
+end
+
+# ---------------------------------------------------------------------------
+# Execution paths: every reusable workflow is derived or listed
+# ---------------------------------------------------------------------------
+#
+# Staleness is only as complete as the path set. A workflow that checks this
+# repository out at its own ref, and from which no executed path can be
+# derived, must be listed in the explicit table; otherwise its pins would read
+# "current" while running stale scripts.
+
+repo_root = File.expand_path("..", __dir__)
+head = ReusablePinContract::Tree.new(repo_root, "HEAD")
+table = ReusablePinContract.execution_table
+reusable = Dir[File.join(repo_root, ".github/workflows/*.y{a,}ml")].sort.filter_map do |file|
+  parsed = ReusablePinContract.document(File.read(file))
+  triggers = parsed["on"] || parsed[true]
+  next unless triggers.is_a?(Hash) && triggers.key?("workflow_call")
+
+  file.delete_prefix("#{repo_root}/")
+end
+abort "no reusable workflows found; the derivation check would pass vacuously" if reusable.empty?
+
+reusable.each do |path|
+  derived = ReusablePinContract.execution_paths(head, path, org: "burin-labs", policy_repo: ".github", table: {})
+  next if derived[:unresolved].empty? || table.key?(path)
+
+  abort "#{path}: execution paths are neither derived nor listed in " \
+        "scripts/reusable-pin-execution-paths.json: #{derived[:unresolved].join('; ')}"
+end
+
+table.each do |path, entry|
+  abort "execution-path table lists #{path}, which is not a reusable workflow" unless reusable.include?(path)
+  abort "execution-path table entry #{path} must say why" if entry["why"].to_s.strip.empty?
+
+  derived = ReusablePinContract.execution_paths(head, path, org: "burin-labs", policy_repo: ".github", table: {})
+  Array(entry["paths"]).each do |listed|
+    abort "execution-path table entry #{path} lists missing path #{listed}" unless head.type(listed)
+    abort "execution-path table entry #{path} lists derivable path #{listed}; drop it" if derived[:paths].include?(listed)
+  end
+end
+
+# The real Smart Ship workflow must derive the directory it sparse-checks out.
+smart_ship = ReusablePinContract.execution_paths(
+  head, ".github/workflows/smart-ship.yml", org: "burin-labs", policy_repo: ".github", table: {}
+)
+unless smart_ship[:paths].include?("scripts/smart-ship")
+  abort "smart-ship.yml must derive scripts/smart-ship, got #{smart_ship[:paths]}"
+end
+
+if ReusablePinContract::STALE_GRACE_SECONDS != 2 * 24 * 60 * 60
+  abort "STALE_GRACE_SECONDS must be 2 days, is #{ReusablePinContract::STALE_GRACE_SECONDS}"
+end
+
+# The census reads pin commits from local history; a shallow checkout makes the
+# script refuse to run, so the workflow must fetch full history.
+checkout = steps.find { |step| step["uses"].to_s.start_with?("actions/checkout@") }
+unless checkout && checkout.dig("with", "fetch-depth").to_s == "0"
+  abort "#{workflow}: the census checkout needs fetch-depth: 0 to read pin history"
+end
+
+# ---------------------------------------------------------------------------
+# Staleness truth table, exercised offline against a fixture repository
+# ---------------------------------------------------------------------------
+#
+# Models the real miss. Consumers pinned smart-ship.yml at
+# 80668ab79200fff018943e50079b6fbc6005b196. smart-ship.yml had no newer commits,
+# but scripts/smart-ship/ship.harn, which the workflow checks out at its own
+# ref, gained the approval-carry fix in a4f6ea4f (#351). A check scoped to the
+# workflow file reported 0 newer commits, so the pinned callers never ran it.
+# The fixture uses the REAL smart-ship.yml so the derivation under test is the
+# one the census applies.
+
+DAY = 24 * 60 * 60
+EPOCH = 1_800_000_000
+NOW = EPOCH + (10 * DAY)
+FIX_SUBJECT = "[CI] Carry an approval across merges of the base branch (#351)"
+
+def fixture_git(dir, *args, time: EPOCH)
+  env = {
+    "GIT_AUTHOR_DATE" => "@#{time} +0000", "GIT_COMMITTER_DATE" => "@#{time} +0000",
+    "GIT_CONFIG_GLOBAL" => File::NULL, "GIT_CONFIG_NOSYSTEM" => "1"
+  }
+  out, err, status = Open3.capture3(
+    env, "git", "-C", dir, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+    "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", *args
+  )
+  abort "fixture git #{args.join(' ')} failed: #{err}" unless status.success?
+  out.strip
+end
+
+def fixture_commit(dir, files, subject, time)
+  files.each do |path, body|
+    full = File.join(dir, path)
+    FileUtils.mkdir_p(File.dirname(full))
+    File.write(full, body)
+  end
+  fixture_git(dir, "add", "-A", time: time)
+  fixture_git(dir, "commit", "-q", "-m", subject, time: time)
+  fixture_git(dir, "rev-parse", "HEAD")
+end
+
+def measured(dir, pinned, target, workflow: ".github/workflows/smart-ship.yml")
+  out, err, status = Open3.capture3(
+    "ruby", File.join(__dir__, "reusable_pin_contract.rb"), "staleness",
+    dir, "burin-labs", ".github", workflow, pinned, target, NOW.to_s, stdin_data: ""
+  )
+  abort "staleness #{pinned[0, 8]}..#{target[0, 8]} failed: #{err}" unless status.success?
+  JSON.parse(out)
+end
+
+smart_ship_source = File.read(File.join(repo_root, ".github/workflows/smart-ship.yml"))
+stale_rows = Dir.mktmpdir("pin-staleness-") do |dir|
+  fixture_git(dir, "init", "-q")
+  pinned = fixture_commit(dir, {
+    ".github/workflows/smart-ship.yml" => smart_ship_source,
+    "scripts/smart-ship/ship.harn" => "// before the approval-carry fix\n",
+    "README.md" => "fixture\n",
+    # A self checkout at its own ref with nothing derivable: must be UNKNOWN.
+    ".github/workflows/opaque.yml" => <<~YAML
+      on:
+        workflow_call:
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@#{FULL_SHA}
+              with:
+                repository: burin-labs/.github
+                ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+                path: .impl
+            - run: make -C "$IMPL_ROOT" ship
+    YAML
+  }, "[CI] Pin point", EPOCH)
+  unrelated = fixture_commit(dir, { "README.md" => "unrelated\n" }, "[Docs] Unrelated change", EPOCH + DAY)
+  fix = fixture_commit(dir, { "scripts/smart-ship/ship.harn" => "// carries the approval\n" }, FIX_SUBJECT, EPOCH + (2 * DAY))
+  recent = fixture_commit(dir, { "scripts/smart-ship/ship.harn" => "// recent\n" }, "[CI] Recent Smart Ship change",
+                          NOW - DAY)
+  target = recent
+
+  # (a) The known stale pin is flagged, with the script commits listed.
+  a = measured(dir, pinned, target)
+  unless a["state"] == "stale" && a["count"] == 2 && a["paths"].include?("scripts/smart-ship") &&
+         a["commits"].map { |c| c["sha"] } == [recent, fix] && a["commits"].last["subject"] == FIX_SUBJECT
+    abort "(a) a smart-ship pin with newer scripts/smart-ship commits must be stale and list them: #{a.inspect}"
+  end
+  abort "(a) an unrelated commit must not be listed" if a["commits"].any? { |c| c["sha"] == unrelated }
+
+  # (b) Negative control: the old logic, scoped to the workflow file, misses it.
+  # Both the path-scoped log and the census's existing blob comparison say clean.
+  workflow_only = fixture_git(dir, "log", "--format=%H", "#{pinned}..#{target}", "--",
+                              ".github/workflows/smart-ship.yml")
+  abort "(b) the workflow-file-only log must report 0 newer commits, got #{workflow_only.inspect}" unless workflow_only.empty?
+  blob_pinned = fixture_git(dir, "rev-parse", "#{pinned}:.github/workflows/smart-ship.yml")
+  blob_target = fixture_git(dir, "rev-parse", "#{target}:.github/workflows/smart-ship.yml")
+  old_verdict, = Open3.capture3("bash", script, "classify", pinned, "behind", blob_pinned, blob_target,
+                                ".github/workflows/smart-ship.yml")
+  unless old_verdict.split("\t").first == "behind-equivalent"
+    abort "(b) the file-blob verdict must call this pin behind-equivalent, got #{old_verdict.inspect}"
+  end
+
+  # (c) A current pin reports nothing.
+  c = measured(dir, target, target)
+  abort "(c) a pin at the target must be current with no commits: #{c.inspect}" unless c["state"] == "current" &&
+                                                                                       c["count"].zero? && c["commits"].empty?
+
+  # (d) Newer commits inside the grace period are listed but not flagged.
+  d = measured(dir, fix, target)
+  unless d["state"] == "pending" && d["commits"].map { |commit| commit["sha"] } == [recent]
+    abort "(d) a pin trailing only an in-grace commit must be pending and list it: #{d.inspect}"
+  end
+
+  # (e) An unreadable pin commit is UNKNOWN, never clean.
+  e = measured(dir, "d" * 40, target)
+  abort "(e) an unreadable pin must be unknown: #{e.inspect}" unless e["state"] == "unknown" && e["count"].nil?
+
+  # (f) A self checkout with nothing derivable is UNKNOWN unless the table lists it.
+  f = measured(dir, pinned, target, workflow: ".github/workflows/opaque.yml")
+  abort "(f) an underivable own-ref checkout must be unknown: #{f.inspect}" unless f["state"] == "unknown"
+
+  row = ->(record, ref) { { repo: "burin-code", workflow: record["workflow"], ref: ref, staleness: record } }
+  [row.call(a, pinned), row.call(a, pinned), row.call(c, target), row.call(d, fix), row.call(e, "d" * 40)]
+end
+
+# The rendered report lists per caller repo, per pin; flags stale and unknown;
+# lists pending without flagging it; and omits the current pin entirely.
+rendered, err, status = Open3.capture3("bash", script, "render-staleness", "main", stdin_data: JSON.generate(stale_rows))
+abort "#{script}: render-staleness failed: #{err}" unless status.success?
+lines = rendered.lines.map(&:rstrip)
+stale_pinned = stale_rows[0][:ref]
+{
+  "repo heading" => "### `burin-code`",
+  "stale pin" => "- `smart-ship.yml` pinned `#{stale_pinned[0, 8]}` (2 call sites): **stale**, 2 newer commit(s), oldest 8d old",
+  "fix commit" => "  - `#{stale_rows[0][:staleness]['commits'].last['sha'][0, 8]}` #{FIX_SUBJECT}",
+  "pending pin" => "- `smart-ship.yml` pinned `#{stale_rows[3][:ref][0, 8]}`: pending, 1 newer commit(s), oldest 1d old",
+  "unknown pin" => "- `smart-ship.yml` pinned `dddddddd`: **unknown**, pinned commit dddddddd is not readable in burin-labs/.github",
+  "count" => "- Stale pins: 2"
+}.each do |what, want|
+  abort "render-staleness: missing #{what} line #{want.inspect} in:\n#{rendered}" unless lines.include?(want)
+end
+if rendered.include?("pinned `#{stale_rows[2][:ref][0, 8]}`")
+  abort "render-staleness: a current pin must not be reported:\n#{rendered}"
 end
 
 puts "reusable-pin-drift policy: ok"
