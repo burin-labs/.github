@@ -1,0 +1,98 @@
+import { gha_write_output } from "std/gha"
+import { live_consumer_workflows, live_dispatcher, live_history, live_read } from "./live.harn"
+import {
+  Bump,
+  OWNER_REPOSITORY,
+  REGISTRY_PATH,
+  definition_problems,
+  dispatch_all,
+  pinned_references,
+  plan_consumer,
+  resolve_requested,
+  token_repositories,
+  validate_registry,
+} from "./pins.harn"
+
+fn required_env(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name)
+  if value == nil || trim(value) == "" {
+    throw name + " is required"
+  }
+  return trim(value)
+}
+
+fn write_output(harness: Harness, name: string, value: string) {
+  if !gha_write_output(harness, name, value) {
+    throw "GITHUB_OUTPUT is not set, so " + name + " cannot reach the next step"
+  }
+}
+
+fn main(harness: Harness) {
+  const root = required_env(harness.env, "CONSUMER_PINS_ROOT")
+  let raw = nil
+  try {
+    raw = json_parse(harness.fs.read_text(path_join(root, REGISTRY_PATH)))
+  } catch (error) {
+    throw REGISTRY_PATH + " is malformed: " + to_string(error)
+  }
+  const registry = validate_registry(raw)
+  const sha = required_env(harness.env, "CONSUMER_PINS_SHA")
+  if regex_match("^[0-9a-f]{40}$", sha) == nil {
+    throw "sha must be a full 40-hex commit, got " + sha
+  }
+  const requested = resolve_requested(registry, harness.env.get("CONSUMER_PINS_REQUESTED") ?? "")
+  const history = live_history(harness.tools, root)
+  // Consumers may only be pinned to commits that landed on main.
+  if history.is_ancestor(sha, "refs/remotes/origin/main") != true {
+    throw sha + " is not on main"
+  }
+  const mode = required_env(harness.env, "CONSUMER_PINS_MODE")
+  if mode == "plan" {
+    write_output(harness, "repositories", token_repositories(registry))
+    return
+  }
+  if mode != "dispatch" {
+    throw "CONSUMER_PINS_MODE must be plan or dispatch, got " + mode
+  }
+  const token = required_env(harness.env, "GH_TOKEN")
+  const scratch = harness.fs.mkdtemp_in_workspace("consumer-pins-gh-")
+  let bumps: list<Bump> = []
+  for consumer in registry.consumers {
+    const texts = live_consumer_workflows(harness.tools, token, scratch, consumer.repository)
+    let pins = 0
+    for text in texts {
+      pins = pins + len(pinned_references(text))
+    }
+    harness.stdio.println(
+      consumer.repository + ": read " + to_string(len(texts)) + " workflow files with "
+        + to_string(pins)
+        + " pins on "
+        + OWNER_REPOSITORY,
+    )
+    const bump = plan_consumer(registry, consumer, texts, sha, requested, history)
+    if bump == nil {
+      harness.stdio.println(consumer.repository + ": every shared pin is current for " + sha)
+      continue
+    }
+    bumps = bumps + [bump]
+  }
+  let references = []
+  for bump in bumps {
+    for ref in bump.references {
+      if !references.contains(ref) {
+        references = references + [ref]
+      }
+    }
+  }
+  const problems = definition_problems(registry, references, sha, live_read(harness.tools, root))
+  if len(problems) > 0 {
+    throw "refusing to move any consumer to " + sha + ": " + join(problems, "; ")
+  }
+  for bump in dispatch_all(live_dispatcher(harness.tools, token, scratch), registry, bumps, sha) {
+    harness.stdio.println(
+      "started " + registry.consumer_workflow + " in " + bump.repository + " for "
+        + join(bump.references, ", ")
+        + (bump.release_path ? " (release path)" : ""),
+    )
+  }
+}

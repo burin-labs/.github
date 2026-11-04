@@ -1,0 +1,165 @@
+import { command_output_tail, command_run } from "std/command"
+import { Commit, Dispatcher, OwnerHistory } from "./pins.harn"
+
+type ContentEntry = {name: string, path: string, type: string}
+
+type ContentListing = list<ContentEntry>
+
+fn diagnostic(tools: HarnessTools, result: dict) -> string {
+  const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
+  const lines = trim(stderr).split("\n")
+  const tail = lines[max(0, len(lines) - 3):len(lines)]
+  const text = trim(join(tail, " "))
+  return text == "" ? "exit " + to_string(result?.exit_code) : text
+}
+
+fn git(tools: HarnessTools, root: string, args: list<string>) -> dict {
+  return command_run(
+    tools,
+    ["git", "-C", root] + args,
+    {capture: {max_inline_bytes: 4000000}, timeout_ms: 120000},
+  )
+}
+
+fn known_commit(tools: HarnessTools, root: string, sha: string) -> bool {
+  return git(tools, root, ["cat-file", "-e", sha + "^{commit}"]).success
+}
+
+/** Read the owner's history from the full checkout at `root`. */
+pub fn live_history(tools: HarnessTools, root: string) -> OwnerHistory {
+  return {
+    is_ancestor: fn(ancestor, descendant) {
+      if !known_commit(tools, root, ancestor) || !known_commit(tools, root, descendant) {
+        return nil
+      }
+      const result = git(tools, root, ["merge-base", "--is-ancestor", ancestor, descendant])
+      if result.exit_code == 0 {
+        return true
+      }
+      if result.exit_code == 1 {
+        return false
+      }
+      throw "git merge-base " + ancestor + " " + descendant + " failed: "
+        + diagnostic(tools, result)
+    },
+    commits: fn(older, newer, paths) {
+      const result = git(
+        tools,
+        root,
+        ["log", "--format=%H%x09%s", older + ".." + newer, "--"] + paths,
+      )
+      if !result.success {
+        throw "git log " + older + ".." + newer + " failed: " + diagnostic(tools, result)
+      }
+      let commits: list<Commit> = []
+      for line in result.stdout.split("\n") {
+        const tab = line.index_of("\t")
+        if tab == 40 {
+          commits = commits + [{sha: line[0:40], subject: line[41:len(line)]}]
+        }
+      }
+      return commits
+    },
+  }
+}
+
+/** Read one owner file at a commit, or nil when the commit does not have it. */
+pub fn live_read(tools: HarnessTools, root: string) -> fn(string, string) -> string? {
+  return fn(sha, path) {
+    if !git(tools, root, ["cat-file", "-e", sha + ":" + path]).success {
+      return nil
+    }
+    const result = git(tools, root, ["show", sha + ":" + path])
+    if !result.success {
+      throw "git show " + sha + ":" + path + " failed: " + diagnostic(tools, result)
+    }
+    return result.stdout
+  }
+}
+
+fn gh_env(token: string, scratch: string) -> dict<string, string> {
+  return {
+    GH_TOKEN: token,
+    GH_CONFIG_DIR: path_join(scratch, "config"),
+    XDG_CACHE_HOME: path_join(scratch, "cache"),
+    XDG_STATE_HOME: path_join(scratch, "state"),
+    XDG_DATA_HOME: path_join(scratch, "data"),
+    GH_PROMPT_DISABLED: "1",
+    GH_NO_UPDATE_NOTIFIER: "1",
+    NO_COLOR: "1",
+  }
+}
+
+/**
+ * Read every workflow file on a consumer's default branch. Workflows can only
+ * live directly under .github/workflows, so the listing is not recursive.
+ */
+pub fn live_consumer_workflows(
+  tools: HarnessTools,
+  token: string,
+  scratch: string,
+  repository: string,
+) -> list<string> {
+  const options = {
+    capture: {max_inline_bytes: 4000000},
+    env: gh_env(token, scratch),
+    timeout_ms: 120000,
+  }
+  const listing = command_run(
+    tools,
+    ["gh", "api", "repos/" + repository + "/contents/.github/workflows"],
+    options,
+  )
+  if !listing.success {
+    throw "listing " + repository + " workflows failed: " + diagnostic(tools, listing)
+  }
+  const entries = json_decode(listing.stdout, schema_of(ContentListing))
+  if !is_ok(entries) {
+    throw "listing " + repository + " workflows returned an unexpected shape"
+  }
+  let texts = []
+  for entry in unwrap(entries) {
+    if entry.type != "file" || regex_match("\\.ya?ml$", entry.name) == nil {
+      continue
+    }
+    const file = command_run(
+      tools,
+      [
+        "gh",
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw+json",
+        "repos/" + repository + "/contents/" + entry.path,
+      ],
+      options,
+    )
+    if !file.success {
+      throw "reading " + repository + " " + entry.path + " failed: " + diagnostic(tools, file)
+    }
+    texts = texts + [file.stdout]
+  }
+  // An empty listing must not read as "every pin is current".
+  if len(texts) == 0 {
+    throw repository + " lists no workflow files under .github/workflows"
+  }
+  return texts
+}
+
+/** Start a consumer workflow with string inputs. */
+pub fn live_dispatcher(tools: HarnessTools, token: string, scratch: string) -> Dispatcher {
+  const options = {
+    capture: {max_inline_bytes: 1000000},
+    env: gh_env(token, scratch),
+    timeout_ms: 120000,
+  }
+  return {
+    dispatch: fn(repository, workflow, inputs) {
+      let argv = ["gh", "workflow", "run", workflow, "--repo", repository]
+      for name in keys(inputs).sorted() {
+        argv = argv + ["-f", name + "=" + (inputs[name] ?? "")]
+      }
+      const result = command_run(tools, argv, options)
+      return result.success ? nil : diagnostic(tools, result)
+    },
+  }
+}

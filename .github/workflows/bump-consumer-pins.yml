@@ -1,0 +1,148 @@
+# Move every consumer's pins on this repository's shared workflows and actions
+# to the commit that changed them.
+#
+# Consumers pin `uses: burin-labs/.github/...@<sha>`, so a fix that lands here
+# reaches none of them until someone moves the pin. Dependabot moves it about
+# monthly; the Smart Ship approval carry-over fix sat unused for weeks.
+#
+# scripts/consumer-pins/registry.json is the one list of what is shared, the
+# owner paths each shared workflow or action runs, and the consumers. On every
+# push to main that touches one of those paths, this workflow reads each
+# consumer's current pins and starts the consumer's own bump-shared-pin.yml
+# with every pin whose code changed since it was pinned. The consumer's
+# workflow opens or updates its one bump pull request with a token it mints
+# itself, so the pull request starts CI, and its normal review decides whether
+# it lands. A pin on the release path is opened without `ship`.
+#
+# Each run carries every stale pin for a consumer, not only the ones this push
+# touched, so a run that GitHub drops from the concurrency group is made up by
+# the next one.
+
+name: Bump consumer pins
+
+on:
+  push:
+    branches: [main]
+    # The union of every registry path. scripts/consumer-pins/pins_test.harn
+    # holds this list equal to the registry.
+    paths:
+      - '.github/actions/check-commit-signatures/**'
+      - '.github/actions/check-dependabot-config/**'
+      - '.github/actions/check-harn-docs/**'
+      - '.github/actions/ci-comparison/**'
+      - '.github/actions/ci-job-proof/**'
+      - '.github/actions/ci-latency-policy/**'
+      - '.github/actions/ci-runtime-evidence/**'
+      - '.github/actions/dependabot-waiver-audit/**'
+      - '.github/actions/harn-package/**'
+      - '.github/actions/harn-repo-policy/**'
+      - '.github/actions/hosted-runner-labels/**'
+      - '.github/actions/local-workflow-checks/**'
+      - '.github/actions/merge-override-verdict/**'
+      - '.github/actions/pr-title-check/**'
+      - '.github/actions/require-successful-needs/**'
+      - '.github/actions/review-dispatch/**'
+      - '.github/actions/rust-test-impact/**'
+      - '.github/actions/validate-candidate-manifest/**'
+      - '.github/release-consumers.json'
+      - '.github/workflows/cargo-deny.yml'
+      - '.github/workflows/dependency-security-proof.yml'
+      - '.github/workflows/harn-package.yml'
+      - '.github/workflows/merge-override.yml'
+      - '.github/workflows/promote-release.yml'
+      - '.github/workflows/register-package-release.yml'
+      - '.github/workflows/repin.yml'
+      - '.github/workflows/runner-availability.yml'
+      - '.github/workflows/smart-ship.yml'
+      - 'schemas/candidate-manifest.v1.json'
+      - 'scripts/captured-command.harn'
+      - 'scripts/ci-job-proof/**'
+      - 'scripts/ci-latency/**'
+      - 'scripts/ci-runtime-evidence/**'
+      - 'scripts/dependabot-config/**'
+      - 'scripts/dependabot-waivers/**'
+      - 'scripts/hosted-runner-labels/**'
+      - 'scripts/local-checks/**'
+      - 'scripts/merge-override/**'
+      - 'scripts/merge-override/github.harn'
+      - 'scripts/release-promotion/**'
+      - 'scripts/release-repin/**'
+      - 'scripts/review-dispatch/**'
+      - 'scripts/smart-ship/**'
+      - 'templates/dependabot-waivers.json'
+      - 'templates/dependabot.yml'
+  workflow_dispatch:
+    inputs:
+      workflow:
+        description: Shared workflow or action to move even when none of its paths changed, such as smart-ship.yml or ci-job-proof. Every other stale pin moves too.
+        required: false
+        default: ""
+        type: string
+      sha:
+        description: Commit on main to move the pins to. Empty means the commit this run starts from.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run at a time. A newer run supersedes a waiting one, which is safe
+  # because every run carries every stale pin.
+  group: bump-consumer-pins
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Start consumer pin bumps
+    # A manual run on another branch would run that branch's code with the
+    # dispatch token.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the full owner history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The change list and the staleness test both read commits between
+          # each consumer's pin and the new commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Harn release
+        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        with:
+          version: "0.10.177"
+
+      - name: Plan the bump from the registry
+        id: plan
+        shell: bash
+        env:
+          CONSUMER_PINS_MODE: plan
+          CONSUMER_PINS_SHA: ${{ inputs.sha || github.sha }}
+          CONSUMER_PINS_REQUESTED: ${{ inputs.workflow }}
+        run: bash scripts/consumer-pins/run.sh
+
+      - name: Mint the consumer dispatch token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.plan.outputs.repositories }}
+          # Reading each consumer's workflow files and starting its bump
+          # workflow is the whole authority this workflow needs. The
+          # consumer's workflow opens its pull request with its own token.
+          permission-actions: write
+          permission-contents: read
+
+      - name: Start each consumer's bump
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          CONSUMER_PINS_MODE: dispatch
+          CONSUMER_PINS_SHA: ${{ inputs.sha || github.sha }}
+          CONSUMER_PINS_REQUESTED: ${{ inputs.workflow }}
+        run: bash scripts/consumer-pins/run.sh

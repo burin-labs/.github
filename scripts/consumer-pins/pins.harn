@@ -1,0 +1,475 @@
+/**
+ * Move consumers' pins on this repository's shared workflows and actions
+ * forward when the code those pins run changes. The registry at
+ * scripts/consumer-pins/registry.json is the one list of what is shared, which
+ * owner paths each shared workflow or action runs, and who consumes it; this
+ * module is the one owner of its shape.
+ *
+ * Each consumer owns its bump. This module reads the consumer's current pins,
+ * decides which of them run owner code that changed since the pinned commit,
+ * and starts the workflow the registry names. That workflow opens or updates
+ * the consumer's one bump pull request, and its own CI and review decide
+ * whether it lands.
+ */
+pub const REGISTRY_PATH = "scripts/consumer-pins/registry.json"
+
+/** The repository whose workflows and actions consumers pin. */
+pub const OWNER_REPOSITORY = "burin-labs/.github"
+
+/** Change-list bounds, so a long gap still fits one workflow_dispatch input. */
+pub const MAX_CHANGE_LINES = 25
+
+pub const MAX_CHANGES_CHARS = 3000
+
+pub type Shared = {kind: string, name: string, paths: list<string>, release_path: bool}
+
+pub type Consumer = {repository: string, public: bool}
+
+pub type Registry = {
+  schema_version: int,
+  consumer_workflow: string,
+  consumers: list<Consumer>,
+  shared: list<Shared>,
+}
+
+/** One `uses:` pin on an owner workflow or action, by owner-relative path. */
+pub type Pin = {reference: string, sha: string}
+
+pub type Commit = {sha: string, subject: string}
+
+/** The owner's own git history, read from a full checkout. */
+pub type OwnerHistory = {
+  is_ancestor: fn(string, string) -> bool?,
+  commits: fn(string, string, list<string>) -> list<Commit>,
+}
+
+/** What one consumer is asked to move, and why. */
+pub type Bump = {repository: string, references: list<string>, release_path: bool, changes: string}
+
+/** Everything dispatching asks of GitHub. */
+pub type Dispatcher = {dispatch: fn(string, string, dict<string, string>) -> string?}
+
+const SLUG = "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+
+const SHA = "^[0-9a-f]{40}$"
+
+const PIN =
+  "(?:^|[^A-Za-z0-9_./-])burin-labs/\\.github/(\\.github/(?:workflows/[A-Za-z0-9_.-]+\\.ya?ml|actions/[A-Za-z0-9_.-]+))@([0-9a-f]{40})\\b"
+
+const REGISTRY_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["schema_version", "consumer_workflow", "consumers", "shared"],
+  properties: {
+    schema_version: {const: 1},
+    consumer_workflow: {type: "string", pattern: "^[A-Za-z0-9_.-]+\\.ya?ml$"},
+    consumers: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["repository", "public"],
+        properties: {repository: {type: "string", pattern: SLUG}, public: {type: "boolean"}},
+      },
+    },
+    shared: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "name", "paths", "release_path"],
+        properties: {
+          kind: {enum: ["workflow", "action"]},
+          name: {type: "string", pattern: "^[A-Za-z0-9_.-]+$"},
+          paths: {
+            type: "array",
+            minItems: 1,
+            items: {type: "string", pattern: "^[A-Za-z0-9_.][A-Za-z0-9_./-]*$"},
+          },
+          release_path: {type: "boolean"},
+        },
+      },
+    },
+  },
+}
+
+fn owner_of(slug: string) -> string {
+  return slug.split("/")[0] ?? ""
+}
+
+fn short(sha: string) -> string {
+  return sha[0:12]
+}
+
+/** The owner-relative path a consumer pins, e.g. .github/workflows/smart-ship.yml. */
+pub fn reference(shared: Shared) -> string {
+  return (shared.kind == "workflow" ? ".github/workflows/" : ".github/actions/") + shared.name
+}
+
+/** The file that defines a shared workflow or action at a commit. */
+pub fn definition_path(shared: Shared) -> string {
+  return shared.kind == "workflow" ? reference(shared) : reference(shared) + "/action.yml"
+}
+
+/**
+ * Validate the registry document. Throws naming every problem; returns the
+ * typed registry otherwise.
+ */
+pub fn validate_registry(raw: unknown) -> Registry {
+  const checked = schema_check(raw, REGISTRY_SCHEMA)
+  if !is_ok(checked) {
+    throw REGISTRY_PATH + " is malformed: "
+      + join(unwrap_err(checked).errors.map({ error -> to_string(error) }), "; ")
+  }
+  const registry: Registry = unwrap(checked)
+  let problems = []
+  let consumers = []
+  for consumer in registry.consumers {
+    if consumers.contains(consumer.repository) {
+      problems = problems + [consumer.repository + " is listed twice"]
+    }
+    consumers = consumers + [consumer.repository]
+    if consumer.repository == OWNER_REPOSITORY {
+      problems = problems + [OWNER_REPOSITORY + " lists itself as a consumer"]
+    }
+    // The dispatch token is minted for the owner's organization.
+    if owner_of(consumer.repository) != owner_of(OWNER_REPOSITORY) {
+      problems = problems
+        + [
+          consumer.repository + " is outside " + owner_of(OWNER_REPOSITORY)
+            + ", so it cannot be dispatched",
+        ]
+    }
+  }
+  let references = []
+  for shared in registry.shared {
+    const ref = reference(shared)
+    if references.contains(ref) {
+      problems = problems + [ref + " is listed twice"]
+    }
+    references = references + [ref]
+    const is_yaml = regex_match("\\.ya?ml$", shared.name) != nil
+    if shared.kind == "workflow" && !is_yaml {
+      problems = problems + [ref + " is a workflow but does not name a .yml file"]
+    }
+    if shared.kind == "action" && is_yaml {
+      problems = problems + [ref + " is an action but names a file, not its directory"]
+    }
+    // A shared workflow's own definition always triggers its bump.
+    const own = shared.kind == "workflow" ? ref : ref + "/"
+    if shared.paths[0] != own {
+      problems = problems + [ref + " must list " + own + " as its first path"]
+    }
+    for path in shared.paths {
+      if path.contains("..") || path.contains("//") {
+        problems = problems + [ref + " path " + path + " is not a plain owner path"]
+      }
+    }
+  }
+  if len(problems) > 0 {
+    throw REGISTRY_PATH + " is malformed: " + join(problems, "; ")
+  }
+  return registry
+}
+
+/** Every owner workflow or action a workflow file pins to a full commit SHA. */
+pub fn pinned_references(text: string) -> list<Pin> {
+  return regex_captures(PIN, text, "m").map(
+    { capture -> {reference: capture.groups[0], sha: capture.groups[1]} },
+  )
+    .to_list()
+}
+
+/**
+ * The `on.push.paths` filter that starts a bump: every owner path the registry
+ * lists, with each directory matched recursively.
+ */
+pub fn trigger_paths(registry: Registry) -> list<string> {
+  let paths = []
+  for shared in registry.shared {
+    for path in shared.paths {
+      const pattern = path.ends_with("/") ? path + "**" : path
+      if !paths.contains(pattern) {
+        paths = paths + [pattern]
+      }
+    }
+  }
+  return paths.sorted()
+}
+
+/** The registry entry a bare name or an owner-relative path names, if any. */
+pub fn find_shared(registry: Registry, name: string) -> Shared? {
+  for shared in registry.shared {
+    if shared.name == name || reference(shared) == name {
+      return shared
+    }
+  }
+  return nil
+}
+
+/**
+ * Resolve what a manual run names to registry references. Accepts a bare
+ * workflow file name, an action directory name, or an owner-relative path.
+ */
+pub fn resolve_requested(registry: Registry, raw: string) -> list<string> {
+  const names = regex_split(trim(raw), "[\\s,]+").filter({ name -> name != "" })
+  let resolved = []
+  let unknown = []
+  for name in names {
+    const found = find_shared(registry, name)
+    if found == nil {
+      unknown = unknown + [name]
+    } else {
+      resolved = resolved + [reference(found)]
+    }
+  }
+  if len(unknown) > 0 {
+    throw join(unknown, ", ") + " is not a shared workflow or action in " + REGISTRY_PATH
+  }
+  return resolved
+}
+
+/**
+ * Whether a commit subject names a private consumer: its repository name with
+ * any separator, or the first word of that name on its own. The organization
+ * name is masked first, because every pin names it.
+ */
+fn mentions_private(registry: Registry, text: string) -> bool {
+  const organization = owner_of(OWNER_REPOSITORY).lower()
+  const masked = text.lower().replace(organization, "")
+  return registry.consumers.any(
+    { consumer ->
+      if consumer.public {
+        return false
+      }
+      const name = (consumer.repository.split("/")[1] ?? consumer.repository).lower()
+      const words = regex_split(name, "[-_.]+").filter({ word -> word != "" }).to_list()
+      const spaced = join(words, "[-_. ]?")
+      const first = words[0] ?? name
+      return regex_match(spaced, masked) != nil || regex_match("\\b" + first + "\\b", masked) != nil
+    },
+  )
+}
+
+/**
+ * Render the change list for one consumer. A public consumer never receives a
+ * subject that names a private consumer, because the pull request it opens is
+ * public.
+ */
+pub fn render_changes(
+  registry: Registry,
+  consumer: Consumer,
+  commits: list<Commit>,
+  notes: list<string>,
+) -> string {
+  let lines = notes.map({ note -> "- " + note })
+  for commit in commits {
+    let subject = commit.subject
+    if consumer.public && mentions_private(registry, subject) {
+      subject = "(subject withheld because it names a private repository)"
+    }
+    lines = lines + ["- " + short(commit.sha) + " " + subject.replace("<!--", "< !--")]
+  }
+  if len(lines) > MAX_CHANGE_LINES {
+    const hidden = len(lines) - (MAX_CHANGE_LINES - 1)
+    lines = lines[0:MAX_CHANGE_LINES - 1] + ["- and " + to_string(hidden) + " more"]
+  }
+  let text = join(lines, "\n")
+  if len(text) > MAX_CHANGES_CHARS {
+    text = text[0:MAX_CHANGES_CHARS - 20] + "\n- (list truncated)"
+  }
+  return text
+}
+
+/**
+ * Decide what one consumer must move to `sha`. A pin moves when any owner
+ * commit since it touched a path its workflow or action runs, when it is not
+ * on the owner's history at all, or when a manual run names it. A pin already
+ * at or past `sha` never moves. Returns nil when nothing moves.
+ */
+pub fn plan_consumer(
+  registry: Registry,
+  consumer: Consumer,
+  texts: list<string>,
+  sha: string,
+  requested: list<string>,
+  history: OwnerHistory,
+) -> Bump? {
+  if regex_match(SHA, sha) == nil {
+    throw "sha must be a full 40-hex commit, got " + sha
+  }
+  let pins = []
+  for text in texts {
+    pins = pins + pinned_references(text)
+  }
+  let references = []
+  let release_path = false
+  let commits = []
+  let seen = []
+  let notes = []
+  for shared in registry.shared {
+    const ref = reference(shared)
+    const used = pins.filter({ pin -> pin.reference == ref })
+    let stale = []
+    for pin in used {
+      if pin.sha != sha && !stale.contains(pin.sha) {
+        stale = stale + [pin.sha]
+      }
+    }
+    if len(stale) == 0 {
+      continue
+    }
+    const forced = requested.contains(ref)
+    let moves = false
+    for pinned in stale {
+      const behind = history.is_ancestor(pinned, sha)
+      if behind == true {
+        moves = moves || forced
+        for commit in history.commits(pinned, sha, shared.paths) {
+          moves = true
+          if !seen.contains(commit.sha) {
+            seen = seen + [commit.sha]
+            commits = commits + [commit]
+          }
+        }
+        continue
+      }
+      if history.is_ancestor(sha, pinned) == true {
+        // The consumer already runs a newer owner commit; never move it back.
+        continue
+      }
+      moves = true
+      notes = notes
+        + [ref + " was pinned to " + short(pinned) + ", which is not on the owner's main history"]
+    }
+    if moves {
+      references = references + [ref]
+      release_path = release_path || shared.release_path
+    }
+  }
+  if len(references) == 0 {
+    return nil
+  }
+  return {
+    repository: consumer.repository,
+    references: references,
+    release_path: release_path,
+    changes: render_changes(registry, consumer, commits, notes),
+  }
+}
+
+fn yaml_mapping(text: string) -> dict? {
+  try {
+    const value = yaml_parse(text)
+    if type_of(value) == "dict" {
+      return value
+    }
+  } catch (_error) {
+    return nil
+  }
+  return nil
+}
+
+fn on_triggers(document: dict) -> list<string> {
+  const on = document["on"]
+  if type_of(on) == "string" {
+    return [to_string(on)]
+  }
+  if type_of(on) == "list" {
+    return on.map({ item -> to_string(item) }).to_list()
+  }
+  if type_of(on) == "dict" {
+    return keys(on)
+  }
+  return []
+}
+
+/**
+ * Check every reference about to be dispatched against the owner commit: the
+ * definition must exist, parse, and still be a reusable workflow or an action.
+ * `read` returns the file text at the commit, or nil when it is absent.
+ * Returns the problems; empty means every definition passed.
+ */
+pub fn definition_problems(
+  registry: Registry,
+  references: list<string>,
+  sha: string,
+  read: fn(string, string) -> string?,
+) -> list<string> {
+  let problems = []
+  for ref in references {
+    const shared = find_shared(registry, ref)
+    if shared == nil {
+      problems = problems + [ref + " is not in " + REGISTRY_PATH]
+      continue
+    }
+    const path = definition_path(shared)
+    const text = read(sha, path)
+    if text == nil {
+      problems = problems + [path + " does not exist at " + short(sha)]
+      continue
+    }
+    const document = yaml_mapping(text)
+    if document == nil {
+      problems = problems + [path + " at " + short(sha) + " is not a YAML mapping"]
+      continue
+    }
+    if shared.kind == "workflow" && !on_triggers(document).contains("workflow_call") {
+      problems = problems + [path + " at " + short(sha) + " is no longer a reusable workflow"]
+    }
+    if shared.kind == "action" && document["runs"] == nil {
+      problems = problems + [path + " at " + short(sha) + " declares no runs"]
+    }
+  }
+  return problems
+}
+
+/** Repository names, without the owner, for scoping the dispatch token. */
+pub fn token_repositories(registry: Registry) -> string {
+  return join(registry.consumers.map({ consumer -> consumer.repository.split("/")[1] }), "\n")
+}
+
+/** The workflow_dispatch inputs a consumer's bump workflow receives. */
+pub fn dispatch_inputs(bump: Bump, sha: string) -> dict<string, string> {
+  return {
+    workflow: join(bump.references, " "),
+    sha: sha,
+    release_path: bump.release_path ? "true" : "false",
+    changes: bump.changes,
+  }
+}
+
+/**
+ * Start each consumer's bump workflow. Tries every consumer, then fails naming
+ * each dispatch that GitHub refused.
+ */
+pub fn dispatch_all(
+  dispatcher: Dispatcher,
+  registry: Registry,
+  bumps: list<Bump>,
+  sha: string,
+) -> list<Bump> {
+  let refused = []
+  let started = []
+  for bump in bumps {
+    const diagnostic = dispatcher.dispatch(
+      bump.repository,
+      registry.consumer_workflow,
+      dispatch_inputs(bump, sha),
+    )
+    if diagnostic == nil {
+      started = started + [bump]
+    } else {
+      refused = refused + [bump.repository + " " + registry.consumer_workflow + ": " + diagnostic]
+    }
+  }
+  if len(refused) > 0 {
+    throw "could not start the pin bump in " + to_string(len(refused)) + " of "
+      + to_string(len(bumps))
+      + " consumers: "
+      + join(refused, "; ")
+  }
+  return started
+}
