@@ -39,6 +39,9 @@ const ENDED = "<!-- smart-ship ended="
 
 const STORAGE_FULL = "<!-- smart-ship storage-full="
 
+// A green head waits because the only bound approval names an earlier head; said once per head.
+const STALE_APPROVAL = "<!-- smart-ship stale-approval="
+
 const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
   nodes { ... on CheckRun { name status conclusion databaseId
       checkSuite { id status conclusion commit { oid } app { id }
@@ -353,6 +356,30 @@ pub fn lease_admits(lease: string, slug: string, pr: Pull) -> bool {
 
 // The stop that a carried approval can answer; a look gathers carry evidence only after it.
 const AWAITING_APPROVAL = "green; waiting for a writer's approval of this head"
+
+/**
+ * The note for a head that would land but whose bound approval names an earlier head, or "" when
+ * there is nothing to say: another stop, no approval at all, a veto, or a note already posted here.
+ */
+fn stale_approval_note(repo: Repo, d: dict) -> string {
+  const pr = repo.pullRequest
+  if d.action != "stop" || d.reason != AWAITING_APPROVAL || d.facts.review_evidence.vetoed
+    || !complete(pr.comments) {
+    return ""
+  }
+  const earlier = approved_earlier_heads(repo)
+  const said = pr.comments.nodes.any(
+    { c -> c.viewerDidAuthor == true && contains(c.body, STALE_APPROVAL + pr.headRefOid) },
+  )
+  if len(earlier) == 0 || said {
+    return ""
+  }
+  const short = { sha -> substring(sha, 0, 12) }
+  return "the approval on record is for ${join(earlier.map(short), ", ")}, but the head is now "
+    + "${short(pr.headRefOid)}, so Smart Ship will not merge until an approval is recorded at the "
+    + "current head. Ask the reviewer to approve the current head again, or, when only a merge of "
+    + "main changed it, use the repository's approval rebind tool.\n\n${STALE_APPROVAL}${pr.headRefOid} -->"
+}
 
 pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", carry: Carry? = nil) {
   const pr = repo.pullRequest
@@ -1621,6 +1648,11 @@ pub fn look(harness: Harness, job: Look) {
   }
   const logged = evidence_line(pr, d.facts.review_evidence)
   harness.stdio.println(logged)
+  // GitHub still shows such a PR as approved, so the wait is said on the PR, not only in the log.
+  const stale = stale_approval_note(r, d)
+  if stale != "" {
+    say(stale)
+  }
   // Looks on one PR never overlap, so an attempt still open now died; it is closed, not repeated.
   for _ in 0..d.facts.close {
     say(

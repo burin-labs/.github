@@ -247,6 +247,7 @@ pipeline test_actual_look_fetches_source_evidence_and_refuses_rebound_bot_review
       {status: 200, body: json_stringify({data: {mergePullRequest: {pullRequest: {state: "MERGED"}}}})},
     ]})
     harness.testing.http_mock("GET", api + "/repos/o/r/git/matching-refs/release-merge-lease/main", {status: 200, body: "[]"})
+    harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
     const decision = look(harness, {
       repo: "o/r", number: 9, token: "fixture-token", work: work, publish: false,
       repair: false, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
@@ -382,6 +383,7 @@ fn carried_look(harness: Harness, rest: dict, over: dict = {}) {
   for {key: path, value: body} in rest.entries() {
     harness.testing.http_mock("GET", api + path, body == nil ? {status: 404, body: "{\"message\":\"Not Found\"}"} : {status: 200, body: json_stringify(body)})
   }
+  harness.testing.http_mock("POST", api + "/repos/o/r/issues/9/comments", {status: 201, body: "{}"})
   const decision = look(harness, {
     repo: "o/r", number: 9, token: "fixture-token", work: harness.fs.mkdtemp_in_workspace("carry-look-"),
     publish: false, repair: false, run_id: "", opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
@@ -390,7 +392,58 @@ fn carried_look(harness: Harness, rest: dict, over: dict = {}) {
   const calls = harness.testing.http_mock_calls({include_sensitive: true})
   const merges = calls.filter({ c -> c.method == "POST" && c.body.contains("mergePullRequest") }).to_list()
   const compares = calls.filter({ c -> c.url.contains("/compare/") }).to_list()
-  return {decision: decision, merges: merges, compares: len(compares)}
+  const posted = calls.filter({ c -> c.method == "POST" && contains(c.url, "/issues/9/comments") })
+    .map({ c -> schema_expect(json_parse(c.body), schema_of(Posted)).body })
+    .to_list()
+  return {decision: decision, merges: merges, compares: len(compares), posted: posted}
+}
+
+const STALE_MARK = "<!-- smart-ship stale-approval="
+
+/**
+ * harn#11013 sat green and CLEAN for 1.5 hours because its only bound approval named the head
+ * before a merge of main, and Smart Ship said nothing while GitHub showed it approved. A head that
+ * would otherwise land now says why it waits, once per head, and nothing else posts that note.
+ */
+pipeline test_a_green_head_says_once_when_its_approval_names_an_earlier_head(harness: Harness) {
+  const ours = { body -> {body: body, viewerDidAuthor: true} }
+  // The carry is refused (the history is unreadable), so the approval stays bound to APPROVED.
+  const stale = carried_look(harness, {})
+  assert_eq(stale.decision.reason, "green; waiting for a writer's approval of this head")
+  assert_eq(len(stale.merges), 0)
+  assert_eq(len(stale.posted), 1, to_string(stale.posted))
+  const note = stale.posted[0]
+  assert(note.contains("approval on record is for ${APPROVED[0:12]}, but the head is now ${MERGED[0:12]}"), note)
+  assert(note.contains("approve the current head again") && note.contains("rebind"), note)
+  assert(note.contains(STALE_MARK + MERGED + " -->"), note)
+  const again = carried_look(harness, {}, {comments: page([ours(note)])})
+  assert_eq(again.posted, [], "the same head is told once")
+  const elsewhere = carried_look(harness, {}, {comments: page([{body: note, viewerDidAuthor: false}])})
+  assert_eq(len(elsewhere.posted), 1, "only Smart Ship's own note answers the head")
+  const moved = carried_look(harness, {}, {comments: page([ours("earlier\n\n${STALE_MARK}${OTHER} -->")])})
+  assert_eq(len(moved.posted), 1, "a new head with the same problem is told again")
+  assert(moved.posted[0].contains(STALE_MARK + MERGED), moved.posted[0])
+  const control = {type: "Bot", login: "burin-control"}
+  const vetoed = [
+    {state: "APPROVED", body: author_receipt(APPROVED), author: control},
+    {state: "CHANGES_REQUESTED", body: "Not yet.", author: {type: "Bot", login: "reviewer"}},
+  ]
+  const silent = [
+    ["no approval at all is the ordinary wait", {latestOpinionatedReviews: page([])}],
+    ["a PR not labeled ship is never written to", {labels: page([])}],
+    ["a failing required check is not otherwise mergeable", red()],
+    ["a writer's change request vetoes the approval", {latestOpinionatedReviews: page(vetoed)}],
+  ]
+  for row in silent {
+    const seen = carried_look(harness, {}, row[1])
+    assert_eq(seen.decision.action, "stop", row[0])
+    assert_eq(seen.posted, [], row[0])
+  }
+  const bound = [{state: "APPROVED", body: author_receipt(MERGED), author: control}]
+  const current = carried_look(harness, {}, {latestOpinionatedReviews: page(bound)})
+  assert_eq(current.decision.action, "merge", "an approval bound to the live head merges as before")
+  assert_eq(len(current.merges), 1)
+  assert_eq(current.posted, [])
 }
 
 /** The REST reads of a live head that merged the base once into the approved head. */
