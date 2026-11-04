@@ -101,7 +101,7 @@ fi
 #   - issue reference lines, the generated-by footer, and bot footers
 prose="$(
   printf '%s\n' "$body" \
-    | sed -e '/<!--/,/-->/d' \
+    | perl -0777 -pe 's/<!--.*?-->//gs' \
     | sed -e '/^[[:space:]]*```/,/^[[:space:]]*```/d' \
     | grep -v -E '^[[:space:]]*#' \
     | grep -v -E '^[[:space:]]*([-*+]|[0-9]+\.)[[:space:]]' \

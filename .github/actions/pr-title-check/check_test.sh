@@ -74,6 +74,22 @@ run_case "empty body fails" 1 '[CI] Fix the flaky release runner probe' false ''
 run_case "unedited template body fails" 1 '[CI] Fix the flaky release runner probe' false "$unfilled_template"
 run_case "headings and checklist only fails" 1 '[CI] Fix the flaky release runner probe' false "$checklist_only"
 
+# A description that names an HTML comment inline, on one line, used to lose every
+# later line: a line range from the first `<!--` found no `-->` line and ran to the
+# end of the body. This is the shape that body had.
+inline_comment_body='## What changed
+
+When a ship pull request is green, Smart Ship posts one comment that carries a hidden `<!-- smart-ship stale-approval=<head> -->` marker, so each head is told once and a new head is told again.
+
+## Why
+
+GitHub keeps showing such a pull request as approved while Smart Ship waits, and nothing says why, so authors wait for a merge that will not come until someone records a fresh approval.'
+run_case "inline comment on one line keeps the prose after it" 0 '[CI] Fix the flaky release runner probe' false "$inline_comment_body"
+
+# The negative control: prose that exists only inside a comment is still not author prose.
+comment_only_prose='<!-- When a ship pull request is green, Smart Ship posts one comment that carries a hidden marker, so each head is told once and a new head is told again, and nobody has to guess why it waits. -->'
+run_case "prose only inside a comment fails" 1 '[CI] Fix the flaky release runner probe' false "$comment_only_prose"
+
 # A merge queue or push event carries no PR number. Skipping there is what
 # keeps this check from deadlocking a queue it was never meant to gate.
 run_case "absent PR number skips instead of failing" 0 '[CI] Fix the flaky release runner probe' false "$good_body" ''
