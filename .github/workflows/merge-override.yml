@@ -97,7 +97,7 @@ jobs:
           ref: ${{ fromJSON(toJSON(job)).workflow_sha || github.sha }}
 
       - name: Set up exact Harn release
-        uses: burin-labs/harn/.github/actions/setup-harn@68ab397be4c1b7eece1743e0f8824840e05c2fa2 # bounded release-asset retries
+        uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c # bounded release-asset retries
         with:
           version: 0.10.133
 
@@ -142,7 +142,7 @@ jobs:
         if: >-
           steps.decide.outcome == 'success' && steps.decide.outputs.merge == 'true' &&
           steps.cancel.outcome != 'failure' && steps.publish.outcome != 'failure'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -175,7 +175,7 @@ jobs:
         id: log-token
         if: always() && steps.decide.outputs.active != 'false'
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

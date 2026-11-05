@@ -155,7 +155,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up exact Harn release
-        uses: burin-labs/harn/.github/actions/setup-harn@68ab397be4c1b7eece1743e0f8824840e05c2fa2 # bounded release-asset retries
+        uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c # bounded release-asset retries
         with:
           version: 0.10.133
 
@@ -170,14 +170,14 @@ jobs:
 
       - name: Set up the consumer reader runtime
         if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '' || inputs.standalone-harn) && github.repository == 'burin-labs/harn'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
       - name: Mint consumer read authority
         if: (inputs.original-consumer-context != '' || inputs.consumer-repair != '') && github.repository == 'burin-labs/harn'
         id: consumer-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -214,7 +214,7 @@ jobs:
         run: bash .harn/promote-release/implementation/scripts/release-promotion/run.sh
 
       - name: Preserve the verified publication intent
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: publication-intent-${{ github.run_attempt }}-${{ hashFiles('.harn/promote-release/candidate/publication-intent.json') }}
           path: .harn/promote-release/candidate/publication-intent.json
@@ -224,7 +224,7 @@ jobs:
 
       - name: Mint the release token
         id: token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
