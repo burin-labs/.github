@@ -7,6 +7,14 @@
 #   reusable-pin-drift.sh report --json       machine-readable rows
 #   reusable-pin-drift.sh sync-issue          file/update/close the drift issue
 #
+# Alongside the contract verdicts, every full-SHA pin gets a MEASURED staleness
+# record: the commits to the target since the pin that touched the workflow or
+# any path it checks out or runs at its own ref. Paths are derived from the
+# workflow by scripts/reusable_pin_contract.rb, plus the explicit table in
+# scripts/reusable-pin-execution-paths.json. The commits are read from a local
+# full-history clone of this repository (PIN_DRIFT_GIT_DIR, default: the clone
+# holding this script).
+#
 # Why this exists: a full-40-character SHA pin satisfies every "is it pinned"
 # guard in the org (harn's `make lint-actions-source`, this repo's own review)
 # while pointing at a revision `main` moved past weeks ago. Those guards check
@@ -56,6 +64,8 @@ ISSUE_TITLE="${PIN_DRIFT_ISSUE_TITLE:-Reusable workflow pin or output contract d
 ISSUE_MARKER="<!-- reusable-pin-drift:report -->"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 CONTRACT_HELPER="${SCRIPT_DIR}/reusable_pin_contract.rb"
+# Not GIT_DIR: git itself reads that name from the environment.
+POLICY_GIT_DIR="${PIN_DRIFT_GIT_DIR:-${SCRIPT_DIR}/..}"
 
 OUTPUT_JSON=false
 WRITE_ISSUE=false
@@ -81,6 +91,11 @@ while [ $# -gt 0 ]; do
       ;;
     classify-outputs)
       COMMAND="classify-outputs"
+      shift
+      break
+      ;;
+    render-staleness)
+      COMMAND="render-staleness"
       shift
       break
       ;;
@@ -235,6 +250,64 @@ if [ "$COMMAND" = "classify-outputs" ]; then
   exit 0
 fi
 
+# Staleness states that keep the report open. `unknown` is here on purpose: a
+# pin that could not be measured must never read as clean. `pending` (newer
+# commits still inside the grace period) is listed but not flagged.
+STALE_FLAGGED='["stale", "unknown"]'
+
+# stale_pin_count <classified-json> -> distinct (repo, workflow, ref) pins flagged
+stale_pin_count() {
+  jq --argjson f "$STALE_FLAGGED" '
+    [.[] | select(.staleness != null and (.staleness.state as $s | $f | index($s)))
+     | [.repo, .workflow, .ref]] | unique | length' <<< "$1"
+}
+
+# render_staleness <classified-json>: per caller repo, per pin, the measured
+# newer commits. Pure, so the `render-staleness` seam tests it offline. Current
+# pins are omitted: they have nothing to report.
+render_staleness() {
+  local listed
+  printf '## Stale pins\n\n'
+  printf 'Commits to `%s` since each pin that touched the pinned workflow or a path\n' "$TARGET_REF"
+  printf 'it checks out or runs at its own ref. **stale**: the oldest is past the grace\n'
+  printf 'period. pending: inside it, not flagged. **unknown**: not measurable, never clean.\n\n'
+  listed="$(jq -r --argjson f "$STALE_FLAGGED" '
+    def days: . / 86400 * 10 | floor / 10;
+    [.[] | select(.staleness != null and .staleness.state != "current")]
+    | group_by(.repo)[]
+    | "### `\(.[0].repo)`\n",
+      (group_by(.workflow + "@" + .ref)[]
+       | length as $sites
+       | .[0] as $r
+       | ($r.staleness) as $s
+       | ($r.workflow | split("/") | last) as $name
+       | (if ($f | index($s.state)) then "**\($s.state)**" else $s.state end) as $state
+       | (if $sites > 1 then " (\($sites) call sites)" else "" end) as $where
+       | if $s.state == "unknown" then
+           "- `\($name)` pinned `\($r.ref[0:8])`\($where): \($state), \($s.detail)"
+         else
+           "- `\($name)` pinned `\($r.ref[0:8])`\($where): \($state), \($s.count) newer commit(s), oldest \($s.oldest_age_seconds | days)d old",
+           ($s.commits[0:10][] | "  - `\(.sha[0:8])` \(.subject)"),
+           (if ($s.commits | length) > 10 then "  - and \(($s.commits | length) - 10) more" else empty end)
+         end),
+      ""
+  ' <<< "$1")"
+  if [ -n "$listed" ]; then
+    printf '%s\n' "$listed"
+  else
+    printf 'No pin trails a commit that touched what it executes.\n\n'
+  fi
+}
+
+if [ "$COMMAND" = "render-staleness" ]; then
+  command -v jq > /dev/null 2>&1 || die "jq is required"
+  rows_in="$(cat)"
+  TARGET_REF="${1:-$TARGET_REF}"
+  render_staleness "$rows_in"
+  printf -- '- Stale pins: %s\n' "$(stale_pin_count "$rows_in")"
+  exit 0
+fi
+
 command -v gh > /dev/null 2>&1 || die "gh is required"
 command -v jq > /dev/null 2>&1 || die "jq is required"
 command -v ruby > /dev/null 2>&1 || die "ruby is required"
@@ -248,6 +321,15 @@ TARGET_SHA="$(gh api "repos/${ORG}/${POLICY_REPO}/commits/${TARGET_REF}" --jq '.
   die "could not resolve ${ORG}/${POLICY_REPO}@${TARGET_REF}"
 [ -n "$TARGET_SHA" ] || die "empty target sha for ${TARGET_REF}"
 note "target: ${ORG}/${POLICY_REPO}@${TARGET_REF} = ${TARGET_SHA}"
+
+# Staleness is read from local history. A shallow clone, or one that does not
+# contain the target, would make every pin unmeasurable; fail here rather than
+# file a report where every row is UNKNOWN for a reason the reader cannot see.
+command -v git > /dev/null 2>&1 || die "git is required"
+[ "$(git -C "$POLICY_GIT_DIR" rev-parse --is-shallow-repository 2> /dev/null)" = "false" ] ||
+  die "${POLICY_GIT_DIR} is not a full-history clone; check out with fetch-depth: 0 or set PIN_DRIFT_GIT_DIR"
+git -C "$POLICY_GIT_DIR" cat-file -e "${TARGET_SHA}^{commit}" 2> /dev/null ||
+  die "${POLICY_GIT_DIR} does not contain ${TARGET_SHA}; fetch ${TARGET_REF} first"
 
 # ---------------------------------------------------------------------------
 # Enumerate consumers by CONTENT, never from a hardcoded repo list
@@ -433,27 +515,38 @@ while IFS=$'\t' read -r repo path line job workflow ref required_outputs; do
     fi
   fi
 
+  # The contract verdict above compares the workflow FILE only. Staleness also
+  # covers what the workflow checks out and runs at its own ref, which is where
+  # the Smart Ship approval-carry fix landed while smart-ship.yml stood still.
+  staleness="null"
+  if is_full_sha "$ref"; then
+    staleness="$(ruby "$CONTRACT_HELPER" staleness "$POLICY_GIT_DIR" "$ORG" "$POLICY_REPO" \
+      "$workflow" "$ref" "$TARGET_SHA" < /dev/null)" ||
+      die "could not measure staleness for ${workflow}@${ref}"
+  fi
+
   classified="$(jq -c \
     --arg repo "$repo" --arg path "$path" --arg line "$line" \
     --arg job "$job" --arg workflow "$workflow" --arg ref "$ref" \
     --argjson required_outputs "$required_outputs" --argjson missing_outputs "$missing_outputs" \
     --arg verdict "$verdict" --arg relation "$relation" \
-    --arg content "$content" --arg detail "$detail" \
+    --arg content "$content" --arg detail "$detail" --argjson staleness "$staleness" \
     '. + [{repo: $repo, path: $path, line: ($line | tonumber), job: $job, workflow: $workflow,
            ref: $ref, verdict: $verdict, relation: $relation, content: $content,
            required_outputs: $required_outputs, missing_outputs: $missing_outputs,
-           detail: $detail}]' <<< "$classified")"
+           detail: $detail, staleness: $staleness}]' <<< "$classified")"
 done <<< "$(jq -r '.[] | [.repo, .path, .line, .job, .workflow, .ref, (.required_outputs | @json)] | @tsv' <<< "$rows")"
 
 actionable_count="$(jq --argjson a "$ACTIONABLE" '[.[] | select(.verdict as $v | $a | index($v))] | length' <<< "$classified")"
+stale_count="$(stale_pin_count "$classified")"
 
 if [ "$OUTPUT_JSON" = true ]; then
   jq -n \
     --arg target_ref "$TARGET_REF" --arg target_sha "$TARGET_SHA" \
     --argjson rows "$classified" --argjson actionable "$actionable_count" \
-    --argjson scanned "$scanned_workflows" \
+    --argjson stale "$stale_count" --argjson scanned "$scanned_workflows" \
     '{target_ref: $target_ref, target_sha: $target_sha, scanned_workflows: $scanned,
-      actionable: $actionable, rows: $rows}'
+      actionable: $actionable, stale_pins: $stale, rows: $rows}'
   exit 0
 fi
 
@@ -472,7 +565,8 @@ render_markdown() {
   printf 'output read that the pinned or target workflow does not declare.\n\n'
   printf -- '- Target: `%s` = `%s`\n' "$TARGET_REF" "$TARGET_SHA"
   printf -- '- Workflow files scanned: %s across %s non-archived repositories\n' "$scanned_workflows" "$repo_count"
-  printf -- '- Actionable: **%s**\n\n' "$actionable_count"
+  printf -- '- Actionable: **%s**\n' "$actionable_count"
+  printf -- '- Stale pins: **%s**\n\n' "$stale_count"
 
   if [ "$actionable_count" -gt 0 ]; then
     printf '## Actionable\n\n'
@@ -510,6 +604,8 @@ render_markdown() {
     printf '| --- | --- | --- | --- | --- |\n'
     printf '%s\n\n' "$informational"
   fi
+
+  render_staleness "$classified"
 
   printf -- '---\n\n'
   printf 'Filed by `scripts/reusable-pin-drift.sh`. Static consumer guards check pin\n'
@@ -552,7 +648,7 @@ existing="$(gh issue list --repo "${ORG}/${POLICY_REPO}" --state open \
 require_report_fields() {
   local rendered="$1" missing=""
   local field
-  for field in '- Target:' '- Workflow files scanned:' '- Actionable:'; do
+  for field in '- Target:' '- Workflow files scanned:' '- Actionable:' '- Stale pins:'; do
     case "$rendered" in
       *"$field"*) : ;;
       *) missing="${missing}${missing:+, }${field}" ;;
@@ -564,20 +660,21 @@ require_report_fields() {
 body="$(render_markdown)"
 require_report_fields "$body"
 
-if [ "$actionable_count" -gt 0 ]; then
+# One issue carries both findings, and it closes only when both are clean.
+if [ "$actionable_count" -gt 0 ] || [ "$stale_count" -gt 0 ]; then
   if [ -n "$existing" ]; then
     gh issue edit "$existing" --repo "${ORG}/${POLICY_REPO}" \
       --title "$ISSUE_TITLE" --body "$body" > /dev/null
-    echo "updated ${ORG}/${POLICY_REPO}#${existing} (${actionable_count} actionable)"
+    echo "updated ${ORG}/${POLICY_REPO}#${existing} (${actionable_count} actionable, ${stale_count} stale pins)"
   else
     url="$(gh issue create --repo "${ORG}/${POLICY_REPO}" \
       --title "$ISSUE_TITLE" --body "$body")"
-    echo "filed ${url} (${actionable_count} actionable)"
+    echo "filed ${url} (${actionable_count} actionable, ${stale_count} stale pins)"
   fi
 else
   if [ -n "$existing" ]; then
     gh issue comment "$existing" --repo "${ORG}/${POLICY_REPO}" \
-      --body "Drift cleared: every pinned consumer now resolves to the same workflow content as \`${TARGET_REF}\` (\`${TARGET_SHA}\`). Closing." > /dev/null
+      --body "Drift cleared: every pinned consumer now resolves to the same workflow content as \`${TARGET_REF}\` (\`${TARGET_SHA}\`), and no pin trails a past-grace commit to a path it executes. Closing." > /dev/null
     gh issue close "$existing" --repo "${ORG}/${POLICY_REPO}" > /dev/null
     echo "closed ${ORG}/${POLICY_REPO}#${existing} (no drift)"
   else
