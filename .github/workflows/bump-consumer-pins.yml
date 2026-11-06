@@ -11,9 +11,9 @@
 # push to main that touches one of those paths, this workflow reads each
 # consumer's current pins and starts the consumer's own bump-shared-pin.yml
 # with every pin whose code changed since it was pinned. The consumer's
-# workflow opens or updates its one bump pull request with a token it mints
-# itself, so the pull request starts CI, and its normal review decides whether
-# it lands. A pin on the release path is opened without `ship`.
+# workflow opens or recovers a snapshot-bound bump pull request with a token it
+# mints itself, so the pull request starts CI. Its review decides whether to
+# add `ship`, after checking release impact.
 #
 # Each run carries every stale pin for a consumer, not only the ones this push
 # touched, so a run that GitHub drops from the concurrency group is made up by
