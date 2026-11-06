@@ -10,7 +10,7 @@ import {
   Input,
   append_log,
   authorized_override,
-  cancel_competing,
+  cancel_with_rerunnable_status,
   comment_on_pull,
   draft_record,
   fallback_record,
@@ -100,7 +100,7 @@ fn draft(vars: HarnessEnv) -> dict {
 }
 
 fn cancel_step(harness: Harness) {
-  const count = cancel_competing(
+  const count = cancel_with_rerunnable_status(
     github(harness, "GH_TOKEN"),
     input(harness),
     to_int(required(harness.env, "OVERRIDE_RUN_ID")),
