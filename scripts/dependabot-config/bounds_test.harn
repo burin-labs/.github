@@ -119,14 +119,29 @@ pipeline test_python_dynamic_dependency_lists_refuse_and_build_requirements_are_
   assert(ignore_covers({"dependency-name": "setuptools", versions: [">=80"]}, item(rows, 1)))
 }
 
-pipeline test_unresolved_npm_alias_identity_refuses() {
+pipeline test_unbounded_npm_aliases_are_measured_without_a_false_ceiling() {
+  const rows = manifest_dependencies(
+    "npm",
+    "package.json",
+    "{\"dependencies\":{\"@typescript/native\":\"npm:typescript@^7.0.2\",\"other\":\"npm:@scope/pkg@~2.1\",\"latest\":\"npm:real\"}}",
+  )
+  assert_eq(len(rows), 3)
+  assert(rows.all({ row -> row.bound == "" }))
+  assert(rows.any({ row -> row.name == "@typescript/native" }))
+}
+
+pipeline test_bounded_or_malformed_npm_alias_identity_refuses() {
   assert_error_contains(
     fn() { manifest_dependencies(
       "npm",
       "package.json",
       "{\"dependencies\":{\"alias\":\"npm:real@>=1 <2\"}}",
     ) },
-    "npm alias dependency identity requires a supported adapter",
+    "bounded npm alias dependency identity requires a supported adapter",
+  )
+  assert_error_contains(
+    fn() { manifest_dependencies("npm", "package.json", "{\"dependencies\":{\"bad\":\"npm:@bad\"}}") },
+    "unsupported npm alias",
   )
 }
 
