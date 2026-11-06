@@ -211,8 +211,18 @@ pub fn manifest_dependencies(
       const declarations = object(document[section])
       for name in keys(declarations).sorted() {
         const constraint: string = schema_expect(declarations[name], schema_of(Text))
-        require !constraint.starts_with("npm:"),
-          "npm alias dependency identity requires a supported adapter: ${manifest}: ${name}"
+        if constraint.starts_with("npm:") {
+          const alias = regex_captures(
+            r"^npm:((?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*)(?:@(.+))?$",
+            constraint,
+          )
+          require alias.count == 1, "unsupported npm alias in ${manifest}: ${name}"
+          const target_requirement = alias[0].groups[1] ?? ""
+          require ceiling(target_requirement) == nil,
+            "bounded npm alias dependency identity requires a supported adapter: ${manifest}: ${name}"
+          result = result + [dependency(name, target_requirement, manifest)]
+          continue
+        }
         result = result + [dependency(name, constraint, manifest)]
       }
     }
