@@ -70,6 +70,11 @@ jobs:
           version: "0.10.177"
       - name: Test runtime evidence on the consumer runtime
         run: harn test scripts/ci-runtime-evidence
+      # bump-consumer-pins.yml runs this release.
+      - name: Test consumer pin bumps on their runtime
+        run: |
+          harn check scripts/consumer-pins/cli.harn
+          harn test scripts/consumer-pins
       - name: Set up the CI job proof runtime
         uses: burin-labs/harn/.github/actions/setup-harn@924532350531f8cce9ae5d44b1a77dda76c6f44c
         with:
@@ -289,5 +294,6 @@ jobs:
           bash -n scripts/release-promotion/run.sh
           bash -n .github/actions/validate-candidate-manifest/run.sh
           bash -n scripts/release-repin/run.sh
+          bash -n scripts/consumer-pins/run.sh
           bash -n scripts/merge-override/run.sh
           bash -n scripts/review-dispatch/run.sh

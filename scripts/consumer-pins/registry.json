@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "consumer_workflow": "bump-shared-pin.yml",
+  "consumers": [
+    {"repository": "burin-labs/burin-code", "public": false},
+    {"repository": "burin-labs/harn", "public": true}
+  ],
+  "shared": [
+    {
+      "kind": "workflow",
+      "name": "cargo-deny.yml",
+      "paths": [".github/workflows/cargo-deny.yml"],
+      "release_path": false
+    },
+    {
+      "kind": "workflow",
+      "name": "dependency-security-proof.yml",
+      "paths": [".github/workflows/dependency-security-proof.yml", ".github/workflows/cargo-deny.yml"],
+      "release_path": true
+    },
+    {
+      "kind": "workflow",
+      "name": "harn-package.yml",
+      "paths": [
+        ".github/workflows/harn-package.yml",
+        ".github/actions/harn-repo-policy/",
+        ".github/actions/check-dependabot-config/",
+        ".github/actions/harn-package/",
+        "scripts/dependabot-config/",
+        "templates/dependabot.yml"
+      ],
+      "release_path": true
+    },
+    {
+      "kind": "workflow",
+      "name": "merge-override.yml",
+      "paths": [".github/workflows/merge-override.yml", "scripts/merge-override/"],
+      "release_path": false
+    },
+    {
+      "kind": "workflow",
+      "name": "promote-release.yml",
+      "paths": [
+        ".github/workflows/promote-release.yml",
+        "scripts/release-promotion/",
+        "scripts/captured-command.harn",
+        "schemas/candidate-manifest.v1.json"
+      ],
+      "release_path": true
+    },
+    {
+      "kind": "workflow",
+      "name": "register-package-release.yml",
+      "paths": [".github/workflows/register-package-release.yml"],
+      "release_path": true
+    },
+    {
+      "kind": "workflow",
+      "name": "repin.yml",
+      "paths": [".github/workflows/repin.yml", "scripts/release-repin/", ".github/release-consumers.json"],
+      "release_path": true
+    },
+    {
+      "kind": "workflow",
+      "name": "runner-availability.yml",
+      "paths": [".github/workflows/runner-availability.yml"],
+      "release_path": true
+    },
+    {
+      "kind": "workflow",
+      "name": "smart-ship.yml",
+      "paths": [".github/workflows/smart-ship.yml", "scripts/smart-ship/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "check-commit-signatures",
+      "paths": [".github/actions/check-commit-signatures/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "check-dependabot-config",
+      "paths": [".github/actions/check-dependabot-config/", "scripts/dependabot-config/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "check-harn-docs",
+      "paths": [".github/actions/check-harn-docs/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "ci-comparison",
+      "paths": [".github/actions/ci-comparison/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "ci-job-proof",
+      "paths": [".github/actions/ci-job-proof/", "scripts/ci-job-proof/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "ci-latency-policy",
+      "paths": [".github/actions/ci-latency-policy/", "scripts/ci-latency/", "scripts/captured-command.harn"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "ci-runtime-evidence",
+      "paths": [".github/actions/ci-runtime-evidence/", "scripts/ci-runtime-evidence/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "dependabot-waiver-audit",
+      "paths": [
+        ".github/actions/dependabot-waiver-audit/",
+        "scripts/dependabot-waivers/",
+        "scripts/merge-override/github.harn",
+        "templates/dependabot-waivers.json"
+      ],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "harn-package",
+      "paths": [".github/actions/harn-package/"],
+      "release_path": true
+    },
+    {
+      "kind": "action",
+      "name": "harn-repo-policy",
+      "paths": [".github/actions/harn-repo-policy/", "templates/dependabot.yml"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "hosted-runner-labels",
+      "paths": [".github/actions/hosted-runner-labels/", "scripts/hosted-runner-labels/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "local-workflow-checks",
+      "paths": [".github/actions/local-workflow-checks/", "scripts/local-checks/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "merge-override-verdict",
+      "paths": [".github/actions/merge-override-verdict/", "scripts/merge-override/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "pr-title-check",
+      "paths": [".github/actions/pr-title-check/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "require-successful-needs",
+      "paths": [".github/actions/require-successful-needs/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "review-dispatch",
+      "paths": [".github/actions/review-dispatch/", "scripts/review-dispatch/", "scripts/merge-override/github.harn"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "rust-test-impact",
+      "paths": [".github/actions/rust-test-impact/"],
+      "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "validate-candidate-manifest",
+      "paths": [
+        ".github/actions/validate-candidate-manifest/",
+        "scripts/release-promotion/",
+        "scripts/captured-command.harn",
+        "schemas/candidate-manifest.v1.json"
+      ],
+      "release_path": true
+    }
+  ]
+}

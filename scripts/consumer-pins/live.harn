@@ -1,0 +1,205 @@
+import { command_output_tail, command_run } from "std/command"
+import { Commit, Dispatcher, OwnerHistory } from "./pins.harn"
+
+type Repository = {default_branch: string}
+
+type GitRef = {object: {sha: string}}
+
+type TreeEntry = {path: string, type: string, mode: string}
+
+type GitTree = {truncated: bool, tree: list<TreeEntry>}
+
+/** Select all workflow and local action definitions from a complete snapshot. */
+pub fn consumer_definition_paths(raw: unknown, repository: string) -> list<string> {
+  const tree = schema_expect(raw, schema_of(GitTree))
+  if tree.truncated {
+    throw repository + " returned a truncated Git tree; shared pins are unmeasured"
+  }
+  let paths: list<string> = []
+  let workflows = 0
+  for entry in tree.tree {
+    if (entry.path.starts_with(".github/actions/") || entry.path == ".github/actions")
+      && (entry.mode == "120000" || entry.type == "commit") {
+      throw repository + " " + entry.path + " is a symlink or submodule; shared pins are unmeasured"
+    }
+    const workflow = regex_match("^\\.github/workflows/[^/]+\\.ya?ml$", entry.path) != nil
+    const action = regex_match("^\\.github/actions/.+/action\\.ya?ml$", entry.path) != nil
+    if !workflow && !action {
+      continue
+    }
+    if entry.type != "blob" || (entry.mode != "100644" && entry.mode != "100755") {
+      throw repository + " " + entry.path + " is not an ordinary file; shared pins are unmeasured"
+    }
+    paths = paths + [entry.path]
+    if workflow {
+      workflows = workflows + 1
+    }
+  }
+  if workflows == 0 {
+    throw repository + " lists no workflow files under .github/workflows"
+  }
+  return paths.sorted()
+}
+
+fn diagnostic(tools: HarnessTools, result: dict) -> string {
+  const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
+  const lines = trim(stderr).split("\n")
+  const tail = lines[max(0, len(lines) - 3):len(lines)]
+  const text = trim(join(tail, " "))
+  return text == "" ? "exit " + to_string(result?.exit_code) : text
+}
+
+fn git(tools: HarnessTools, root: string, args: list<string>) -> dict {
+  return command_run(
+    tools,
+    ["git", "-C", root] + args,
+    {capture: {max_inline_bytes: 4000000}, timeout_ms: 120000},
+  )
+}
+
+fn known_commit(tools: HarnessTools, root: string, sha: string) -> bool {
+  return git(tools, root, ["cat-file", "-e", sha + "^{commit}"]).success
+}
+
+/** Read the owner's history from the full checkout at `root`. */
+pub fn live_history(tools: HarnessTools, root: string) -> OwnerHistory {
+  return {
+    is_ancestor: fn(ancestor, descendant) {
+      if !known_commit(tools, root, ancestor) || !known_commit(tools, root, descendant) {
+        return nil
+      }
+      const result = git(tools, root, ["merge-base", "--is-ancestor", ancestor, descendant])
+      if result.exit_code == 0 {
+        return true
+      }
+      if result.exit_code == 1 {
+        return false
+      }
+      throw "git merge-base " + ancestor + " " + descendant + " failed: "
+        + diagnostic(tools, result)
+    },
+    commits: fn(older, newer, paths) {
+      const result = git(
+        tools,
+        root,
+        ["log", "--format=%H%x09%s", older + ".." + newer, "--"] + paths,
+      )
+      if !result.success {
+        throw "git log " + older + ".." + newer + " failed: " + diagnostic(tools, result)
+      }
+      let commits: list<Commit> = []
+      for line in result.stdout.split("\n") {
+        const tab = line.index_of("\t")
+        if tab == 40 {
+          commits = commits + [{sha: line[0:40], subject: line[41:len(line)]}]
+        }
+      }
+      return commits
+    },
+  }
+}
+
+/** Read one owner file at a commit, or nil when the commit does not have it. */
+pub fn live_read(tools: HarnessTools, root: string) -> fn(string, string) -> string? {
+  return fn(sha, path) {
+    if !git(tools, root, ["cat-file", "-e", sha + ":" + path]).success {
+      return nil
+    }
+    const result = git(tools, root, ["show", sha + ":" + path])
+    if !result.success {
+      throw "git show " + sha + ":" + path + " failed: " + diagnostic(tools, result)
+    }
+    return result.stdout
+  }
+}
+
+fn gh_env(token: string, scratch: string) -> dict<string, string> {
+  return {
+    GH_TOKEN: token,
+    GH_CONFIG_DIR: path_join(scratch, "config"),
+    XDG_CACHE_HOME: path_join(scratch, "cache"),
+    XDG_STATE_HOME: path_join(scratch, "state"),
+    XDG_DATA_HOME: path_join(scratch, "data"),
+    GH_PROMPT_DISABLED: "1",
+    GH_NO_UPDATE_NOTIFIER: "1",
+    NO_COLOR: "1",
+  }
+}
+
+/**
+ * Read workflows and local action definitions from one immutable default-branch
+ * snapshot. A local composite action can itself pin an owner action.
+ */
+pub fn live_consumer_workflows(
+  tools: HarnessTools,
+  token: string,
+  scratch: string,
+  repository: string,
+) -> list<string> {
+  const options = {
+    capture: {max_inline_bytes: 16000000},
+    env: gh_env(token, scratch),
+    timeout_ms: 120000,
+  }
+  const repo = command_run(tools, ["gh", "api", "repos/" + repository], options)
+  if !repo.success {
+    throw "reading " + repository + " failed: " + diagnostic(tools, repo)
+  }
+  const branch = schema_expect(json_parse(repo.stdout), schema_of(Repository)).default_branch
+  const ref = command_run(
+    tools,
+    ["gh", "api", "repos/" + repository + "/git/ref/heads/" + branch],
+    options,
+  )
+  if !ref.success {
+    throw "reading " + repository + " default branch failed: " + diagnostic(tools, ref)
+  }
+  const sha = schema_expect(json_parse(ref.stdout), schema_of(GitRef)).object.sha
+  const listing = command_run(
+    tools,
+    ["gh", "api", "repos/" + repository + "/git/trees/" + sha + "?recursive=1"],
+    options,
+  )
+  if !listing.success {
+    throw "listing " + repository + " definitions failed: " + diagnostic(tools, listing)
+  }
+  const paths = consumer_definition_paths(json_parse(listing.stdout), repository)
+  let texts = []
+  for path in paths {
+    const file = command_run(
+      tools,
+      [
+        "gh",
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw+json",
+        "repos/" + repository + "/contents/" + path + "?ref=" + sha,
+      ],
+      options,
+    )
+    if !file.success {
+      throw "reading " + repository + " " + path + " failed: " + diagnostic(tools, file)
+    }
+    texts = texts + [file.stdout]
+  }
+  return texts
+}
+
+/** Start a consumer workflow with string inputs. */
+pub fn live_dispatcher(tools: HarnessTools, token: string, scratch: string) -> Dispatcher {
+  const options = {
+    capture: {max_inline_bytes: 1000000},
+    env: gh_env(token, scratch),
+    timeout_ms: 120000,
+  }
+  return {
+    dispatch: fn(repository, workflow, inputs) {
+      let argv = ["gh", "workflow", "run", workflow, "--repo", repository]
+      for name in keys(inputs).sorted() {
+        argv = argv + ["-f", name + "=" + (inputs[name] ?? "")]
+      }
+      const result = command_run(tools, argv, options)
+      return result.success ? nil : diagnostic(tools, result)
+    },
+  }
+}

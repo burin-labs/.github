@@ -179,6 +179,20 @@ the lookup reason and read count.
   successful run. [Package release promotion](docs/promote-package-release.md)
   keeps a package's version tags separate from the application's latest release.
 
+### How consumer pins move
+
+Consumers pin every workflow and action here to a full commit SHA, so a fix
+reaches a consumer only when its pin moves. `scripts/consumer-pins/registry.json`
+lists each shared workflow and action, the owner paths it runs, whether it is on
+a release path, and the consumers. A push to `main` that touches one of those
+paths starts `.github/workflows/bump-consumer-pins.yml`, which starts the
+consumer's own `bump-shared-pin.yml` with every pin whose code changed since it
+was pinned. The consumer opens or recovers a pull request bound to the measured
+consumer and owner commits. Reviewers check release impact and generated
+projections before adding `ship`.
+A new shared workflow or action must be added to the registry; its test fails
+until it is.
+
 ## Registering package releases
 
 A release tag and the Harn package index are two facts that have to agree, and

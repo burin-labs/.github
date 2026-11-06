@@ -1,0 +1,576 @@
+import { command_run } from "std/command"
+import { read_yaml } from "std/fs"
+import { assert_error_contains } from "std/testing"
+import { consumer_definition_paths } from "./live.harn"
+import {
+  Registry,
+  definition_path,
+  definition_problems,
+  dispatch_all,
+  find_shared,
+  pinned_references,
+  plan_consumer,
+  reference,
+  render_changes,
+  resolve_requested,
+  token_repositories,
+  trigger_paths,
+  validate_registry,
+} from "./pins.harn"
+
+const ROOT = "../.."
+
+const OLD = "1111111111111111111111111111111111111111"
+
+const MID = "2222222222222222222222222222222222222222"
+
+const NEW = "3333333333333333333333333333333333333333"
+
+const NEWER = "4444444444444444444444444444444444444444"
+
+const STRAY = "9999999999999999999999999999999999999999"
+
+pipeline test_consumer_definition_census_reaches_nested_actions_and_rejects_partial_reads() {
+  const entries = [
+    {path: ".github/workflows/ci.yml", type: "blob", mode: "100644"},
+    {path: ".github/actions/nested/example/action.yaml", type: "blob", mode: "100644"},
+    {path: ".github/workflows/subdir/ignored.yml", type: "blob", mode: "100644"},
+    {path: "src/action.yml", type: "blob", mode: "100644"},
+  ]
+  assert_eq(
+    consumer_definition_paths({truncated: false, tree: entries}, "org/repo"),
+    [".github/actions/nested/example/action.yaml", ".github/workflows/ci.yml"],
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths({truncated: true, tree: entries}, "org/repo") },
+    "truncated Git tree",
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths({truncated: false, tree: []}, "org/repo") },
+    "lists no workflow files",
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths(
+      {truncated: false, tree: [{path: ".github/workflows/ci.yml", type: "blob", mode: "120000"}]},
+      "org/repo",
+    ) },
+    "not an ordinary file",
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths(
+      {
+        truncated: false,
+        tree: entries + [{path: ".github/actions/linked", type: "blob", mode: "120000"}],
+      },
+      "org/repo",
+    ) },
+    "symlink or submodule",
+  )
+}
+
+fn real_registry(fs: HarnessFs) -> Registry {
+  return validate_registry(json_parse(fs.read_text("registry.json")))
+}
+
+fn small_registry() -> Registry {
+  return validate_registry(
+    {
+      schema_version: 1,
+      consumer_workflow: "bump-shared-pin.yml",
+      consumers: [
+        {repository: "burin-labs/private-app", public: false},
+        {repository: "burin-labs/open-app", public: true},
+      ],
+      shared: [
+        {
+          kind: "workflow",
+          name: "smart-ship.yml",
+          paths: [".github/workflows/smart-ship.yml", "scripts/smart-ship/"],
+          release_path: false,
+        },
+        {
+          kind: "workflow",
+          name: "promote-release.yml",
+          paths: [".github/workflows/promote-release.yml", "scripts/release-promotion/"],
+          release_path: true,
+        },
+        {
+          kind: "action",
+          name: "ci-job-proof",
+          paths: [".github/actions/ci-job-proof/", "scripts/ci-job-proof/"],
+          release_path: false,
+        },
+      ],
+    },
+  )
+}
+
+fn private_app() -> dict {
+  return {repository: "burin-labs/private-app", public: false}
+}
+
+fn open_app() -> dict {
+  return {repository: "burin-labs/open-app", public: true}
+}
+
+/**
+ * A linear owner history OLD -> MID -> NEW -> NEWER. MID touched only Smart
+ * Ship's scripts; NEW touched only the release promotion workflow and names
+ * the private consumer in its subject.
+ */
+fn history() -> dict {
+  const order = [OLD, MID, NEW, NEWER]
+  const touched = {
+    [MID]: {
+      subject: "[CI] Carry an approval across merges",
+      files: ["scripts/smart-ship/ship.harn"],
+    },
+    [NEW]: {
+      subject: "[CI] Fix the private-app release race",
+      files: [".github/workflows/promote-release.yml"],
+    },
+    [NEWER]: {subject: "[Docs] Reword the README", files: ["README.md"]},
+  }
+  return {
+    is_ancestor: fn(ancestor, descendant) {
+      const a = order.index_of(ancestor)
+      const d = order.index_of(descendant)
+      if a < 0 || d < 0 {
+        return nil
+      }
+      return a <= d
+    },
+    commits: fn(older, newer, paths) {
+      let found = []
+      for sha in order[order.index_of(older) + 1:order.index_of(newer) + 1].reversed() {
+        const commit = touched[sha]
+        const hit = commit.files.any(
+          { file ->
+            paths.any({ path -> path.ends_with("/") ? file.starts_with(path) : file == path })
+          },
+        )
+        if hit {
+          found = found + [{sha: sha, subject: commit.subject}]
+        }
+      }
+      return found
+    },
+  }
+}
+
+fn uses(ref: string, sha: string) -> string {
+  return "      uses: burin-labs/.github/" + ref + "@" + sha + "\n"
+}
+
+pipeline test_the_registry_covers_every_shared_workflow_and_action(harness: Harness) {
+  const registry = real_registry(harness.fs)
+  let missing = []
+  for entry in harness.fs.list_dir(ROOT + "/.github/workflows") {
+    const name = to_string(entry)
+    if !name.ends_with(".yml") {
+      continue
+    }
+    const document = read_yaml(harness.fs, ROOT + "/.github/workflows/" + name)
+    const on = document["on"]
+    const reusable = type_of(on) == "dict" && on.workflow_call != nil
+    if reusable && find_shared(registry, ".github/workflows/" + name) == nil {
+      missing = missing + [".github/workflows/" + name]
+    }
+  }
+  for entry in harness.fs.list_dir(ROOT + "/.github/actions") {
+    const name = to_string(entry)
+    if harness.fs.exists(ROOT + "/.github/actions/" + name + "/action.yml")
+      && find_shared(registry, ".github/actions/" + name) == nil {
+      missing = missing + [".github/actions/" + name]
+    }
+  }
+  assert_eq(missing, [], "every reusable workflow and action consumers can pin must be registered")
+  let absent = []
+  for shared in registry.shared {
+    if !harness.fs.exists(ROOT + "/" + definition_path(shared)) {
+      absent = absent + [definition_path(shared)]
+    }
+    for path in shared.paths {
+      if !harness.fs.exists(ROOT + "/" + path) {
+        absent = absent + [reference(shared) + " path " + path]
+      }
+    }
+  }
+  assert_eq(absent, [], "every registered definition and trigger path must exist")
+  assert(len(registry.shared) > 20, "the census must have found the shared workflows and actions")
+  assert_eq(
+    find_shared(registry, "runner-availability.yml")?.release_path,
+    true,
+    "the Burin release and deploy workflows use runner availability",
+  )
+}
+
+pipeline test_workflow_registry_covers_the_canonical_execution_paths(harness: Harness) {
+  const registry = real_registry(harness.fs)
+  let measured = 0
+  let missing: list<string> = []
+  for shared in registry.shared {
+    if shared.kind != "workflow" {
+      continue
+    }
+    const result = command_run(
+      harness.tools,
+      [
+        "ruby",
+        ROOT + "/scripts/reusable_pin_contract.rb",
+        "staleness",
+        ROOT,
+        "burin-labs",
+        ".github",
+        reference(shared),
+        "HEAD",
+        "HEAD",
+      ],
+      {capture: {max_inline_bytes: 1000000}, timeout_ms: 30000},
+    )
+    assert(result.success, reference(shared) + " execution-path audit failed: " + result.stderr)
+    const record = json_parse(result.stdout)
+    assert_eq(record.state, "current", reference(shared) + " execution paths must be measured")
+    assert(len(record.paths) > 0, reference(shared) + " must have execution paths")
+    measured = measured + 1
+    for path in record.paths {
+      const covered = shared.paths.any(
+        { registered ->
+          registered == path || registered == path + "/"
+            || (registered.ends_with("/") && path.starts_with(registered))
+        },
+      )
+      if !covered {
+        missing = missing + [reference(shared) + " misses " + path]
+      }
+    }
+  }
+  assert(measured > 5, "the audit must measure actual shared workflows")
+  assert_eq(
+    missing,
+    [],
+    "consumer pin registry misses canonical execution paths: " + join(missing, ", "),
+  )
+}
+
+pipeline test_the_push_trigger_is_the_registry_paths(harness: Harness) {
+  const registry = real_registry(harness.fs)
+  const workflow = read_yaml(harness.fs, ROOT + "/.github/workflows/bump-consumer-pins.yml")
+  const push = workflow["on"].push
+  assert_eq(push.branches, ["main"])
+  assert_eq(push.paths, trigger_paths(registry))
+  assert(push.paths.contains("scripts/smart-ship/**"), "Smart Ship's scripts must trigger its bump")
+  const token = workflow.jobs.bump.steps.find({ step -> step?.id == "token" })
+  assert_eq(token.with["permission-actions"], "write")
+  assert_eq(token.with["permission-contents"], "read")
+  assert_eq(
+    keys(token.with).filter({ key -> key.starts_with("permission-") }).to_list().sorted(),
+    ["permission-actions", "permission-contents"],
+    "the dispatch token must not carry any other authority",
+  )
+  assert_eq(token_repositories(registry), "burin-code\nharn")
+}
+
+pipeline test_every_consumer_pin_form_resolves_to_a_registry_entry(harness: Harness) {
+  const registry = real_registry(harness.fs)
+  // The forms consumers use today: reusable workflows and actions, bare,
+  // quoted, and with a trailing comment.
+  const sha = "7e287a6cfa82db8fd7c253120b2f13dcce34b2b9"
+  let text = ""
+  for ref in [
+    ".github/workflows/smart-ship.yml",
+    ".github/workflows/runner-availability.yml",
+    ".github/workflows/merge-override.yml",
+    ".github/workflows/cargo-deny.yml",
+    ".github/workflows/dependency-security-proof.yml",
+    ".github/workflows/promote-release.yml",
+    ".github/workflows/repin.yml",
+    ".github/actions/ci-job-proof",
+    ".github/actions/check-dependabot-config",
+    ".github/actions/hosted-runner-labels",
+    ".github/actions/ci-latency-policy",
+    ".github/actions/rust-test-impact",
+    ".github/actions/ci-runtime-evidence",
+    ".github/actions/validate-candidate-manifest",
+    ".github/actions/pr-title-check",
+  ] {
+    text = text + uses(ref, sha)
+  }
+  text = text + "    - uses: 'burin-labs/.github/.github/actions/hosted-runner-labels@" + sha
+    + "' # v1\n"
+  const pins = pinned_references(text)
+  assert_eq(len(pins), 16)
+  for pin in pins {
+    assert(find_shared(registry, pin.reference) != nil, pin.reference + " must be registered")
+    assert_eq(pin.sha, sha)
+  }
+  // Negative control: the same parser on a name the registry lacks.
+  const stray = pinned_references(uses(".github/workflows/unlisted.yml", sha))
+  assert_eq(stray, [{reference: ".github/workflows/unlisted.yml", sha: sha}])
+  assert_eq(find_shared(registry, stray[0].reference), nil)
+}
+
+pipeline test_only_full_sha_pins_on_this_repository_are_read() {
+  const text = uses(".github/workflows/smart-ship.yml", "main")
+    + uses(".github/workflows/smart-ship.yml", "7e287a6")
+    + uses(".github/workflows/smart-ship.yml", OLD + "a")
+    + "      uses: burin-labs/harn/.github/actions/setup-harn@"
+    + OLD
+    + "\n"
+    + "      uses: notburin-labs/.github/.github/workflows/smart-ship.yml@"
+    + OLD
+    + "\n"
+    + "#       uses: burin-labs/.github/.github/workflows/smart-ship.yml@<sha>\n"
+  assert_eq(pinned_references(text), [])
+  assert_eq(
+    pinned_references(text + uses(".github/workflows/smart-ship.yml", OLD)),
+    [{reference: ".github/workflows/smart-ship.yml", sha: OLD}],
+  )
+}
+
+pipeline test_a_pin_moves_only_when_code_it_runs_changed() {
+  const registry = small_registry()
+  const texts = [
+    uses(".github/workflows/smart-ship.yml", OLD),
+    uses(".github/actions/ci-job-proof", OLD) + uses(".github/workflows/smart-ship.yml", OLD),
+  ]
+  const bump = plan_consumer(registry, private_app(), texts, NEW, [], history())
+  // ci-job-proof's paths did not change between OLD and NEW.
+  assert_eq(bump?.references, [".github/workflows/smart-ship.yml"])
+  assert_eq(bump?.release_path, false)
+  assert_eq(bump?.changes, "- 222222222222 [CI] Carry an approval across merges")
+  // Negative control: a later commit that touches nothing shared moves nothing.
+  assert_eq(
+    plan_consumer(
+      registry,
+      private_app(),
+      [uses(".github/workflows/smart-ship.yml", NEW)],
+      NEWER,
+      [],
+      history(),
+    ),
+    nil,
+  )
+}
+
+pipeline test_current_newer_and_unknown_pins() {
+  const registry = small_registry()
+  const current = [uses(".github/workflows/smart-ship.yml", NEW)]
+  assert_eq(plan_consumer(registry, private_app(), current, NEW, [], history()), nil)
+  const newer = [uses(".github/workflows/smart-ship.yml", NEWER)]
+  assert_eq(plan_consumer(registry, private_app(), newer, MID, [], history()), nil)
+  // A forced name never moves a pin backwards either.
+  assert_eq(
+    plan_consumer(
+      registry,
+      private_app(),
+      newer,
+      MID,
+      [".github/workflows/smart-ship.yml"],
+      history(),
+    ),
+    nil,
+  )
+  const unknown = plan_consumer(
+    registry,
+    private_app(),
+    [uses(".github/actions/ci-job-proof", STRAY)],
+    NEW,
+    [],
+    history(),
+  )
+  assert_eq(unknown?.references, [".github/actions/ci-job-proof"])
+  assert(
+    unknown?.changes.contains("pinned to 999999999999, which is not on the owner's main history"),
+    "an unknown pin must say why it moves",
+  )
+}
+
+pipeline test_a_manual_run_forces_a_named_pin_and_keeps_every_other_stale_pin() {
+  const registry = small_registry()
+  const texts = [
+    uses(".github/workflows/smart-ship.yml", OLD) + uses(".github/actions/ci-job-proof", OLD),
+  ]
+  const requested = resolve_requested(registry, "ci-job-proof")
+  assert_eq(requested, [".github/actions/ci-job-proof"])
+  const bump = plan_consumer(registry, private_app(), texts, NEW, requested, history())
+  assert_eq(bump?.references, [".github/workflows/smart-ship.yml", ".github/actions/ci-job-proof"])
+  assert_error_contains(
+    fn() { resolve_requested(registry, "smart-ship.yml, nope.yml") },
+    "nope.yml is not a shared workflow or action",
+  )
+}
+
+pipeline test_a_release_path_pin_marks_the_bump_and_public_consumers_never_see_private_names() {
+  const registry = small_registry()
+  const texts = [
+    uses(".github/workflows/smart-ship.yml", OLD)
+      + uses(".github/workflows/promote-release.yml", OLD),
+  ]
+  const private_bump = plan_consumer(registry, private_app(), texts, NEW, [], history())
+  assert_eq(
+    private_bump?.references,
+    [".github/workflows/smart-ship.yml", ".github/workflows/promote-release.yml"],
+  )
+  assert_eq(private_bump?.release_path, true)
+  assert(
+    private_bump?.changes.contains("Fix the private-app release race"),
+    "a private consumer sees subjects",
+  )
+  const public_bump = plan_consumer(registry, open_app(), texts, NEW, [], history())
+  assert_eq(public_bump?.release_path, true)
+  assert(
+    !(public_bump?.changes.contains("private-app") ?? true),
+    "a public consumer must not see a private name",
+  )
+  assert(
+    public_bump?.changes.contains(
+      "333333333333 (subject withheld because it names a private repository)",
+    ),
+    "the withheld commit is still listed",
+  )
+}
+
+pipeline test_a_public_consumer_never_sees_a_private_name_in_any_spelling() {
+  const registry = small_registry()
+  const commits = [
+    {sha: OLD, subject: "[CI] Speed up Private App's merges"},
+    {sha: MID, subject: "[CI] Fix the private_app runner"},
+    {sha: NEW, subject: "[CI] Ask Private about it"},
+    {sha: NEWER, subject: "chore(deps): bump burin-labs/harn/.github/actions/setup-harn"},
+  ]
+  assert_eq(
+    render_changes(registry, open_app(), commits, []),
+    "- 111111111111 (subject withheld because it names a private repository)\n"
+      + "- 222222222222 (subject withheld because it names a private repository)\n"
+      + "- 333333333333 (subject withheld because it names a private repository)\n"
+      + "- 444444444444 chore(deps): bump burin-labs/harn/.github/actions/setup-harn",
+  )
+  // Negative control: the private consumer itself sees every subject.
+  assert(
+    render_changes(registry, private_app(), commits, []).contains("Speed up Private App's merges"),
+    "a private consumer sees subjects",
+  )
+}
+
+pipeline test_definition_problems_refuse_a_missing_or_changed_definition() {
+  const registry = small_registry()
+  const files = {
+    ".github/workflows/smart-ship.yml": "on:\n  workflow_call: {}\njobs: {}\n",
+    ".github/workflows/promote-release.yml": "on:\n  push: {}\njobs: {}\n",
+  }
+  const read = fn(_sha, path) { return files[path] }
+  assert_eq(definition_problems(registry, [".github/workflows/smart-ship.yml"], NEW, read), [])
+  assert_eq(
+    definition_problems(
+      registry,
+      [
+        ".github/workflows/promote-release.yml",
+        ".github/actions/ci-job-proof",
+        ".github/workflows/x.yml",
+      ],
+      NEW,
+      read,
+    ),
+    [
+      ".github/workflows/promote-release.yml at 333333333333 is no longer a reusable workflow",
+      ".github/actions/ci-job-proof/action.yml does not exist at 333333333333",
+      ".github/workflows/x.yml is not in scripts/consumer-pins/registry.json",
+    ],
+  )
+  const actions = {".github/actions/ci-job-proof/action.yml": "name: x\n"}
+  assert_eq(
+    definition_problems(
+      registry,
+      [".github/actions/ci-job-proof"],
+      NEW,
+      fn(_sha, path) { return actions[path] },
+    ),
+    [".github/actions/ci-job-proof/action.yml at 333333333333 declares no runs"],
+  )
+}
+
+pipeline test_refuses_a_malformed_registry() {
+  const base = {
+    schema_version: 1,
+    consumer_workflow: "bump-shared-pin.yml",
+    consumers: [{repository: "burin-labs/app", public: false}],
+    shared: [
+      {
+        kind: "workflow",
+        name: "smart-ship.yml",
+        paths: [".github/workflows/smart-ship.yml"],
+        release_path: false,
+      },
+    ],
+  }
+  const entry = base.shared[0]
+  for case in [
+    {registry: base + {schema_version: 2}, message: "is malformed"},
+    {registry: base + {shared: [entry + {kind: "job"}]}, message: "is malformed"},
+    {registry: base + {shared: [entry + {release_path: "no"}]}, message: "is malformed"},
+    {
+      registry: base + {shared: [entry, entry]},
+      message: ".github/workflows/smart-ship.yml is listed twice",
+    },
+    {
+      registry: base + {shared: [entry + {paths: ["scripts/smart-ship/"]}]},
+      message: "must list .github/workflows/smart-ship.yml as its first path",
+    },
+    {
+      registry: base
+        + {shared: [entry + {kind: "action", paths: [".github/actions/smart-ship.yml/"]}]},
+      message: "is an action but names a file",
+    },
+    {
+      registry: base
+        + {shared: [entry + {paths: [".github/workflows/smart-ship.yml", "scripts/../x"]}]},
+      message: "is not a plain owner path",
+    },
+    {
+      registry: base + {consumers: [{repository: "elsewhere/app", public: true}]},
+      message: "elsewhere/app is outside burin-labs",
+    },
+    {
+      registry: base + {consumers: [{repository: "burin-labs/.github", public: true}]},
+      message: "lists itself as a consumer",
+    },
+  ] {
+    assert_error_contains(fn() { validate_registry(case.registry) }, case.message)
+  }
+}
+
+pipeline test_dispatches_every_consumer_and_names_each_refusal() {
+  const registry = small_registry()
+  const texts = [uses(".github/workflows/smart-ship.yml", OLD)]
+  const bumps = [
+    plan_consumer(registry, private_app(), texts, NEW, [], history()),
+    plan_consumer(registry, open_app(), texts, NEW, [], history()),
+  ]
+  let calls = []
+  const dispatcher = {
+    dispatch: fn(repository, workflow, inputs) {
+      calls = calls + [{repository: repository, workflow: workflow, inputs: inputs}]
+      return repository == "burin-labs/private-app" ? "HTTP 404: workflow not found" : nil
+    },
+  }
+  assert_error_contains(
+    fn() { dispatch_all(dispatcher, registry, bumps, NEW) },
+    "could not start the pin bump in 1 of 2 consumers: burin-labs/private-app bump-shared-pin.yml: HTTP 404",
+  )
+  // A refused consumer does not stop the others.
+  assert_eq(len(calls), 2)
+  assert_eq(
+    calls[1],
+    {
+      repository: "burin-labs/open-app",
+      workflow: "bump-shared-pin.yml",
+      inputs: {
+        workflow: ".github/workflows/smart-ship.yml",
+        sha: NEW,
+        release_path: "false",
+        changes: "- 222222222222 [CI] Carry an approval across merges",
+      },
+    },
+  )
+}
