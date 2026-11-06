@@ -15,13 +15,14 @@
 # mints itself, so the pull request starts CI. Its review decides whether to
 # add `ship`, after checking release impact.
 #
-# Each run carries every stale pin for a consumer, not only the ones this push
-# touched, so a run that GitHub drops from the concurrency group is made up by
-# the next one.
+# Each run carries every stale pin for a consumer. The scheduled sweep retries
+# a dispatch held by an active release even if no new owner change lands.
 
 name: Bump consumer pins
 
 on:
+  schedule:
+    - cron: '11,41 * * * *'
   push:
     branches: [main]
     # The union of every registry path. scripts/consumer-pins/pins_test.harn

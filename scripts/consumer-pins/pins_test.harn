@@ -259,6 +259,7 @@ pipeline test_the_push_trigger_is_the_registry_paths(harness: Harness) {
   const push = workflow["on"].push
   assert_eq(push.branches, ["main"])
   assert_eq(push.paths, trigger_paths(registry))
+  assert_eq(workflow["on"].schedule, [{cron: "11,41 * * * *"}])
   assert(push.paths.contains("scripts/smart-ship/**"), "Smart Ship's scripts must trigger its bump")
   const token = workflow.jobs.bump.steps.find({ step -> step?.id == "token" })
   assert_eq(token.with["permission-actions"], "write")
