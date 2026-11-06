@@ -445,6 +445,28 @@ pipeline test_the_outcome_and_org_log_entry_cover_every_attempt(harness: Harness
     "2026-10-04T17:19:00Z",
   )
   assert_eq(refused.outcome, "refused")
+  for record in [applied, errored, refused] {
+    const prefix = "<!-- burin-merge-override-result: "
+    const body = record_markdown(record)
+    const markers = body.split("\n").filter({ line -> line.starts_with(prefix) }).to_list()
+    assert_eq(len(markers), 1)
+    const marker = markers[0]
+    assert(marker.ends_with(" -->"))
+    assert_eq(
+      json_parse(marker[len(prefix):len(marker) - 4]),
+      {
+        schema: "burin.merge-override-result.v1",
+        repository: INPUT.repository,
+        pr: INPUT.pr,
+        head_sha: INPUT.head_sha,
+        label: draft.label,
+        labeled_at: draft.labeled_at,
+        outcome: record.outcome,
+      },
+    )
+    assert(body.contains("- Requested by @kennethsinder"))
+    assert(body.contains("- Requested at: ${draft.labeled_at}"))
+  }
   assert_eq(log_issue_title("2026-10-04T17:19:00Z"), "Merge overrides 2026-Q4")
   assert_eq(log_issue_title("2027-03-31T23:59:00Z"), "Merge overrides 2027-Q1")
   const listing = "repos/burin-labs/override-log/issues?labels=override-log&state=all&per_page=100"
