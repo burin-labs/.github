@@ -1,6 +1,5 @@
-# Project into .github/workflows/merge-override-dispatch.yml and replace
-# <full-commit-sha> with the burin-labs/.github commit that owns
-# merge-override.yml.
+# Project into .github/workflows/merge-override-dispatch.yml and replace the
+# pin placeholder with the burin-labs/.github commit that owns merge-override.yml.
 #
 # pull_request_target runs the default branch's copy of this file, never a pull
 # request's or its base's, so a `CI status` aggregator can trust this
@@ -10,7 +9,7 @@
 name: Merge override dispatch
 
 on:
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] calls only the pinned shared dispatcher, which reads the PR through the API and never checks out its code
     types: [labeled]
 
 permissions:
