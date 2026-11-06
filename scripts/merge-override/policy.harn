@@ -663,11 +663,27 @@ fn signal_line(name: string, signal: Signal) -> string {
   return name + ": " + signal.state + " (" + signal.detail + ")"
 }
 
-/**
- * The PR comment and step summary for one attempt: the outcome and the reason
- * first, the audit trail behind a toggle.
- */
+type OverrideResult = {
+  schema: string,
+  repository: string,
+  pr: int,
+  head_sha: string,
+  label: string,
+  labeled_at: string,
+  outcome: string,
+}
+
+/** The human report and correlated machine result for one attempt. */
 pub fn record_markdown(record: dict) -> string {
+  const result: OverrideResult = {
+    schema: "burin.merge-override-result.v1",
+    repository: record.repository,
+    pr: record.pr,
+    head_sha: record.head_sha,
+    label: record.label,
+    labeled_at: record.labeled_at,
+    outcome: record.outcome,
+  }
   const heading = {applied: "applied", refused: "refused", errored: "errored"}[record.outcome]
   const checks = record.checks
   const actors = join(record.actors.map({ actor -> "@" + actor }), ", ")
@@ -730,7 +746,7 @@ pub fn record_markdown(record: dict) -> string {
   }
   return join(lines, "\n") + "\n\n<details><summary>Audit record</summary>\n\n"
     + join(detail, "\n")
-    + "\n\n</details>"
+    + "\n\n</details>\n\n<!-- burin-merge-override-result: ${json_stringify(result)} -->"
 }
 
 /** One org-log comment: a readable line plus the machine record. */
