@@ -187,8 +187,9 @@ lists each shared workflow and action, the owner paths it runs, whether it is on
 a release path, and the consumers. A push to `main` that touches one of those
 paths starts `.github/workflows/bump-consumer-pins.yml`, which starts the
 consumer's own `bump-shared-pin.yml` with every pin whose code changed since it
-was pinned. That workflow keeps one open pull request on `ci/shared-pin-bump`
-and labels it `ship`, unless a release-path pin moved; then a person lands it.
+was pinned. The consumer opens or recovers a pull request bound to the measured
+consumer and owner commits. Reviewers check release impact and generated
+projections before adding `ship`.
 A new shared workflow or action must be added to the registry; its test fails
 until it is.
 
