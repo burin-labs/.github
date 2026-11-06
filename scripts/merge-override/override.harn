@@ -450,6 +450,27 @@ pub fn cancel_competing(gh: GitHub, input: Input, run_id: int, sleep_ms: fn(int)
   return selection.pending_count
 }
 
+/** Cancel only after the required CI status job can be re-run. */
+pub fn cancel_with_rerunnable_status(
+  gh: GitHub,
+  input: Input,
+  run_id: int,
+  sleep_ms: fn(int) -> nil,
+) -> int {
+  const job = required_check_job(gh, input)
+  if job == nil {
+    throw "CI status job has not been created for this pull request head; "
+      + "running workflows were preserved, so retry after CI starts it"
+  }
+  if type_of(job?.id) != "int" || job.id <= 0
+    || !["requested", "queued", "in_progress", "waiting", "pending", "completed"].contains(
+      job?.status,
+    ) {
+    throw "CI status job identity or state could not be measured; running workflows were preserved"
+  }
+  return cancel_competing(gh, input, run_id, sleep_ms)
+}
+
 /** The step whose success marks a run as an admin's authorized override of the head's CI status. */
 pub const AUTHORIZE_STEP = "Authorize CI status override"
 
@@ -483,7 +504,7 @@ fn field_items(pages: list, field: string) -> list {
  * run's authorize step. Returns the re-run job's id, or 0 when the newest
  * `CI status` already passed.
  */
-pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
+fn required_check_job(gh: GitHub, input: Input) -> dict? {
   const repo = "repos/" + input.repository
   // A same-named job from another workflow, event, head or pull request has no authority.
   const runs = field_items(
@@ -497,17 +518,37 @@ pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
           && (run?.pull_requests ?? []).any({ pull -> pull?.number == input.pr })
       },
     )
-    .sort_by({ run -> run.id })
-  let newest = nil
+  let latest_run = nil
   for run in runs {
-    const jobs = field_items(
-      gh.pages(repo + "/actions/runs/" + to_string(run.id) + "/jobs?per_page=100"),
-      "jobs",
-    )
-    for job in jobs.filter({ job -> job?.name == REQUIRED_CHECK }) {
+    if type_of(run?.id) != "int" || run.id <= 0 {
+      throw "CI workflow run identity could not be measured"
+    }
+    if latest_run == nil || run.id > latest_run.id {
+      latest_run = run
+    }
+  }
+  if latest_run == nil {
+    return nil
+  }
+  const jobs = field_items(
+    gh.pages(repo + "/actions/runs/" + to_string(latest_run.id) + "/jobs?per_page=100"),
+    "jobs",
+  )
+  let newest = nil
+  for job in jobs.filter({ job -> job?.name == REQUIRED_CHECK }) {
+    if type_of(job?.id) != "int" || job.id <= 0 {
+      throw "CI status job identity could not be measured"
+    }
+    if newest == nil || job.id > newest.id {
       newest = job
     }
   }
+  return newest
+}
+
+pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
+  const repo = "repos/" + input.repository
+  const newest = required_check_job(gh, input)
   if newest == nil {
     throw "no `" + REQUIRED_CHECK + "` job ran on " + input.head_sha
       + ", so there is nothing to re-run"

@@ -3,6 +3,7 @@ import {
   append_log,
   authorized_override,
   cancel_competing,
+  cancel_with_rerunnable_status,
   draft_record,
   finish_record,
   measure,
@@ -1020,6 +1021,52 @@ fn job(id: int, name: string, status: string, conclusion: string?, steps: list =
 
 fn jobs_of(run: int) -> string {
   return REPO + "/actions/runs/" + to_string(run) + "/jobs?per_page=100"
+}
+
+fn preflight_cancel_world(jobs: list, extra: dict = {}) -> dict {
+  let paths = {
+    [HEAD_RUNS]: [{workflow_runs: [ci_run(10)]}],
+    [jobs_of(10)]: [{jobs: jobs}],
+    [REPO + "/actions/runs/9"]: {workflow_id: 100},
+    [REPO + "/actions/runs/5"]: {status: "completed"},
+  }
+  for status in ["requested", "queued", "in_progress", "waiting", "pending"] {
+    const runs = status == "in_progress" ? [{id: 5, workflow_id: 200}] : []
+    paths = paths
+      + {
+        [REPO + "/actions/runs?head_sha=" + HEAD + "&status=" + status + "&per_page=100"]: [
+          {total_count: len(runs), workflow_runs: runs},
+        ],
+      }
+  }
+  return fake(paths + extra)
+}
+
+pipeline test_cancel_preserves_running_ci_until_its_status_job_exists(harness: Harness) {
+  const missing = preflight_cancel_world([])
+  assert_error_contains(
+    { -> cancel_with_rerunnable_status(missing.gh, INPUT, 9, { _ms -> nil }) },
+    "CI status job has not been created",
+  )
+  assert_eq(missing.sent(), [], "an absent aggregate must not cancel running work")
+  const stale = preflight_cancel_world(
+    [job(101, "CI status", "completed", "failure")],
+    {[HEAD_RUNS]: [{workflow_runs: [ci_run(20), ci_run(10)]}], [jobs_of(20)]: [{jobs: []}]},
+  )
+  assert_error_contains(
+    { -> cancel_with_rerunnable_status(stale.gh, INPUT, 9, { _ms -> nil }) },
+    "CI status job has not been created",
+  )
+  assert_eq(stale.sent(), [], "an old aggregate must not authorize canceling newer CI")
+  const malformed = preflight_cancel_world([job(0, "CI status", "in_progress", nil)])
+  assert_error_contains(
+    { -> cancel_with_rerunnable_status(malformed.gh, INPUT, 9, { _ms -> nil }) },
+    "identity could not be measured",
+  )
+  assert_eq(malformed.sent(), [], "an invalid job identity must not cancel running work")
+  const present = preflight_cancel_world([job(101, "CI status", "in_progress", nil)])
+  assert_eq(cancel_with_rerunnable_status(present.gh, INPUT, 9, { _ms -> nil }), 1)
+  assert_eq(present.sent().map({ call -> call.path }), [REPO + "/actions/runs/5/cancel"])
 }
 
 /**
