@@ -1,0 +1,17 @@
+{
+  "description": "Paths a reusable workflow executes or reads at its own ref that scripts/reusable_pin_contract.rb cannot derive from the workflow file. Each entry says why. Everything derivable (the workflow, its own-ref checkouts, their sparse paths, local actions, and scripts named in run steps) is derived, not listed here.",
+  "workflows": {
+    ".github/workflows/harn-package.yml": {
+      "paths": ["scripts/dependabot-config"],
+      "why": "check-dependabot-config/run.sh runs $GITHUB_ACTION_PATH/../../../scripts/dependabot-config/cli.harn"
+    },
+    ".github/workflows/promote-release.yml": {
+      "paths": ["scripts/captured-command.harn"],
+      "why": "scripts/release-promotion imports ../captured-command.harn"
+    },
+    ".github/workflows/repin.yml": {
+      "paths": [".github/release-consumers.json"],
+      "why": "scripts/release-repin reads REGISTRY_PATH from the implementation checkout"
+    }
+  }
+}
