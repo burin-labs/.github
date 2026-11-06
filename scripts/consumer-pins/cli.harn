@@ -64,7 +64,7 @@ fn main(harness: Harness) {
       pins = pins + len(pinned_references(text))
     }
     harness.stdio.println(
-      consumer.repository + ": read " + to_string(len(texts)) + " workflow files with "
+      consumer.repository + ": read " + to_string(len(texts)) + " workflow and action files with "
         + to_string(pins)
         + " pins on "
         + OWNER_REPOSITORY,

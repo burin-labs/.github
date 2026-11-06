@@ -64,7 +64,7 @@
       "kind": "workflow",
       "name": "runner-availability.yml",
       "paths": [".github/workflows/runner-availability.yml"],
-      "release_path": false
+      "release_path": true
     },
     {
       "kind": "workflow",

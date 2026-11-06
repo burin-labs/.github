@@ -1,5 +1,7 @@
+import { command_run } from "std/command"
 import { read_yaml } from "std/fs"
 import { assert_error_contains } from "std/testing"
+import { consumer_definition_paths } from "./live.harn"
 import {
   Registry,
   definition_path,
@@ -27,6 +29,44 @@ const NEW = "3333333333333333333333333333333333333333"
 const NEWER = "4444444444444444444444444444444444444444"
 
 const STRAY = "9999999999999999999999999999999999999999"
+
+pipeline test_consumer_definition_census_reaches_nested_actions_and_rejects_partial_reads() {
+  const entries = [
+    {path: ".github/workflows/ci.yml", type: "blob", mode: "100644"},
+    {path: ".github/actions/nested/example/action.yaml", type: "blob", mode: "100644"},
+    {path: ".github/workflows/subdir/ignored.yml", type: "blob", mode: "100644"},
+    {path: "src/action.yml", type: "blob", mode: "100644"},
+  ]
+  assert_eq(
+    consumer_definition_paths({truncated: false, tree: entries}, "org/repo"),
+    [".github/actions/nested/example/action.yaml", ".github/workflows/ci.yml"],
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths({truncated: true, tree: entries}, "org/repo") },
+    "truncated Git tree",
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths({truncated: false, tree: []}, "org/repo") },
+    "lists no workflow files",
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths(
+      {truncated: false, tree: [{path: ".github/workflows/ci.yml", type: "blob", mode: "120000"}]},
+      "org/repo",
+    ) },
+    "not an ordinary file",
+  )
+  assert_error_contains(
+    fn() { consumer_definition_paths(
+      {
+        truncated: false,
+        tree: entries + [{path: ".github/actions/linked", type: "blob", mode: "120000"}],
+      },
+      "org/repo",
+    ) },
+    "symlink or submodule",
+  )
+}
 
 fn real_registry(fs: HarnessFs) -> Registry {
   return validate_registry(json_parse(fs.read_text("registry.json")))
@@ -158,6 +198,59 @@ pipeline test_the_registry_covers_every_shared_workflow_and_action(harness: Harn
   }
   assert_eq(absent, [], "every registered definition and trigger path must exist")
   assert(len(registry.shared) > 20, "the census must have found the shared workflows and actions")
+  assert_eq(
+    find_shared(registry, "runner-availability.yml")?.release_path,
+    true,
+    "the Burin release and deploy workflows use runner availability",
+  )
+}
+
+pipeline test_workflow_registry_covers_the_canonical_execution_paths(harness: Harness) {
+  const registry = real_registry(harness.fs)
+  let measured = 0
+  let missing: list<string> = []
+  for shared in registry.shared {
+    if shared.kind != "workflow" {
+      continue
+    }
+    const result = command_run(
+      harness.tools,
+      [
+        "ruby",
+        ROOT + "/scripts/reusable_pin_contract.rb",
+        "staleness",
+        ROOT,
+        "burin-labs",
+        ".github",
+        reference(shared),
+        "HEAD",
+        "HEAD",
+      ],
+      {capture: {max_inline_bytes: 1000000}, timeout_ms: 30000},
+    )
+    assert(result.success, reference(shared) + " execution-path audit failed: " + result.stderr)
+    const record = json_parse(result.stdout)
+    assert_eq(record.state, "current", reference(shared) + " execution paths must be measured")
+    assert(len(record.paths) > 0, reference(shared) + " must have execution paths")
+    measured = measured + 1
+    for path in record.paths {
+      const covered = shared.paths.any(
+        { registered ->
+          registered == path || registered == path + "/"
+            || (registered.ends_with("/") && path.starts_with(registered))
+        },
+      )
+      if !covered {
+        missing = missing + [reference(shared) + " misses " + path]
+      }
+    }
+  }
+  assert(measured > 5, "the audit must measure actual shared workflows")
+  assert_eq(
+    missing,
+    [],
+    "consumer pin registry misses canonical execution paths: " + join(missing, ", "),
+  )
 }
 
 pipeline test_the_push_trigger_is_the_registry_paths(harness: Harness) {

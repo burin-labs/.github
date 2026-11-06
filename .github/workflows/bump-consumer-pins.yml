@@ -1,12 +1,13 @@
-# Move every consumer's pins on this repository's shared workflows and actions
-# to the commit that changed them.
+# Move registered consumers' pins on this repository's shared workflows and
+# actions to the commit that changed them. The initial rollout covers Harn and
+# Burin Code; other repositories are not enrolled in this dispatcher.
 #
 # Consumers pin `uses: burin-labs/.github/...@<sha>`, so a fix that lands here
 # reaches none of them until someone moves the pin. Dependabot moves it about
 # monthly; the Smart Ship approval carry-over fix sat unused for weeks.
 #
-# scripts/consumer-pins/registry.json is the one list of what is shared, the
-# owner paths each shared workflow or action runs, and the consumers. On every
+# scripts/consumer-pins/registry.json lists what is shared, the owner paths
+# each shared workflow or action runs, and the enrolled consumers. On every
 # push to main that touches one of those paths, this workflow reads each
 # consumer's current pins and starts the consumer's own bump-shared-pin.yml
 # with every pin whose code changed since it was pinned. The consumer's

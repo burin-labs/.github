@@ -1,9 +1,45 @@
 import { command_output_tail, command_run } from "std/command"
 import { Commit, Dispatcher, OwnerHistory } from "./pins.harn"
 
-type ContentEntry = {name: string, path: string, type: string}
+type Repository = {default_branch: string}
 
-type ContentListing = list<ContentEntry>
+type GitRef = {object: {sha: string}}
+
+type TreeEntry = {path: string, type: string, mode: string}
+
+type GitTree = {truncated: bool, tree: list<TreeEntry>}
+
+/** Select all workflow and local action definitions from a complete snapshot. */
+pub fn consumer_definition_paths(raw: unknown, repository: string) -> list<string> {
+  const tree = schema_expect(raw, schema_of(GitTree))
+  if tree.truncated {
+    throw repository + " returned a truncated Git tree; shared pins are unmeasured"
+  }
+  let paths: list<string> = []
+  let workflows = 0
+  for entry in tree.tree {
+    if (entry.path.starts_with(".github/actions/") || entry.path == ".github/actions")
+      && (entry.mode == "120000" || entry.type == "commit") {
+      throw repository + " " + entry.path + " is a symlink or submodule; shared pins are unmeasured"
+    }
+    const workflow = regex_match("^\\.github/workflows/[^/]+\\.ya?ml$", entry.path) != nil
+    const action = regex_match("^\\.github/actions/.+/action\\.ya?ml$", entry.path) != nil
+    if !workflow && !action {
+      continue
+    }
+    if entry.type != "blob" || (entry.mode != "100644" && entry.mode != "100755") {
+      throw repository + " " + entry.path + " is not an ordinary file; shared pins are unmeasured"
+    }
+    paths = paths + [entry.path]
+    if workflow {
+      workflows = workflows + 1
+    }
+  }
+  if workflows == 0 {
+    throw repository + " lists no workflow files under .github/workflows"
+  }
+  return paths.sorted()
+}
 
 fn diagnostic(tools: HarnessTools, result: dict) -> string {
   const stderr = command_output_tail(tools, result, {source: "stderr", length: 12000}).content
@@ -91,8 +127,8 @@ fn gh_env(token: string, scratch: string) -> dict<string, string> {
 }
 
 /**
- * Read every workflow file on a consumer's default branch. Workflows can only
- * live directly under .github/workflows, so the listing is not recursive.
+ * Read workflows and local action definitions from one immutable default-branch
+ * snapshot. A local composite action can itself pin an owner action.
  */
 pub fn live_consumer_workflows(
   tools: HarnessTools,
@@ -101,27 +137,35 @@ pub fn live_consumer_workflows(
   repository: string,
 ) -> list<string> {
   const options = {
-    capture: {max_inline_bytes: 4000000},
+    capture: {max_inline_bytes: 16000000},
     env: gh_env(token, scratch),
     timeout_ms: 120000,
   }
+  const repo = command_run(tools, ["gh", "api", "repos/" + repository], options)
+  if !repo.success {
+    throw "reading " + repository + " failed: " + diagnostic(tools, repo)
+  }
+  const branch = schema_expect(json_parse(repo.stdout), schema_of(Repository)).default_branch
+  const ref = command_run(
+    tools,
+    ["gh", "api", "repos/" + repository + "/git/ref/heads/" + branch],
+    options,
+  )
+  if !ref.success {
+    throw "reading " + repository + " default branch failed: " + diagnostic(tools, ref)
+  }
+  const sha = schema_expect(json_parse(ref.stdout), schema_of(GitRef)).object.sha
   const listing = command_run(
     tools,
-    ["gh", "api", "repos/" + repository + "/contents/.github/workflows"],
+    ["gh", "api", "repos/" + repository + "/git/trees/" + sha + "?recursive=1"],
     options,
   )
   if !listing.success {
-    throw "listing " + repository + " workflows failed: " + diagnostic(tools, listing)
+    throw "listing " + repository + " definitions failed: " + diagnostic(tools, listing)
   }
-  const entries = json_decode(listing.stdout, schema_of(ContentListing))
-  if !is_ok(entries) {
-    throw "listing " + repository + " workflows returned an unexpected shape"
-  }
+  const paths = consumer_definition_paths(json_parse(listing.stdout), repository)
   let texts = []
-  for entry in unwrap(entries) {
-    if entry.type != "file" || regex_match("\\.ya?ml$", entry.name) == nil {
-      continue
-    }
+  for path in paths {
     const file = command_run(
       tools,
       [
@@ -129,18 +173,14 @@ pub fn live_consumer_workflows(
         "api",
         "-H",
         "Accept: application/vnd.github.raw+json",
-        "repos/" + repository + "/contents/" + entry.path,
+        "repos/" + repository + "/contents/" + path + "?ref=" + sha,
       ],
       options,
     )
     if !file.success {
-      throw "reading " + repository + " " + entry.path + " failed: " + diagnostic(tools, file)
+      throw "reading " + repository + " " + path + " failed: " + diagnostic(tools, file)
     }
     texts = texts + [file.stdout]
-  }
-  // An empty listing must not read as "every pin is current".
-  if len(texts) == 0 {
-    throw repository + " lists no workflow files under .github/workflows"
   }
   return texts
 }
