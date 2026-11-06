@@ -190,3 +190,37 @@ pipeline test_swift_unknown_array_elements_concatenations_and_inferred_initializ
     [],
   )
 }
+
+pipeline test_swift_static_conditional_arrays_are_resolved_without_accepting_dynamic_uses(
+  harness: Harness,
+) {
+  const source = """
+#if os(macOS)
+let gui: [Package.Dependency] = [
+  .package(url: "https://example.invalid/gui", "1.0.0"..<"2.0.0")
+]
+#else
+let gui: [Package.Dependency] = []
+#endif
+let package = Package(name: "example", dependencies: [
+  .package(url: "https://example.invalid/core", from: "1.0.0")
+] + gui)
+"""
+  const rows = manifest_dependencies("swift", "Package.swift", source, harness.ast)
+  assert_eq(len(rows), 2)
+  assert_eq(item(rows, 0).name, "example.invalid/gui")
+  assert_eq(item(rows, 0).bound, ">=1.0.0,<2.0.0")
+  assert_eq(item(rows, 1).name, "example.invalid/core")
+  for invalid in [
+    "var gui: [Package.Dependency] = []; let package = Package(name: \"x\", dependencies: [] + gui)",
+    "let gui = buildDependencies(); let package = Package(name: \"x\", dependencies: [] + gui)",
+    "let gui: [Package.Dependency] = []; print(gui); let package = Package(name: \"x\", dependencies: [] + gui)",
+    "let gui: [Package.Dependency] = []; func make(gui: [Package.Dependency]) { let p = Package(name: \"x\", dependencies: [] + gui) }",
+    "let gui: [Package.Dependency] = []; let package = Package(name: \"x\", dependencies: [] - gui)",
+  ] {
+    assert_error_contains(
+      fn() { manifest_dependencies("swift", "Package.swift", invalid, harness.ast) },
+      "Swift dependency array",
+    )
+  }
+}
