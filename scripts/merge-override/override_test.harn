@@ -982,7 +982,13 @@ const CI_PATH = ".github/workflows/ci.yml"
 
 /** A run of CI for this pull request unless `overrides` says otherwise. */
 fn ci_run(id: int, overrides: dict = {}) -> dict {
-  return {id: id, path: CI_PATH, event: "pull_request", pull_requests: [{number: INPUT.pr}]}
+  return {
+    id: id,
+    path: CI_PATH,
+    event: "pull_request",
+    head_sha: HEAD,
+    pull_requests: [{number: INPUT.pr}],
+  }
     + overrides
 }
 
@@ -1052,6 +1058,55 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
   )
   assert_error_contains({ -> rerun_required_check(none.gh, INPUT) }, "nothing to re-run")
   assert_eq(none.sent(), [])
+}
+
+pipeline test_the_override_selects_the_recorded_pr_ci_caller_and_refuses_other_identities() {
+  const input = INPUT
+    + {
+      repository: "burin-labs/burin-code",
+      pr: 13419,
+      head_sha: "807c3eb3beb7536af7a935a5b9ffe2184affd4cf",
+    }
+  const repo = "repos/${input.repository}"
+  const run = {
+    id: 42232430126,
+    path: ".github/workflows/ci-pr.yml",
+    event: "pull_request",
+    head_sha: input.head_sha,
+    pull_requests: [{number: input.pr}],
+  }
+  for changed in [
+    {},
+    {head_sha: HEAD},
+    {pull_requests: [{number: 42}]},
+    {event: "workflow_dispatch"},
+    {path: ".github/workflows/forged.yml"},
+  ] {
+    const world = fake(
+      {
+        ["${repo}/actions/runs?head_sha=${input.head_sha}&per_page=100"]: [
+          {workflow_runs: [run + changed]},
+        ],
+        ["${repo}/actions/runs/42232430126/jobs?per_page=100"]: [
+          {
+            jobs: [
+              {id: 127977018050, name: "CI status", status: "completed", conclusion: "failure"},
+            ],
+          },
+        ],
+      },
+    )
+    if len(keys(changed)) == 0 {
+      assert_eq(rerun_required_check(world.gh, input), 127977018050)
+      assert_eq(
+        world.sent(),
+        [{method: "POST", path: "${repo}/actions/jobs/127977018050/rerun", body: {}}],
+      )
+    } else {
+      assert_error_contains({ -> rerun_required_check(world.gh, input) }, "nothing to re-run")
+      assert_eq(world.sent(), [])
+    }
+  }
 }
 
 const DISPATCH_RUNS = REPO

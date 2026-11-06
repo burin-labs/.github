@@ -461,8 +461,8 @@ pub const AUTHORIZE_STEP = "Authorize CI status override"
  */
 pub const DISPATCH_WORKFLOW = ".github/workflows/merge-override-dispatch.yml"
 
-/** The file that owns the `CI status` job an override re-runs. */
-pub const MAIN_CI_PATH = ".github/workflows/ci.yml"
+/** Canonical entry points owning the pull request's required aggregate. */
+pub const PR_CI_PATHS = [".github/workflows/ci.yml", ".github/workflows/ci-pr.yml"]
 
 fn field_items(pages: list, field: string) -> list {
   let items = []
@@ -485,16 +485,15 @@ fn field_items(pages: list, field: string) -> list {
  */
 pub fn rerun_required_check(gh: GitHub, input: Input) -> int {
   const repo = "repos/" + input.repository
-  // Only CI's own file, run for this pull request: a pull request may add any
-  // workflow with a job named `CI status`, and a dispatched or fork run of CI at
-  // the same commit is not the run the branch rule reads.
+  // A same-named job from another workflow, event, head or pull request has no authority.
   const runs = field_items(
     gh.pages(repo + "/actions/runs?head_sha=" + input.head_sha + "&per_page=100"),
     "workflow_runs",
   )
     .filter(
       { run ->
-        run?.path == MAIN_CI_PATH && run?.event == "pull_request"
+        PR_CI_PATHS.contains(run?.path) && run?.event == "pull_request"
+          && run?.head_sha == input.head_sha
           && (run?.pull_requests ?? []).any({ pull -> pull?.number == input.pr })
       },
     )
