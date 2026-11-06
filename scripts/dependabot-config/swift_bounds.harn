@@ -15,6 +15,23 @@ type ArraySearch = {
   matches: list<{captures: {literal?: Capture, array?: Capture, element?: Capture}}>,
 }
 
+type StructureSearch = {
+  result: string,
+  had_errors: bool,
+  truncated: bool,
+  matches: list<{
+    captures: {
+      addition?: Capture,
+      left?: Capture,
+      right?: Capture,
+      binding?: Capture,
+      name?: Capture,
+      value?: Capture,
+      identifier?: Capture,
+    },
+  }>,
+}
+
 type Text = string
 
 const QUERY =
@@ -76,6 +93,92 @@ fn same_range(left: Capture, right: Capture) -> bool {
     && left.range.end_byte == right.range.end_byte
 }
 
+fn inside(parent: Capture, child: Capture) -> bool {
+  return parent.range.start_byte <= child.range.start_byte
+    && child.range.end_byte <= parent.range.end_byte
+}
+
+fn validate_literal(value: Capture, arrays: ArraySearch, calls: SwiftSearch, manifest: string) {
+  require arrays.matches.any(
+    { row -> row.captures.literal != nil && same_range(row.captures.literal, value) },
+  ),
+    "Swift dependency array is dynamic: ${manifest}"
+  for row in arrays.matches {
+    const parent = row.captures.array
+    const element = row.captures.element
+    if parent == nil || element == nil || !same_range(parent, value) {
+      continue
+    }
+    if element.text.starts_with("//") || element.text.starts_with("/*") {
+      continue
+    }
+    require calls.matches.any(
+      { declaration ->
+        same_range(declaration.captures.call, element)
+          && [".package", "Package.Dependency.package"].contains(declaration.captures.callee.text)
+      },
+    ),
+      "Swift dependency array contains an unresolved element: ${manifest}"
+  }
+}
+
+fn validate_expression(
+  value: Capture,
+  arrays: ArraySearch,
+  structure: StructureSearch,
+  calls: SwiftSearch,
+  manifest: string,
+  depth: int,
+) {
+  require depth < 64, "Swift dependency expression is too deeply nested: ${manifest}"
+  if arrays.matches.any(
+    { row -> row.captures.literal != nil && same_range(row.captures.literal, value) },
+  ) {
+    validate_literal(value, arrays, calls, manifest)
+    return
+  }
+  const additions = structure.matches.filter(
+    { row -> row.captures.addition != nil && same_range(row.captures.addition, value) },
+  )
+  if len(additions) == 1 {
+    const captures = additions[0].captures
+    require captures.left != nil && captures.right != nil,
+      "Incomplete Swift dependency concatenation: ${manifest}"
+    validate_expression(captures.left, arrays, structure, calls, manifest, depth + 1)
+    validate_expression(captures.right, arrays, structure, calls, manifest, depth + 1)
+    return
+  }
+  const identifiers = structure.matches.filter(
+    { row -> row.captures.identifier != nil && same_range(row.captures.identifier, value) },
+  )
+  require len(identifiers) == 1, "Swift dependency array is dynamic: ${manifest}"
+  const bindings = structure.matches.filter(
+    { row -> row.captures.binding != nil && row.captures.name?.text == value.text },
+  )
+  require len(bindings) > 0, "Swift dependency array is dynamic: ${manifest}"
+  // Every use must be a let declaration or occur within a Package dependency
+  // expression. This refuses shadowing, mutation, and unmeasured aliases.
+  for row in structure.matches {
+    const identifier = row.captures.identifier
+    if identifier == nil || identifier.text != value.text {
+      continue
+    }
+    const declaration = bindings.any({ binding -> same_range(binding.captures.name, identifier) })
+    const dependency = calls.matches.any(
+      { call ->
+        ["Package", "Package.init", ".init"].contains(call.captures.callee.text)
+          && call.captures.label?.text == "dependencies"
+          && inside(call.captures.value, identifier)
+      },
+    )
+    require declaration || dependency, "Swift dependency array is dynamic: ${manifest}"
+  }
+  for binding in bindings {
+    require binding.captures.value != nil, "Swift dependency array is dynamic: ${manifest}"
+    validate_literal(binding.captures.value, arrays, calls, manifest)
+  }
+}
+
 fn validate_arrays(ast: HarnessAst, source: string, manifest: string, calls: SwiftSearch) {
   const arrays: ArraySearch = schema_expect(
     ast.search(
@@ -89,6 +192,20 @@ fn validate_arrays(ast: HarnessAst, source: string, manifest: string, calls: Swi
   )
   require arrays.result == "ok" && !arrays.had_errors && !arrays.truncated,
     "Swift dependency array census is incomplete: ${manifest}"
+  const structure: StructureSearch = schema_expect(
+    ast.search(
+      {
+        source: source,
+        language: "swift",
+        query: "(additive_expression lhs: (_) @left op: \"+\" rhs: (_) @right) @addition\n"
+          + "(property_declaration (value_binding_pattern mutability: \"let\") name: (pattern bound_identifier: (simple_identifier) @name) value: (_) @value) @binding\n"
+          + "(simple_identifier) @identifier",
+      },
+    ),
+    schema_of(StructureSearch),
+  )
+  require structure.result == "ok" && !structure.had_errors && !structure.truncated,
+    "Swift dependency expression census is incomplete: ${manifest}"
   let initialized = false
   for item in calls.matches {
     const capture = item.captures
@@ -99,27 +216,7 @@ fn validate_arrays(ast: HarnessAst, source: string, manifest: string, calls: Swi
     if capture.label?.text != "dependencies" {
       continue
     }
-    require arrays.matches.any(
-      { row -> row.captures.literal != nil && same_range(row.captures.literal, capture.value) },
-    ),
-      "Swift dependency array is dynamic: ${manifest}"
-    for row in arrays.matches {
-      const parent = row.captures.array
-      const element = row.captures.element
-      if parent == nil || element == nil || !same_range(parent, capture.value) {
-        continue
-      }
-      if element.text.starts_with("//") || element.text.starts_with("/*") {
-        continue
-      }
-      require calls.matches.any(
-        { declaration ->
-          same_range(declaration.captures.call, element)
-            && [".package", "Package.Dependency.package"].contains(declaration.captures.callee.text)
-        },
-      ),
-        "Swift dependency array contains an unresolved element: ${manifest}"
-    }
+    validate_expression(capture.value, arrays, structure, calls, manifest, 0)
   }
   require initialized, "Swift package construction is unresolved: ${manifest}"
 }
