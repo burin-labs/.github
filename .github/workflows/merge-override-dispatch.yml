@@ -26,6 +26,7 @@ jobs:
     name: Dispatch merge override
     if: >-
       github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
       contains(fromJSON('["bypass-ci", "bypass-merge-queue", "force-merge"]'), github.event.label.name)
     uses: ./.github/workflows/merge-override.yml
     with:
