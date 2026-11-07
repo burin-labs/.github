@@ -138,3 +138,19 @@ pipeline test_the_bootstrap_only_dispatches_harn_with_every_variable_granted(har
     }
   }
 }
+
+/**
+ * A fork's head must be refused before credentials reach the reusable workflow.
+ * The organization dispatcher and the template consumers copy admit only a head
+ * in the same repository, and the two stay in step.
+ */
+pipeline test_override_dispatchers_admit_only_same_repository_heads(harness: Harness) {
+  const same_repo = "github.event.pull_request.head.repo.full_name == github.repository"
+  for path in [
+    ".github/workflows/merge-override-dispatch.yml",
+    "templates/merge-override-dispatch.yml",
+  ] {
+    const condition = yaml_parse(read(harness.fs, path)).jobs.override["if"]
+    assert(condition.contains(same_repo), path)
+  }
+}
