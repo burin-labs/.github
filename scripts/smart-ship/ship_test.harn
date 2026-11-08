@@ -868,6 +868,76 @@ fn ci_run(
     .to_list()
 }
 
+fn consumer_measurements(suite_over: dict = {}, aggregate_over: dict = {}) -> list {
+  const names = [
+    "Consumer check / Consumer canary",
+    "Consumer base check / Consumer canary",
+    "CI status",
+    "lint",
+  ]
+  const suite = {
+    workflowRun: {
+      databaseId: 42,
+      event: "pull_request",
+      workflow: {id: "W_kwDORxdAHc4PAxHq", name: "CI"},
+    },
+  } + suite_over
+  let rows = []
+  for c in ci_run("CS_consumer", 42, names, "FAILURE", suite) {
+    rows = rows + [c + {
+      databaseId: 100 + len(rows),
+      conclusion: c.name == "CI status" || c.name == "lint" ? "SUCCESS" : "FAILURE",
+    } + (c.name == "CI status" ? aggregate_over : {})]
+  }
+  return rows
+}
+
+fn consumer_pr(rows: list, total: int = -1) -> Repo {
+  return pr(checks(rows, total) + {
+    latestOpinionatedReviews: page([
+      {state: "APPROVED", body: author_receipt("abc", "burin-labs/harn"), author: {type: "Bot", login: "reviewer"}},
+    ]),
+  }) + {nameWithOwner: "burin-labs/harn"}
+}
+
+pipeline test_the_owning_aggregate_admits_only_its_measured_consumer_failures() {
+  const rows = consumer_measurements()
+  const inherited = decide(consumer_pr(rows), "clear", false)
+  assert_eq(inherited.action, "merge", "the same-run aggregate owns inherited consumer failures")
+  assert_eq(len(inherited.facts.failing), 0)
+  assert_eq(len(inherited.facts.measurements), 2, "negative measurements stay visible")
+
+  // A causal failure and an absent measurement both make the owning aggregate red.
+  for conclusion in ["FAILURE", "SKIPPED", "NEUTRAL", "CANCELLED", nil] {
+    assert_eq(decide(consumer_pr(consumer_measurements({}, {conclusion: conclusion})), "clear", false).action, "stop")
+  }
+  const refused = [
+    consumer_measurements({}, {status: "IN_PROGRESS"}),
+    consumer_measurements({}, {checkSuite: nil}),
+    consumer_measurements({}, {checkSuite: {id: "CS_foreign"}}),
+    consumer_measurements({}, {name: "another aggregate"}),
+    consumer_measurements({}, {state: "SUCCESS"}),
+    consumer_measurements({commit: {oid: "def"}}),
+    consumer_measurements({app: nil}),
+    consumer_measurements({app: {id: "another-app"}}),
+    consumer_measurements({workflowRun: {databaseId: 42, event: "push", workflow: {id: "W_kwDORxdAHc4PAxHq", name: "CI"}}}),
+    consumer_measurements({workflowRun: {databaseId: 42, event: "schedule", workflow: {id: "W_kwDORxdAHc4PAxHq", name: "CI"}}}),
+    consumer_measurements({workflowRun: {databaseId: 42, event: "pull_request", workflow: {id: "another-workflow", name: "CI"}}}),
+    consumer_measurements({checkRuns: {totalCount: 5}}),
+    rows.filter({ c -> c.name != "CI status" }).to_list(),
+    rows + [rows[0]],
+    rows.map({ c -> c.name == "Consumer check / Consumer canary" ? c + {name: "Consumer check / Another gate"} : c }).to_list(),
+    rows.map({ c -> c.name == "Consumer check / Consumer canary" ? c + {conclusion: "TIMED_OUT"} : c }).to_list(),
+    rows + [{name: "unrelated", status: "COMPLETED", conclusion: "FAILURE"}],
+    rows + [{name: "unrelated", status: "IN_PROGRESS"}],
+  ]
+  for checks in refused {
+    assert_eq(decide(consumer_pr(checks), "clear", false).action, "stop", to_string(checks))
+  }
+  assert_eq(decide(consumer_pr(rows, 5), "clear", false).action, "stop", "partial rollup refuses")
+  assert_eq(decide(pr(checks(rows)), "clear", false).action, "stop", "another repository cannot borrow Harn's policy")
+}
+
 /**
  * A run cancelled before its matrix expanded leaves a check named `matrix.name` that no later
  * run reuses. Only a newer run of the same workflow, head and event that finished green, with

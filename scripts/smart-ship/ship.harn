@@ -142,6 +142,29 @@ pub type Repo = {
   pullRequest: Pull,
 }
 
+type MeasurementPolicy = {
+  repository: string,
+  app: string,
+  workflow: string,
+  aggregate: string,
+  measurements: list<string>,
+}
+
+// Harn's aggregate compares each PR rehearsal with its base on the same
+// consumer commit. These checks report measurements, not independent gates.
+const CONSUMER_MEASUREMENTS: MeasurementPolicy = {
+  repository: "burin-labs/harn",
+  app: "MDM6QXBwMTUzNjg=",
+  workflow: "W_kwDORxdAHc4PAxHq",
+  aggregate: "CI status",
+  measurements: [
+    "Consumer check / Consumer canary",
+    "Consumer check retry / Consumer canary",
+    "Consumer base check / Consumer canary",
+    "Consumer base check retry / Consumer canary",
+  ],
+}
+
 type Response = {data: {repository: Repo}}
 
 fn complete(page: Page<any>) -> bool {
@@ -214,6 +237,40 @@ fn whole_green(c: Check, checks: list<Check>) -> bool {
   )
 }
 
+/** Negative measurements delegated to their exact, successful owning aggregate. */
+fn aggregate_measurements(repo: Repo, checks: list<Check>) -> list<Check> {
+  const policy = CONSUMER_MEASUREMENTS
+  if repo.nameWithOwner != policy.repository {
+    return []
+  }
+  const head = repo.pullRequest.headRefOid
+  const aggregates = checks.filter({ c -> c.name == policy.aggregate }).to_list()
+  if len(aggregates) != 1 {
+    return []
+  }
+  const aggregate = aggregates[0]
+  if aggregate == nil {
+    return []
+  }
+  const suite = aggregate.checkSuite
+  const run = suite?.workflowRun
+  const key = generation(aggregate, head)
+  if key == nil || suite?.id == nil || suite.status != "COMPLETED"
+    || suite.app?.id != policy.app || run?.workflow?.id != policy.workflow
+    || run.event != "pull_request" || aggregate.status != "COMPLETED"
+    || aggregate.conclusion != "SUCCESS" {
+    return []
+  }
+  const read = checks.filter({ c -> c.checkSuite?.id == suite.id }).to_list()
+  if len(read) != (suite.checkRuns?.totalCount ?? -1)
+    || len(read.map({ c -> c.databaseId }).unique()) != len(read)
+    || !read.all({ c -> c.databaseId != nil && c.status == "COMPLETED"
+      && generation(c, head) == key && run_id(c) == run_id(aggregate) }) {
+    return []
+  }
+  return read.filter({ c -> c.conclusion == "FAILURE" && policy.measurements.contains(c.name) }).to_list()
+}
+
 /**
  * A run cancelled before its matrix expanded leaves a check, such as `matrix.name`, that no later
  * run reuses the name of. It is set aside only for a newer run of the same workflow, head and
@@ -281,6 +338,7 @@ pub fn observe(repo: Repo, own: string = "", carry: Carry? = nil) {
     rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.id != own }),
     pr.headRefOid,
   )
+  const measurements = aggregate_measurements(repo, checks)
   const live = review_admission(
     pr.latestOpinionatedReviews.nodes,
     {repository: repo.nameWithOwner, pr: pr.number, head_sha: pr.headRefOid},
@@ -311,7 +369,9 @@ pub fn observe(repo: Repo, own: string = "", carry: Carry? = nil) {
     signed: head?.signature?.isValid ?? false,
     signature_state: head?.signature?.state ?? (head?.signature == nil ? "MISSING" : "UNMEASURED"),
     no_checks: len(checks) == 0,
-    failing: checks.filter({ c -> RED.contains(outcome(c)) }),
+    measurements: measurements,
+    failing: checks.filter({ c -> RED.contains(outcome(c))
+      && !measurements.any({ m -> m.databaseId == c.databaseId && m.checkSuite?.id == c.checkSuite?.id }) }),
     rerun: checks.filter({ c -> RERUN.contains(outcome(c)) }).map({ c -> c.name }),
     pending: checks.filter(
       { c ->
@@ -1648,6 +1708,9 @@ pub fn look(harness: Harness, job: Look) {
   }
   const logged = evidence_line(pr, d.facts.review_evidence)
   harness.stdio.println(logged)
+  harness.stdio.println("Check evidence: failing=${len(d.facts.failing)} [${d.facts.failing.map({ c -> c.name }).join(", ")}] "
+    + "pending=${len(d.facts.pending)} [${d.facts.pending.join(", ")}] "
+    + "aggregate_measurements=[${d.facts.measurements.map({ c -> c.name }).join(", ")}].")
   // GitHub still shows such a PR as approved, so the wait is said on the PR, not only in the log.
   const stale = stale_approval_note(r, d)
   if stale != "" {
