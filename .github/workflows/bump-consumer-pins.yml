@@ -113,7 +113,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up exact Harn release
-        uses: burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f
+        uses: burin-labs/harn/.github/actions/setup-harn@2c4eb2b36db924471f4b692ac5b5622cfd0ae864
         with:
           version: "0.10.177"
 
