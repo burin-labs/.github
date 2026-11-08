@@ -74,7 +74,7 @@ runs:
       run: node "$GITHUB_ACTION_PATH/read-origin.mjs"
 
     - name: Set up typed policy runtime
-      uses: burin-labs/harn/.github/actions/setup-harn@2c4eb2b36db924471f4b692ac5b5622cfd0ae864 # supports compressed release archives
+      uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b # supports compressed release archives
       with:
         version: ${{ inputs.harn-version }}
 
