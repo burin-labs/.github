@@ -1042,31 +1042,27 @@ fn preflight_cancel_world(jobs: list, extra: dict = {}) -> dict {
   return fake(paths + extra)
 }
 
-pipeline test_cancel_preserves_running_ci_until_its_status_job_exists(harness: Harness) {
-  const missing = preflight_cancel_world([])
+pipeline test_cancel_preserves_running_work_until_this_heads_ci_exists(harness: Harness) {
+  const missing = preflight_cancel_world([], {[HEAD_RUNS]: [{workflow_runs: []}]})
   assert_error_contains(
     { -> cancel_with_rerunnable_status(missing.gh, INPUT, 9, { _ms -> nil }) },
-    "CI status job has not been created",
+    "CI has not started",
   )
-  assert_eq(missing.sent(), [], "an absent aggregate must not cancel running work")
-  const stale = preflight_cancel_world(
-    [job(101, "CI status", "completed", "failure")],
-    {[HEAD_RUNS]: [{workflow_runs: [ci_run(20), ci_run(10)]}], [jobs_of(20)]: [{jobs: []}]},
+  assert_eq(missing.sent(), [], "an absent CI run must not cancel running work")
+  const foreign = preflight_cancel_world(
+    [],
+    {[HEAD_RUNS]: [{workflow_runs: [ci_run(10, {pull_requests: [{number: 41}]})]}]},
   )
   assert_error_contains(
-    { -> cancel_with_rerunnable_status(stale.gh, INPUT, 9, { _ms -> nil }) },
-    "CI status job has not been created",
+    { -> cancel_with_rerunnable_status(foreign.gh, INPUT, 9, { _ms -> nil }) },
+    "CI has not started",
   )
-  assert_eq(stale.sent(), [], "an old aggregate must not authorize canceling newer CI")
-  const malformed = preflight_cancel_world([job(0, "CI status", "in_progress", nil)])
-  assert_error_contains(
-    { -> cancel_with_rerunnable_status(malformed.gh, INPUT, 9, { _ms -> nil }) },
-    "identity could not be measured",
-  )
-  assert_eq(malformed.sent(), [], "an invalid job identity must not cancel running work")
-  const present = preflight_cancel_world([job(101, "CI status", "in_progress", nil)])
-  assert_eq(cancel_with_rerunnable_status(present.gh, INPUT, 9, { _ms -> nil }), 1)
-  assert_eq(present.sent().map({ call -> call.path }), [REPO + "/actions/runs/5/cancel"])
+  assert_eq(foreign.sent(), [], "another pull request's CI must not authorize a cancel")
+  // burin-code#13519: the aggregate waits on a queued macOS job, so its job
+  // does not exist yet; cancelling creates it through `if: always()`.
+  const waiting = preflight_cancel_world([job(102, "macOS build and tests", "queued", nil)])
+  assert_eq(cancel_with_rerunnable_status(waiting.gh, INPUT, 9, { _ms -> nil }), 1)
+  assert_eq(waiting.sent().map({ call -> call.path }), [REPO + "/actions/runs/5/cancel"])
 }
 
 /**
@@ -1106,7 +1102,7 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
       [jobs_of(60)]: [{jobs: [job(601, "CI status", "completed", "failure")]}],
     },
   )
-  assert_eq(rerun_required_check(failed.gh, INPUT), 202)
+  assert_eq(rerun_required_check(failed.gh, INPUT, { _ms -> nil }), 202)
   assert_eq(
     failed.sent().map({ call -> call.method + " " + call.path }),
     ["POST " + REPO + "/actions/jobs/202/rerun"],
@@ -1117,7 +1113,7 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
       [jobs_of(10)]: [{jobs: [job(101, "CI status", "completed", "success")]}],
     },
   )
-  assert_eq(rerun_required_check(green.gh, INPUT), 0)
+  assert_eq(rerun_required_check(green.gh, INPUT, { _ms -> nil }), 0)
   assert_eq(green.sent(), [])
   const none = fake(
     {
@@ -1125,8 +1121,30 @@ pipeline test_the_override_reruns_the_newest_failed_ci_status_job(harness: Harne
       [jobs_of(40)]: [{jobs: [job(401, "CI status", "completed", "failure")]}],
     },
   )
-  assert_error_contains({ -> rerun_required_check(none.gh, INPUT) }, "nothing to re-run")
+  assert_error_contains(
+    { -> rerun_required_check(none.gh, INPUT, { _ms -> nil }) },
+    "nothing to re-run",
+  )
   assert_eq(none.sent(), [])
+}
+
+/**
+ * A cancelled run's `CI status` starts after cancel returns; publish waits a bounded time for it.
+ */
+pipeline test_the_override_waits_for_a_running_ci_status_before_rerunning(harness: Harness) {
+  const running = fake(
+    {
+      [HEAD_RUNS]: [{workflow_runs: [ci_run(10)]}],
+      [jobs_of(10)]: [{jobs: [job(101, "CI status", "in_progress", nil)]}],
+    },
+  )
+  let slept = 0
+  assert_error_contains(
+    { -> rerun_required_check(running.gh, INPUT, { ms -> slept = slept + ms }) },
+    "is still in_progress",
+  )
+  assert_eq(slept, 300000, "publish waits its whole budget before giving up")
+  assert_eq(running.sent(), [], "a running aggregate is never re-run mid-flight")
 }
 
 pipeline test_the_override_selects_the_recorded_pr_ci_caller_and_refuses_other_identities() {
@@ -1166,13 +1184,16 @@ pipeline test_the_override_selects_the_recorded_pr_ci_caller_and_refuses_other_i
       },
     )
     if len(keys(changed)) == 0 {
-      assert_eq(rerun_required_check(world.gh, input), 127977018050)
+      assert_eq(rerun_required_check(world.gh, input, { _ms -> nil }), 127977018050)
       assert_eq(
         world.sent(),
         [{method: "POST", path: "${repo}/actions/jobs/127977018050/rerun", body: {}}],
       )
     } else {
-      assert_error_contains({ -> rerun_required_check(world.gh, input) }, "nothing to re-run")
+      assert_error_contains(
+        { -> rerun_required_check(world.gh, input, { _ms -> nil }) },
+        "nothing to re-run",
+      )
       assert_eq(world.sent(), [])
     }
   }
