@@ -110,7 +110,11 @@ fn cancel_step(harness: Harness) {
 }
 
 fn publish_step(harness: Harness) {
-  const job = rerun_required_check(github(harness, "GH_TOKEN"), input(harness))
+  const job = rerun_required_check(
+    github(harness, "GH_TOKEN"),
+    input(harness),
+    { ms -> harness.clock.sleep_ms(ms) },
+  )
   harness.stdio.println(
     job == 0 ? "The newest CI status already passed; nothing to re-run" : "Re-ran CI status job "
       + to_string(job),
