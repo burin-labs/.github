@@ -52,7 +52,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Harn
-        uses: burin-labs/harn/.github/actions/setup-harn@36b0c000132756a91c7c11f1533d97d9db9ea2db
+        uses: burin-labs/harn/.github/actions/setup-harn@2c4eb2b36db924471f4b692ac5b5622cfd0ae864
         with:
           version-file: scripts/guard-publication/.harn-version
 

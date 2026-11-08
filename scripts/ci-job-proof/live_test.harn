@@ -240,7 +240,7 @@ pipeline test_composite_projects_identities_and_persists_attempt_bound_receipts(
   )
   assert_eq(
     steps[0].uses,
-    "burin-labs/harn/.github/actions/setup-harn@11681af676a5e4dc4200cfee683150cdec26763f",
+    "burin-labs/harn/.github/actions/setup-harn@2c4eb2b36db924471f4b692ac5b5622cfd0ae864",
   )
   assert_eq(steps[0]["with"].version, "0.10.159")
   assert_eq(steps[1].env.CI_JOB_PROOF_IDENTITIES, "$" + "{{ inputs.job-identities }}")

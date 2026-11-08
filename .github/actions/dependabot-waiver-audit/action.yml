@@ -19,7 +19,7 @@ runs:
   using: composite
   steps:
     - name: Install audit runtime
-      uses: burin-labs/harn/.github/actions/setup-harn@389a3aeb579e70d73999d7af6eac7b22a30c7808
+      uses: burin-labs/harn/.github/actions/setup-harn@2c4eb2b36db924471f4b692ac5b5622cfd0ae864
       with:
         version: ${{ inputs.harn-version }}
     - name: Reconcile waivers against live alerts
