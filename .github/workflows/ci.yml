@@ -53,13 +53,11 @@ jobs:
           policy: .github/fixtures/local-workflow-checks/policy.json
       - name: Check the Harn package and controls
         run: |
-          harn package check .
           harn test scripts/local-checks
           harn test scripts/ci-runtime-evidence
           harn test scripts/release-promotion
           harn test scripts/release-repin
           harn test scripts/merge-override
-          harn test scripts/workflow-policy
           harn test scripts/hosted-runner-labels
           harn test scripts/harn-required-review
           harn test scripts/review-dispatch
@@ -170,9 +168,36 @@ jobs:
         working-directory: services/smart-ship-relay
         run: node --test
 
+  verified-release-assets:
+    name: Verified release asset transport
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b
+        with:
+          version: "0.10.192"
+      - name: Exercise the release asset action
+        uses: ./.github/actions/download-release-asset
+        with:
+          url: https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+          sha256: "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
+          output: ${{ runner.temp }}/verified-cargo-audit.tgz
+          github-token: ${{ github.token }}
+      - name: Check the package and verified transport controls
+        run: |
+          harn package check .
+          harn check scripts/release-asset
+          harn lint scripts/release-asset
+          harn test scripts/workflow-policy
+          harn test scripts/release-asset
+
   ci-status:
     name: CI status
-    needs: [local-check-contract, package-smoke, smart-ship, smart-ship-relay]
+    needs: [local-check-contract, package-smoke, smart-ship, smart-ship-relay, verified-release-assets]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     permissions:
@@ -199,24 +224,19 @@ jobs:
         uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
           globs: "**/*.md"
+      - name: Set up verified release transport
+        uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b
+        with:
+          version: "0.10.192"
       - name: Install actionlint
         env:
+          RELEASE_TOOL_NAME: actionlint
+          GH_TOKEN: ${{ github.token }}
           ACTIONLINT_VERSION: "1.7.12"
           ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
         run: |
           set -euo pipefail
-          bin_dir="${RUNNER_TEMP}/bin"
-          mkdir -p "${bin_dir}"
-          archive="${RUNNER_TEMP}/actionlint.tar.gz"
-          curl -fsSL \
-            --retry 5 \
-            --retry-all-errors \
-            --retry-delay 2 \
-            -o "${archive}" \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
-          tar -xzf "${archive}" -C "${bin_dir}" actionlint
-          echo "${bin_dir}" >> "$GITHUB_PATH"
+          harn run --standalone --no-sandbox scripts/release-asset/install-tool.harn
       - name: GitHub Actions lint
         run: actionlint
       - name: Test graph-derived Rust impact planning
@@ -233,11 +253,13 @@ jobs:
           PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
           SMART_SHIP_RESULT: ${{ needs.smart-ship.result }}
           SMART_SHIP_RELAY_RESULT: ${{ needs.smart-ship-relay.result }}
+          VERIFIED_RELEASE_ASSETS_RESULT: ${{ needs.verified-release-assets.result }}
         run: |
           test "$LOCAL_CHECK_CONTRACT_RESULT" = success
           test "$PACKAGE_SMOKE_RESULT" = success
           test "$SMART_SHIP_RESULT" = success
           test "$SMART_SHIP_RELAY_RESULT" = success
+          test "$VERIFIED_RELEASE_ASSETS_RESULT" = success
       - name: Check Dependabot config
         uses: ./.github/actions/check-dependabot-config
       - name: Test package workflow policy

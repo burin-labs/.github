@@ -38,16 +38,22 @@ pipeline test_every_shared_setup_uses_an_immutable_installer_reference(harness: 
   assert(!immutable_setup_reference(references[0] + "x"), "a malformed digest must be refused")
 }
 
-pipeline test_bootstrap_download_retries_transient_failures(harness: Harness) {
-  const source = harness.fs.read_text("../../.github/workflows/ci.yml")
-  assert(contains(source, "--retry 5"))
-  assert(contains(source, "--retry-all-errors"))
-  assert(contains(source, "--retry-delay 2"))
-  // Negative control: a one-shot curl must not satisfy this contract merely
-  // because the workflow still verifies the downloaded archive's checksum.
-  const one_shot = source.replace("--retry 5", "").replace("--retry-all-errors", "").replace(
-    "--retry-delay 2",
-    "",
+pipeline test_actionlint_routes_through_the_verified_shared_installer(harness: Harness) {
+  const flow = yaml_parse(harness.fs.read_text("../../.github/workflows/ci.yml"))
+  const installers = flow.jobs["ci-status"].steps.filter(
+    { step -> step.name == "Install actionlint" },
   )
-  assert_eq(contains(one_shot, "--retry"), false)
+    .to_list()
+  assert_eq(len(installers), 1)
+  const installer = installers[0]
+  assert_eq(installer.env.RELEASE_TOOL_NAME, "actionlint")
+  assert_eq(installer.env.ACTIONLINT_VERSION, "1.7.12")
+  assert_eq(
+    installer.env.ACTIONLINT_SHA256,
+    "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+  )
+  assert_eq(
+    installer.run.trim(),
+    "set -euo pipefail\nharn run --standalone --no-sandbox scripts/release-asset/install-tool.harn",
+  )
 }

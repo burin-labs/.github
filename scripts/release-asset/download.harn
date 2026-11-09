@@ -1,0 +1,219 @@
+/** Verified transport only. Existing tool owners retain caching and installation. */
+pub type Asset = {url: string, sha256: string, max_bytes: int, deadline_ms: int}
+
+type Release = {assets: list<{id: int, name: string}>}
+
+/** The downloader needs only network access and a monotonic deadline. */
+pub type Transport = {clock: HarnessClock, net: HarnessNet}
+
+fn refuse(reason: string) {
+  throw {error: "release_asset_refused", reason: reason}
+}
+
+fn remaining(clock: HarnessClock, deadline: int) -> int {
+  const value = deadline - clock.monotonic_ms()
+  if value <= 0 {
+    refuse("deadline")
+  }
+  return min(value, 30000)
+}
+
+fn request(
+  harness: Transport,
+  url: string,
+  headers: dict,
+  limit: int,
+  deadline: int,
+  redirects: bool,
+  attempts: int,
+) -> dict {
+  for attempt in range(attempts) {
+    const timeout = remaining(harness.clock, deadline)
+    const result = try {
+      harness.net.request(
+        "GET",
+        url,
+        {
+          headers: headers,
+          response_type: "bytes",
+          max_response_bytes: limit,
+          timeout_ms: timeout,
+          total_timeout_ms: timeout,
+          connect_timeout_ms: min(timeout, 15000),
+          retry: {max: 0},
+          follow_redirects: redirects,
+          max_redirects: 5,
+        },
+      )
+    }
+    if is_ok(result) {
+      const response = unwrap(result)
+      if ![408, 429, 500, 502, 503, 504].contains(response.status) {
+        return response
+      }
+    }
+    if attempt + 1 < attempts {
+      harness.clock.sleep_ms(min(250 * (attempt + 1), remaining(harness.clock, deadline)))
+    }
+  }
+  return {ok: false, status: 0, headers: {}}
+}
+
+fn checked(response: dict, pin: string) -> bytes {
+  if response.status != 200 || !response.ok {
+    refuse("download_failed")
+  }
+  const data = response.body_bytes
+  if len(data) == 0 || sha256_hex(data) != pin {
+    refuse("sha256_mismatch")
+  }
+  return data
+}
+
+fn header(headers: dict, name: string) -> string {
+  for key in headers.keys() {
+    if key.lower() == name {
+      return headers[key]
+    }
+  }
+  return ""
+}
+
+fn identity(asset: Asset) -> {base: string, tag: string, name: string} {
+  const parsed = url_parse(asset.url)
+  const parts = parsed.path.split("/")
+  if !asset.url.starts_with("https://github.com/") || parsed.scheme != "https"
+    || parsed.host != "github.com"
+    || parsed.port != nil
+    || (parsed.query ?? "") != ""
+    || (parsed.fragment ?? "") != ""
+    || len(parts) != 7
+    || parts[3] != "releases"
+    || parts[4] != "download"
+    || regex_match("^[A-Za-z0-9_.-]+$", parts[1]) == nil
+    || regex_match("^[A-Za-z0-9_.-]+$", parts[2]) == nil
+    || parts[5] == ""
+    || parts[6] == "" {
+    refuse("invalid_github_release_url")
+  }
+  if regex_match("^[0-9a-f]{64}$", asset.sha256) == nil || asset.max_bytes <= 0
+    || asset.max_bytes > 1073741824
+    || asset.deadline_ms <= 0
+    || asset.deadline_ms > 600000 {
+    refuse("invalid_pin_or_bounds")
+  }
+  return {
+    base: "https://api.github.com/repos/" + (parts[1] ?? "") + "/" + (parts[2] ?? ""),
+    tag: url_encode(url_decode((parts[5] ?? "").replace("+", "%2B"))),
+    name: url_decode((parts[6] ?? "").replace("+", "%2B")),
+  }
+}
+
+/** No caller-supplied API URL or asset id. Derive both from the admitted browser URL. */
+pub fn acquire(harness: Transport, asset: Asset, token: string) -> {data: bytes, route: string} {
+  const source = identity(asset)
+  const deadline = harness.clock.monotonic_ms() + asset.deadline_ms
+  const public_headers = {"User-Agent": "burin-verified-release-asset"}
+  const direct = request(harness, asset.url, public_headers, asset.max_bytes, deadline, true, 2)
+  if direct.status == 200 {
+    return {data: checked(direct, asset.sha256), route: "browser"}
+  }
+  if token.trim() == "" || token.contains("\n") || token.contains("\r") {
+    refuse("authenticated_fallback_unavailable")
+  }
+  const auth = {
+    ...public_headers,
+    Authorization: "Bearer " + token,
+    "X-GitHub-Api-Version": "2022-11-28",
+    Accept: "application/vnd.github+json",
+  }
+  const metadata = request(
+    harness,
+    source.base + "/releases/tags/" + source.tag,
+    auth,
+    1048576,
+    deadline,
+    false,
+    3,
+  )
+  if metadata.status != 200 || !metadata.ok {
+    refuse("release_api_failed")
+  }
+  let release: Release = {assets: []}
+  match json_decode(bytes_to_string(metadata.body_bytes), schema_of(Release)) {
+    Result.Ok(value) -> { release = value }
+    Result.Err(_) -> { refuse("invalid_release_metadata") }
+  }
+  const matches = release.assets.filter({ candidate -> candidate.name == source.name }).to_list()
+  const selected = matches[0]
+  if selected == nil {
+    throw {error: "release_asset_refused", reason: "asset_missing"}
+  }
+  if len(matches) != 1 || selected.id <= 0 {
+    refuse("asset_identity_unmeasured_or_ambiguous")
+  }
+  let response = request(
+    harness,
+    source.base + "/releases/assets/" + to_string(selected.id),
+    {...auth, Accept: "application/octet-stream"},
+    asset.max_bytes,
+    deadline,
+    false,
+    3,
+  )
+  if [301, 302, 303, 307, 308].contains(response.status) {
+    const location = header(response.headers, "location")
+    const target = url_parse(location)
+    if !location.starts_with("https://release-assets.githubusercontent.com/")
+      || target.scheme != "https"
+      || target.host != "release-assets.githubusercontent.com"
+      || target.port != nil {
+      refuse("untrusted_asset_redirect")
+    }
+    // Never forward the API credential to an asset CDN, including redirects.
+    response = request(harness, location, public_headers, asset.max_bytes, deadline, false, 3)
+  }
+  return {data: checked(response, asset.sha256), route: "asset_api"}
+}
+
+/** Environment-driven transport entrypoint for the shared composite action. */
+pub fn run_cli(harness: Harness) {
+  const asset: Asset = {
+    url: harness.env.get("RELEASE_ASSET_URL") ?? "",
+    sha256: harness.env.get("RELEASE_ASSET_SHA256") ?? "",
+    max_bytes: to_int(harness.env.get("RELEASE_ASSET_MAX_BYTES") ?? "67108864"),
+    deadline_ms: to_int(harness.env.get("RELEASE_ASSET_DEADLINE_MS") ?? "180000"),
+  }
+  const output = harness.env.get("RELEASE_ASSET_OUTPUT") ?? ""
+  if output == "" {
+    refuse("output_required")
+  }
+  const acquired = acquire(
+    pick(harness, ["net", "clock"]),
+    asset,
+    harness.env.get("GH_TOKEN") ?? harness.env.get("GITHUB_TOKEN") ?? "",
+  )
+  // Publish only verified bytes. Atomic replacement refuses a symlink destination.
+  harness.fs.replace_bytes(output, acquired.data, {durability: "flush"})
+  harness.stdio.println(
+    json_stringify(
+      {
+        route: acquired.route,
+        sha256: asset.sha256,
+        bytes: len(acquired.data),
+        pending: 0,
+        failing_names: [],
+      },
+    ),
+  )
+}
+
+fn main(harness: Harness) {
+  try {
+    run_cli(harness)
+  } catch (error) {
+    // Original transport exceptions can contain signed URLs or credentials.
+    harness.stdio.println(json_stringify({pending: 1, failing_names: ["verified_release_asset"]}))
+    harness.runtime.exit(1)
+  }
+}

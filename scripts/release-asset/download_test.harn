@@ -1,0 +1,185 @@
+import { Asset, acquire } from "./download.harn"
+import { projected } from "./projection.harn"
+
+const URL = "https://github.com/example/tool/releases/download/v1.2.3/tool.tar.gz"
+
+const META = "https://api.github.com/repos/example/tool/releases/tags/v1.2.3"
+
+const API = "https://api.github.com/repos/example/tool/releases/assets/42"
+
+const BODY = "verified archive fixture"
+
+fn spec() -> Asset {
+  return {url: URL, sha256: sha256_hex(BODY), max_bytes: 1024, deadline_ms: 10000}
+}
+
+fn altered(url: string, pin: string, limit: int, deadline: int) -> Asset {
+  return {url: url, sha256: pin, max_bytes: limit, deadline_ms: deadline}
+}
+
+fn fallback(testing: HarnessTesting, metadata: dict) {
+  testing.http_mock("GET", URL, {status: 504, body: ""})
+  testing.http_mock("GET", META, {status: 200, body: json_stringify(metadata)})
+}
+
+pipeline test_browser_success_verifies_bytes_without_api_or_credentials(harness: Harness) {
+  harness.testing.http_mock("GET", URL, {status: 200, body: BODY})
+  const result = acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+  assert_eq(result.route, "browser")
+  assert_eq(sha256_hex(result.data), spec().sha256)
+  const calls = harness.testing.http_mock_calls()
+  assert_eq(len(calls), 1)
+  assert(!calls[0].headers.has("Authorization") && !calls[0].headers.has("authorization"))
+}
+
+pipeline test_bad_direct_bytes_are_not_retried_or_salvaged_by_api(harness: Harness) {
+  harness.testing.http_mock("GET", URL, {status: 200, body: "corrupt"})
+  assert(
+    is_err(
+      try {
+        acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.http_mock_calls()), 1)
+}
+
+pipeline test_fallback_uses_authenticated_exact_asset_and_strips_auth_on_cdn(harness: Harness) {
+  fallback(
+    harness.testing,
+    {assets: [{id: 41, name: "other.tar.gz"}, {id: 42, name: "tool.tar.gz"}]},
+  )
+  const cdn = "https://release-assets.githubusercontent.com/fixture/tool?signature=public-fixture"
+  harness.testing.http_mock("GET", API, {status: 302, headers: {Location: cdn}, body: ""})
+  harness.testing.http_mock("GET", cdn, {status: 200, body: BODY})
+  const result = acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+  assert_eq(result.route, "asset_api")
+  assert_eq(sha256_hex(result.data), spec().sha256)
+  const calls = harness.testing.http_mock_calls()
+  assert_eq(len(calls), 5)
+  assert(calls[2].headers.has("Authorization") || calls[2].headers.has("authorization"))
+  assert(calls[3].headers.has("Authorization") || calls[3].headers.has("authorization"))
+  assert(!calls[4].headers.has("Authorization") && !calls[4].headers.has("authorization"))
+  assert(calls.all({ call -> call.headers.has("User-Agent") || call.headers.has("user-agent") }))
+}
+
+pipeline test_fallback_refuses_bad_api_bytes(harness: Harness) {
+  fallback(harness.testing, {assets: [{id: 42, name: "tool.tar.gz"}]})
+  harness.testing.http_mock("GET", API, {status: 200, body: "corrupt"})
+  assert(
+    is_err(
+      try {
+        acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.http_mock_calls()), 4)
+}
+
+pipeline test_fallback_refuses_missing_credential_without_api(harness: Harness) {
+  harness.testing.http_mock("GET", URL, {status: 504, body: ""})
+  assert(
+    is_err(
+      try {
+        acquire(pick(harness, ["net", "clock"]), spec(), "")
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.http_mock_calls()), 2)
+}
+
+pipeline test_fallback_refuses_permanent_api_errors_without_retry(harness: Harness) {
+  harness.testing.http_mock("GET", URL, {status: 504, body: ""})
+  harness.testing.http_mock("GET", META, {status: 403, body: "denied"})
+  assert(
+    is_err(
+      try {
+        acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.http_mock_calls()), 3)
+}
+
+pipeline test_fallback_bounds_transient_api_attempts(harness: Harness) {
+  harness.testing.http_mock("GET", URL, {status: 504, body: ""})
+  harness.testing.http_mock("GET", META, {status: 504, body: ""})
+  assert(
+    is_err(
+      try {
+        acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.http_mock_calls()), 5)
+}
+
+pipeline test_fallback_requires_unique_nonempty_asset_identity(harness: Harness) {
+  for assets in [
+    [],
+    [{id: 42, name: "other"}],
+    [{id: 0, name: "tool.tar.gz"}],
+    [{id: 42, name: "tool.tar.gz"}, {id: 43, name: "tool.tar.gz"}],
+  ] {
+    harness.testing.http_mock_clear()
+    fallback(harness.testing, {assets: assets})
+    assert(
+      is_err(
+        try {
+          acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+        },
+      ),
+    )
+    assert_eq(len(harness.testing.http_mock_calls()), 3)
+  }
+}
+
+pipeline test_fallback_refuses_untrusted_redirect_without_following(harness: Harness) {
+  fallback(harness.testing, {assets: [{id: 42, name: "tool.tar.gz"}]})
+  harness.testing.http_mock(
+    "GET",
+    API,
+    {status: 302, headers: {Location: "https://attacker.example/tool"}, body: ""},
+  )
+  assert(
+    is_err(
+      try {
+        acquire(pick(harness, ["net", "clock"]), spec(), "fixture-token")
+      },
+    ),
+  )
+  assert_eq(len(harness.testing.http_mock_calls()), 4)
+}
+
+pipeline test_bounds_and_url_validation_refuse_before_network(harness: Harness) {
+  const invalid: list<Asset> = [
+    altered(URL, spec().sha256, 0, 10000),
+    altered(URL, spec().sha256, 1024, 0),
+    altered(URL, "", 1024, 10000),
+    altered(
+      "https://alice@github.com/example/tool/releases/download/v1.2.3/tool.tar.gz",
+      spec().sha256,
+      1024,
+      10000,
+    ),
+    altered(URL + "?token=fixture", spec().sha256, 1024, 10000),
+  ]
+  for request in invalid {
+    assert(
+      is_err(
+        try {
+          acquire(pick(harness, ["net", "clock"]), request, "fixture-token")
+        },
+      ),
+    )
+  }
+  assert_eq(len(harness.testing.http_mock_calls()), 0)
+}
+
+pipeline test_caller_workflow_embeds_exact_owner_sources(harness: Harness) {
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  assert_eq(
+    harness.fs.read_text(path_join(root, ".github/workflows/cargo-deny.yml")),
+    projected(harness.fs, root),
+  )
+}

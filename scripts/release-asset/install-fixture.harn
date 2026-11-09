@@ -1,0 +1,69 @@
+// Test-only network adapter. The workflow executes the real owner CLI.
+import { install_cli } from "./install-tool.harn"
+
+fn main(harness: Harness) {
+  const mode = harness.env.get("ASSET_FIXTURE_MODE") ?? ""
+  const url =
+    "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz"
+  const api = "https://api.github.com/repos/rustsec/rustsec/releases/"
+  const body = "verified cargo-audit fixture\n"
+  harness.testing.http_mock(
+    "GET",
+    url,
+    {
+      status: if mode == "direct" {
+        200
+      } else {
+        504
+      },
+      body: body,
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "tags/cargo-audit%2Fv0.22.2",
+    {
+      status: if mode == "denied" {
+        403
+      } else {
+        200
+      },
+      body: json_stringify(
+        {assets: [{id: 439292222, name: "cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz"}]},
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "assets/439292222",
+    {
+      status: 200,
+      body: if mode == "corrupt" {
+        "corrupt fixture"
+      } else {
+        body
+      },
+    },
+  )
+  const result = try {
+    install_cli(harness)
+  }
+  const calls = harness.testing.http_mock_calls()
+  harness.fs.write_text(
+    harness.env.get("ASSET_NETWORK_CALLS") ?? "",
+    json_stringify(
+      calls.map(
+        { call ->
+          {
+            url: call.url,
+            authenticated: call.headers.has("Authorization") || call.headers.has("authorization"),
+          }
+        },
+      )
+        .to_list(),
+    ),
+  )
+  if !is_ok(result) {
+    harness.runtime.exit(1)
+  }
+}

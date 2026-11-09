@@ -64,9 +64,118 @@ pipeline test_advisories_always_run_and_the_lockfile_scan_owns_stale_ignores(har
 
 pipeline test_cargo_audit_is_checksum_verified_before_use(harness: Harness) {
   const install = step(steps(harness.fs), "Install cargo-audit")
-  assert(regex_match("^[0-9a-f]{64}$", install.env.CARGO_AUDIT_SHA256) != nil, "a full sha256 pin")
-  assert(install.run.contains("sha256sum -c -"), "the archive is verified")
+  assert_eq(
+    install.env.CARGO_AUDIT_SHA256,
+    "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428",
+  )
+  assert(install.run.contains("install-tool.harn"), "the verified owner installs the archive")
   assert(install.run.contains("set -euo pipefail"), "a failed verification stops the step")
+}
+
+fn run_audit_install(harness: Harness, mode: string) -> dict {
+  let result: dict = {}
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+      const binary = harness.env.get("HARN_EXT_TEST_BINARY")
+        ?? harness.process.run({program: "which", args: ["harn"]}).stdout.trim()
+      const install = step(steps(harness.fs), "Install cargo-audit")
+      harness.fs.write_text(
+        path_join(work, "step.sh"),
+        step(steps(harness.fs), "Prepare verified release tools").run + "\n" + install.run,
+      )
+      harness.fs.write_text(path_join(work, "effects"), "")
+      harness.fs.write_text(path_join(work, "network.json"), "[]")
+      harness.fs.write_text(path_join(work, "github-path"), "")
+      harness.fs.write_text(
+        path_join(work, "curl"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'browser\\n' >> \"$ASSET_EFFECTS\"\nif [[ \"$ASSET_FIXTURE_MODE\" != direct ]]; then exit 22; fi\nwhile [[ $# -gt 0 ]]; do if [[ \"$1\" == -o ]]; then printf 'verified cargo-audit fixture\\n' > \"$2\"; exit 0; fi; shift; done\nexit 91\n",
+      )
+      harness.fs.write_text(
+        path_join(work, "harn"),
+        "#!/usr/bin/env bash\nset -euo pipefail\n[[ $# == 4 && $1 == run && $2 == --standalone && $3 == --no-sandbox && $4 == \"$RUNNER_TEMP/install-tool.harn\" ]]\ncmp \"$RUNNER_TEMP/download.harn\" \"$RELEASE_ASSET_SOURCE/download.harn\"\ncmp \"$RUNNER_TEMP/install-tool.harn\" \"$RELEASE_ASSET_SOURCE/install-tool.harn\"\nexec \"$HARN_EXT_TEST_BINARY\" run --standalone --no-sandbox \"$RELEASE_ASSET_FIXTURE\"\n",
+      )
+      harness.fs.write_text(
+        path_join(work, "tar"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'extract\\n' >> \"$ASSET_EFFECTS\"\nmkdir -p \"$(dirname \"$4/$5\")\"\nprintf '#!/usr/bin/env bash\\nprintf cargo-audit-fixture\\\\n\\n' > \"$4/$5\"\n",
+      )
+      for name in ["curl", "harn", "tar"] {
+        assert(
+          harness.process.run({program: "/bin/chmod", args: ["755", path_join(work, name)]})
+            .success,
+        )
+      }
+      const ran = harness.process.run(
+        {
+          program: "/bin/bash",
+          args: ["-e", "-o", "pipefail", path_join(work, "step.sh")],
+          cwd: work,
+          env: {
+            ...install.env,
+            HOME: work,
+            RUNNER_TEMP: work,
+            GITHUB_PATH: path_join(work, "github-path"),
+            PATH: work + ":" + (harness.env.get("PATH") ?? ""),
+            GH_TOKEN: "public-test-credential",
+            HARN_EXT_TEST_BINARY: binary,
+            RELEASE_ASSET_SOURCE: path_join(root, "scripts/release-asset"),
+            RELEASE_ASSET_FIXTURE: path_join(root, "scripts/release-asset/install-fixture.harn"),
+            ASSET_EFFECTS: path_join(work, "effects"),
+            ASSET_NETWORK_CALLS: path_join(work, "network.json"),
+            ASSET_FIXTURE_MODE: mode,
+            CARGO_AUDIT_SHA256: sha256_hex("verified cargo-audit fixture\n"),
+          },
+          timeout_ms: 30000,
+        },
+      )
+      result = {
+        success: ran.success,
+        stderr: ran.stderr,
+        effects: harness.fs.read_text(path_join(work, "effects")),
+        calls: json_parse(harness.fs.read_text(path_join(work, "network.json"))),
+        installed: harness.fs.exists(path_join(work, ".local/bin/cargo-audit")),
+      }
+    },
+  )
+  return result
+}
+
+pipeline test_actual_audit_install_recovers_direct_failure_through_authenticated_api(
+  harness: Harness,
+) {
+  const result = run_audit_install(harness, "api")
+  assert(result.success, "actual install step must recover through the asset API: " + result.stderr)
+  assert(
+    result.installed && result.effects.contains("extract"),
+    "verified bytes reached installation",
+  )
+  const api = result.calls.filter({ call -> call.url.starts_with("https://api.github.com/") })
+    .to_list()
+  assert_eq(len(api), 2, "release metadata and exact asset were reached")
+  assert(api.all({ call -> call.authenticated }), "API requests carry authentication")
+}
+
+pipeline test_actual_audit_install_refuses_corrupt_api_bytes(harness: Harness) {
+  const result = run_audit_install(harness, "corrupt")
+  assert(!result.success && !result.installed && !result.effects.contains("extract"))
+  assert_eq(
+    len(result.calls),
+    4,
+    "two failed direct attempts, metadata, and corrupt API asset were reached",
+  )
+}
+
+pipeline test_actual_audit_install_refuses_api_denial(harness: Harness) {
+  const result = run_audit_install(harness, "denied")
+  assert(!result.success && !result.installed && !result.effects.contains("extract"))
+  assert_eq(len(result.calls), 3, "API refusal is measured and no asset or extraction follows")
+}
+
+pipeline test_actual_audit_install_direct_positive_needs_no_api(harness: Harness) {
+  const result = run_audit_install(harness, "direct")
+  assert(result.success && result.installed && result.effects.contains("extract"), result.stderr)
+  assert(!result.calls.any({ call -> call.url.starts_with("https://api.github.com/") }))
 }
 
 fn lockfile_script(fs: HarnessFs) -> string {
@@ -92,7 +201,7 @@ fn quinn(id: string) -> dict {
 }
 
 fn run_lockfile_scan(harness: Harness, deny: string, report: string, today: string) -> dict {
-  let result = nil
+  let result: dict = {}
   with_temp_dir(
     harness.fs,
     { work ->
@@ -223,7 +332,7 @@ pipeline test_policy_checks_follow_the_caller_switch(harness: Harness) {
 pipeline test_the_binary_is_checksum_verified_before_use(harness: Harness) {
   const install = step(steps(harness.fs), "Install cargo-deny")
   assert(regex_match("^[0-9a-f]{64}$", install.env.CARGO_DENY_SHA256) != nil, "a full sha256 pin")
-  assert(install.run.contains("sha256sum -c -"), "the archive is verified")
+  assert(install.run.contains("install-tool.harn"), "the verified owner installs the archive")
   assert(install.run.contains("set -euo pipefail"), "a failed verification stops the step")
 }
 
@@ -236,7 +345,7 @@ pipeline test_both_checks_run_in_the_caller_directory(harness: Harness) {
 }
 
 fn run_source_step(harness: Harness, name: string, values: dict, fake_git: string) -> dict {
-  let result = nil
+  let result: dict = {}
   with_temp_dir(
     harness.fs,
     { work ->

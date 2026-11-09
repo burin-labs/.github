@@ -1,0 +1,89 @@
+import { acquire } from "./download.harn"
+
+fn required(env: HarnessEnv, name: string) -> string {
+  const value = env.get(name) ?? ""
+  if value == "" {
+    throw {error: "tool_install_refused", reason: "missing_install_input"}
+  }
+  return value
+}
+
+fn command(process: HarnessProcess, program: string, args: list<string>) {
+  const result = process.run({program: program, args: args, timeout_ms: 30000})
+  if !result.success {
+    throw {error: "tool_install_refused", reason: "install_command_failed"}
+  }
+}
+
+/** Own the three shared workflow installations. Transport policy lives in acquire. */
+pub fn install_cli(harness: Harness) {
+  const name = required(harness.env, "RELEASE_TOOL_NAME")
+  const prefix = name.upper().replace("-", "_")
+  const version = required(harness.env, prefix + "_VERSION")
+  if regex_match("^[0-9]+[.][0-9]+[.][0-9]+$", version) == nil {
+    throw {error: "tool_install_refused", reason: "invalid_version"}
+  }
+  let url = ""
+  let member = name
+  if name == "cargo-audit" {
+    const slug = "cargo-audit-x86_64-unknown-linux-musl-v" + version
+    member = slug + "/cargo-audit"
+    url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv" + version + "/"
+      + slug
+      + ".tgz"
+  } else if name == "cargo-deny" {
+    const slug = "cargo-deny-" + version + "-x86_64-unknown-linux-musl"
+    member = slug + "/cargo-deny"
+    url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/" + version + "/" + slug
+      + ".tar.gz"
+  } else if name == "actionlint" {
+    url = "https://github.com/rhysd/actionlint/releases/download/v" + version + "/actionlint_"
+      + version
+      + "_linux_amd64.tar.gz"
+  } else {
+    throw {error: "tool_install_refused", reason: "unregistered_tool"}
+  }
+  const acquired = acquire(
+    pick(harness, ["net", "clock"]),
+    {
+      url: url,
+      sha256: required(harness.env, prefix + "_SHA256"),
+      max_bytes: 67108864,
+      deadline_ms: 180000,
+    },
+    harness.env.get("GH_TOKEN") ?? harness.env.get("GITHUB_TOKEN") ?? "",
+  )
+  const work = harness.fs.mkdtemp("burin-verified-tool-")
+  try {
+    const archive = path_join(work, "archive.tar.gz")
+    harness.fs.write_bytes(archive, acquired.data)
+    command(harness.process, "tar", ["-xzf", archive, "-C", work, member])
+    const source = path_join(work, member)
+    const info = harness.fs.stat(source, {follow_symlinks: false})
+    if !info.is_file || info.is_symlink {
+      throw {error: "tool_install_refused", reason: "nonregular_executable"}
+    }
+    const bin = path_join(required(harness.env, "HOME"), ".local/bin")
+    harness.fs.mkdir(bin)
+    const executable = path_join(bin, name)
+    command(harness.process, "install", ["-m", "0755", source, executable])
+    command(harness.process, executable, ["--version"])
+    harness.fs.append(required(harness.env, "GITHUB_PATH"), bin + "\n")
+    harness.stdio.println(
+      json_stringify(
+        {tool: name, version: version, route: acquired.route, pending: 0, failing_names: []},
+      ),
+    )
+  } finally {
+    harness.fs.delete(work)
+  }
+}
+
+fn main(harness: Harness) {
+  try {
+    install_cli(harness)
+  } catch (error) {
+    harness.stdio.println(json_stringify({pending: 1, failing_names: ["verified_tool_install"]}))
+    harness.runtime.exit(1)
+  }
+}
