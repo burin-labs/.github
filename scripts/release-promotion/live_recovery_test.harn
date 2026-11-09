@@ -94,6 +94,9 @@ pipeline test_live_recovery_refuses_failed_empty_malformed_and_truncated_command
     { work ->
       for output in [
         "process.stderr.write('private-reader-detail fixture-read-only-token'); process.exit(13);\n",
+        "process.stdout.write('{\"reading\":{\"product\":{\"verdict\":\"pass\"}}}'); process.exit(13);\n",
+        "process.stdout.write('{\"schema\":\"harn.consumer_observer.read_refusal.v1\",\"reason\":\"github_read_unavailable\"}');\n",
+        "process.stdout.write('{\"schema\":\"harn.consumer_observer.read_refusal.v1\",\"reason\":\"private-reader-detail fixture-read-only-token\"}'); process.exit(13);\n",
         "",
         "process.stdout.write('not-json');\n",
         "process.stdout.write('malformed-prefix' + ' '.repeat(20000) + '{\"measured\":true}');\n",
@@ -136,6 +139,40 @@ pipeline test_live_recovery_refuses_failed_empty_malformed_and_truncated_command
           )
         }
       }
+    },
+  )
+}
+
+pipeline test_live_recovery_names_the_structured_refusal_without_private_diagnostics(
+  harness: Harness,
+) {
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const refusal = {
+        schema: "harn.consumer_observer.read_refusal.v1",
+        reason: "github_read_unavailable",
+        retryable: true,
+        retry_after_seconds: 30,
+        status: 429,
+        private_detail: "private-reader-detail",
+      }
+      const reader = fixture(
+        harness.fs,
+        work,
+        "process.stdout.write(${json_stringify(json_stringify(refusal))});\n"
+          + "process.stderr.write('private-reader-detail fixture-read-only-token'); process.exit(13);\n",
+      )
+      const outcome = try {
+        live_consumer_recovery(harness.tools, config(reader))(CONTEXT, SOURCE)
+      }
+      assert(is_err(outcome), "a reader refusal must never authorize publication")
+      const error = to_string(unwrap_err(outcome))
+      assert(error.contains("reason=github_read_unavailable"), error)
+      assert(error.contains("status=429"), error)
+      assert(error.contains("exit=13"), error)
+      assert(!error.contains("private-reader-detail"))
+      assert(!error.contains(TOKEN))
     },
   )
 }
