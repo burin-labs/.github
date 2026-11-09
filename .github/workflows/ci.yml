@@ -187,6 +187,17 @@ jobs:
           sha256: "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
           output: ${{ runner.temp }}/verified-cargo-audit.tgz
           github-token: ${{ github.token }}
+      - name: Install actionlint
+        env:
+          RELEASE_TOOL_NAME: actionlint
+          GH_TOKEN: ${{ github.token }}
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          harn run --standalone --no-sandbox scripts/release-asset/install-tool.harn
+      - name: GitHub Actions lint
+        run: actionlint
       - name: Check the package and verified transport controls
         run: |
           harn package check .
@@ -224,21 +235,6 @@ jobs:
         uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
           globs: "**/*.md"
-      - name: Set up verified release transport
-        uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b
-        with:
-          version: "0.10.192"
-      - name: Install actionlint
-        env:
-          RELEASE_TOOL_NAME: actionlint
-          GH_TOKEN: ${{ github.token }}
-          ACTIONLINT_VERSION: "1.7.12"
-          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
-        run: |
-          set -euo pipefail
-          harn run --standalone --no-sandbox scripts/release-asset/install-tool.harn
-      - name: GitHub Actions lint
-        run: actionlint
       - name: Test graph-derived Rust impact planning
         run: node --test .github/actions/rust-test-impact/plan.test.mjs
       - name: Test immutable CI baseline bootstrap transport

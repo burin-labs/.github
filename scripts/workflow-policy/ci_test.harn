@@ -205,13 +205,14 @@ pipeline test_ci_preserves_lint_title_and_owner_tests(harness: Harness) {
     "DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff",
   )
   assert_eq(markdown["with"], {globs: "**/*.md"})
-  const install = step(steps, "Install actionlint").env
+  const lint_steps = workflow(harness, "ci").jobs["verified-release-assets"].steps
+  const install = step(lint_steps, "Install actionlint").env
   assert_eq(install.ACTIONLINT_VERSION, "1.7.12")
   assert_eq(
     install.ACTIONLINT_SHA256,
     "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
   )
-  assert_eq(step(steps, "GitHub Actions lint").run, "actionlint")
+  assert_eq(step(lint_steps, "GitHub Actions lint").run, "actionlint")
   assert_eq(
     step(steps, "Test graph-derived Rust impact planning").run,
     "node --test .github/actions/rust-test-impact/plan.test.mjs",

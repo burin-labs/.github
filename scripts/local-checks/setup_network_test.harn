@@ -40,7 +40,7 @@ pipeline test_every_shared_setup_uses_an_immutable_installer_reference(harness: 
 
 pipeline test_actionlint_routes_through_the_verified_shared_installer(harness: Harness) {
   const flow = yaml_parse(harness.fs.read_text("../../.github/workflows/ci.yml"))
-  const installers = flow.jobs["ci-status"].steps.filter(
+  const installers = flow.jobs["verified-release-assets"].steps.filter(
     { step -> step.name == "Install actionlint" },
   )
     .to_list()
@@ -56,4 +56,24 @@ pipeline test_actionlint_routes_through_the_verified_shared_installer(harness: H
     installer.run.trim(),
     "set -euo pipefail\nharn run --standalone --no-sandbox scripts/release-asset/install-tool.harn",
   )
+}
+
+pipeline test_asset_runtime_is_confined_to_the_asset_job(harness: Harness) {
+  const flow = yaml_parse(harness.fs.read_text("../../.github/workflows/ci.yml"))
+  let measured = 0
+  for name in keys(flow.jobs) {
+    for item in flow.jobs[name]?.steps ?? [] {
+      const reference = to_string(item?.uses ?? "")
+      if reference.starts_with("burin-labs/harn/.github/actions/setup-harn@")
+        && item?.with?.version == "0.10.192" {
+        measured = measured + 1
+        assert_eq(
+          name,
+          "verified-release-assets",
+          "the asset runtime must not replace another job's runtime",
+        )
+      }
+    }
+  }
+  assert_eq(measured, 1, "the isolated job installs its required runtime")
 }
