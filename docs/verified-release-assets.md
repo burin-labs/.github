@@ -8,8 +8,8 @@ It requires Harn 0.10.192.
 
 Pin `burin-labs/.github/.github/actions/download-release-asset` to a reviewed
 commit. Supply `url`, `sha256`, `output`, and `github-token`. Preserve an existing
-archive ceiling with `max-bytes`; the default is 64 MiB. `deadline-ms` defaults to
-180000 and bounds all transport attempts together.
+archive ceiling with `max-bytes`; the default is 64 MiB.
+`deadline-ms` defaults to 180000 and bounds all transport attempts together.
 
 The URL must identify an exact asset under
 `https://github.com/OWNER/REPO/releases/download/TAG/NAME`. The downloader derives

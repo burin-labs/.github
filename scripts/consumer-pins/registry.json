@@ -9,13 +9,13 @@
     {
       "kind": "workflow",
       "name": "cargo-deny.yml",
-      "paths": [".github/workflows/cargo-deny.yml"],
+      "paths": [".github/workflows/cargo-deny.yml", "scripts/release-asset/download.harn", "scripts/release-asset/install-tool.harn"],
       "release_path": false
     },
     {
       "kind": "workflow",
       "name": "dependency-security-proof.yml",
-      "paths": [".github/workflows/dependency-security-proof.yml", ".github/workflows/cargo-deny.yml"],
+      "paths": [".github/workflows/dependency-security-proof.yml", ".github/workflows/cargo-deny.yml", "scripts/release-asset/download.harn", "scripts/release-asset/install-tool.harn"],
       "release_path": true
     },
     {
@@ -124,6 +124,12 @@
         "templates/dependabot-waivers.json"
       ],
       "release_path": false
+    },
+    {
+      "kind": "action",
+      "name": "download-release-asset",
+      "paths": [".github/actions/download-release-asset/", "scripts/release-asset/download.harn"],
+      "release_path": true
     },
     {
       "kind": "action",
