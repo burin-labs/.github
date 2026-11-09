@@ -1,0 +1,39 @@
+name: Download a verified GitHub release asset
+description: Bounded browser download with authenticated asset API fallback and a required SHA256 pin
+inputs:
+  url:
+    description: Exact https GitHub releases/download URL
+    required: true
+  sha256:
+    description: Pinned lowercase SHA256 of the archive bytes
+    required: true
+  output:
+    description: Destination published only after verification
+    required: true
+  github-token:
+    description: Read token for the API fallback, never sent to the browser URL or asset CDN
+    required: true
+  max-bytes:
+    description: Archive byte ceiling, preserve the caller's existing bound
+    default: "67108864"
+  deadline-ms:
+    description: Overall transport deadline including bounded retries
+    default: "180000"
+runs:
+  using: composite
+  steps:
+    - uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b
+      with:
+        version: "0.10.192"
+    - name: Acquire checksum-verified bytes
+      shell: bash
+      env:
+        RELEASE_ASSET_URL: ${{ inputs.url }}
+        RELEASE_ASSET_SHA256: ${{ inputs.sha256 }}
+        RELEASE_ASSET_OUTPUT: ${{ inputs.output }}
+        RELEASE_ASSET_MAX_BYTES: ${{ inputs.max-bytes }}
+        RELEASE_ASSET_DEADLINE_MS: ${{ inputs.deadline-ms }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        harn run --standalone --no-sandbox "$GITHUB_ACTION_PATH/../../../scripts/release-asset/download.harn"

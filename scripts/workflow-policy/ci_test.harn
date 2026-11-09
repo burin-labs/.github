@@ -1,3 +1,4 @@
+import { with_temp_dir } from "std/testing"
 import { regex_all_first_captures } from "std/text"
 import { check, decode } from "../ci-latency/policy.harn"
 
@@ -82,7 +83,13 @@ pipeline test_ci_joins_contracts_and_uses_exact_package_fixture(harness: Harness
   assert_eq(status["if"], expression("always()"))
   assert_eq(
     status.needs,
-    ["local-check-contract", "package-smoke", "smart-ship", "smart-ship-relay"],
+    [
+      "local-check-contract",
+      "package-smoke",
+      "smart-ship",
+      "smart-ship-relay",
+      "verified-release-assets",
+    ],
   )
   const smoke = step(status.steps, "Require reusable package smoke")
   assert_eq(
@@ -92,12 +99,42 @@ pipeline test_ci_joins_contracts_and_uses_exact_package_fixture(harness: Harness
       PACKAGE_SMOKE_RESULT: expression("needs.package-smoke.result"),
       SMART_SHIP_RESULT: expression("needs.smart-ship.result"),
       SMART_SHIP_RELAY_RESULT: expression("needs.smart-ship-relay.result"),
+      VERIFIED_RELEASE_ASSETS_RESULT: expression("needs.verified-release-assets.result"),
     },
   )
   assert(smoke.run.contains("test \"$LOCAL_CHECK_CONTRACT_RESULT\" = success"))
   assert(smoke.run.contains("test \"$PACKAGE_SMOKE_RESULT\" = success"))
   assert(smoke.run.contains("test \"$SMART_SHIP_RESULT\" = success"))
   assert(smoke.run.contains("test \"$SMART_SHIP_RELAY_RESULT\" = success"))
+  assert(smoke.run.contains("test \"$VERIFIED_RELEASE_ASSETS_RESULT\" = success"))
+}
+
+pipeline test_status_refuses_failed_skipped_or_unmeasured_asset_job(harness: Harness) {
+  const status = workflow(harness, "ci").jobs["ci-status"]
+  with_temp_dir(
+    harness.fs,
+    { work ->
+      const script = path_join(work, "status.sh")
+      harness.fs.write_text(script, step(status.steps, "Require reusable package smoke").run)
+      for measured in ["success", "failure", "skipped", ""] {
+        const ran = harness.process.run(
+          {
+            program: "/bin/bash",
+            args: ["-e", "-o", "pipefail", script],
+            env: {
+              LOCAL_CHECK_CONTRACT_RESULT: "success",
+              PACKAGE_SMOKE_RESULT: "success",
+              SMART_SHIP_RESULT: "success",
+              SMART_SHIP_RELAY_RESULT: "success",
+              VERIFIED_RELEASE_ASSETS_RESULT: measured,
+            },
+            timeout_ms: 10000,
+          },
+        )
+        assert_eq(ran.success, measured == "success", "asset job state: " + measured)
+      }
+    },
+  )
 }
 
 pipeline test_checkout_policy_scans_every_current_source(harness: Harness) {
@@ -168,13 +205,14 @@ pipeline test_ci_preserves_lint_title_and_owner_tests(harness: Harness) {
     "DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff",
   )
   assert_eq(markdown["with"], {globs: "**/*.md"})
-  const install = step(steps, "Install actionlint").env
+  const lint_steps = workflow(harness, "ci").jobs["verified-release-assets"].steps
+  const install = step(lint_steps, "Install actionlint").env
   assert_eq(install.ACTIONLINT_VERSION, "1.7.12")
   assert_eq(
     install.ACTIONLINT_SHA256,
     "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
   )
-  assert_eq(step(steps, "GitHub Actions lint").run, "actionlint")
+  assert_eq(step(lint_steps, "GitHub Actions lint").run, "actionlint")
   assert_eq(
     step(steps, "Test graph-derived Rust impact planning").run,
     "node --test .github/actions/rust-test-impact/plan.test.mjs",
@@ -283,9 +321,16 @@ pipeline test_ci_reaches_every_shell_and_remaining_ruby_test(harness: Harness) {
   )
     .map({ line -> line[5:len(line)] })
   assert_eq(sort(declared), census(harness.fs, [".github/**/*_test.rb", "scripts/**/*_test.rb"]))
-  const local = step(jobs["local-check-contract"].steps, "Check the Harn package and controls").run
+  const local = step(
+    jobs["verified-release-assets"].steps,
+    "Check the package and verified transport controls",
+  ).run
   assert(
     local.contains("harn test scripts/workflow-policy"),
     "the replacement Harn policy test must execute in CI",
+  )
+  assert(
+    local.contains("harn test scripts/release-asset"),
+    "the shared transport controls must execute",
   )
 }

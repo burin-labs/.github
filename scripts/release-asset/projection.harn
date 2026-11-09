@@ -1,0 +1,54 @@
+const BEGIN = "      # BEGIN VERIFIED RELEASE TOOL PROJECTION\n"
+
+const END = "      # END VERIFIED RELEASE TOOL PROJECTION\n"
+
+fn ensure(ok: bool, message: string) {
+  if !ok {
+    throw message
+  }
+}
+
+/** Reusable workflows check out their caller. Embed mechanically checked owner sources. */
+pub fn render(fs: HarnessFs, root: string) -> string {
+  let result =
+    "      - name: Prepare verified release tools\n        shell: bash\n        run: |\n          set -euo pipefail\n"
+  for name in ["download.harn", "install-tool.harn"] {
+    const source = fs.read_text(path_join(root, "scripts/release-asset/" + name)).trim_end()
+    const delimiter = "BURIN_VERIFIED_RELEASE_SOURCE"
+    ensure(!source.contains(delimiter), "projection delimiter cannot occur in source")
+    ensure(!source.contains("$" + "{{"), "owner source cannot contain GitHub expression syntax")
+    result = result + "          cat > \"$RUNNER_TEMP/" + name + "\" <<'" + delimiter + "'\n"
+    for line in source.split("\n") {
+      result = result
+        + if line == "" {
+          "\n"
+        } else {
+          "          " + line + "\n"
+        }
+    }
+    result = result + "          " + delimiter + "\n"
+  }
+  return result
+}
+
+pub fn projected(fs: HarnessFs, root: string) -> string {
+  const workflow = fs.read_text(path_join(root, ".github/workflows/cargo-deny.yml"))
+  const start = workflow.split(BEGIN)
+  ensure(len(start) == 2, "one projection start")
+  const end = (start[1] ?? "").split(END)
+  ensure(len(end) == 2, "one projection end")
+  return (start[0] ?? "") + BEGIN + render(fs, root) + END + (end[1] ?? "")
+}
+
+fn main(harness: Harness) {
+  const root = harness.env.get("RELEASE_ASSET_REPO") ?? harness.fs.cwd()
+  const path = path_join(root, ".github/workflows/cargo-deny.yml")
+  const generated = projected(harness.fs, root)
+  if harness.env.get("RELEASE_ASSET_WRITE") == "1" {
+    harness.fs.write_text(path, generated)
+  }
+  ensure(
+    harness.fs.read_text(path) == generated,
+    "run RELEASE_ASSET_WRITE=1 harn run scripts/release-asset/projection.harn",
+  )
+}

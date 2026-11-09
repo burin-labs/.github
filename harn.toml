@@ -14,5 +14,6 @@ ci_runtime_evidence = "scripts/ci-runtime-evidence/collector.harn"
 candidate_manifest = "scripts/release-promotion/manifest.harn"
 ci_latency = "scripts/ci-latency/lib.harn"
 ci_job_proof = "scripts/ci-job-proof/lib.harn"
+release_asset = "scripts/release-asset/download.harn"
 
 [dependencies]
