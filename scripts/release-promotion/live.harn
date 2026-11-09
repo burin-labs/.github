@@ -12,6 +12,12 @@ pub type ConsumerRecoveryConfig = {
   reader: string,
 }
 
+type ReaderRefusal = {
+  schema: "harn.consumer_observer.read_refusal.v1",
+  reason: string,
+  status?: int,
+}
+
 /**
  * Invoke the immutable shared reader. Its closed output contains public
  * context/counts only; arbitrary subprocess diagnostics never reach logs.
@@ -42,14 +48,27 @@ pub fn live_consumer_recovery(
       },
     )
     const captured = complete_command_result(result)
-    if !captured.success {
-      throw "original consumer recovery is unproven"
-    }
     const parsed = try {
       json_parse(captured.stdout)
     }
+    if !captured.success {
+      if is_ok(parsed) {
+        const refusal = schema_parse(unwrap(parsed), schema_of(ReaderRefusal))
+        if is_ok(refusal) {
+          const measured = unwrap(refusal)
+          if regex_match("^[a-z_]{1,96}$", measured.reason) != nil
+            && (measured.status == nil || (measured.status >= 100 && measured.status <= 599)) {
+            throw "consumer reader refused reason=${measured.reason} status=${measured.status ?? "unmeasured"} exit=${result.exit_code ?? "unmeasured"}"
+          }
+        }
+      }
+      throw "consumer reader failed without a measured refusal; exit=${result.exit_code ?? "unmeasured"}"
+    }
     if !is_ok(parsed) || unwrap(parsed) == nil {
       throw "original consumer recovery returned no measured decision"
+    }
+    if unwrap(parsed)?.schema == "harn.consumer_observer.read_refusal.v1" {
+      throw "consumer reader returned a refusal with a successful exit"
     }
     return unwrap(parsed)
   }
