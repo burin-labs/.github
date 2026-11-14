@@ -1,0 +1,77 @@
+import { NEEDS_YOU, NeedsYouObservation, needs_you_plan } from "./needs-you.harn"
+
+fn observed(over: dict = {}) -> NeedsYouObservation {
+  return schema_expect(
+    {
+      head: "abc",
+      status: "blocked",
+      reason: "merge conflict with main; repair is off here",
+      complete: true,
+      labeled: true,
+      comments: [{databaseId: 17, body: "Old cause\n${NEEDS_YOU}", viewerDidAuthor: true}],
+    }
+      + over,
+    schema_of(NeedsYouObservation),
+  )
+}
+
+pipeline test_blocked_reason_replaces_the_stale_cause() {
+  const plan = needs_you_plan(observed())
+  assert_eq(plan.action, "update")
+  assert_eq(plan.comment_id, 17)
+  assert(contains(plan.body, "merge conflict with main"))
+  assert(contains(plan.body, "when that cause clears"))
+  assert(!plan.remove_label)
+}
+
+pipeline test_recovery_clears_the_label_and_updates_the_same_comment_once() {
+  const clear = observed({status: "resolved"})
+  const plan = needs_you_plan(clear)
+  assert_eq(plan.action, "update")
+  assert_eq(plan.comment_id, 17)
+  assert(contains(plan.body, "No longer needs you"))
+  assert(plan.remove_label)
+  const repeated = needs_you_plan(
+    observed(
+      {
+        status: "resolved",
+        labeled: false,
+        comments: [{databaseId: 17, body: plan.body, viewerDidAuthor: true}],
+      },
+    ),
+  )
+  assert_eq(repeated.action, "none")
+  assert(!repeated.remove_label)
+}
+
+pipeline test_missing_and_partial_observations_preserve_the_existing_state() {
+  for item in [{complete: false}, {status: "unmeasured"}] {
+    const plan = needs_you_plan(observed(item))
+    assert_eq(plan.action, "none")
+    assert(!plan.remove_label)
+  }
+  const absent = needs_you_plan(observed({labeled: false, comments: []}))
+  assert_eq(absent.action, "none", "a PR without needs-you state requires no write")
+}
+
+pipeline test_only_a_measured_owned_comment_can_be_updated() {
+  const foreign = needs_you_plan(
+    observed({comments: [{databaseId: 19, body: NEEDS_YOU, viewerDidAuthor: false}]}),
+  )
+  assert_eq(foreign.action, "post", "a planted marker never authorizes overwriting its author")
+  assert_eq(foreign.comment_id, nil)
+  assert(
+    is_err(
+      try {
+        needs_you_plan(observed({comments: [{body: NEEDS_YOU, viewerDidAuthor: true}]}))
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        needs_you_plan(observed({comments: observed().comments + observed().comments}))
+      },
+    ),
+  )
+}

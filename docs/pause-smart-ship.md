@@ -34,6 +34,19 @@ gh pr view 42 --repo OWNER/REPO --json headRefOid,labels,state,mergeStateStatus
    the protected result through merge; a workflow's successful exit alone does
    not prove that it merged the PR.
 
+## Clear a stale needs-you warning
+
+1. Resolve the cause named in Smart Ship's stop line, such as a merge conflict,
+   failing checks, or a requested review change. Keep `ship` on the PR.
+2. Let the next look read the current head and its checks. Once the cause clears,
+   it updates the warning to "No longer needs you" and removes `ship-needs-you`.
+3. Confirm the updated warning and label state on the PR. Smart Ship confirms
+   both writes before attempting its protected merge. It also resolves an old
+   warning when it observes a merged PR.
+
+An unreadable or changing comment history leaves the warning in place. The
+next look retries that observation; a missing result doesn't count as cleanup.
+
 ## Stop shipping a PR
 
 Remove `ship` only when you intend to withdraw the request to land it. First
