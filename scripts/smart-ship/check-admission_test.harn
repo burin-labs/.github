@@ -1,0 +1,59 @@
+import { Check, current_checks } from "./check-admission.harn"
+
+fn check(id: int, conclusion: string) -> Check {
+  return {
+    name: "Privacy",
+    databaseId: id,
+    createdAt: "2026-11-14T02:49:48Z",
+    status: "COMPLETED",
+    conclusion: conclusion,
+    checkSuite: {app: {id: "actions"}, workflowRun: {workflow: {id: "privacy", name: "Privacy"}}},
+  }
+}
+
+pipeline test_same_second_attempts_use_check_identity() {
+  const fixed = current_checks([check(100, "CANCELLED"), check(101, "SUCCESS")], "head")
+  assert_eq(len(fixed), 1)
+  assert_eq(fixed[0]?.databaseId, 101)
+  assert_eq(fixed[0]?.conclusion, "SUCCESS")
+  const failing = current_checks([check(100, "SUCCESS"), check(101, "FAILURE")], "head")
+  assert_eq(len(failing), 1)
+  assert_eq(failing[0]?.conclusion, "FAILURE")
+}
+
+pipeline test_missing_producer_or_check_identity_never_hides_a_failure() {
+  const old = check(100, "FAILURE")
+  const fresh = check(101, "SUCCESS")
+  for unknown in [
+    fresh + {databaseId: nil},
+    fresh + {checkSuite: nil},
+    fresh
+      + {
+        checkSuite: {
+          app: {id: "other-app"},
+          workflowRun: {workflow: {id: "privacy", name: "Privacy"}},
+        },
+      },
+    fresh
+      + {
+        checkSuite: {
+          app: {id: "actions"},
+          workflowRun: {workflow: {id: "other-workflow", name: "Privacy"}},
+        },
+      },
+  ] {
+    const retained = current_checks([old, unknown], "head")
+    assert_eq(len(retained), 2)
+    assert(retained.any({ row -> row.conclusion == "FAILURE" }))
+  }
+}
+
+pipeline test_duplicate_check_identity_is_not_ordered_by_input_position() {
+  const tied = current_checks([check(100, "FAILURE"), check(100, "SUCCESS")], "head")
+  assert_eq(len(tied), 2)
+}
+
+pipeline test_current_check_census_keeps_a_known_nonempty_and_measured_zero() {
+  assert_eq(len(current_checks([check(100, "SUCCESS")], "head")), 1)
+  assert_eq(current_checks([], "head"), [])
+}

@@ -1,0 +1,102 @@
+/** The current checks at one head, shared by the merger and read-only adapters. */
+pub type Check = {
+  name: string,
+  status?: string?,
+  conclusion?: string?,
+  state?: string?,
+  databaseId?: int?,
+  createdAt?: string?,
+  creator?: {login: string}?,
+  checkSuite?: {
+    id?: string?,
+    status?: string?,
+    conclusion?: string?,
+    commit?: {oid: string}?,
+    app?: {id: string}?,
+    checkRuns?: {totalCount: int}?,
+    workflowRun?: {databaseId?: int?, event?: string?, workflow: {id?: string?, name: string}}?,
+  }?,
+}
+
+pub const RERUN = ["CANCELLED", "STALE"]
+
+/** Unknown producers never collapse; display names are not producer identity. */
+fn producer(c: Check) -> string? {
+  if c.state != nil {
+    const creator = c.creator?.login
+    return creator == nil || c.createdAt == nil ? nil : "status\n${creator}\n${c.name}"
+  }
+  const app = c.checkSuite?.app?.id
+  const run = c.checkSuite?.workflowRun
+  const workflow = run == nil ? "" : run.workflow.id
+  return app == nil || workflow == nil || c.databaseId == nil ? nil : "check\n${app}\n${workflow}\n${c.name}"
+}
+
+/** Strictly newer; a tie never supersedes. Check ids resolve same-second attempts. */
+fn later(a: Check, b: Check) -> bool {
+  return a.state != nil ? a.createdAt > b.createdAt : a.databaseId > b.databaseId
+}
+
+/**
+ * A head keeps every attempt of a check, and re-running an old run replays its old workflow, so
+ * only the newest attempt from each producer speaks for it.
+ */
+pub fn current_checks(checks: list<Check>, head: string) -> list<Check> {
+  const latest = checks.filter(
+    { c ->
+      const key = producer(c)
+      key == nil || !checks.any({ o -> producer(o) == key && later(o, c) })
+    },
+  )
+    .to_list()
+  return latest.filter({ c -> !superseded(c, latest, head) }).to_list()
+}
+
+/** Which workflow, head and event a check answers; nil when any identity is unknown. */
+pub fn generation(c: Check, head: string) -> string? {
+  const suite = c.checkSuite
+  const run = suite?.workflowRun
+  const app = suite?.app?.id
+  const workflow = run?.workflow?.id
+  const event = run?.event
+  if c.state != nil || suite?.id == nil || run?.databaseId == nil || app == nil || workflow == nil
+    || event == nil
+    || suite.commit?.oid != head {
+    return nil
+  }
+  return "${app}\n${workflow}\n${head}\n${event}"
+}
+
+pub fn run_id(c: Check) -> int {
+  return c.checkSuite?.workflowRun?.databaseId ?? 0
+}
+
+/** A run that finished green, every check it reports read and terminal. */
+fn whole_green(c: Check, checks: list<Check>) -> bool {
+  const suite = c.checkSuite
+  if suite?.status != "COMPLETED" || suite?.conclusion != "SUCCESS" {
+    return false
+  }
+  const read = checks.filter({ o -> o.checkSuite?.id == suite.id }).to_list()
+  return len(read) == (suite.checkRuns?.totalCount ?? -1)
+    && read.all(
+      { o ->
+        o.status == "COMPLETED" && ["SUCCESS", "NEUTRAL", "SKIPPED"].contains(o.conclusion ?? "")
+      },
+    )
+}
+
+/** A cancelled matrix placeholder yields only to its own newer, wholly green generation. */
+fn superseded(c: Check, checks: list<Check>, head: string) -> bool {
+  const key = generation(c, head)
+  if key == nil || c.status != "COMPLETED" || !RERUN.contains(c.conclusion ?? "") {
+    return false
+  }
+  return checks.any(
+    { o ->
+      generation(o, head) == key
+        && run_id(o) > run_id(c)
+        && whole_green(o, checks)
+    },
+  )
+}

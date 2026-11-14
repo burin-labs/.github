@@ -21,6 +21,12 @@ An incomplete workflow census and a run with zero measured checks both fail.
 See [Local workflow checks](docs/local-workflow-checks.md) for the policy
 contract, local command, and pinned action syntax.
 
+## Check admission
+
+[`burin-ci-checks/check_admission`](docs/check-admission.md) exposes Smart Ship's
+current-check selection for read-only adapters. Callers supply a complete check
+census for one stable head and retain observed, pending, and failing counts.
+
 ## Selective Rust tests
 
 Capture exact path-filter and planner inputs with the
