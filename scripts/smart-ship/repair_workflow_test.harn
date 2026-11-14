@@ -1,0 +1,59 @@
+import { shell_command_shape } from "std/command"
+
+fn repair_workflow(fs: HarnessFs) -> dict {
+  const root = path_normalize(path_join(fs.cwd(), "../.."))
+  return yaml_parse(fs.read_text(path_join(root, ".github/workflows/smart-ship.yml")))
+}
+
+pipeline test_smart_ship_repair_runtime_has_process_cleanup_fixes(harness: Harness) {
+  const workflow = repair_workflow(harness.fs)
+  const setup = workflow.jobs.ship.steps.find({ step -> step.name == "Install Harn" })
+  const version = to_string(setup["with"].version).split(".")
+  assert_eq(len(version), 3, "the repair runtime is an exact published release")
+  assert_eq(version[0:2], ["0", "10"], "the package supports the 0.10 release series")
+  assert(
+    (to_int(version[2]) ?? 0) >= 197,
+    "repair cancellation needs the released process cleanup fixes",
+  )
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const ci = yaml_parse(harness.fs.read_text(path_join(root, ".github/workflows/ci.yml")))
+  const tested = ci.jobs["smart-ship"].steps.find(
+    { step -> step.name == "Install the Smart Ship runtime" },
+  )
+  assert_eq(tested["with"].version, setup["with"].version, "CI exercises the workflow's runtime")
+}
+
+pipeline test_smart_ship_repair_has_a_host_deadline_before_actions_deadlines(harness: Harness) {
+  const job = repair_workflow(harness.fs).jobs.ship
+  const repair = job.steps.find({ step -> step.id == "repair" })
+  const shape = shell_command_shape(repair.run, "bash")
+  assert_eq(shape.status, "measured", "the actual repair launch must be structurally readable")
+  let launches = []
+  for segment in shape.segments {
+    for stage in segment.stages {
+      if stage.words[0] == "harn" && stage.words[1] == "run" {
+        launches = launches + [stage.words]
+      }
+    }
+  }
+  assert_eq(len(launches), 1, "one Harn process owns the repair")
+  const words = launches[0]
+  assert_eq(words[2], "--timeout", "the repair must use Harn's hard wall-clock limit")
+  const duration = words[3]
+  assert(duration.ends_with("m"), "the workflow states its repair limit in whole minutes")
+  const minutes = to_int(duration[0:len(duration) - 1]) ?? 0
+  assert(
+    minutes > 0 && minutes < repair["timeout-minutes"],
+    "the host can clean up before Actions stops the step",
+  )
+  assert(
+    repair["timeout-minutes"] < job["timeout-minutes"],
+    "publication retains time after the repair step",
+  )
+  assert(words.contains("--environment-policy"), "the repair keeps its environment boundary")
+  assert_eq(
+    keys(repair.env).sorted(),
+    ["OPENAI_API_KEY", "SHIP_WORK"],
+    "no control credential enters the repair",
+  )
+}
