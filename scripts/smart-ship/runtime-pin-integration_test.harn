@@ -1,0 +1,261 @@
+import { omit } from "std/json"
+import { NEEDS_YOU } from "./needs-you.harn"
+import { Repo, look } from "./ship.harn"
+
+type Fixture = {
+  source?: bool,
+  source_status?: int,
+  version_missing?: bool,
+  runtime_version?: string,
+  draft?: bool,
+  partial_release?: bool,
+  needs_you?: bool,
+}
+
+fn ready_candidate(needs_you: bool = false) -> Repo {
+  const receipt = {
+    schema: "review.author_evidence.v1",
+    repository_digest: sha256_hex("burin-labs/burin-code"),
+    pr: 9,
+    head_sha: "abc",
+    replies: [],
+  }
+  return {
+    nameWithOwner: "burin-labs/burin-code",
+    defaultBranchRef: {name: "main"},
+    mergeQueue: nil,
+    pullRequest: {
+      id: "PR_1",
+      number: 9,
+      title: "Candidate",
+      state: "OPEN",
+      isDraft: false,
+      isCrossRepository: false,
+      isInMergeQueue: false,
+      headRefName: "candidate",
+      headRefOid: "abc",
+      baseRefName: "main",
+      baseRef: {target: {oid: "1" * 40}},
+      mergeStateStatus: "CLEAN",
+      reviewDecision: nil,
+      labels: {
+        totalCount: needs_you ? 2 : 1,
+        nodes: needs_you ? [{name: "ship"}, {name: "ship-needs-you"}] : [{name: "ship"}],
+      },
+      latestOpinionatedReviews: {
+        totalCount: 1,
+        nodes: [
+          {
+            state: "APPROVED",
+            body: "<!-- automated-review-author-evidence: ${json_stringify(receipt)} -->",
+            author: {type: "Bot", login: "reviewer"},
+          },
+        ],
+      },
+      comments: {
+        totalCount: needs_you ? 1 : 0,
+        nodes: needs_you ? [
+          {databaseId: 17, body: "Old cause\n${NEEDS_YOU}", viewerDidAuthor: true},
+        ] : [],
+      },
+      reviewThreads: {totalCount: 0, nodes: []},
+      commits: {
+        nodes: [
+          {
+            commit: {
+              oid: "abc",
+              signature: {isValid: true},
+              statusCheckRollup: {
+                contexts: {
+                  totalCount: 1,
+                  pageInfo: {hasNextPage: false},
+                  nodes: [{name: "CI status", status: "COMPLETED", conclusion: "SUCCESS"}],
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+  }
+}
+
+fn inspect(harness: Harness, fixture: Fixture = {}) -> dict {
+  harness.testing.http_mock_clear()
+  const api = "https://api.github.com"
+  const repository = "burin-labs/burin-code"
+  harness.testing.http_mock(
+    "POST",
+    api + "/graphql",
+    {
+      responses: [
+        {
+          status: 200,
+          body: json_stringify({data: {repository: ready_candidate(fixture.needs_you ?? false)}}),
+        },
+        {
+          status: 200,
+          body: json_stringify({data: {mergePullRequest: {pullRequest: {state: "MERGED"}}}}),
+        },
+      ],
+    },
+  )
+  const blocked_body =
+    "**Smart Ship:** Shipping is blocked: Burin main requires a released Harn tag pin; repin to the released tag and remove .harn-revision before merging. Shipping continues when that cause clears.\n\nHead: `abc`.\n\n${NEEDS_YOU}"
+  harness.testing.http_mock(
+    "PATCH",
+    api + "/repos/${repository}/issues/comments/17",
+    {status: 200, body: json_stringify({id: 17, body: blocked_body})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/${repository}/git/matching-refs/release-merge-lease/main",
+    {status: 200, body: "[]"},
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/${repository}",
+    {status: 200, body: json_stringify({full_name: repository})},
+  )
+  const file = { path, text ->
+    {
+      type: "file",
+      path: path,
+      name: path,
+      sha: "a" * 40,
+      encoding: "base64",
+      size: len(text),
+      content: base64_encode(text),
+    }
+  }
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/${repository}/contents/.harn-revision?ref=abc",
+    {
+      status: fixture.source_status ?? (fixture.source == true ? 200 : 404),
+      body: fixture.source == true ? json_stringify(
+        file(".harn-revision", "b" * 40 + "\n"),
+      ) : "{\"message\":\"Not Found\"}",
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/${repository}/contents/.harn-version?ref=abc",
+    {
+      status: fixture.version_missing == true ? 404 : 200,
+      body: fixture.version_missing == true ? "{\"message\":\"Not Found\"}" : json_stringify(
+        file(".harn-version", "v0.10.196\n"),
+      ),
+    },
+  )
+  const release = {
+    id: 19,
+    tag_name: "v0.10.196",
+    draft: fixture.draft ?? false,
+    prerelease: false,
+    published_at: "2026-11-01T00:00:00Z",
+  }
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/burin-labs/harn/releases/tags/v0.10.196",
+    {
+      status: 200,
+      body: json_stringify(fixture.partial_release == true ? omit(release, ["draft"]) : release),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/burin-labs/harn/git/ref/tags/v0.10.196",
+    {
+      status: 200,
+      body: json_stringify({ref: "refs/tags/v0.10.196", object: {type: "commit", sha: "f" * 40}}),
+    },
+  )
+  const manifest = "[workspace.package]\nversion = \"${fixture.runtime_version ?? "0.10.196"}\"\n"
+  harness.testing.http_mock(
+    "GET",
+    api + "/repos/burin-labs/harn/contents/Cargo.toml?ref=${"f" * 40}",
+    {status: 200, body: json_stringify(file("Cargo.toml", manifest))},
+  )
+  const result = look(
+    harness,
+    {
+      repo: repository,
+      number: 9,
+      token: "fixture-token",
+      work: "",
+      publish: false,
+      repair: false,
+      run_id: "",
+      opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+      git_host: "file:///nonexistent-smart-ship-host/",
+      nonce: "",
+    },
+  )
+  return {result: result, calls: harness.testing.http_mock_calls({include_sensitive: true})}
+}
+
+pipeline test_source_only_pin_never_reaches_a_main_merge(harness: Harness) {
+  const seen = inspect(harness, {source: true})
+  assert(seen.result.facts.approved && seen.result.facts.signed)
+  assert(!seen.result.facts.no_checks)
+  assert_eq(len(seen.result.facts.failing), 0)
+  assert_eq(len(seen.result.facts.pending), 0)
+  assert_eq(len(seen.result.facts.threads), 0)
+  const writes = seen.calls.filter(
+    { call -> call.method == "POST" && contains(call.body ?? "", "mutation($id:") },
+  )
+  assert_eq(len(writes), 0, "a source-only runtime pin must cause zero merge writes")
+  assert_eq(seen.result.action, "stop")
+  assert(contains(seen.result.reason, "requires a released Harn tag pin"))
+  assert(
+    !seen.calls.any(
+      { call -> call.method == "POST" && contains(call.body ?? "", "mutation($id:") },
+    ),
+  )
+}
+
+pipeline test_main_pin_refusal_keeps_the_blocked_comment_and_label(harness: Harness) {
+  const seen = inspect(harness, {source: true, needs_you: true})
+  assert_eq(seen.result.action, "stop")
+  const updates = seen.calls.filter({ call -> call.method == "PATCH" })
+  assert_eq(len(updates), 1)
+  assert(contains(updates[0].body ?? "", "requires a released Harn tag pin"))
+  assert(!contains(updates[0].body ?? "", "No longer needs you"))
+  assert(!seen.calls.any({ call -> call.method == "DELETE" }))
+}
+
+type Merge = {variables: {head: string}}
+
+pipeline test_published_matching_runtime_reaches_the_same_main_merge(harness: Harness) {
+  const seen = inspect(harness)
+  assert(seen.result.facts.approved && seen.result.facts.signed)
+  assert_eq(seen.result.action, "merge")
+  assert_eq(seen.result.facts.runtime_pin.tag, "v0.10.196")
+  assert_eq(seen.result.facts.runtime_pin.source_revision, "f" * 40)
+  const writes = seen.calls.filter(
+    { call -> call.method == "POST" && contains(call.body ?? "", "mutation($id:") },
+  )
+  assert_eq(len(writes), 1)
+  const merge = schema_expect(json_parse(writes[0].body), schema_of(Merge))
+  assert_eq(merge.variables.head, "abc")
+}
+
+pipeline test_unmeasured_or_mismatched_main_pin_evidence_never_merges(harness: Harness) {
+  for fixture in [
+    {source_status: 403},
+    {version_missing: true},
+    {runtime_version: "0.10.195"},
+    {draft: true},
+    {partial_release: true},
+  ] {
+    const seen = inspect(harness, fixture)
+    assert_eq(seen.result.action, "stop")
+    assert(contains(seen.result.reason, "requires a released Harn tag pin"))
+    assert(
+      !seen.calls.any(
+        { call -> call.method == "POST" && contains(call.body ?? "", "mutation($id:") },
+      ),
+    )
+  }
+}
