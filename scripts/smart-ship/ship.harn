@@ -1696,7 +1696,7 @@ fn reconcile_needs_you(
   const facts = decision.facts
   const labeled = pr.labels.nodes.any({label -> label.name == "ship-needs-you"})
   const recorded = pr.comments.nodes.any({comment -> comment.viewerDidAuthor == true && contains(comment.body, NEEDS_YOU)})
-  if !labeled && !recorded {
+  if !labeled && !recorded && complete(pr.comments) {
     return false
   }
   const merged = pr.state == "MERGED" && pr.labels.nodes.any({label -> label.name == "ship"})

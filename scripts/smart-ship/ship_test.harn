@@ -37,6 +37,7 @@ pipeline test_stop_reasons_name_the_current_cause() {
 type NeedsYouFixture = {
   merged?: bool,
   paged?: bool,
+  no_label?: bool,
   changed_head?: bool,
   duplicate_page?: bool,
   confirm_comment?: bool,
@@ -53,7 +54,7 @@ fn needs_you_look(harness: Harness, fixture: NeedsYouFixture = {}) -> dict {
     : page([owned])
   const state = pr({
     state: fixture.merged == true ? "MERGED" : "OPEN",
-    labels: page([{name: "ship"}, {name: "ship-needs-you"}]),
+    labels: page(fixture.no_label == true ? [{name: "ship"}] : [{name: "ship"}, {name: "ship-needs-you"}]),
     comments: comments,
   })
   let responses = [{status: 200, body: json_stringify({data: {repository: state}})}]
@@ -86,14 +87,16 @@ fn needs_you_look(harness: Harness, fixture: NeedsYouFixture = {}) -> dict {
 }
 
 pipeline test_a_green_or_merged_head_clears_needs_you_through_the_real_look(harness: Harness) {
-  for fixture in [{}, {merged: true}, {paged: true}] {
+  for fixture in [{}, {merged: true}, {paged: true}, {paged: true, no_label: true}] {
     const seen = needs_you_look(harness, fixture)
     assert(is_ok(seen.result), to_string(seen.result))
     const writes = seen.calls.filter({call -> call.method == "PATCH" || call.method == "DELETE"})
-    assert_eq(len(writes), 2)
+    assert_eq(len(writes), fixture?.no_label == true ? 1 : 2)
     assert_eq(writes[0].method, "PATCH", "post the resolution before removing the label")
     assert(contains(writes[0].body, "No longer needs you"))
-    assert_eq(writes[1].method, "DELETE")
+    if fixture?.no_label != true {
+      assert_eq(writes[1].method, "DELETE")
+    }
     const merges = seen.calls.filter({call -> call.method == "POST" && contains(call.body ?? "", "mutation($id:")})
     assert_eq(len(merges), fixture?.merged == true ? 0 : 1)
     if len(merges) == 1 {
@@ -105,7 +108,8 @@ pipeline test_a_green_or_merged_head_clears_needs_you_through_the_real_look(harn
 
 pipeline test_unconfirmed_needs_you_cleanup_never_proceeds_to_merge(harness: Harness) {
   for fixture in [{confirm_comment: false}, {confirm_label: false},
-    {paged: true, changed_head: true}, {paged: true, duplicate_page: true}] {
+    {paged: true, changed_head: true}, {paged: true, duplicate_page: true},
+    {paged: true, no_label: true, confirm_comment: false}] {
     const seen = needs_you_look(harness, fixture)
     assert(is_err(seen.result), to_string(seen.result))
     assert(!seen.calls.any({call -> call.method == "POST" && contains(call.body ?? "", "mutation($id:")}))
@@ -1398,8 +1402,10 @@ pipeline test_only_an_admitted_whole_census_closes_an_attempt(harness: Harness) 
   }
   const partial = look_at(harness, [], true, {comments: {totalCount: 101, nodes: visible}})
   assert_eq(partial.posted, [], "a partial census closes nothing")
+  assert(is_err(partial.result), "an unreadable needs-you history must stop the look")
+  assert(contains(to_string(partial.result), "needs-you comment census is incomplete"))
   assert_eq(
-    unwrap(partial.result).reason,
+    decide(pr(red() + {comments: {totalCount: 101, nodes: visible}}), "clear", true).reason,
     "failing checks: CI status; repair attempts used up; a person needs to take it",
     "and its unread attempts read as used up",
   )
