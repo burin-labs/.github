@@ -1,8 +1,8 @@
 ---
 name: house-style
-short: Write Burin Labs documentation to house style.
-description: Reading level, Diátaxis mode, voice, headings, claims, and generated-page rules for every page published from a Burin Labs repository.
-when-to-use: Use when writing or reviewing any documentation page, README, help-center article, migration note, or changelog entry in burin-code, harn, or harn-cloud.
+description: Write or review documentation pages, README material, help-center articles, migration notes, and changelog entries in burin-code, harn, or harn-cloud. Applies house rules for reading level, Diátaxis mode, voice, headings, claims, and generated pages.
+metadata:
+  short-description: Write Burin Labs documentation to house style.
 ---
 
 # Write to Burin Labs house style
@@ -26,7 +26,7 @@ For Harn-specific authoring, also load `harn-docs` (`harn skill get harn-docs
 
 - Target Flesch-Kincaid grade 9 or below.
 - Measure it, per page, before you ship:
-  `node scripts/reading-level.mjs --max 9 <page>` in burin-code.
+  `./scripts/harnw run scripts/reading-level.harn -- --max 9 <page>` in burin-code.
 - One idea per sentence. Cut a clause before you shorten a word.
 - A good score does not prove a readable page. Check that every product noun is
   defined before it is used.
