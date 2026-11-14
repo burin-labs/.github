@@ -4,7 +4,19 @@ import {
   read_github_review_author_evidence,
 } from "harn-github-connector/review_evidence"
 
+/** A latest opinionated review from GitHub's independently measured writer-only census. */
 pub type WriterReview = {state: string, body?: string, author?: {type: string, login: string}?}
+
+/** Source and protected-policy evidence behind one review-admission decision. */
+pub type ReviewAdmissionReport = {
+  approved: bool,
+  aggregate: string,
+  vetoed: bool,
+  approvals_seen: int,
+  source_bound: int,
+  policy_bound: int,
+  unbound: list<string>,
+}
 
 type ReviewAdmission = {actor: string, authority: string, refusal: string}
 
@@ -33,7 +45,7 @@ pub fn review_admission(
   reviews: list<WriterReview>,
   source: GithubReviewSourceIdentity,
   aggregate: string?,
-) {
+) -> ReviewAdmissionReport {
   const approvals = reviews.filter({ review -> review.state == "APPROVED" }).map(
     { review -> admit(review, source, aggregate) },
   )
