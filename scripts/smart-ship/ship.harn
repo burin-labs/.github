@@ -1603,7 +1603,7 @@ fn reconcile_needs_you(
   }
   const merged = pr.state == "MERGED" && pr.labels.nodes.any({label -> label.name == "ship"})
   const status = needs_you_status({
-    admitted: facts.admitted, main_admitted: decision.action == "merge", complete: facts.complete, merged: merged, checks_reported: !facts.no_checks,
+    admitted: facts.admitted, main_admitted: decision.action == "merge" || pr.isInMergeQueue, complete: facts.complete, merged: merged, checks_reported: !facts.no_checks,
     signed: facts.signed, approved: facts.approved, conflict: pr.mergeStateStatus == "DIRTY",
     failing: len(facts.failing), pending: len(facts.pending), rerun: len(facts.rerun), threads: len(facts.threads),
   })
