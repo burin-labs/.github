@@ -1,4 +1,24 @@
-import { NEEDS_YOU, NeedsYouObservation, needs_you_plan } from "./needs-you.harn"
+import { NEEDS_YOU, NeedsYouObservation, needs_you_plan, needs_you_status } from "./needs-you.harn"
+
+pipeline test_green_checks_do_not_resolve_a_main_admission_refusal() {
+  const ready = {
+    admitted: true,
+    main_admitted: false,
+    complete: true,
+    merged: false,
+    checks_reported: true,
+    signed: true,
+    approved: true,
+    conflict: false,
+    failing: 0,
+    pending: 0,
+    rerun: 0,
+    threads: 0,
+  }
+  assert_eq(needs_you_status(ready), "blocked")
+  assert_eq(needs_you_status(ready + {main_admitted: true}), "resolved")
+  assert_eq(needs_you_status(ready + {merged: true}), "resolved")
+}
 
 fn observed(over: dict = {}) -> NeedsYouObservation {
   return schema_expect(

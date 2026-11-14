@@ -26,6 +26,7 @@ pub type NeedsYouPlan = {
 
 pub type NeedsYouReadiness = {
   admitted: bool,
+  main_admitted: bool,
   complete: bool,
   merged: bool,
   checks_reported: bool,
@@ -43,7 +44,7 @@ pub fn needs_you_status(facts: NeedsYouReadiness) -> "blocked" | "resolved" | "u
     return "unmeasured"
   }
   if facts.merged
-    || (facts.complete && facts.checks_reported && facts.signed && facts.approved
+    || (facts.main_admitted && facts.complete && facts.checks_reported && facts.signed && facts.approved
       && !facts.conflict
       && facts.failing == 0
       && facts.pending == 0

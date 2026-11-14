@@ -1,0 +1,21 @@
+import { released_pin_admission } from "./runtime-pin.harn"
+
+pipeline test_released_pin_policy_requires_observed_matching_identity() {
+  const pin = {version: "v0.10.196", source_revision_present: false}
+  const runtime = {tag: "v0.10.196", version: "0.10.196", source_revision: "f" * 40, release_id: 19}
+  assert(released_pin_admission(pin, runtime).admitted)
+  assert(!released_pin_admission(pin, nil).admitted)
+  assert(!released_pin_admission(pin + {source_revision_present: true}, runtime).admitted)
+  for invalid in [
+    runtime + {tag: "v0.10.195"},
+    runtime + {version: "0.10.195"},
+    runtime + {source_revision: ""},
+    runtime + {source_revision: "F" * 40},
+    runtime + {release_id: 0},
+  ] {
+    assert(!released_pin_admission(pin, invalid).admitted)
+  }
+  for version in [nil, "", "v0.10.195"] {
+    assert(!released_pin_admission(pin + {version: version}, runtime).admitted)
+  }
+}

@@ -1,0 +1,182 @@
+import { GithubClientOptions, api_call, github_file_at_ref } from "harn-github-connector/default"
+
+pub const RELEASED_PIN_REQUIRED =
+  "Burin main requires a released Harn tag pin; repin to the released tag and remove .harn-revision before merging"
+
+pub type RuntimePin = {version: string?, source_revision_present: bool}
+
+pub type ReleasedRuntime = {tag: string, source_revision: string, version: string, release_id: int}
+
+pub type RuntimePinAdmission = {admitted: bool, reason: string, runtime: ReleasedRuntime?}
+
+pub type MainPinGate = {read_required: bool, refusal: string, runtime: ReleasedRuntime?}
+
+pub fn main_pin_gate(repository: string, admission: RuntimePinAdmission?) -> MainPinGate {
+  if repository != "burin-labs/burin-code" {
+    return {read_required: false, refusal: "", runtime: nil}
+  }
+  if admission == nil {
+    return {read_required: true, refusal: RELEASED_PIN_REQUIRED, runtime: nil}
+  }
+  if !admission.admitted || admission.runtime == nil {
+    return {
+      read_required: false,
+      refusal: trim(admission.reason) == "" ? RELEASED_PIN_REQUIRED : admission.reason,
+      runtime: nil,
+    }
+  }
+  return {read_required: false, refusal: "", runtime: admission.runtime}
+}
+
+type Release = {id: int, tag_name: string, draft: bool, prerelease: bool, published_at: string?}
+
+type GitObject = {type: string, sha: string}
+
+type GitReference = {ref: string, object: GitObject}
+
+type AnnotatedTag = {sha: string, object: GitObject}
+
+type RuntimeManifest = {workspace: {package: {version: string}}}
+
+fn file_at_ref(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repository: string,
+  path: string,
+  ref: string,
+) -> string? {
+  const parts = split(repository, "/")
+  require len(parts) == 2 && parts[0] != "" && parts[1] != "", "invalid runtime pin repository"
+  const read = github_file_at_ref(
+    harness,
+    {owner: parts[0], repo: parts[1], path: path, ref: ref, options: opts},
+  )?
+  require read.repo == repository && read.path == path && read.ref == ref,
+    "the runtime pin read returned a different candidate"
+  if read.state == "absent" {
+    require !read.found && read.file == nil, "runtime pin absence is unmeasured"
+    return nil
+  }
+  require read.found && read.file != nil && read.file.path == path,
+    "the runtime pin file read is incomplete"
+  return read.file.text
+}
+
+/** The released-main invariant, shared by admission and the repository backstop. */
+pub fn released_pin_admission(pin: RuntimePin, runtime: ReleasedRuntime?) -> RuntimePinAdmission {
+  const refuse = { reason -> {admitted: false, reason: reason, runtime: nil} }
+  if pin.source_revision_present {
+    return refuse(RELEASED_PIN_REQUIRED)
+  }
+  const declared = trim(pin.version ?? "")
+  if declared == "" {
+    return refuse("${RELEASED_PIN_REQUIRED}; .harn-version is unmeasured")
+  }
+  if runtime == nil {
+    return refuse("${RELEASED_PIN_REQUIRED}; published runtime identity is unmeasured")
+  }
+  if declared != runtime.tag || runtime.tag != "v${runtime.version}"
+    || runtime.release_id <= 0
+    || regex_match("^[0-9a-f]{40}$", runtime.source_revision) == nil {
+    return refuse(
+      "${RELEASED_PIN_REQUIRED}; the declared tag and published runtime identity differ",
+    )
+  }
+  return {
+    admitted: true,
+    reason: "released Harn runtime ${runtime.tag} at ${runtime.source_revision}",
+    runtime: runtime,
+  }
+}
+
+fn api(harness: Harness, opts: GithubClientOptions, path: string) -> unknown {
+  const response = api_call(harness, {path: path, options: opts})
+  require is_ok(response), "reading runtime pin evidence ${path}: ${unwrap_err(response)?.message}"
+  return unwrap(response)
+}
+
+/** Observe the published tag and the runtime version at its exact source commit. */
+pub fn published_runtime(
+  harness: Harness,
+  opts: GithubClientOptions,
+  tag: string,
+) -> ReleasedRuntime {
+  const repository = "burin-labs/harn"
+  const release: Release = schema_expect(
+    api(harness, opts, "/repos/${repository}/releases/tags/${url_encode(tag)}"),
+    schema_of(Release),
+  )
+  require release.id > 0 && release.tag_name == tag && !release.draft && !release.prerelease
+    && trim(release.published_at ?? "") != "",
+    "${tag} is not an observed published Harn release"
+  const reference: GitReference = schema_expect(
+    api(harness, opts, "/repos/${repository}/git/ref/tags/${url_encode(tag)}"),
+    schema_of(GitReference),
+  )
+  require reference.ref == "refs/tags/${tag}", "the Harn release tag lookup returned another ref"
+  let object = reference.object
+  let seen: list<string> = []
+  while object.type == "tag" {
+    require len(seen) < 8 && !seen.contains(object.sha),
+      "the Harn release tag chain is incomplete or cyclic"
+    seen = seen + [object.sha]
+    const annotated: AnnotatedTag = schema_expect(
+      api(harness, opts, "/repos/${repository}/git/tags/${object.sha}"),
+      schema_of(AnnotatedTag),
+    )
+    require annotated.sha == object.sha, "the Harn release tag object changed identity"
+    object = annotated.object
+  }
+  require object.type == "commit" && regex_match("^[0-9a-f]{40}$", object.sha) != nil,
+    "the Harn release tag does not name a measured commit"
+  const manifest = file_at_ref(harness, opts, repository, "Cargo.toml", object.sha)
+  require manifest != nil, "the released Harn runtime manifest is unmeasured"
+  const runtime: RuntimeManifest = schema_expect(toml_parse(manifest), schema_of(RuntimeManifest))
+  return {
+    tag: release.tag_name,
+    source_revision: object.sha,
+    version: runtime.workspace.package.version,
+    release_id: release.id,
+  }
+}
+
+/** Read immutable candidate files. An unavailable read never becomes an absent source pin. */
+pub fn candidate_runtime_pin(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repository: string,
+  head: string,
+) -> RuntimePin {
+  const revision = file_at_ref(harness, opts, repository, ".harn-revision", head)
+  if revision != nil {
+    return {version: nil, source_revision_present: true}
+  }
+  const version = file_at_ref(harness, opts, repository, ".harn-version", head)
+  require version != nil, "the candidate Harn version is unmeasured"
+  return {version: trim(version), source_revision_present: false}
+}
+
+/** Only Burin's main carries this dependency invariant. Other repositories keep their owners. */
+pub fn repository_runtime_admission(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repository: string,
+  head: string,
+) -> RuntimePinAdmission {
+  if repository != "burin-labs/burin-code" {
+    return {
+      admitted: true,
+      reason: "no released-runtime pin policy for this repository",
+      runtime: nil,
+    }
+  }
+  try {
+    const pin = candidate_runtime_pin(harness, opts, repository, head)
+    if pin.source_revision_present {
+      return released_pin_admission(pin, nil)
+    }
+    return released_pin_admission(pin, published_runtime(harness, opts, pin.version ?? ""))
+  } catch (error) {
+    return {admitted: false, reason: "${RELEASED_PIN_REQUIRED}; ${to_string(error)}", runtime: nil}
+  }
+}

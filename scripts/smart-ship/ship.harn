@@ -14,6 +14,7 @@ import { github_commit_worktree } from "harn-github-connector/worktree"
 import { Check, RERUN, current_checks, generation, run_id } from "./check-admission.harn"
 import { NEEDS_YOU, NeedsYouComment, NeedsYouCommentPage, needs_you_plan, needs_you_status } from "./needs-you.harn"
 import { WriterReview, review_admission } from "./review-admission.harn"
+import { RuntimePinAdmission, main_pin_gate, repository_runtime_admission } from "./runtime-pin.harn"
 
 const HOLDS = ["hold", "do-not-merge"]
 
@@ -352,7 +353,7 @@ fn stale_approval_note(repo: Repo, d: dict) -> string {
     + "main changed it, use the repository's approval rebind tool.\n\n${STALE_APPROVAL}${pr.headRefOid} -->"
 }
 
-pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", carry: Carry? = nil) {
+pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", carry: Carry? = nil, runtime_pin: RuntimePinAdmission? = nil) {
   const pr = repo.pullRequest
   const seen = observe(repo, own, carry)
   const labels = pr.labels.nodes.map({ l -> l.name })
@@ -370,9 +371,11 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
     ],
   ]
   const admitted = !admission.any({ g -> g[0] == true })
+  const pin_gate = main_pin_gate(repo.nameWithOwner, runtime_pin)
   // Dead attempts the look closes: only for an admitted PR, and only from the whole comment
   // census; a partial one closes nothing and already reads as attempts used up.
-  const f = seen + {admitted: admitted, close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0}
+  const f = seen + {admitted: admitted, close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0,
+    runtime_pin_required: false, runtime_pin: pin_gate.runtime}
   const stop = { why -> {action: "stop", reason: why, facts: f} }
   const conflict = pr.mergeStateStatus == "DIRTY"
   const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
@@ -417,6 +420,10 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
     }
     if !lease_admits(lease, repo.nameWithOwner, pr) {
       return stop("a release merge lease holds ${pr.baseRefName}: ${lease}")
+    }
+    if pin_gate.refusal != "" {
+      return {action: "stop", reason: pin_gate.refusal,
+        facts: f + {runtime_pin_required: pin_gate.read_required}}
     }
     return {action: "merge", reason: "approved and green", facts: f}
   }
@@ -1596,7 +1603,7 @@ fn reconcile_needs_you(
   }
   const merged = pr.state == "MERGED" && pr.labels.nodes.any({label -> label.name == "ship"})
   const status = needs_you_status({
-    admitted: facts.admitted, complete: facts.complete, merged: merged, checks_reported: !facts.no_checks,
+    admitted: facts.admitted, main_admitted: decision.action == "merge", complete: facts.complete, merged: merged, checks_reported: !facts.no_checks,
     signed: facts.signed, approved: facts.approved, conflict: pr.mergeStateStatus == "DIRTY",
     failing: len(facts.failing), pending: len(facts.pending), rerun: len(facts.rerun), threads: len(facts.threads),
   })
@@ -1715,9 +1722,15 @@ pub fn look(harness: Harness, job: Look) {
   const lease = release_lease(harness, opts, repo, pr.baseRefName)
   const own = own_workflow(harness, opts, repo, job.run_id)
   let d = decide(r, lease, job.repair, own)
+  let carry: Carry? = nil
   // Only a green, signed head that waits on approval reads the history for a carried approval.
   if d.action == "stop" && d.reason == AWAITING_APPROVAL {
-    d = decide(r, lease, job.repair, own, approval_carry(harness, opts, r))
+    carry = approval_carry(harness, opts, r)
+    d = decide(r, lease, job.repair, own, carry)
+  }
+  if d.facts.runtime_pin_required {
+    const pin = repository_runtime_admission(harness, opts, repo, pr.headRefOid)
+    d = decide(r, lease, job.repair, own, carry, pin)
   }
   reconcile_needs_you(harness, opts, repo, pr, d)
   const logged = evidence_line(pr, d.facts.review_evidence)
