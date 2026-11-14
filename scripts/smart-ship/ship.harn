@@ -447,6 +447,17 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
 
 // No global or system git config: nothing the agent could have written outside its jail is read here.
 const GIT_ISOLATED = {GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null"}
+// Publication and reconstruction read identical literal patches, independent of repository attributes.
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+const CHECKPOINT_DIFF = [
+  "git",
+  "--attr-source=" + EMPTY_TREE,
+  "diff",
+  "--no-ext-diff",
+  "--no-textconv",
+  "--binary",
+  "--no-renames",
+]
 
 // Captured output past this is cut off; a cut-off read refuses rather than judge part of it.
 const READ_CAP = 16777216
@@ -822,7 +833,7 @@ pub fn checkout(
 fn previous_patch(harness: Harness, work: string, head: string, wip: string, env: dict) -> string {
   const diff = run(
     harness.tools,
-    ["git", "diff", "--binary", "--no-renames", head, wip],
+    CHECKPOINT_DIFF + [head, wip],
     env,
     work + "/pristine",
   )
@@ -1165,10 +1176,6 @@ pub fn stage_repair(harness: Harness, work: string, merged_base: string = "") ->
   return ""
 }
 
-// Read diffs under no repository attributes, so a `diff` or textconv attribute cannot turn
-// binary content into text the credential scan misreads.
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-
 /**
  * Paths whose staged content differs from `against` and holds a NUL anywhere, read from the blob
  * itself: Git's own binary test samples only the start of a file. nil when a blob cannot be read.
@@ -1209,7 +1216,7 @@ fn staged_binaries(tools: HarnessTools, dir: string, against: string) -> list<st
  * base merge brought in unchanged is the base's own content, not the repair's.
  */
 pub fn diff_refusal(tools: HarnessTools, dir: string, against: string, merged_base: string = "") -> string {
-  const got = run(tools, ["git", "--attr-source=" + EMPTY_TREE, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary", against], {}, dir)
+  const got = run(tools, CHECKPOINT_DIFF + ["--cached", against], {}, dir)
   if !got.success || (got?.stdout_truncated ?? false) {
     return "its diff could not be read whole"
   }
