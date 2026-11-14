@@ -11,6 +11,7 @@ import {
 } from "harn-github-connector/default"
 import { github_merge_signed_staging } from "harn-github-connector/signed_merge"
 import { github_commit_worktree } from "harn-github-connector/worktree"
+import { Check, RERUN, current_checks, generation, run_id } from "./check-admission.harn"
 import { NEEDS_YOU, NeedsYouComment, NeedsYouCommentPage, needs_you_plan, needs_you_status } from "./needs-you.harn"
 import { WriterReview, review_admission } from "./review-admission.harn"
 
@@ -21,8 +22,6 @@ pub const MAX_ATTEMPTS = 3
 const MAX_RETAINED = 5
 
 const RED = ["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"]
-
-const RERUN = ["CANCELLED", "STALE"]
 
 const TRUSTED = ["OWNER", "MEMBER", "COLLABORATOR"]
 
@@ -70,25 +69,6 @@ const MORE_CONTEXTS = """
 query($owner: String!, $name: String!, $oid: GitObjectID!, $after: String!) { repository(owner: $owner, name: $name) {
   object(oid: $oid) { ... on Commit { statusCheckRollup { contexts(first: 100, after: $after) { ${CONTEXTS} } } } } } }
 """
-
-pub type Check = {
-  name: string,
-  status?: string?,
-  conclusion?: string?,
-  state?: string?,
-  databaseId?: int?,
-  createdAt?: string?,
-  creator?: {login: string}?,
-  checkSuite?: {
-    id?: string?,
-    status?: string?,
-    conclusion?: string?,
-    commit?: {oid: string}?,
-    app?: {id: string}?,
-    checkRuns?: {totalCount: int}?,
-    workflowRun?: {databaseId?: int?, event?: string?, workflow: {id?: string?, name: string}}?,
-  }?,
-}
 
 type Comment = {
   databaseId: int,
@@ -172,72 +152,6 @@ fn complete(page: Page<any>) -> bool {
   return len(page.nodes) == page.totalCount
 }
 
-/**
- * Who produced a check, by stable ids rather than display names: the app and workflow for a check
- * run, the creator for a status. Nil when any part is unknown, and an unknown producer never collapses.
- */
-fn producer(c: Check) -> string? {
-  if c.state != nil {
-    const creator = c.creator?.login
-    return creator == nil || c.createdAt == nil ? nil : "status\n${creator}\n${c.name}"
-  }
-  const app = c.checkSuite?.app?.id
-  const run = c.checkSuite?.workflowRun
-  const workflow = run == nil ? "" : run.workflow.id
-  return app == nil || workflow == nil || c.databaseId == nil ? nil : "check\n${app}\n${workflow}\n${c.name}"
-}
-
-/** Strictly newer; a tie never supersedes. */
-fn later(a: Check, b: Check) -> bool {
-  return a.state != nil ? a.createdAt > b.createdAt : a.databaseId > b.databaseId
-}
-
-/**
- * A head keeps every attempt of a check, and re-running an old run replays its old workflow, so
- * only the newest attempt from each producer speaks for it.
- */
-fn newest(checks: list<Check>, head: string) -> list<Check> {
-  const latest = checks.filter(
-    { c ->
-      const key = producer(c)
-      key == nil || !checks.any({ o -> producer(o) == key && later(o, c) })
-    },
-  )
-    .to_list()
-  return latest.filter({ c -> !superseded(c, latest, head) }).to_list()
-}
-
-/** Which workflow, head and event a check run answers, by stable ids; nil when any part is unknown. */
-fn generation(c: Check, head: string) -> string? {
-  const suite = c.checkSuite
-  const run = suite?.workflowRun
-  const app = suite?.app?.id
-  const workflow = run?.workflow?.id
-  const event = run?.event
-  if c.state != nil || suite?.id == nil || run?.databaseId == nil || app == nil || workflow == nil
-    || event == nil
-    || suite.commit?.oid != head {
-    return nil
-  }
-  return "${app}\n${workflow}\n${head}\n${event}"
-}
-
-fn run_id(c: Check) -> int {
-  return c.checkSuite?.workflowRun?.databaseId ?? 0
-}
-
-/** A run that finished green, every check it reports read and terminal. */
-fn whole_green(c: Check, checks: list<Check>) -> bool {
-  const suite = c.checkSuite
-  if suite?.status != "COMPLETED" || suite?.conclusion != "SUCCESS" {
-    return false
-  }
-  const read = checks.filter({ o -> o.checkSuite?.id == suite.id }).to_list()
-  return len(read) == (suite.checkRuns?.totalCount ?? -1) && read.all(
-    { o -> o.status == "COMPLETED" && ["SUCCESS", "NEUTRAL", "SKIPPED"].contains(o.conclusion ?? "") },
-  )
-}
-
 /** Negative measurements delegated to their exact, successful owning aggregate. */
 fn aggregate_measurements(repo: Repo, checks: list<Check>) -> list<Check> {
   const policy = CONSUMER_MEASUREMENTS
@@ -270,25 +184,6 @@ fn aggregate_measurements(repo: Repo, checks: list<Check>) -> list<Check> {
     return []
   }
   return read.filter({ c -> c.conclusion == "FAILURE" && policy.measurements.contains(c.name) }).to_list()
-}
-
-/**
- * A run cancelled before its matrix expanded leaves a check, such as `matrix.name`, that no later
- * run reuses the name of. It is set aside only for a newer run of the same workflow, head and
- * event that finished green whole.
- */
-fn superseded(c: Check, checks: list<Check>, head: string) -> bool {
-  const key = generation(c, head)
-  if key == nil || c.status != "COMPLETED" || !RERUN.contains(c.conclusion ?? "") {
-    return false
-  }
-  return checks.any(
-    { o ->
-      generation(o, head) == key
-        && run_id(o) > run_id(c)
-        && whole_green(o, checks)
-    },
-  )
 }
 
 /**
@@ -335,7 +230,7 @@ pub fn observe(repo: Repo, own: string = "", carry: Carry? = nil) {
   const pr = repo.pullRequest
   const head = pr.commits.nodes[0]?.commit
   const rollup = head?.statusCheckRollup?.contexts ?? {totalCount: 0, nodes: []}
-  const checks = newest(
+  const checks = current_checks(
     rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.id != own }),
     pr.headRefOid,
   )

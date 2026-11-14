@@ -16,6 +16,7 @@ ci_latency = "scripts/ci-latency/lib.harn"
 ci_job_proof = "scripts/ci-job-proof/lib.harn"
 release_asset = "scripts/release-asset/download.harn"
 review_admission = "scripts/smart-ship/review-admission.harn"
+check_admission = "scripts/smart-ship/check-admission.harn"
 
 [dependencies]
 harn-github-connector = { git = "https://github.com/burin-labs/harn-github-connector", tag = "v0.19.0" }
