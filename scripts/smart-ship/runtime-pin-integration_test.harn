@@ -10,9 +10,10 @@ type Fixture = {
   draft?: bool,
   partial_release?: bool,
   needs_you?: bool,
+  queued?: bool,
 }
 
-fn ready_candidate(needs_you: bool = false) -> Repo {
+fn ready_candidate(needs_you: bool = false, queued: bool = false) -> Repo {
   const receipt = {
     schema: "review.author_evidence.v1",
     repository_digest: sha256_hex("burin-labs/burin-code"),
@@ -31,7 +32,7 @@ fn ready_candidate(needs_you: bool = false) -> Repo {
       state: "OPEN",
       isDraft: false,
       isCrossRepository: false,
-      isInMergeQueue: false,
+      isInMergeQueue: queued,
       headRefName: "candidate",
       headRefOid: "abc",
       baseRefName: "main",
@@ -91,7 +92,13 @@ fn inspect(harness: Harness, fixture: Fixture = {}) -> dict {
       responses: [
         {
           status: 200,
-          body: json_stringify({data: {repository: ready_candidate(fixture.needs_you ?? false)}}),
+          body: json_stringify(
+            {
+              data: {
+                repository: ready_candidate(fixture.needs_you ?? false, fixture.queued ?? false),
+              },
+            },
+          ),
         },
         {
           status: 200,
@@ -102,10 +109,20 @@ fn inspect(harness: Harness, fixture: Fixture = {}) -> dict {
   )
   const blocked_body =
     "**Smart Ship:** Shipping is blocked: Burin main requires a released Harn tag pin; repin to the released tag and remove .harn-revision before merging. Shipping continues when that cause clears.\n\nHead: `abc`.\n\n${NEEDS_YOU}"
+  const resolved_body =
+    "**Smart Ship:** No longer needs you. Shipping continues through the normal checks and protected merge.\n\nHead: `abc`.\n\n${NEEDS_YOU}"
   harness.testing.http_mock(
     "PATCH",
     api + "/repos/${repository}/issues/comments/17",
-    {status: 200, body: json_stringify({id: 17, body: blocked_body})},
+    {
+      status: 200,
+      body: json_stringify({id: 17, body: fixture.queued == true ? resolved_body : blocked_body}),
+    },
+  )
+  harness.testing.http_mock(
+    "DELETE",
+    api + "/repos/${repository}/issues/9/labels/ship-needs-you",
+    {status: 200, body: "[{\"name\":\"ship\"}]"},
   )
   harness.testing.http_mock(
     "GET",
@@ -223,6 +240,27 @@ pipeline test_main_pin_refusal_keeps_the_blocked_comment_and_label(harness: Harn
   assert(contains(updates[0].body ?? "", "requires a released Harn tag pin"))
   assert(!contains(updates[0].body ?? "", "No longer needs you"))
   assert(!seen.calls.any({ call -> call.method == "DELETE" }))
+}
+
+pipeline test_a_green_queued_candidate_resolves_the_old_blocker_without_another_merge(
+  harness: Harness,
+) {
+  const seen = inspect(harness, {queued: true, needs_you: true})
+  assert_eq(seen.result.action, "stop")
+  assert_eq(seen.result.reason, "already in the merge queue")
+  assert(seen.result.facts.approved && seen.result.facts.signed)
+  assert(!seen.result.facts.no_checks)
+  assert_eq(len(seen.result.facts.failing), 0)
+  assert_eq(len(seen.result.facts.pending), 0)
+  const updates = seen.calls.filter({ call -> call.method == "PATCH" })
+  assert_eq(len(updates), 1)
+  assert(contains(updates[0].body ?? "", "No longer needs you"))
+  assert_eq(len(seen.calls.filter({ call -> call.method == "DELETE" })), 1)
+  assert(
+    !seen.calls.any(
+      { call -> call.method == "POST" && contains(call.body ?? "", "mutation($id:") },
+    ),
+  )
 }
 
 type Merge = {variables: {head: string}}
