@@ -1,0 +1,87 @@
+pub const NEEDS_YOU = "<!-- smart-ship-needs-you -->"
+
+pub type NeedsYouComment = {databaseId?: int?, body: string, viewerDidAuthor?: bool}
+
+pub type NeedsYouCommentPage = {
+  totalCount: int,
+  nodes: list<NeedsYouComment>,
+  pageInfo?: {hasPreviousPage: bool, startCursor: string?},
+}
+
+pub type NeedsYouObservation = {
+  head: string,
+  status: "blocked" | "resolved" | "unmeasured",
+  reason: string,
+  complete: bool,
+  labeled: bool,
+  comments: list<NeedsYouComment>,
+}
+
+pub type NeedsYouPlan = {
+  action: "none" | "post" | "update",
+  comment_id: int?,
+  body: string,
+  remove_label: bool,
+}
+
+pub type NeedsYouReadiness = {
+  admitted: bool,
+  complete: bool,
+  merged: bool,
+  checks_reported: bool,
+  signed: bool,
+  approved: bool,
+  conflict: bool,
+  failing: int,
+  pending: int,
+  rerun: int,
+  threads: int,
+}
+
+pub fn needs_you_status(facts: NeedsYouReadiness) -> "blocked" | "resolved" | "unmeasured" {
+  if !facts.admitted && !facts.merged {
+    return "unmeasured"
+  }
+  if facts.merged
+    || (facts.complete && facts.checks_reported && facts.signed && facts.approved
+      && !facts.conflict
+      && facts.failing == 0
+      && facts.pending == 0
+      && facts.rerun == 0
+      && facts.threads == 0) {
+    return "resolved"
+  }
+  return "blocked"
+}
+
+pub fn needs_you_plan(observed: NeedsYouObservation) -> NeedsYouPlan {
+  const none: NeedsYouPlan = {action: "none", comment_id: nil, body: "", remove_label: false}
+  if !observed.complete || observed.status == "unmeasured" {
+    return none
+  }
+  const owned = observed.comments.filter(
+    { comment -> comment.viewerDidAuthor == true && contains(comment.body, NEEDS_YOU) },
+  )
+  require len(owned) <= 1, "Smart Ship needs-you comment identity is ambiguous"
+  if len(owned) == 0 && !observed.labeled {
+    return none
+  }
+  const message =
+    observed.status == "resolved" ? "No longer needs you. Shipping continues through the normal checks and protected merge." : "Shipping is blocked: ${observed.reason}. Shipping continues when that cause clears."
+  const body = "**Smart Ship:** ${message}\n\nHead: `${observed.head}`.\n\n${NEEDS_YOU}"
+  const remove = observed.status == "resolved" && observed.labeled
+  if len(owned) == 0 {
+    return {action: "post", comment_id: nil, body: body, remove_label: remove}
+  }
+  const comment = owned[0]
+  if comment == nil {
+    throw "Smart Ship needs-you comment identity is unmeasured"
+  }
+  require (comment.databaseId ?? 0) > 0, "Smart Ship needs-you comment identity is unmeasured"
+  return {
+    action: comment.body == body ? "none" : "update",
+    comment_id: comment.databaseId,
+    body: body,
+    remove_label: remove,
+  }
+}

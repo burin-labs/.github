@@ -33,7 +33,7 @@ jobs:
           harn install --locked
           harn check ship.harn repair.harn
           harn lint ship.harn repair.harn ship_test.harn
-          harn test ship_test.harn
+          harn test ship_test.harn needs-you_test.harn
 
   local-check-contract:
     name: Local workflow check contract

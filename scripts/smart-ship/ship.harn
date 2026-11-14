@@ -11,6 +11,7 @@ import {
 } from "harn-github-connector/default"
 import { github_merge_signed_staging } from "harn-github-connector/signed_merge"
 import { github_commit_worktree } from "harn-github-connector/worktree"
+import { NEEDS_YOU, NeedsYouComment, NeedsYouCommentPage, needs_you_plan, needs_you_status } from "./needs-you.harn"
 import { WriterReview, review_admission } from "./review-admission.harn"
 
 const HOLDS = ["hold", "do-not-merge"]
@@ -57,7 +58,7 @@ query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner
     labels(first: 100) { totalCount nodes { name } }
     latestOpinionatedReviews(first: 100, writersOnly: true) { totalCount nodes {
       state body author { type: __typename login } } }
-    comments(last: 100) { totalCount nodes { body viewerDidAuthor } }
+    comments(last: 100) { totalCount pageInfo { hasPreviousPage startCursor } nodes { databaseId body viewerDidAuthor } }
     reviewThreads(first: 100) { totalCount nodes { isResolved path comments(first: 100) { totalCount nodes {
       databaseId body authorAssociation author { __typename } } } } }
     commits(last: 1) { nodes { commit { oid signature { isValid state } statusCheckRollup { contexts(first: 100) {
@@ -122,7 +123,7 @@ pub type Pull = {
   reviewDecision: string?,
   labels: Page<{name: string}>,
   latestOpinionatedReviews: Page<WriterReview>,
-  comments: Page<{body: string, viewerDidAuthor?: bool}>,
+  comments: NeedsYouCommentPage,
   reviewThreads: Page<{isResolved: bool, path: string?, comments: Page<Comment>}>,
   commits: {
     nodes: list<{
@@ -417,6 +418,21 @@ pub fn lease_admits(lease: string, slug: string, pr: Pull) -> bool {
 // The stop that a carried approval can answer; a look gathers carry evidence only after it.
 const AWAITING_APPROVAL = "green; waiting for a writer's approval of this head"
 
+fn blocking_cause(
+  base: string,
+  conflict: bool,
+  failing: list<string>,
+  pending: list<string>,
+  threads: int,
+) -> string {
+  return [
+    conflict ? "merge conflict with ${base}" : "",
+    len(failing) > 0 ? "failing checks: ${failing.join(", ")}" : "",
+    len(pending) > 0 ? "pending checks: ${pending.join(", ")}" : "",
+    threads > 0 ? "${threads} unresolved review thread(s)" : "",
+  ].filter({cause -> cause != ""}).join("; ")
+}
+
 /**
  * The note for a head that would land but whose bound approval names an earlier head, or "" when
  * there is nothing to say: another stop, no approval at all, a veto, or a note already posted here.
@@ -461,17 +477,18 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
   const admitted = !admission.any({ g -> g[0] == true })
   // Dead attempts the look closes: only for an admitted PR, and only from the whole comment
   // census; a partial one closes nothing and already reads as attempts used up.
-  const f = seen + {close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0}
+  const f = seen + {admitted: admitted, close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0}
   const stop = { why -> {action: "stop", reason: why, facts: f} }
   const conflict = pr.mergeStateStatus == "DIRTY"
   const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
+  const cause = blocking_cause(pr.baseRefName, conflict, f.failing.map({check -> check.name}), f.pending, len(f.threads))
   // The first gate that holds stops the look, in this order.
   const gates = admission
     + [
       [pr.isInMergeQueue, "already in the merge queue"],
       // A conflicted head may never get checks; its repair does not wait on them.
       [!conflict && f.no_checks, "waiting on checks to report"],
-      [!conflict && len(f.pending) > 0, "waiting on " + join(f.pending, ", ")],
+      [!conflict && len(f.pending) > 0, cause],
       [
         !conflict && len(f.rerun) > 0,
         "cancelled or stale checks need a fresh push: " + join(f.rerun, ", "),
@@ -487,6 +504,13 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
       return stop("head signature is not verified (${f.signature_state})")
     }
     if !f.approved {
+      if f.review_evidence.aggregate == "CHANGES_REQUESTED"
+        || pr.latestOpinionatedReviews.nodes.any({review -> review.state == "CHANGES_REQUESTED"}) {
+        return stop("a writer requested changes at this head")
+      }
+      if !["UNREPORTED", "APPROVED", "REVIEW_REQUIRED"].contains(f.review_evidence.aggregate) {
+        return stop("review decision is unmeasured: ${f.review_evidence.aggregate}")
+      }
       return stop(AWAITING_APPROVAL)
     }
     if pr.mergeStateStatus == "BEHIND" {
@@ -508,15 +532,15 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
       f.threads.any({ t -> !complete(t.comments) }),
       "a review thread is too long to read whole; a person needs to take it",
     ],
-    [!can_repair, "blocked, and repair is off here"],
-    [labels.contains("no-auto-repair"), "blocked, and labeled no-auto-repair"],
+    [!can_repair, "repair is off here"],
+    [labels.contains("no-auto-repair"), "labeled no-auto-repair"],
   ]
   for gate in refusals {
     if gate[0] {
-      return stop(gate[1])
+      return stop("${cause}; ${gate[1]}")
     }
   }
-  return {action: "repair", reason: "blocked", facts: f}
+  return {action: "repair", reason: cause, facts: f}
 }
 
 // No global or system git config: nothing the agent could have written outside its jail is read here.
@@ -1618,6 +1642,100 @@ pub type Look = {
   retention?: string,
 }
 
+type NeedsYouWrite = {id: int, body: string}
+type LabelList = list<{name: string}>
+type EarlierComments = {data: {repository: {pullRequest: {
+  headRefOid: string, state: string, comments: NeedsYouCommentPage,
+}}}}
+
+const EARLIER_COMMENTS = """
+query($owner: String!, $name: String!, $number: Int!, $before: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) { headRefOid state
+      comments(last: 100, before: $before) { totalCount
+        pageInfo { hasPreviousPage startCursor } nodes { databaseId body viewerDidAuthor }
+      }
+    }
+  }
+}
+"""
+
+fn needs_you_comments(harness: Harness, opts: GithubClientOptions, repo: string, pr: Pull) -> list<NeedsYouComment> {
+  let comments = pr.comments.nodes
+  let cursor = pr.comments.pageInfo?.startCursor ?? ""
+  require pr.comments.totalCount <= 1000, "Smart Ship needs-you comment census exceeds its bound"
+  while len(comments) < pr.comments.totalCount {
+    require cursor != "", "Smart Ship needs-you comment census is incomplete"
+    const page = schema_expect(gh(harness, opts, "/graphql", "POST", {
+      query: EARLIER_COMMENTS,
+      variables: {owner: split(repo, "/")[0], name: split(repo, "/")[1], number: pr.number, before: cursor},
+    }), schema_of(EarlierComments)).data.repository.pullRequest
+    require page.headRefOid == pr.headRefOid && page.state == pr.state
+      && page.comments.totalCount == pr.comments.totalCount && len(page.comments.nodes) > 0,
+      "Smart Ship needs-you comment census changed during observation"
+    comments = page.comments.nodes + comments
+    const ids = comments.map({comment -> comment.databaseId ?? 0})
+    require ids.all({id -> id > 0}) && len(unique(ids)) == len(ids)
+      && len(comments) <= pr.comments.totalCount,
+      "Smart Ship needs-you comment census has missing or duplicate identities"
+    const next = page.comments.pageInfo?.startCursor ?? ""
+    require len(comments) == pr.comments.totalCount || next != cursor,
+      "Smart Ship needs-you comment census did not advance"
+    cursor = next
+  }
+  return comments
+}
+
+fn reconcile_needs_you(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  pr: Pull,
+  decision: dict,
+) -> bool {
+  const facts = decision.facts
+  const labeled = pr.labels.nodes.any({label -> label.name == "ship-needs-you"})
+  const recorded = pr.comments.nodes.any({comment -> comment.viewerDidAuthor == true && contains(comment.body, NEEDS_YOU)})
+  if !labeled && !recorded && complete(pr.comments) {
+    return false
+  }
+  const merged = pr.state == "MERGED" && pr.labels.nodes.any({label -> label.name == "ship"})
+  const status = needs_you_status({
+    admitted: facts.admitted, complete: facts.complete, merged: merged, checks_reported: !facts.no_checks,
+    signed: facts.signed, approved: facts.approved, conflict: pr.mergeStateStatus == "DIRTY",
+    failing: len(facts.failing), pending: len(facts.pending), rerun: len(facts.rerun), threads: len(facts.threads),
+  })
+  const comments = needs_you_comments(harness, opts, repo, pr)
+  const plan = needs_you_plan({
+    head: pr.headRefOid,
+    status: status,
+    reason: quiet(decision.reason),
+    complete: len(comments) == pr.comments.totalCount && complete(pr.labels) && (merged || facts.complete),
+    labeled: labeled,
+    comments: comments,
+  })
+  if plan.action != "none" {
+    const path = plan.action == "post" ? "/repos/${repo}/issues/${pr.number}/comments"
+      : "/repos/${repo}/issues/comments/${plan.comment_id}"
+    const written = schema_expect(
+      gh(harness, opts, path, plan.action == "post" ? "POST" : "PATCH", {body: plan.body}),
+      schema_of(NeedsYouWrite),
+    )
+    require written.body == plan.body && written.id > 0
+      && (plan.comment_id == nil || written.id == plan.comment_id),
+      "Smart Ship needs-you comment update was not confirmed"
+  }
+  if plan.remove_label {
+    const labels = schema_expect(
+      gh(harness, opts, "/repos/${repo}/issues/${pr.number}/labels/ship-needs-you", "DELETE"),
+      schema_of(LabelList),
+    )
+    require !labels.any({label -> label.name == "ship-needs-you"}),
+      "Smart Ship needs-you label removal was not confirmed"
+  }
+  return plan.action != "none" || plan.remove_label
+}
+
 fn main(harness: Harness) {
   const repo = harness.env.get("REPO") ?? ""
   const number = to_int(harness.env.get("PR") ?? "") ?? 0
@@ -1706,6 +1824,7 @@ pub fn look(harness: Harness, job: Look) {
   if d.action == "stop" && d.reason == AWAITING_APPROVAL {
     d = decide(r, lease, job.repair, own, approval_carry(harness, opts, r))
   }
+  reconcile_needs_you(harness, opts, repo, pr, d)
   const logged = evidence_line(pr, d.facts.review_evidence)
   harness.stdio.println(logged)
   harness.stdio.println("Check evidence: failing=${len(d.facts.failing)} [${d.facts.failing.map({ c -> c.name }).join(", ")}] "
