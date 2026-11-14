@@ -26,7 +26,7 @@ For Harn-specific authoring, also load `harn-docs` (`harn skill get harn-docs
 
 - Target Flesch-Kincaid grade 9 or below.
 - Measure it, per page, before you ship:
-  `node scripts/reading-level.mjs --max 9 <page>` in burin-code.
+  `./scripts/harnw run scripts/reading-level.harn -- --max 9 <page>` in burin-code.
 - One idea per sentence. Cut a clause before you shorten a word.
 - A good score does not prove a readable page. Check that every product noun is
   defined before it is used.
