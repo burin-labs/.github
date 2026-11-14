@@ -126,7 +126,7 @@ jobs:
       - name: Install Harn
         uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b # supports compressed release archives
         with:
-          version: "0.10.180"
+          version: "0.10.197"
       - name: Look at the pull request
         id: look
         working-directory: .smart-ship/scripts/smart-ship
@@ -169,7 +169,8 @@ jobs:
           mkdir -p "$SHIP_WORK/agent"
           cp .smart-ship/scripts/smart-ship/repair.harn "$SHIP_WORK/agent/repair.harn"
           cd "$SHIP_WORK/pr"
-          harn run --environment-policy granted \
+          # Leave cleanup time before Actions' step deadline.
+          harn run --timeout 20m --environment-policy granted \
             --grant "openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,to=in_process" \
             --write-root "$SHIP_WORK/pr" \
             "$SHIP_WORK/agent/repair.harn"

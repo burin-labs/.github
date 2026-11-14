@@ -26,14 +26,14 @@ jobs:
       - name: Install the Smart Ship runtime
         uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b # supports compressed release archives
         with:
-          version: "0.10.180"
+          version: "0.10.197"
       - name: Check and test the landing gate
         working-directory: scripts/smart-ship
         run: |
           harn install --locked
-          harn check ship.harn repair.harn
-          harn lint ship.harn repair.harn ship_test.harn
-          harn test ship_test.harn needs-you_test.harn runtime-pin_test.harn runtime-pin-integration_test.harn
+          harn check ship.harn repair.harn repair_workflow_test.harn
+          harn lint ship.harn repair.harn ship_test.harn repair_workflow_test.harn
+          harn test ship_test.harn needs-you_test.harn runtime-pin_test.harn runtime-pin-integration_test.harn repair_workflow_test.harn
 
   local-check-contract:
     name: Local workflow check contract
