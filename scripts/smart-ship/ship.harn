@@ -1735,6 +1735,9 @@ pub fn look(harness: Harness, job: Look) {
   reconcile_needs_you(harness, opts, repo, pr, d)
   const logged = evidence_line(pr, d.facts.review_evidence)
   harness.stdio.println(logged)
+  if d.facts.runtime_pin != nil {
+    harness.stdio.println("Runtime pin evidence: ${json_stringify(d.facts.runtime_pin)}")
+  }
   harness.stdio.println("Check evidence: failing=${len(d.facts.failing)} [${d.facts.failing.map({ c -> c.name }).join(", ")}] "
     + "pending=${len(d.facts.pending)} [${d.facts.pending.join(", ")}] "
     + "aggregate_measurements=[${d.facts.measurements.map({ c -> c.name }).join(", ")}].")
