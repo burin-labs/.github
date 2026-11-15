@@ -1,0 +1,342 @@
+import { assert_error_contains } from "std/testing"
+import { Artifact, Job, ProducerPolicy, Registration, Run } from "./contract.harn"
+import { declarable_scopes, declared_scope_admission, declared_scopes } from "./declared_scope.harn"
+import { document_from_archive } from "./live.harn"
+import {
+  ProofSource,
+  ScopeInspection,
+  inspect_original_run,
+  inspect_scope_run,
+} from "./reader.harn"
+import {
+  ScopeExecution,
+  ScopeSelection,
+  SelectedJob,
+  scope_execution,
+  scope_selection,
+} from "./selection.harn"
+
+pub const HEAD = "a".repeat(40)
+
+const DIGEST = "b".repeat(64)
+
+const ALLOWED = ["full", "replay"]
+
+const SELECTION: ScopeSelection = {
+  schema: "burin.ci_scope_selection.v1",
+  fullSuite: false,
+  declared: [],
+}
+
+type FixtureSource = {
+  source: ProofSource,
+  producer: Run,
+  policy: ProducerPolicy,
+  execution: ScopeExecution,
+}
+
+pub fn fixture_source(
+  conclusion: string,
+  selection: ScopeSelection? = SELECTION,
+  aggregate: string = "success",
+  required: list<SelectedJob> = [{id: "replay", names: ["Replay"]}],
+) -> FixtureSource {
+  const producer: Run = {
+    id: 10,
+    run_attempt: 2,
+    head_sha: HEAD,
+    event: "pull_request",
+    path: ".github/workflows/ci-pr.yml",
+    status: "completed",
+    conclusion: "success",
+    repository: {full_name: "acme/product"},
+    head_repository: {full_name: "acme/product"},
+  }
+  const record: Registration = {
+    schema: "burin.ci_job_proof_registration.v3",
+    repository: "acme/product",
+    workflow: "ci-pr.yml",
+    event: "pull_request",
+    commit: HEAD,
+    runId: 10,
+    attempt: 2,
+    registrarJob: "Detect changes",
+    registrarStep: "Resolve CI job proof reuse",
+    tested_source: {commit: "c".repeat(40), tree: "d".repeat(40)},
+    jobs: [{id: "replay", names: ["Replay"], digest: DIGEST, provenance: nil}],
+  }
+  const recorded = selection == nil ? record : record + {selection: selection}
+  const execution: ScopeExecution = {
+    schema: "burin.ci_scope_execution.v1",
+    repository: record.repository,
+    workflow: record.workflow,
+    event: record.event,
+    commit: record.commit,
+    runId: record.runId,
+    attempt: record.attempt,
+    tested_source: record.tested_source,
+    selection: selection ?? SELECTION,
+    requiredJobs: required,
+  }
+  const artifact = {
+    id: 99,
+    name: "ci-job-inputs-10-2",
+    size_in_bytes: 10,
+    expired: false,
+    digest: "sha256:${DIGEST}",
+    created_at: "2026-10-09T10:00:00Z",
+    workflow_run: {id: 10, head_sha: HEAD},
+  }
+  const base = {
+    run_id: 10,
+    run_attempt: 2,
+    head_sha: HEAD,
+    status: "completed",
+    conclusion: "success",
+    started_at: "2026-10-09T10:00:02Z",
+    completed_at: "2026-10-09T10:00:03Z",
+    steps: [],
+  }
+  const final_artifact = artifact
+    + {id: 100, name: "ci-scope-execution-10-2", created_at: "2026-10-09T10:00:02Z"}
+  const rows = [
+    {
+      ...base,
+      id: 1,
+      name: "Detect changes",
+      completed_at: "2026-10-09T10:00:01Z",
+      steps: [{name: "Resolve CI job proof reuse", status: "completed", conclusion: "success"}],
+    },
+    {...base, id: 2, name: "Replay", conclusion: conclusion},
+    {
+      ...base,
+      id: 3,
+      name: "CI status",
+      conclusion: aggregate,
+      steps: [
+        {name: "Check for failures", status: "completed", conclusion: "success"},
+        {name: "Retain declared scope execution", status: "completed", conclusion: "success"},
+      ],
+    },
+  ]
+  const source: ProofSource = {
+    json: fn(path) {
+      if path == "/repos/acme/product/actions/runs/10" {
+        return producer
+      }
+      if path == "/repos/acme/product/actions/runs/10/artifacts?per_page=100&page=1" {
+        return {total_count: 2, artifacts: [artifact, final_artifact]}
+      }
+      assert_eq(path, "/repos/acme/product/actions/runs/10/attempts/2/jobs?per_page=30&page=1")
+      return {total_count: 3, jobs: rows}
+    },
+    registration: fn(_repo, _artifact) { return recorded },
+    scope_execution: fn(_repo, item) {
+      assert_eq(item.id, 100)
+      return execution
+    },
+  }
+  const policy: ProducerPolicy = {
+    repository: "acme/product",
+    workflow: "ci-pr.yml",
+    events: ["pull_request"],
+    registrarJob: "Detect changes",
+    registrarStep: "Resolve CI job proof reuse",
+  }
+  return {source: source, producer: producer, policy: policy, execution: execution}
+}
+
+fn fixture(
+  conclusion: string,
+  selection: ScopeSelection? = SELECTION,
+  aggregate: string = "success",
+  required: list<SelectedJob> = [{id: "replay", names: ["Replay"]}],
+) -> ScopeInspection {
+  const parts = fixture_source(conclusion, selection, aggregate, required)
+  return {
+    original: inspect_original_run(parts.source, parts.policy, parts.producer),
+    execution: parts.execution,
+  }
+}
+
+pipeline test_scope_expansion_waits_for_the_new_job_and_cosmetic_edits_preserve_proof() {
+  const old = fixture("skipped")
+  for body in ["Description.", "Reworded description."] {
+    assert(declared_scope_admission(declared_scopes(body, ALLOWED), HEAD, old).admitted)
+  }
+  const requested = declared_scopes("Description.\nCI-Scope: replay", ALLOWED)
+  const pending = declared_scope_admission(requested, HEAD, old)
+  assert_eq(pending.unproven, ["replay"])
+  assert(!pending.admitted)
+  const rerun = fixture("success", SELECTION + {declared: requested})
+  assert(declared_scope_admission(requested, HEAD, rerun).admitted)
+  // An unchanged selection that already executed the job needs no extra run.
+  assert(declared_scope_admission(requested, HEAD, fixture("success")).admitted)
+  assert_eq(declared_scope_admission(requested, HEAD, nil).unproven, ["replay"])
+}
+
+pipeline test_omitted_selection_is_not_a_measured_empty_scope() {
+  const requested = ["replay"]
+  assert(!declared_scope_admission(requested, HEAD, fixture("success", nil)).admitted)
+  assert(declared_scope_admission(requested, HEAD, fixture("success", SELECTION)).admitted)
+}
+
+pipeline test_full_selection_and_successful_execution_are_separate_facts() {
+  assert(!declared_scope_admission(["full"], HEAD, fixture("success")).admitted)
+  const full = SELECTION + {fullSuite: true}
+  assert(declared_scope_admission(["full"], HEAD, fixture("success", full)).admitted)
+  const skipped = declared_scope_admission(["full"], HEAD, fixture("skipped", full))
+  assert(!skipped.admitted)
+  assert_eq(skipped.required_jobs, 1)
+  assert_eq(skipped.unexecuted_jobs, ["replay"])
+  const missing = [{id: "missing", names: ["Missing"]}, {id: "replay", names: ["Replay"]}]
+  assert_eq(
+    declared_scope_admission(["full"], HEAD, fixture("success", full, "success", missing))
+      .unexecuted_jobs,
+    ["missing"],
+  )
+  for outcome in ["failure", "skipped", "cancelled"] {
+    assert(!declared_scope_admission(["full"], HEAD, fixture("success", full, outcome)).admitted)
+    assert(!declared_scope_admission(["replay"], HEAD, fixture(outcome)).admitted)
+  }
+  assert_error_contains(
+    fn() { declared_scope_admission(["replay"], "f".repeat(40), fixture("success")) },
+    "different source",
+  )
+}
+
+pipeline test_scope_boundary_normalizes_only_supported_declarations() {
+  const policy = {
+    schema: "burin.ci_selection.v1",
+    deferredJobs: {replay: {declarable: true}, private: {declarable: false}},
+  }
+  assert_eq(declarable_scopes(policy), ALLOWED)
+  assert_eq(declared_scopes("  ci-scope: replay, full\r\nCI-Scope: replay", ALLOWED), ALLOWED)
+  assert_eq(declared_scopes(json_parse("\"\\uFEFFCI-Scope: replay\""), ALLOWED), ["replay"])
+  for body in ["CI-Scope: replay\r", json_parse("\"CI-Scope: replay\\u2028\""), "CI-ſcope: replay"] {
+    assert_eq(declared_scopes(body, ALLOWED), [])
+  }
+  for body in ["CI-Scope:", "CI-Scope: Replay", "CI-Scope: private", "CI-Scope: unknown"] {
+    assert_error_contains(fn() { declared_scopes(body, ALLOWED) }, "empty or unsupported")
+  }
+  for value in [
+    SELECTION + {schema: "other"},
+    SELECTION + {declared: ["replay", "replay"]},
+    SELECTION + {declared: ["replay", "full"]},
+    SELECTION + {declared: [""]},
+  ] {
+    assert(
+      is_err(
+        try {
+          scope_selection(value)
+        },
+      ),
+    )
+  }
+}
+
+pipeline test_terminal_scope_artifact_binds_the_original_source_and_normal_verdict() {
+  const parts = fixture_source("success")
+  const measured = inspect_scope_run(parts.source, parts.policy, parts.producer)
+  assert_eq(measured.execution.requiredJobs, [{id: "replay", names: ["Replay"]}])
+  for wrong in [
+    parts.execution + {commit: "f".repeat(40)},
+    parts.execution + {attempt: 1},
+    parts.execution + {runId: 11},
+    parts.execution + {tested_source: {commit: "f".repeat(40), tree: "d".repeat(40)}},
+    parts.execution + {selection: SELECTION + {declared: ["replay"]}},
+    parts.execution
+      + {requiredJobs: [{id: "replay", names: ["Replay"]}, {id: "replay", names: ["Replay"]}]},
+  ] {
+    const source = parts.source + {scope_execution: fn(_repo, _artifact) { return wrong }}
+    assert(
+      is_err(
+        try {
+          inspect_scope_run(source, parts.policy, parts.producer)
+        },
+      ),
+    )
+  }
+  type Page = {total_count: int, artifacts: list<Artifact>}
+  type Jobs = {total_count: int, jobs: list<Job>}
+  for cohort in [
+    "missing",
+    "stale-publisher",
+    "wrong-digest",
+    "missing-publish-step",
+    "override-only",
+  ] {
+    const source: ProofSource = parts.source
+      + {
+        json: fn(path) {
+          const original = parts.source.json(path)
+          if path.contains("/jobs?") && ["missing-publish-step", "override-only"].contains(cohort) {
+            const page = schema_expect(original, schema_of(Jobs))
+            return page
+              + {
+                jobs: page.jobs.map(
+                  { job ->
+                    job.name != "CI status" ? job : job
+                      + {
+                        steps: cohort == "missing-publish-step" ? [] : [
+                          {name: "Check for failures", status: "completed", conclusion: "failure"},
+                          {
+                            name: "Retain declared scope execution",
+                            status: "completed",
+                            conclusion: "success",
+                          },
+                        ],
+                      }
+                  },
+                ),
+              }
+          }
+          if !path.contains("/artifacts?") {
+            return original
+          }
+          const page = schema_expect(original, schema_of(Page))
+          const records = cohort == "missing" ? page.artifacts.filter({ item -> item.id != 100 })
+            .to_list() : page.artifacts.map(
+            { item ->
+              item.id != 100 ? item : item
+                + {
+                  created_at: cohort == "stale-publisher" ? "2026-10-09T09:59:59Z" : item
+                    .created_at,
+                  digest: cohort == "wrong-digest" ? "" : item.digest,
+                }
+            },
+          )
+          return {total_count: len(records), artifacts: records}
+        },
+      }
+    assert(
+      is_err(
+        try {
+          inspect_scope_run(source, parts.policy, parts.producer)
+        },
+      ),
+      cohort,
+    )
+  }
+}
+
+pipeline test_scope_execution_round_trips_through_the_existing_bounded_archive_reader(
+  harness: Harness,
+) {
+  const expected = fixture_source("success").execution
+  const root = harness.fs.mkdtemp_in_workspace("scope-execution-archive-")
+  const path = "${root}/proof.zip"
+  const archive = zip_create([{path: "scope-execution.json", content: json_stringify(expected)}])
+  harness.fs.write_bytes(path, archive)
+  const parsed = document_from_archive(
+    harness.fs,
+    path,
+    "sha256:${sha256(archive)}",
+    "scope-execution.json",
+  )
+  assert_eq(scope_execution(parsed), expected)
+  assert_error_contains(
+    fn() { document_from_archive(harness.fs, path, "sha256:${"f".repeat(64)}", "scope-execution.json") },
+    "digest mismatch",
+  )
+}

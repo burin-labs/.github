@@ -1,3 +1,5 @@
+import { ScopeSelection, SelectedJob } from "./selection.harn"
+
 pub const IDENTITY_SCHEMA = "burin.ci_job_identity.v1"
 
 pub const REGISTRATION_SCHEMA = "burin.ci_job_proof_registration.v3"
@@ -96,7 +98,12 @@ pub type TestedSource = {commit: string, tree: string}
 
 /** An attempt's registered identities retain its actual checkout and API run context. */
 pub type Registration = RunContext \
-  & {schema: string, tested_source: TestedSource, jobs: list<RegisteredJob>}
+  & {
+  schema: string,
+  tested_source: TestedSource,
+  jobs: list<RegisteredJob>,
+  selection?: ScopeSelection,
+}
 
 /** GitHub's workflow-run metadata for one explicit attempt. */
 pub type Run = {
@@ -354,8 +361,8 @@ fn successful_registrar(recorded: Registration, jobs: list<Job>) -> Job {
 
 /** Every leg of the job passed, after its contract was registered; nil when it did not. */
 fn executed(
-  wanted: JobIdentity,
-  others: list<JobIdentity>,
+  wanted: SelectedJob,
+  others: list<SelectedJob>,
   jobs: list<Job>,
   registered_at: int | float,
   registrar_completed: int | float,
@@ -381,6 +388,29 @@ fn executed(
     }
   }
   return legs.map({ job -> job.id }).sorted()
+}
+
+/** Selection requirements prove execution without making output-producing jobs reusable. */
+pub fn unexecuted_selection(
+  producer: Run,
+  registered: RegisteredArtifact,
+  jobs: list<Job>,
+  declared: int,
+  required: list<SelectedJob>,
+) -> list<string> {
+  coherent_jobs(jobs, declared, producer)
+  const registrar = successful_registrar(registered.registration, jobs)
+  return required.filter(
+    { job ->
+      executed(
+        job,
+        required.filter({ other -> other.id != job.id }).to_list(),
+        jobs,
+        date_parse(registered.artifact.created_at),
+        date_parse(registrar.completed_at),
+      ) == nil
+    },
+  ).map({ job -> job.id }).to_list()
 }
 
 /**

@@ -42,6 +42,7 @@ pipeline test_reader_reaches_actual_archive_and_job_proof(harness: Harness) {
     commit: "a".repeat(40),
     runId: 10,
     attempt: 2,
+    selection: {schema: "burin.ci_scope_selection.v1", fullSuite: false, declared: []},
     jobs: [{id: "rust", names: ["Rust"], digest: digest, provenance: nil}],
   }
   const producer: Run = {
@@ -108,6 +109,7 @@ pipeline test_reader_reaches_actual_archive_and_job_proof(harness: Harness) {
   assert_eq(inspected.census.jobs, rows)
   assert_eq(inspected.registered.artifact.digest, artifact.digest)
   assert_eq(inspected.registered.registration.tested_source, recorded.tested_source)
+  assert_eq(inspected.registered.registration.selection, recorded.selection)
   assert(inspected.registered.registration.tested_source.commit != producer.head_sha)
   assert_eq(inspected.admission, outcome)
   // An observer need not pretend it is a distinct run of the producer workflow.

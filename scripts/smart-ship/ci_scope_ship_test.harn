@@ -1,0 +1,228 @@
+import { ScopeObservation } from "./ci-scope.harn"
+import { Repo, decide, transition_scope } from "./ship.harn"
+
+const REPOSITORY = "burin-labs/burin-code"
+
+const HEAD = "a".repeat(40)
+
+const API = "https://api.github.com"
+
+const PENDING = {
+  admitted: false,
+  declared: ["replay"],
+  unproven: ["replay"],
+  runId: 10,
+  attempt: 2,
+  refreshable: true,
+  required_jobs: nil,
+  unexecuted_jobs: nil,
+}
+
+const SCOPE: ScopeObservation = {admission: PENDING, error: nil, allowed: ["full", "replay"]}
+
+const PIN = {
+  admitted: true,
+  reason: "released",
+  runtime: {tag: "v0.10.197", source_revision: "f".repeat(40), version: "0.10.197", release_id: 20},
+}
+
+fn fixture(queued: bool = false, body: string = "CI-Scope: replay", comments: list = []) -> Repo {
+  const check = {
+    name: "CI status",
+    databaseId: 99,
+    status: "COMPLETED",
+    conclusion: "SUCCESS",
+    checkSuite: {
+      id: "suite",
+      commit: {oid: HEAD},
+      app: {id: "actions"},
+      workflowRun: {
+        databaseId: 10,
+        event: "pull_request",
+        workflow: {id: "ci", name: "CI (owned PR)"},
+      },
+    },
+  }
+  const receipt = {
+    schema: "review.author_evidence.v1",
+    repository_digest: sha256_hex(REPOSITORY),
+    pr: 9,
+    head_sha: HEAD,
+    replies: [],
+  }
+  return {
+    nameWithOwner: REPOSITORY,
+    defaultBranchRef: {name: "main"},
+    mergeQueue: nil,
+    pullRequest: {
+      id: "PR_1",
+      number: 9,
+      title: "t",
+      body: body,
+      state: "OPEN",
+      isDraft: false,
+      isCrossRepository: false,
+      isInMergeQueue: queued,
+      headRefName: "feature",
+      headRefOid: HEAD,
+      baseRefName: "main",
+      baseRef: {target: {oid: "b".repeat(40)}},
+      mergeStateStatus: "CLEAN",
+      reviewDecision: nil,
+      labels: {totalCount: 1, nodes: [{name: "ship"}]},
+      latestOpinionatedReviews: {
+        totalCount: 1,
+        nodes: [
+          {
+            state: "APPROVED",
+            body: "<!-- automated-review-author-evidence: ${json_stringify(receipt)} -->",
+            author: {type: "Bot", login: "reviewer"},
+          },
+        ],
+      },
+      comments: {totalCount: len(comments), nodes: comments},
+      reviewThreads: {totalCount: 0, nodes: []},
+      commits: {
+        nodes: [
+          {
+            commit: {
+              oid: HEAD,
+              signature: {isValid: true},
+              statusCheckRollup: {
+                contexts: {totalCount: 1, pageInfo: {hasNextPage: false}, nodes: [check]},
+              },
+            },
+          },
+        ],
+      },
+    },
+  }
+}
+
+pipeline test_shipping_cannot_use_the_queued_short_circuit_to_skip_scope_admission() {
+  for queued in [false, true] {
+    const unread = decide(fixture(queued), "clear", false, "", nil, PIN)
+    assert_eq(unread.action, "stop")
+    assert(unread.facts.scope_required)
+    const expanded = decide(fixture(queued), "clear", false, "", nil, PIN, SCOPE)
+    assert_eq(expanded.action, queued ? "dequeue" : "refresh_ci")
+    assert_eq(expanded.facts.scope.admission.unproven, ["replay"])
+    const proven = SCOPE
+      + {admission: PENDING + {admitted: true, unproven: [], refreshable: false}}
+    assert_eq(
+      decide(fixture(queued), "clear", false, "", nil, PIN, proven).action,
+      queued ? "stop" : "merge",
+    )
+    const old_source = SCOPE + {admission: PENDING + {refreshable: false}}
+    assert_eq(decide(fixture(false), "clear", false, "", nil, PIN, old_source).action, "stop")
+    const unreadable = {admission: nil, error: "unavailable", declared: ["replay"]}
+    const uncertain = decide(fixture(queued), "clear", false, "", nil, PIN, unreadable)
+    assert_eq(uncertain.action, queued ? "dequeue" : "stop")
+    assert(uncertain.reason.contains("replay"))
+  }
+}
+
+pipeline test_scope_refresh_calls_the_whole_producer_once_and_confirms_its_intent(
+  harness: Harness,
+) {
+  const initial = fixture()
+  const body =
+    "**Smart Ship:** Refreshing the complete CI selection producer for declared scopes: replay. "
+    + "Source-bound review remains unchanged.\n\n<!-- smart-ship-ci-scope-refresh:${sha256(json_stringify({head: HEAD, declared: ["replay"]}))} -->"
+  const intent = {databaseId: 71, body: body, viewerDidAuthor: true}
+  const options = {installation_token: "fixture-token", budget: {state_dir: ""}}
+  const producer = {
+    id: 10,
+    run_attempt: 2,
+    head_sha: HEAD,
+    event: "pull_request",
+    path: ".github/workflows/ci-pr.yml",
+    status: "completed",
+  }
+  for cohort in ["valid", "repeat", "wrong-head", "expanded", "unconfirmed", "wrong-attempt"] {
+    harness.testing.http_mock_clear()
+    const latest = cohort == "repeat" ? fixture(false, "CI-Scope: replay", [intent]) : cohort
+      == "expanded" ? fixture(false, "CI-Scope: full") : cohort == "wrong-head" ? initial
+      + {pullRequest: initial.pullRequest + {headRefOid: "b".repeat(40)}} : initial
+    harness.testing.http_mock(
+      "POST",
+      "${API}/graphql",
+      {status: 200, body: json_stringify({data: {repository: latest}})},
+    )
+    harness.testing.http_mock(
+      "GET",
+      "${API}/repos/${REPOSITORY}/actions/runs/10",
+      {
+        status: 200,
+        body: json_stringify(producer + {run_attempt: cohort == "wrong-attempt" ? 3 : 2}),
+      },
+    )
+    harness.testing.http_mock(
+      "POST",
+      "${API}/repos/${REPOSITORY}/issues/9/comments",
+      {status: 201, body: json_stringify({id: 71, body: cohort == "unconfirmed" ? "wrong" : body})},
+    )
+    harness.testing.http_mock(
+      "POST",
+      "${API}/repos/${REPOSITORY}/actions/runs/10/rerun",
+      {status: 204, body: ""},
+    )
+    const result = try {
+      transition_scope(harness, options, REPOSITORY, initial.pullRequest, SCOPE, "refresh_ci")
+    }
+    assert_eq(is_ok(result), ["valid", "repeat"].contains(cohort), cohort)
+    const calls = harness.testing.http_mock_calls({include_sensitive: true})
+    assert_eq(
+      len(calls.filter({ call -> call.url.ends_with("/rerun") })),
+      cohort == "valid" ? 1 : 0,
+      cohort,
+    )
+    assert(!calls.any({ call -> call.url.ends_with("/rerun-failed-jobs") }))
+    assert_eq(
+      len(calls.filter({ call -> call.url.ends_with("/comments") })),
+      ["valid", "unconfirmed"].contains(cohort) ? 1 : 0,
+      cohort,
+    )
+  }
+}
+
+pipeline test_stale_candidate_dequeue_is_source_bound_and_confirmed(harness: Harness) {
+  const initial = fixture(true)
+  const options = {installation_token: "fixture-token", budget: {state_dir: ""}}
+  for cohort in ["valid", "changed-scope", "unconfirmed", "still-queued"] {
+    harness.testing.http_mock_clear()
+    const latest = cohort == "changed-scope" ? fixture(true, "CI-Scope: full") : initial
+    const removed = {
+      data: {
+        dequeuePullRequest: {
+          mergeQueueEntry: {pullRequest: {id: cohort == "unconfirmed" ? "PR_OTHER" : "PR_1"}},
+        },
+      },
+    }
+    harness.testing.http_mock(
+      "POST",
+      "${API}/graphql",
+      {
+        responses: [
+          {status: 200, body: json_stringify({data: {repository: latest}})},
+          {status: 200, body: json_stringify(removed)},
+          {
+            status: 200,
+            body: json_stringify({data: {repository: fixture(cohort == "still-queued")}}),
+          },
+        ],
+      },
+    )
+    const result = try {
+      transition_scope(harness, options, REPOSITORY, initial.pullRequest, SCOPE, "dequeue")
+    }
+    assert_eq(is_ok(result), cohort == "valid", cohort)
+    const calls = harness.testing.http_mock_calls({include_sensitive: true})
+    const writes = calls.filter(
+      { call -> call.body.contains("mutation($id:ID!){dequeuePullRequest") },
+    )
+      .to_list()
+    assert_eq(len(writes), cohort == "changed-scope" ? 0 : 1)
+    assert(!calls.any({ call -> call.url.contains("/rerun") }))
+  }
+}

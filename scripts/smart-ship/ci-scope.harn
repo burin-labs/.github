@@ -1,0 +1,112 @@
+import { ProducerPolicy, Run } from "../ci-job-proof/contract.harn"
+import {
+  DeclaredScopeAdmission,
+  declarable_scopes,
+  declared_scope_admission,
+  declared_scopes,
+  scope_declaration_names,
+} from "../ci-job-proof/declared_scope.harn"
+import { ProofSource, inspect_scope_run } from "../ci-job-proof/reader.harn"
+import { Check, current_checks, run_id } from "./check-admission.harn"
+import { GithubClientOptions, github_file_at_ref } from "harn-github-connector/default"
+
+pub type ScopeObservation = {
+  admission: DeclaredScopeAdmission?,
+  error: string?,
+  allowed?: list<string>,
+  declared?: list<string>?,
+}
+
+pub type ScopeGate = {read_required: bool, refusal: string, observation: ScopeObservation?}
+
+pub type ScopeRequest = {
+  repository: string,
+  head: string,
+  body: string,
+  policy: unknown,
+  checks: list<Check>,
+}
+
+pub fn scope_gate(repository: string, observed: ScopeObservation?) -> ScopeGate {
+  if repository != "burin-labs/burin-code" {
+    return {read_required: false, refusal: "", observation: nil}
+  }
+  if observed == nil {
+    return {
+      read_required: true,
+      refusal: "current declared CI scope is unmeasured",
+      observation: nil,
+    }
+  }
+  const proof = observed.admission
+  const requested = observed.declared
+  const refusal =
+    proof == nil ? "current declared CI scope proof is unreadable${requested == nil ? "" : ": ${requested.join(", ")}"}" : proof
+    .admitted ? "" : "waiting for declared CI scopes: ${proof.unproven.join(", ")}"
+  return {read_required: false, refusal: refusal, observation: observed}
+}
+
+/** Read one latest original attempt through the same job-proof qualifier that owns reuse. */
+pub fn observe_scope(source: ProofSource, request: ScopeRequest) -> DeclaredScopeAdmission {
+  const {repository, head, body, policy, checks} = request
+  if len(scope_declaration_names(body)) == 0 {
+    return declared_scope_admission([], head, nil)
+  }
+  const declared = declared_scopes(body, declarable_scopes(policy))
+  const candidates = current_checks(checks, head).filter(
+    { check ->
+      check.name == "CI status" && check.checkSuite?.commit?.oid == head
+        && check.checkSuite?.workflowRun?.event == "pull_request"
+        && run_id(check) > 0
+    },
+  )
+    .map({ check -> run_id(check) })
+    .unique()
+    .sorted()
+    .reversed()
+  require len(candidates) <= 8, "too many current CI scope producers"
+  for id in candidates {
+    const producer = schema_expect(
+      source.json("/repos/${repository}/actions/runs/${id}"),
+      schema_of(Run),
+    )
+    if producer.path != ".github/workflows/ci-pr.yml" {
+      continue
+    }
+    require producer.id == id && producer.head_sha == head, "CI scope producer source changed"
+    if producer.status != "completed" {
+      return declared_scope_admission(declared, head, nil)
+    }
+    const expected: ProducerPolicy = {
+      repository: repository,
+      workflow: "ci-pr.yml",
+      events: ["pull_request"],
+      registrarJob: "Detect changes",
+      registrarStep: "Resolve CI job proof reuse",
+    }
+    return declared_scope_admission(declared, head, inspect_scope_run(source, expected, producer))
+  }
+  return declared_scope_admission(declared, head, nil)
+}
+
+pub fn scope_policy(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repository: string,
+  head: string,
+) -> unknown {
+  const parts = repository.split("/")
+  require len(parts) == 2 && parts.all({ part -> part != "" }), "invalid CI scope repository"
+  const path = "scripts/config/ci-selection.json"
+  const read = github_file_at_ref(
+    harness,
+    {owner: parts[0] ?? "", repo: parts[1] ?? "", path: path, ref: head, options: opts},
+  )?
+  require read.repo == repository && read.path == path && read.ref == head
+    && read.state == "found"
+    && read.found
+    && read.file != nil
+    && read.file.path == path,
+    "current CI scope registry is unmeasured"
+  return json_parse(read.file.text)
+}

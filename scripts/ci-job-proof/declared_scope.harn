@@ -1,0 +1,119 @@
+import { unexecuted_selection } from "./contract.harn"
+import { ScopeInspection } from "./reader.harn"
+import { scope_execution, scope_selection } from "./selection.harn"
+
+pub type DeclaredScopeAdmission = {
+  admitted: bool,
+  declared: list<string>,
+  unproven: list<string>,
+  runId: int?,
+  attempt: int?,
+  refreshable: bool,
+  required_jobs: int?,
+  unexecuted_jobs: list<string>?,
+}
+
+type ScopePolicy = {schema: string, deferredJobs: dict<string, {declarable: bool}>}
+
+/** The repository's existing scope registry owns which declarations are supported. */
+pub fn declarable_scopes(raw: unknown) -> list<string> {
+  const policy = schema_expect(raw, schema_of(ScopePolicy))
+  require policy.schema == "burin.ci_selection.v1" && len(policy.deferredJobs) > 0,
+    "CI scope policy is unmeasured"
+  return (["full"]
+    + policy.deferredJobs.keys().filter({ name -> policy.deferredJobs[name]?.declarable == true }))
+    .sorted()
+}
+
+// ECMAScript's whitespace class preserves the bootstrap selector's existing grammar.
+const SCOPE_SPACE =
+  r"[\x09-\x0D\x20\u{A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]"
+
+/** The bootstrap adapter mechanically tests normalization against this owner. */
+pub fn scope_declaration_names(body: string) -> list<string> {
+  let declared: list<string> = []
+  for line in body.replace("\r\n", "\n").split("\n") {
+    const found = regex_captures(
+      "^${SCOPE_SPACE}*(?i-u:CI-Scope:)${SCOPE_SPACE}*([^\\r\\n\\u{2028}\\u{2029}]*)$",
+      line,
+    )
+    if len(found) == 0 {
+      continue
+    }
+    const names = regex_split(found[0].groups[0], "(?:${SCOPE_SPACE}|,)+").filter(
+      { name -> name != "" },
+    )
+      .to_list()
+    require len(names) > 0, "CI-Scope names an empty or unsupported scope"
+    declared = declared + names
+  }
+  return declared.unique().sorted()
+}
+
+pub fn declared_scopes(body: string, allowed: list<string>) -> list<string> {
+  require len(allowed) > 0 && allowed == allowed.unique().sorted(),
+    "declarable CI scopes are unmeasured"
+  const declared = scope_declaration_names(body)
+  require declared.all({ name -> allowed.contains(name) }),
+    "CI-Scope names an empty or unsupported scope"
+  return declared
+}
+
+/** A skipped job cannot prove a newly requested scope, even when the old aggregate passed. */
+pub fn declared_scope_admission(
+  declared: list<string>,
+  head: string,
+  proof: ScopeInspection?,
+) -> DeclaredScopeAdmission {
+  require regex_match("^[0-9a-f]{40}$", head) != nil, "invalid CI scope source"
+  require declared == declared.unique().sorted(), "CI scopes are not normalized"
+  const pending: DeclaredScopeAdmission = {
+    admitted: len(declared) == 0,
+    declared: declared,
+    unproven: declared,
+    runId: nil,
+    attempt: nil,
+    refreshable: false,
+    required_jobs: nil,
+    unexecuted_jobs: nil,
+  }
+  if len(declared) == 0 || proof == nil {
+    return pending
+  }
+  const inspection = proof.original
+  const record = inspection.registered.registration
+  require record.commit == head && inspection.producer.head_sha == head,
+    "CI scope proof answers a different source"
+  const status = inspection.census.jobs.filter({ job -> job.name == "CI status" }).to_list()
+  const aggregate = len(status) == 1 && status[0]?.status == "completed"
+    && status[0]?.conclusion == "success"
+  const selection = record.selection == nil ? nil : scope_selection(record.selection)
+  const execution = scope_execution(proof.execution)
+  const unexecuted = selection == nil ? nil : unexecuted_selection(
+    inspection.producer,
+    inspection.registered,
+    inspection.census.jobs,
+    inspection.census.declared,
+    execution.requiredJobs,
+  )
+  const selected = execution.requiredJobs.map({ job -> job.id })
+  const passed = selected.filter({ id -> unexecuted != nil && !unexecuted.contains(id) })
+  const unproven = declared.filter(
+    { name ->
+      selection == nil || !aggregate
+        || (name == "full" ? selection.fullSuite != true || unexecuted == nil
+          || len(unexecuted) > 0 : !passed.contains(name))
+    },
+  )
+    .to_list()
+  return {
+    admitted: len(unproven) == 0,
+    declared: declared,
+    unproven: unproven,
+    runId: record.runId,
+    attempt: record.attempt,
+    refreshable: selection != nil && aggregate && len(unproven) > 0,
+    required_jobs: selection == nil ? nil : len(execution.requiredJobs),
+    unexecuted_jobs: unexecuted,
+  }
+}

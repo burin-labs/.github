@@ -15,6 +15,7 @@ import {
 } from "./contract.harn"
 import { checkpoint_enrollment, current_run, live_source } from "./live.harn"
 import { READ_BUDGET, discover, merge_group_pull } from "./reader.harn"
+import { scope_selection } from "./selection.harn"
 import { tested_source } from "./source.harn"
 
 type Decision = {discovery: dict, requested: int?, reused: list<string>, unproven: int?}
@@ -38,6 +39,7 @@ fn register(harness: Harness, published: Registration) {
   const path = directory + "/registration.json"
   write_json(harness.fs, path, published, {pretty: true, trailing_newline: true})
   output(harness, "registration", path)
+  output(harness, "tested-source", json_stringify(published.tested_source))
   output(
     harness,
     "registration-name",
@@ -101,7 +103,10 @@ fn resolve(harness: Harness, wanted: list<JobIdentity>, universe: ProofUniverse?
   // proves it there instead of trusting this run's pointer.
   require tested_source(harness.process, workspace) == actual_source,
     "tested checkout changed during proof discovery"
-  const published = registration(current, wanted, found.admitted, actual_source)
+  const recorded = registration(current, wanted, found.admitted, actual_source)
+  const selection = trim(harness.env.get("CI_JOB_PROOF_SELECTION") ?? "")
+  const published: Registration = selection == "" ? recorded : recorded
+    + {selection: scope_selection(json_parse(selection))}
   register(harness, published)
   if len(found.admitted) == 0 {
     harness.stdio.println("No qualified job proof; selected jobs will run.")

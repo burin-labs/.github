@@ -1,0 +1,48 @@
+/** Selection is recorded by the same attempt that registers the jobs' inputs. */
+pub type SelectedJob = {id: string, names: list<string>}
+
+pub type ScopeSelection = {schema: string, fullSuite: bool, declared: list<string>}
+
+pub type ScopeExecution = {
+  schema: string,
+  repository: string,
+  workflow: string,
+  event: string,
+  commit: string,
+  runId: int,
+  attempt: int,
+  tested_source: {commit: string, tree: string},
+  selection: ScopeSelection,
+  requiredJobs: list<SelectedJob>,
+}
+
+pub fn scope_selection(raw: unknown) -> ScopeSelection {
+  const value = schema_expect(raw, schema_of(ScopeSelection))
+  require value.schema == "burin.ci_scope_selection.v1", "unknown CI scope selection schema"
+  require len(value.declared) <= 256 && value.declared == value.declared.unique().sorted()
+    && value.declared.all({ name -> regex_match("^[A-Za-z_][A-Za-z0-9_-]{0,127}$", name) != nil }),
+    "CI scope selection is not normalized"
+  require !value.declared.contains("full") || value.fullSuite,
+    "a declared full CI scope must select the full suite"
+  return value
+}
+
+pub fn scope_execution(raw: unknown) -> ScopeExecution {
+  const value = schema_expect(raw, schema_of(ScopeExecution))
+  require value.schema == "burin.ci_scope_execution.v1", "unknown CI scope execution schema"
+  const selection = scope_selection(value.selection)
+  const ids = value.requiredJobs.map({ job -> job.id })
+  require len(ids) <= 1000 && ids == ids.unique().sorted()
+    && (!selection.fullSuite || len(ids) > 0)
+    && value.requiredJobs.all(
+      { job ->
+        regex_match("^[A-Za-z_][A-Za-z0-9_-]{0,127}$", job.id) != nil
+          && len(job.names) > 0
+          && len(job.names) <= 256
+          && job.names == job.names.unique()
+          && job.names.all({ name -> name != "" && len(name) <= 1024 })
+      },
+    ),
+    "CI scope execution requirements are unmeasured"
+  return value
+}

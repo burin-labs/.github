@@ -18,6 +18,7 @@ release_asset = "scripts/release-asset/download.harn"
 review_admission = "scripts/smart-ship/review-admission.harn"
 check_admission = "scripts/smart-ship/check-admission.harn"
 runtime_pin = "scripts/smart-ship/runtime-pin.harn"
+ci_scope = "scripts/smart-ship/ci-scope.harn"
 
 [dependencies]
 harn-github-connector = { git = "https://github.com/burin-labs/harn-github-connector", tag = "v0.19.0" }

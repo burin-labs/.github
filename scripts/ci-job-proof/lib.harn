@@ -7,12 +7,22 @@ pub import {
   RunContext,
   TestedSource,
 } from "./contract.harn"
+pub import {
+  DeclaredScopeAdmission,
+  declarable_scopes,
+  declared_scope_admission,
+  declared_scopes,
+  scope_declaration_names,
+} from "./declared_scope.harn"
 pub import { current_run, live_source } from "./live.harn"
 pub import {
   HistoricalReuse,
   OriginalRunInspection,
+  ScopeInspection,
   ProofSource,
   historical_reuse,
   inspect_original_run,
+  inspect_scope_run,
   inspect_run,
 } from "./reader.harn"
+pub import { ScopeExecution, ScopeSelection, scope_execution, scope_selection } from "./selection.harn"

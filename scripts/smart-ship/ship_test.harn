@@ -149,6 +149,7 @@ fn pr(over: dict = {}) -> Repo {
     id: "PR_1",
     number: 9,
     title: "t",
+    body: "",
     state: "OPEN",
     isDraft: false,
     isCrossRepository: false,

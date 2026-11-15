@@ -6,6 +6,10 @@ description: >-
   Unknown or unreadable proof runs the job.
 
 inputs:
+  selection:
+    description: Optional normalized scope selection measured by this attempt's canonical selector.
+    required: false
+    default: ''
   skip-harn-setup:
     description: Use the caller's already installed supported Harn instead of replacing its pinned runtime.
     required: false
@@ -85,6 +89,9 @@ inputs:
     default: ""
 
 outputs:
+  tested-source:
+    description: Measured clean checkout commit and tree bound to this attempt's registration.
+    value: ${{ steps.resolve.outputs.tested-source }}
   registration:
     description: Path to the complete source-bound registration uploaded for this attempt; empty when none.
     value: ${{ steps.resolve.outputs.registration }}
@@ -126,6 +133,7 @@ runs:
         CI_JOB_PROOF_REPOSITORY: ${{ inputs.repository }}
         CI_JOB_PROOF_WORKFLOW: ${{ inputs.workflow-file }}
         CI_JOB_PROOF_IDENTITIES: ${{ inputs.job-identities }}
+        CI_JOB_PROOF_SELECTION: ${{ inputs.selection }}
         CI_JOB_PROOF_MERGE_GROUP_HEAD_REF: ${{ inputs.merge-group-head-ref }}
         CI_JOB_PROOF_REGISTRAR_JOB: ${{ inputs.registrar-job }}
         CI_JOB_PROOF_REGISTRAR_STEP: ${{ inputs.registrar-step }}
