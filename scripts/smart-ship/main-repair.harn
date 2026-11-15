@@ -1,0 +1,377 @@
+import {
+  auth,
+  checkout,
+  diff_refusal,
+  job_tail,
+  quiet,
+  sh,
+  signed,
+  stage_repair,
+} from "./ship.harn"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+type SourceControl = {sha: string, runId: int, attempt: int, passed: bool}
+
+type MainEpisode = {
+  schema: string,
+  redSha: string,
+  redRunId: int,
+  jobs: list<string>,
+  culprit: string,
+  goodSha: string,
+  bisect: {candidates: list<string>, lo: int, hi: int},
+  control: SourceControl,
+  testing?: unknown,
+}
+
+type Issue = {number: int, state: string, body: string, pull_request?: unknown}
+
+type Repository = {full_name: string, default_branch: string}
+
+type Ref = {ref: string, object: {sha: string}}
+
+type Run = {
+  id: int,
+  run_attempt: int,
+  head_sha: string,
+  status: string,
+  conclusion: string?,
+  path: string,
+}
+
+type Job = {
+  id: int,
+  name: string,
+  conclusion: string?,
+  steps: list<{name: string, conclusion: string?}>,
+}
+
+type JobPage = {total_count: int, jobs: list<Job>}
+
+type Report = {outcome: string, summary: string, spend: string}
+
+type DraftPull = {html_url: string, head: {sha: string}, draft: bool}
+
+type Prepared = {
+  nonce: string,
+  repo: string,
+  issue: int,
+  red_run: int,
+  head: string,
+  base: string,
+  branch: string,
+  episode: MainEpisode,
+}
+
+pub type Request = {
+  repo: string,
+  issue: int,
+  red_run: int,
+  head: string,
+  work: string,
+  nonce: string,
+  token: string,
+  opts: GithubClientOptions,
+  git_host: string,
+  read_log: fn(int) -> string,
+}
+
+fn gh(
+  harness: Harness,
+  opts: GithubClientOptions,
+  path: string,
+  method: string = "GET",
+  body: unknown = nil,
+) -> unknown {
+  const result = api_call(harness, {path: path, method: method, body: body, options: opts})
+  require is_ok(result), "main repair GitHub request failed: ${path}"
+  return unwrap(result)
+}
+
+pub fn episode(body: string) -> MainEpisode {
+  const parts = split(body, "<!-- main-red-state ")
+  require len(parts) == 2 && contains(parts[1], " -->"), "one controlled main-red state is required"
+  const value = schema_expect(json_parse(split(parts[1], " -->")[0]), schema_of(MainEpisode))
+  require value.schema == "burin.main_red_episode.v2" && value.redRunId > 0
+    && value.control.runId > 0
+    && value.control.attempt > 0
+    && value.control.passed
+    && value.testing == nil
+    && len(value.jobs) > 0
+    && len(unique(value.jobs)) == len(value.jobs)
+    && value.jobs.all({ name -> trim(name) != "" && name != "CI status" }),
+    "the episode has no controlled repairable failure"
+  const bisect = value.bisect
+  require bisect.lo == bisect.hi && bisect.lo >= 0 && bisect.hi < len(bisect.candidates)
+    && value.culprit == bisect.candidates[bisect.hi]
+    && value.redSha == bisect.candidates[len(bisect.candidates) - 1]
+    && value.control.sha == (bisect.lo == 0 ? value.goodSha : bisect.candidates[bisect.lo - 1]),
+    "the culprit and preceding control do not match the episode"
+  for sha in [value.redSha, value.culprit, value.goodSha, value.control.sha] + bisect.candidates {
+    require regex_match("^[0-9a-f]{40}$", sha) != nil, "the episode source is not a full commit"
+  }
+  return value
+}
+
+fn jobs(harness: Harness, request: Request, run: int) -> list<Job> {
+  let rows: list<Job> = []
+  let total = -1
+  for page in 1..21 {
+    const got = schema_expect(
+      gh(
+        harness,
+        request.opts,
+        "/repos/${request.repo}/actions/runs/${run}/jobs?filter=latest&per_page=50&page=${page}",
+      ),
+      schema_of(JobPage),
+    )
+    require got.total_count > 0 && got.total_count <= 1000
+      && (total == -1 || total == got.total_count)
+      && len(got.jobs) > 0,
+      "the repair job census is empty, partial or changing"
+    total = got.total_count
+    rows = rows + got.jobs
+    require len(rows) <= total && len(unique(rows.map({ row -> row.id }))) == len(rows)
+      && rows.all({ row -> row.id > 0 }),
+      "the repair job census has duplicate or invalid identities"
+    if len(rows) == total {
+      return rows
+    }
+  }
+  throw "the repair job census exceeds its bound"
+}
+
+fn named_jobs_measured(harness: Harness, request: Request, state: MainEpisode) {
+  const red_jobs = jobs(harness, request, state.redRunId)
+  const control_jobs = jobs(harness, request, state.control.runId)
+  for name in state.jobs {
+    const failed = red_jobs.filter({ job -> job.name == name })
+    const passed = control_jobs.filter({ job -> job.name == name })
+    const failure = failed[0]
+    const pass = passed[0]
+    require len(failed) == 1 && failure != nil && failure.conclusion == "failure"
+      && failure.steps.any({ step -> step.conclusion == "failure" && step.name != "Set up job" })
+      && len(passed) == 1
+      && pass != nil
+      && pass.conclusion == "success",
+      "the named failure or preceding-source control is unmeasured: ${name}"
+  }
+}
+
+fn current(harness: Harness, request: Request) -> {state: MainEpisode, base: string} {
+  require regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", request.repo) != nil
+    && request.issue > 0
+    && request.red_run > 0
+    && regex_match("^[0-9a-f]{40}$", request.head) != nil,
+    "invalid main repair request identity"
+  const repository = schema_expect(
+    gh(harness, request.opts, "/repos/${request.repo}"),
+    schema_of(Repository),
+  )
+  require repository.full_name == request.repo && repository.default_branch == "main",
+    "the main repair repository changed"
+  const ref = schema_expect(
+    gh(harness, request.opts, "/repos/${request.repo}/git/ref/heads/main"),
+    schema_of(Ref),
+  )
+  require ref.ref == "refs/heads/main" && ref.object.sha == request.head,
+    "main moved before repair publication"
+  const issue = schema_expect(
+    gh(harness, request.opts, "/repos/${request.repo}/issues/${request.issue}"),
+    schema_of(Issue),
+  )
+  require issue.number == request.issue && issue.state == "open" && issue.pull_request == nil,
+    "the main-red issue moved or closed"
+  const state = episode(issue.body)
+  require state.redRunId == request.red_run, "the main-red episode changed"
+  const red = schema_expect(
+    gh(harness, request.opts, "/repos/${request.repo}/actions/runs/${state.redRunId}"),
+    schema_of(Run),
+  )
+  const control = schema_expect(
+    gh(harness, request.opts, "/repos/${request.repo}/actions/runs/${state.control.runId}"),
+    schema_of(Run),
+  )
+  require red.id == state.redRunId && red.head_sha == state.redSha && red.status == "completed"
+    && red.conclusion == "failure"
+    && red.run_attempt >= 2
+    && red.path == ".github/workflows/ci-pr.yml"
+    && control.id == state.control.runId
+    && control.head_sha == state.control.sha
+    && control.status == "completed"
+    && control.run_attempt == state.control.attempt
+    && control.path == red.path,
+    "the red or preceding-source control run changed"
+  named_jobs_measured(harness, request, state)
+  return {state: state, base: repository.default_branch}
+}
+
+pub fn prepare_main(harness: Harness, request: Request) -> {prepared: bool} {
+  const observed = current(harness, request)
+  require request.nonce != "" && !harness.fs.exists(request.work),
+    "the main repair work directory is occupied"
+  const attempt_ref = "refs/smart-ship/main-red/${request.issue}/${request.red_run}"
+  const admitted = schema_expect(
+    gh(
+      harness,
+      request.opts,
+      "/repos/${request.repo}/git/refs",
+      "POST",
+      {ref: attempt_ref, sha: request.head},
+    ),
+    schema_of(Ref),
+  )
+  require admitted.ref == attempt_ref && admitted.object.sha == request.head,
+    "the main repair attempt was not confirmed"
+  sh(harness.tools, ["mkdir", "-m", "700", "--", request.work])
+  harness.fs.write_text("${request.work}/.owner", request.nonce)
+  checkout(
+    harness.tools,
+    "${request.git_host}${request.repo}.git",
+    auth(request.token),
+    request.work,
+    request.head,
+    observed.base,
+    false,
+  )
+  sh(
+    harness.tools,
+    ["git", "merge-base", "--is-ancestor", observed.state.redSha, request.head],
+    {},
+    "${request.work}/pristine",
+  )
+  harness.fs.write_text(
+    "${request.work}/pr/.git/objects/info/alternates",
+    "../../../pristine/.git/objects\n",
+  )
+  const task = harness.fs.render_prompt(
+    "main-repair.harn.prompt",
+    {
+      repo: request.repo,
+      issue: request.issue,
+      head: request.head,
+      red_run: request.red_run,
+      culprit: observed.state.culprit,
+      control: observed.state.control,
+      jobs: observed.state.jobs,
+      failures: jobs(harness, request, request.red_run).filter(
+        { job -> observed.state.jobs.contains(job.name) },
+      )
+        .map({ job -> {name: job.name, log: quiet(request.read_log(job.id))} }),
+    },
+  )
+  harness.fs.write_text(
+    "${request.work}/pr/.git/ship-task.json",
+    json_stringify({task: task, turns: 60}),
+  )
+  const prepared: Prepared = {
+    nonce: request.nonce,
+    repo: request.repo,
+    issue: request.issue,
+    red_run: request.red_run,
+    head: request.head,
+    base: observed.base,
+    branch: "smart-ship/main-red-${request.issue}-${substring(request.head, 0, 12)}",
+    episode: observed.state,
+  }
+  harness.fs.write_text("${request.work}/job.json", json_stringify(prepared))
+  gh(
+    harness,
+    request.opts,
+    "/repos/${request.repo}/issues/${request.issue}/comments",
+    "POST",
+    {
+      body:
+        "Smart Ship started one bounded fix-forward repair at `${request.head}`. It can open a draft fix PR; approval and protected CI still own integration. Run: https://github.com/${request.repo}/actions/runs/${split(request.nonce, ".")[0]}.",
+    },
+  )
+  return {prepared: true}
+}
+
+pub fn publish_main(harness: Harness, request: Request) -> string {
+  const observed = current(harness, request)
+  const job = schema_expect(
+    json_parse(harness.fs.read_text("${request.work}/job.json")),
+    schema_of(Prepared),
+  )
+  require job.nonce == request.nonce && job.repo == request.repo && job.issue == request.issue
+    && job.red_run == request.red_run
+    && job.head == request.head
+    && job.episode == observed.state,
+    "the prepared main repair does not match this publication"
+  const result = "${request.work}/pr/.git/ship-result.json"
+  require harness.fs.exists(result),
+    "the repair has no terminal report; its work remains on the runner"
+  const out = schema_expect(json_parse(harness.fs.read_text(result)), schema_of(Report))
+  require ["fixed", "stuck", "timeout", "unrelated"].contains(out.outcome), "unknown repair result"
+  let note =
+    "Repair outcome: ${out.outcome}. ${quiet(out.summary)}\n\nRepair model spend: ${quiet(out.spend)}."
+  if out.outcome == "fixed" {
+    require stage_repair(harness, request.work) == "", "the main repair could not be safely staged"
+    const pristine = "${request.work}/pristine"
+    sh(harness.tools, ["git", "diff", "--cached", "--check"], {}, pristine)
+    const refusal = diff_refusal(harness.tools, pristine, job.head)
+    require refusal == "", "the main repair was refused: ${refusal}"
+    const ref = "/repos/${request.repo}/git/refs"
+    gh(harness, request.opts, ref, "POST", {ref: "refs/heads/${job.branch}", sha: job.head})
+    const commit = signed(
+      harness,
+      request.opts,
+      request.repo,
+      job.branch,
+      pristine,
+      "[CI] Repair the controlled main failure for #${job.issue}",
+    )
+    const pull = schema_expect(
+      gh(
+        harness,
+        request.opts,
+        "/repos/${request.repo}/pulls",
+        "POST",
+        {
+          title: "[CI] Repair the controlled main failure for #${job.issue}",
+          head: job.branch,
+          base: job.base,
+          draft: true,
+          body:
+            "Fix-forward repair for #${job.issue}, prepared from `${job.head}` after the responder measured a failing run and a passing preceding-source control.\n\n${note}\n\nThe agent's report is not CI evidence. Review this exact head and complete the protected checks before shipping. Refs #${job.issue}.",
+        },
+      ),
+      schema_of(DraftPull),
+    )
+    require pull.head.sha == commit && pull.draft, "the draft fix PR publication was not confirmed"
+    note = "Opened ${pull.html_url} at `${commit}`. ${note}"
+  }
+  gh(
+    harness,
+    request.opts,
+    "/repos/${request.repo}/issues/${request.issue}/comments",
+    "POST",
+    {body: note},
+  )
+  return note
+}
+
+fn main(harness: Harness) {
+  const repo = harness.env.get("GITHUB_REPOSITORY") ?? ""
+  const token = harness.env.get("GH_TOKEN") ?? ""
+  const request: Request = {
+    repo: repo,
+    issue: to_int(harness.env.get("MAIN_REPAIR_ISSUE") ?? "") ?? 0,
+    red_run: to_int(harness.env.get("MAIN_REPAIR_RUN") ?? "") ?? 0,
+    head: harness.env.get("MAIN_REPAIR_HEAD") ?? "",
+    work: harness.env.get("SHIP_WORK") ?? "",
+    nonce: harness.env.get("SHIP_NONCE") ?? "",
+    token: token,
+    opts: {installation_token: harness.env.get("GH_TOKEN") ?? "", budget: {state_dir: ""}},
+    git_host: "https://github.com/",
+    read_log: { id -> job_tail(harness.tools, repo, token, id) },
+  }
+  require request.token != "" && request.work != "",
+    "missing main repair authority or work directory"
+  if harness.env.get("SHIP_MODE") == "publish" {
+    harness.stdio.println(publish_main(harness, request))
+  } else {
+    prepare_main(harness, request)
+  }
+}

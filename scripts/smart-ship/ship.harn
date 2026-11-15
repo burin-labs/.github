@@ -938,20 +938,8 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
   } else if wip != "" && !previous {
     gh(harness, job.opts, "/repos/${repo}/git/refs/smart-ship/wip/${number}", "DELETE")
   }
-  const tail = { id ->
-    const got = run(
-      harness.tools,
-      ["gh", "api", "--allow-escape-sequences", "repos/${repo}/actions/jobs/${id}/logs"],
-      {GH_TOKEN: token},
-    )
-    // A cut-off read holds the head of the log, not its end, so it is not passed off as the end.
-    return !got.success || (got?.stdout_truncated ?? false) ? "(the log could not be read whole)" : join(
-      split(regex_replace("\\x1b\\[[0-9;]*[A-Za-z]", "", got.stdout), "\n").slice(-120),
-      "\n",
-    )
-  }
   const failing = f.failing.map(
-    { c -> {name: c.name, log: c.databaseId == nil ? "" : tail(c.databaseId)} },
+    { c -> {name: c.name, log: c.databaseId == nil ? "" : job_tail(harness.tools, repo, token, c.databaseId)} },
   )
   // Only writers' words reach the agent; any unresolved thread still blocks the landing.
   const threads = f.threads.map(
@@ -1008,6 +996,19 @@ fn prepare(harness: Harness, job: Look, r: Repo, f: dict) {
 }
 
 const DIFF_CAP = 1048576
+
+/** A bounded log tail is evidence only when the command read the whole log. */
+pub fn job_tail(tools: HarnessTools, repo: string, token: string, id: int) -> string {
+  const got = run(
+    tools,
+    ["gh", "api", "--allow-escape-sequences", "repos/${repo}/actions/jobs/${id}/logs"],
+    {GH_TOKEN: token},
+  )
+  return !got.success || (got?.stdout_truncated ?? false) ? "(the log could not be read whole)" : join(
+    split(regex_replace("\\x1b\\[[0-9;]*[A-Za-z]", "", got.stdout), "\n").slice(-120),
+    "\n",
+  )
+}
 
 const SECRET =
   "ghs_[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
@@ -1252,7 +1253,7 @@ pub fn quiet(text: string) -> string {
   return regex_replace(SECRET, "[redacted]", replace(text, "<!--", "&lt;!--"))
 }
 
-fn auth(token: string) -> dict {
+pub fn auth(token: string) -> dict {
   return GIT_ISOLATED
     + {
       GIT_CONFIG_COUNT: "1",
@@ -1264,7 +1265,7 @@ fn auth(token: string) -> dict {
 /**
  * Commit the trusted clone's index onto `branch` as one GitHub-signed commit; a moved branch refuses.
  */
-fn signed(
+pub fn signed(
   harness: Harness,
   opts: GithubClientOptions,
   repo: string,
