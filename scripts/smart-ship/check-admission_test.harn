@@ -1,4 +1,4 @@
-import { Check, current_checks } from "./check-admission.harn"
+import { Check, assess_checks, current_checks } from "./check-admission.harn"
 
 fn check(id: int, conclusion: string) -> Check {
   return {
@@ -56,4 +56,101 @@ pipeline test_duplicate_check_identity_is_not_ordered_by_input_position() {
 pipeline test_current_check_census_keeps_a_known_nonempty_and_measured_zero() {
   assert_eq(len(current_checks([check(100, "SUCCESS")], "head")), 1)
   assert_eq(current_checks([], "head"), [])
+}
+
+fn consumer_checks() -> list<Check> {
+  const names = [
+    "Consumer check / Consumer canary",
+    "Consumer check retry / Consumer canary",
+    "CI status",
+  ]
+  return [0, 1, 2].map(
+    { index ->
+      {
+        name: names[index] ?? "",
+        databaseId: 100 + index,
+        status: "COMPLETED",
+        conclusion: index == 0 ? "FAILURE" : "SUCCESS",
+        checkSuite: {
+          id: "consumer-suite",
+          status: "COMPLETED",
+          conclusion: "FAILURE",
+          commit: {oid: "head"},
+          app: {id: "MDM6QXBwMTUzNjg="},
+          checkRuns: {totalCount: 3},
+          workflowRun: {
+            databaseId: 42,
+            event: "pull_request",
+            workflow: {id: "W_kwDORxdAHc4PAxHq", name: "CI"},
+          },
+        },
+      }
+    },
+  )
+    .to_list()
+}
+
+pipeline test_assessment_keeps_recovered_measurements_visible() {
+  const rows = consumer_checks()
+  const source = {repository: "burin-labs/harn", head_sha: "head"}
+  const result = assess_checks(rows, source)
+  assert_eq(result.current, rows)
+  assert_eq(result.measurements, [rows[0]])
+  assert_eq(result.gating, [rows[1], rows[2]])
+  assert_eq(current_checks(rows, "head"), rows, "raw current checks retain the failure")
+  assert_eq(assess_checks([], source), {current: [], measurements: [], gating: []})
+}
+
+pipeline test_assessment_refuses_unproven_recovery() {
+  const rows = consumer_checks()
+  const source = {repository: "burin-labs/harn", head_sha: "head"}
+  for invalid in [
+    rows.filter({ c -> c.name != "CI status" }).to_list(),
+    rows + [rows[2]],
+    rows.map({ c -> c.name == "CI status" ? c + {conclusion: "SKIPPED"} : c }).to_list(),
+    rows.map({ c -> c.name == "CI status" ? c + {status: "IN_PROGRESS"} : c }).to_list(),
+    rows.map({ c -> c.name == "CI status" ? c + {checkSuite: nil} : c }).to_list(),
+    rows.map({ c -> c.name == "CI status" ? c + {databaseId: nil} : c }).to_list(),
+    rows.map(
+      { c ->
+        c.name == "CI status" ? c
+          + {checkSuite: (c.checkSuite ?? {}) + {checkRuns: {totalCount: 4}}} : c
+      },
+    )
+      .to_list(),
+    rows.map(
+      { c ->
+        c.name == "Consumer check / Consumer canary" ? c
+          + {
+            checkSuite: (c.checkSuite ?? {})
+              + {
+                workflowRun: {
+                  databaseId: 43,
+                  event: "pull_request",
+                  workflow: {id: "W_kwDORxdAHc4PAxHq", name: "CI"},
+                },
+              },
+          } : c
+      },
+    )
+      .to_list(),
+    rows.map(
+      { c -> c.name == "Consumer check / Consumer canary" ? c + {name: "unrelated failure"} : c },
+    )
+      .to_list(),
+    rows.map(
+      { c -> c.name == "Consumer check / Consumer canary" ? c + {conclusion: "TIMED_OUT"} : c },
+    )
+      .to_list(),
+  ] {
+    const result = assess_checks(invalid, source)
+    assert_eq(result.measurements, [], to_string(invalid))
+    assert_eq(result.gating, result.current)
+    assert(result.gating.any({ c -> c.conclusion == "FAILURE" || c.conclusion == "TIMED_OUT" }))
+  }
+  for wrong_source in [source + {repository: "burin-labs/other"}, source + {head_sha: "other-head"}] {
+    const result = assess_checks(rows, wrong_source)
+    assert_eq(result.measurements, [])
+    assert_eq(result.gating, rows)
+  }
 }

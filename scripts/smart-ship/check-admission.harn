@@ -20,6 +20,93 @@ pub type Check = {
 
 pub const RERUN = ["CANCELLED", "STALE"]
 
+pub type CheckSource = {repository: string, head_sha: string}
+
+pub type CheckAssessment = {current: list<Check>, measurements: list<Check>, gating: list<Check>}
+
+type MeasurementPolicy = {
+  repository: string,
+  app: string,
+  workflow: string,
+  aggregate: string,
+  measurements: list<string>,
+}
+
+// Harn's aggregate compares each PR rehearsal with its base on the same
+// consumer commit. These checks report measurements, not independent gates.
+const CONSUMER_MEASUREMENTS: MeasurementPolicy = {
+  repository: "burin-labs/harn",
+  app: "MDM6QXBwMTUzNjg=",
+  workflow: "W_kwDORxdAHc4PAxHq",
+  aggregate: "CI status",
+  measurements: [
+    "Consumer check / Consumer canary",
+    "Consumer check retry / Consumer canary",
+    "Consumer base check / Consumer canary",
+    "Consumer base check retry / Consumer canary",
+  ],
+}
+
+/** Current observations, their delegated negative measurements, and independent gates. */
+pub fn assess_checks(checks: list<Check>, source: CheckSource) -> CheckAssessment {
+  const current = current_checks(checks, source.head_sha)
+  const measurements = aggregate_measurements(current, source)
+  return {
+    current: current,
+    measurements: measurements,
+    gating: current.filter(
+      { c ->
+        !measurements.any(
+          { m -> m.databaseId == c.databaseId && m.checkSuite?.id == c.checkSuite?.id },
+        )
+      },
+    )
+      .to_list(),
+  }
+}
+
+/** Negative measurements delegated to their exact, successful owning aggregate. */
+fn aggregate_measurements(checks: list<Check>, source: CheckSource) -> list<Check> {
+  const policy = CONSUMER_MEASUREMENTS
+  if source.repository != policy.repository {
+    return []
+  }
+  const head = source.head_sha
+  const aggregates = checks.filter({ c -> c.name == policy.aggregate }).to_list()
+  if len(aggregates) != 1 {
+    return []
+  }
+  const aggregate = aggregates[0]
+  if aggregate == nil {
+    return []
+  }
+  const suite = aggregate.checkSuite
+  const run = suite?.workflowRun
+  const key = generation(aggregate, head)
+  if key == nil || suite?.id == nil || suite.status != "COMPLETED"
+    || suite.app?.id != policy.app
+    || run?.workflow?.id != policy.workflow
+    || run.event != "pull_request"
+    || aggregate.status != "COMPLETED"
+    || aggregate.conclusion != "SUCCESS" {
+    return []
+  }
+  const read = checks.filter({ c -> c.checkSuite?.id == suite.id }).to_list()
+  if len(read) != (suite.checkRuns?.totalCount ?? -1)
+    || len(read.map({ c -> c.databaseId }).unique()) != len(read)
+    || !read.all(
+      { c ->
+        c.databaseId != nil && c.status == "COMPLETED"
+          && generation(c, head) == key
+          && run_id(c) == run_id(aggregate)
+      },
+    ) {
+    return []
+  }
+  return read.filter({ c -> c.conclusion == "FAILURE" && policy.measurements.contains(c.name) })
+    .to_list()
+}
+
 /** Unknown producers never collapse; display names are not producer identity. */
 fn producer(c: Check) -> string? {
   if c.state != nil {
