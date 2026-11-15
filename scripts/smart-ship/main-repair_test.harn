@@ -1,5 +1,5 @@
 import { shell_command_shape } from "std/command"
-import { Request, prepare_main, publish_main } from "./main-repair.harn"
+import { Request, prepare_main, publish_main, setup_main } from "./main-repair.harn"
 import { sh } from "./ship.harn"
 
 type Fixture = {dir: string, head: string, good: string, state: dict, request: Request}
@@ -217,6 +217,83 @@ pipeline test_main_repair_prepares_the_actual_controlled_checkout(harness: Harne
   const claim = calls.filter({ call -> call.method == "POST" && ends_with(call.url, "/git/refs") })
   assert_eq(len(claim), 1, "the actual expected-absent attempt is written before model work")
   assert(contains(claim[0].body, "refs/smart-ship/main-red/9/10"))
+}
+
+pipeline test_dependency_preparation_requires_owned_source_and_a_successful_locked_install(
+  harness: Harness,
+) {
+  for scenario in [
+    "ready",
+    "wrong-owner",
+    "wrong-head",
+    "unknown-repo",
+    "installer-failed",
+    "install-failed",
+  ] {
+    const f = fixture(pick(harness, ["fs", "tools"]))
+    mocks(harness.testing, f)
+    prepare_main(harness, f.request)
+    const root = "${f.request.work}/pr"
+    const job_path = "${f.request.work}/job.json"
+    const job = json_parse(harness.fs.read_text(job_path))
+    harness.fs.write_text(
+      job_path,
+      json_stringify(
+        job
+          + {
+            repo: scenario == "unknown-repo" ? "o/r" : "burin-labs/burin-code",
+            head: scenario == "wrong-head" ? f.good : f.head,
+          },
+      ),
+    )
+    if scenario == "wrong-owner" {
+      harness.fs.write_text("${f.request.work}/.owner", "another-run")
+    }
+    const installer = "${root}/.github/actions/setup-pnpm"
+    harness.fs.mkdir(installer, true)
+    harness.fs.write_text(
+      "${installer}/install.mjs",
+      """
+import {mkdirSync, writeFileSync, chmodSync} from 'node:fs';
+const root = process.env.GITHUB_WORKSPACE;
+writeFileSync(root + '/installer-reached', 'yes');
+if (${json_stringify(scenario)} === 'installer-failed') process.exit(17);
+const bin = process.env.INPUT_DEST + '/bin';
+mkdirSync(bin, {recursive: true});
+const script = `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (JSON.stringify(args) === '["--version"]') { console.log('1.2.3'); }
+else {
+  if (JSON.stringify(args) !== '["install","--frozen-lockfile","--ignore-scripts"]') process.exit(19);
+  fs.writeFileSync('install-reached', JSON.stringify({args, ci: process.env.CI}));
+  if (${json_stringify(scenario)} === 'install-failed') process.exit(23);
+}
+`;
+writeFileSync(bin + '/pnpm', script);
+chmodSync(bin + '/pnpm', 0o755);
+""",
+    )
+    // The fixture controls only the external installer; the actual setup owner runs.
+    const result = try {
+      setup_main(harness, f.request.work, f.request.nonce)
+    }
+    assert_eq(is_ok(result), scenario == "ready", scenario)
+    const admitted = ["ready", "installer-failed", "install-failed"].contains(scenario)
+    assert_eq(harness.fs.exists("${root}/installer-reached"), admitted, scenario)
+    assert_eq(
+      harness.fs.exists("${root}/install-reached"),
+      ["ready", "install-failed"].contains(scenario),
+      scenario,
+    )
+    if scenario == "ready" {
+      assert_eq(unwrap(result), {ready: true})
+      assert_eq(
+        json_parse(harness.fs.read_text("${root}/install-reached")),
+        {args: ["install", "--frozen-lockfile", "--ignore-scripts"], ci: "true"},
+      )
+    }
+  }
 }
 
 pipeline test_main_repair_refuses_stale_or_unmeasured_inputs_before_preparing(harness: Harness) {
@@ -456,6 +533,13 @@ pipeline test_main_repair_keeps_the_existing_credential_and_deadline_boundary(ha
   )
   assert_eq(job.env.MAIN_REPAIR_TARGET_BRANCH, r"${{ inputs.target_branch }}")
   const agent = job.steps.find({ step -> step.id == "repair" })
+  const dependencies = job.steps.find({ step -> step.id == "dependencies" })
+  assert_eq(keys(dependencies.env).sorted(), ["SHIP_MODE", "SHIP_WORK"])
+  assert_eq(dependencies.env.SHIP_MODE, "setup")
+  assert_eq(
+    agent.if,
+    "steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success'",
+  )
   const previous = regular.jobs.ship.steps.find({ step -> step.id == "repair" })
   assert_eq(
     keys(agent.env),

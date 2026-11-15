@@ -346,6 +346,37 @@ pub fn prepare_main(harness: Harness, request: Request) -> {prepared: bool} {
   return {prepared: true}
 }
 
+/** Prepare the existing repository toolchain before the agent loses child network. */
+pub fn setup_main(harness: Harness, work: string, nonce: string) -> {ready: bool} {
+  const job = schema_expect(
+    json_parse(harness.fs.read_text("${work}/job.json")),
+    schema_of(Prepared),
+  )
+  require nonce != "" && job.nonce == nonce && harness.fs.read_text("${work}/.owner") == nonce,
+    "main repair setup does not own this checkout"
+  require job.repo == "burin-labs/burin-code",
+    "main repair dependency preparation is not declared for this repository"
+  const root = "${work}/pr"
+  require sh(harness.tools, ["git", "rev-parse", "HEAD"], {}, root) == job.head,
+    "the repair checkout changed before dependency preparation"
+  const destination = "${root}/.git/ship-pnpm"
+  sh(
+    harness.tools,
+    ["node", ".github/actions/setup-pnpm/install.mjs"],
+    {GITHUB_WORKSPACE: root, INPUT_DEST: destination},
+    root,
+  )
+  const pnpm = "${destination}/bin/pnpm"
+  const version = sh(harness.tools, [pnpm, "--version"], {}, root)
+  require regex_match("^[0-9]+\\.[0-9]+\\.[0-9]+$", version) != nil,
+    "the prepared package manager did not report its version"
+  sh(harness.tools, [pnpm, "install", "--frozen-lockfile", "--ignore-scripts"], {CI: "true"}, root)
+  harness.stdio.println(
+    "Main repair dependencies prepared with canonical pnpm ${version}; child network remains disabled",
+  )
+  return {ready: true}
+}
+
 pub fn publish_main(harness: Harness, request: Request) -> string {
   const observed = current(harness, request)
   const job = schema_expect(
@@ -413,6 +444,12 @@ pub fn publish_main(harness: Harness, request: Request) -> string {
 }
 
 fn main(harness: Harness) {
+  if harness.env.get("SHIP_MODE") == "setup" {
+    harness.stdio.println(
+      setup_main(harness, harness.env.get("SHIP_WORK") ?? "", harness.env.get("SHIP_NONCE") ?? ""),
+    )
+    return
+  }
   const repo = harness.env.get("GITHUB_REPOSITORY") ?? ""
   const token = harness.env.get("GH_TOKEN") ?? ""
   const request: Request = {

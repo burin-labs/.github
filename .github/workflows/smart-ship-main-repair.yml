@@ -76,9 +76,22 @@ jobs:
           set -euo pipefail
           harn install --locked
           harn run --no-sandbox main-repair.harn
+      - name: Set up the checkout's Node runtime
+        if: steps.prepare.outcome == 'success'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ runner.temp }}/smart-ship-main-${{ github.run_id }}-${{ github.run_attempt }}/pr/.node-version
+      - name: Prepare locked dependencies without publication credentials
+        id: dependencies
+        if: steps.prepare.outcome == 'success'
+        working-directory: .smart-ship/scripts/smart-ship
+        env:
+          SHIP_MODE: setup
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-main-${{ github.run_id }}-${{ github.run_attempt }}
+        run: harn run --no-sandbox main-repair.harn
       - name: Repair without credentials
         id: repair
-        if: steps.prepare.outcome == 'success'
+        if: steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success'
         timeout-minutes: 25
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -93,7 +106,7 @@ jobs:
             --write-root "$SHIP_WORK/pr" \
             "$SHIP_WORK/agent/repair.harn"
       - name: Publish a draft fix PR
-        if: always() && steps.prepare.outcome == 'success'
+        if: always() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success'
         working-directory: .smart-ship/scripts/smart-ship
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
