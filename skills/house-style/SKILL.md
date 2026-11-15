@@ -1,5 +1,6 @@
 ---
 name: house-style
+short: Write Burin Labs documentation to house style.
 description: Write or review documentation pages, README material, help-center articles, migration notes, and changelog entries in burin-code, harn, or harn-cloud. Applies house rules for reading level, Diátaxis mode, voice, headings, claims, and generated pages.
 metadata:
   short-description: Write Burin Labs documentation to house style.
