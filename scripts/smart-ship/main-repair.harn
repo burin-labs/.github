@@ -37,6 +37,8 @@ type Run = {
   status: string,
   conclusion: string?,
   path: string,
+  head_branch: string,
+  event: string,
 }
 
 type Job = {
@@ -192,18 +194,28 @@ fn current(harness: Harness, request: Request) -> {state: MainEpisode, base: str
     gh(harness, request.opts, "/repos/${request.repo}/actions/runs/${state.control.runId}"),
     schema_of(Run),
   )
-  require red.id == state.redRunId && red.head_sha == state.redSha && red.status == "completed"
+  require run_pair_matches(red, control, state), "the red or preceding-source control run changed"
+  named_jobs_measured(harness, request, state)
+  return {state: state, base: repository.default_branch}
+}
+
+fn run_pair_matches(red: Run, control: Run, state: MainEpisode) -> bool {
+  const red_origin =
+    (red.head_branch == "main" && ["push", "workflow_dispatch"].contains(red.event))
+    || (red.event == "workflow_dispatch" && red.head_branch == "ci-checkpoint/${state.redSha}")
+  return red_origin && red.id == state.redRunId && red.head_sha == state.redSha
+    && red.status == "completed"
     && red.conclusion == "failure"
     && red.run_attempt >= 2
     && red.path == ".github/workflows/ci-pr.yml"
     && control.id == state.control.runId
+    && control.id > red.id
     && control.head_sha == state.control.sha
     && control.status == "completed"
     && control.run_attempt == state.control.attempt
-    && control.path == red.path,
-    "the red or preceding-source control run changed"
-  named_jobs_measured(harness, request, state)
-  return {state: state, base: repository.default_branch}
+    && control.path == red.path
+    && control.event == "workflow_dispatch"
+    && control.head_branch == "ci-bisect/${substring(state.redSha, 0, 12)}/${state.control.sha}"
 }
 
 pub fn prepare_main(harness: Harness, request: Request) -> {prepared: bool} {

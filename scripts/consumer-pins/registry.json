@@ -73,6 +73,12 @@
       "release_path": false
     },
     {
+      "kind": "workflow",
+      "name": "smart-ship-main-repair.yml",
+      "paths": [".github/workflows/smart-ship-main-repair.yml", "scripts/smart-ship/"],
+      "release_path": false
+    },
+    {
       "kind": "action",
       "name": "check-commit-signatures",
       "paths": [".github/actions/check-commit-signatures/"],

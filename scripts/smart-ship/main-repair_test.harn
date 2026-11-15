@@ -65,14 +65,18 @@ fn mocks(testing: HarnessTesting, f: Fixture, overrides: dict = {}) {
       status: "completed",
       conclusion: "failure",
       path: ".github/workflows/ci-pr.yml",
+      head_branch: "main",
+      event: "push",
     },
-    "/actions/runs/11": {
-      id: 11,
+    ["/actions/runs/${overrides.control_run_id ?? 11}"]: {
+      id: overrides.control_run_id ?? 11,
       run_attempt: 1,
       head_sha: f.good,
       status: "completed",
       conclusion: "success",
       path: ".github/workflows/ci-pr.yml",
+      head_branch: overrides.control_branch ?? "ci-bisect/${substring(f.head, 0, 12)}/${f.good}",
+      event: "workflow_dispatch",
     },
     "/actions/runs/10/jobs?filter=latest&per_page=50&page=1": overrides.red_jobs
       ?? {
@@ -86,7 +90,8 @@ fn mocks(testing: HarnessTesting, f: Fixture, overrides: dict = {}) {
           },
         ],
       },
-    "/actions/runs/11/jobs?filter=latest&per_page=50&page=1": overrides.control_jobs
+    ["/actions/runs/${overrides.control_run_id ?? 11}/jobs?filter=latest&per_page=50&page=1"]: overrides
+      .control_jobs
       ?? {total_count: 1, jobs: [{id: 2, name: "Unit tests", conclusion: "success", steps: []}]},
   }
   for path in keys(rows) {
@@ -129,6 +134,8 @@ pipeline test_main_repair_refuses_stale_or_unmeasured_inputs_before_preparing(ha
   for scenario in [
     {head: f.good},
     {issue_state: "closed"},
+    {control_branch: "main"},
+    {control_run_id: 9, state: {...f.state, control: {...f.state.control, runId: 9}}},
     {red_jobs: {total_count: 0, jobs: []}},
     {
       control_jobs: {

@@ -56,6 +56,7 @@ on:
       - '.github/workflows/register-package-release.yml'
       - '.github/workflows/repin.yml'
       - '.github/workflows/runner-availability.yml'
+      - '.github/workflows/smart-ship-main-repair.yml'
       - '.github/workflows/smart-ship.yml'
       - 'schemas/candidate-manifest.v1.json'
       - 'scripts/captured-command.harn'
