@@ -1,4 +1,4 @@
-import { Registration, Run } from "./contract.harn"
+import { CONSUMER_EVENTS, Registration, Run } from "./contract.harn"
 import { registration_from_archive } from "./live.harn"
 import { ProofSource, historical_reuse, historical_reuse_batch } from "./reader.harn"
 
@@ -114,6 +114,79 @@ fn fixture(
     ) },
   }
   return {source: source, current: current, main: main, directory: directory}
+}
+
+pipeline test_historical_original_census_must_finish_inside_its_existing_elapsed_budget(
+  harness: Harness,
+) {
+  const sample = fixture(harness.fs, "skipped", "success", "a".repeat(64))
+  try {
+    assert(CONSUMER_EVENTS.contains(sample.main.event))
+    assert(CONSUMER_EVENTS.contains(sample.current.event))
+    assert_eq(sample.main.event, "push")
+    const positive = historical_reuse(sample.source, sample.current, sample.main, { -> 0 })
+    assert_eq(len(positive.jobs), 1)
+    assert_eq(positive.jobs[0]?.provenance, {runId: 10, attempt: 1})
+    for settled in [44999, 45000, 45001] {
+      let now = 0
+      let censuses = 0
+      const delayed: ProofSource = sample.source
+        + {
+          json: fn(path) {
+            const value = sample.source.json(path)
+            if path.contains("/runs/10/") && path.contains("/jobs?") {
+              censuses += 1
+              now = settled
+            }
+            return value
+          },
+        }
+      const measured = try {
+        historical_reuse(delayed, sample.current, sample.main, { -> now })
+      }
+      assert_eq(censuses, 1, "the original census must actually be reached")
+      if is_ok(measured) {
+        assert_eq(len(unwrap(measured).jobs), 1)
+      }
+      assert_eq(is_ok(measured), settled < 45000, "original census settled at ${settled}ms")
+    }
+  } finally {
+    harness.fs.delete(sample.directory)
+  }
+}
+
+pipeline test_historical_registration_cannot_publish_measured_empty_after_its_deadline(
+  harness: Harness,
+) {
+  const sample = fixture(harness.fs, "skipped", "success", "a".repeat(64))
+  try {
+    const positive = historical_reuse(
+      sample.source,
+      sample.current,
+      sample.main,
+      { -> 0 },
+      ["Other"],
+    )
+    assert_eq(positive, {jobs: [], pending: []})
+    let now = 0
+    let archives = 0
+    const delayed: ProofSource = sample.source
+      + {
+        registration: fn(repo, artifact) {
+          const value = sample.source.registration(repo, artifact)
+          archives += 1
+          now = 45000
+          return value
+        },
+      }
+    const measured = try {
+      historical_reuse(delayed, sample.current, sample.main, { -> now }, ["Other"])
+    }
+    assert_eq(archives, 1, "the authenticated registration must actually be read")
+    assert(is_err(measured), "an expired final archive is not a measured empty result")
+  } finally {
+    harness.fs.delete(sample.directory)
+  }
 }
 
 pipeline test_historical_skip_keeps_original_identity_and_phase(harness: Harness) {

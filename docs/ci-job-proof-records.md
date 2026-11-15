@@ -45,6 +45,10 @@ The implemented events are `pull_request`, `merge_group`, `push` and
 policy comes from your trusted installation, not from the inspected change.
 Supply the producer from an authenticated read of that exact run and attempt.
 The bounded `live_source` transport checks the downloaded archive bytes.
+Discovery and historical reuse share a 45-second read budget. Each JSON and
+registration read must finish before that deadline; a late final read cannot
+publish admitted jobs or a measured empty result. Cached reads also check the
+same deadline without consuming another network-read allowance.
 The shared action publishes an original input record for dispatch runs. Those
 runs do not search history, skip selected jobs or publish a reuse receipt.
 

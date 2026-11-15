@@ -454,26 +454,36 @@ fn bounded_source(source: ProofSource, now: fn() -> int, limit: int = READ_BUDGE
   let reads = 0
   let memo = {}
   const expires_at = now() + 45000
-  const take = fn() {
-    if reads >= limit || now() >= expires_at {
+  const check_elapsed = fn() {
+    if now() >= expires_at {
       throw "proof discovery budget exhausted"
     }
+  }
+  const take = fn() {
+    if reads >= limit {
+      throw "proof discovery budget exhausted"
+    }
+    check_elapsed()
     reads = reads + 1
   }
   return {
     source: {
       json: fn(endpoint) {
         if memo[endpoint] != nil {
+          check_elapsed()
           return memo[endpoint]
         }
         take()
         const result = source.json(endpoint)
+        check_elapsed()
         memo = memo + {[endpoint]: result}
         return result
       },
       registration: fn(repo, artifact) {
         take()
-        return source.registration(repo, artifact)
+        const result = source.registration(repo, artifact)
+        check_elapsed()
+        return result
       },
     },
     reads: fn() { return reads },
@@ -554,7 +564,7 @@ fn discover_positive(
     candidates(bounded.source, current, pull)
   }
   if is_err(listed) {
-    return result([], 0, "history_unmeasured")
+    return result([], 0, bounded.exhausted() ? "discovery_budget_exhausted" : "history_unmeasured")
   }
   let queue: list<Provenance> = unwrap(listed).map(
     { run -> {runId: run.id, attempt: run.run_attempt} },
