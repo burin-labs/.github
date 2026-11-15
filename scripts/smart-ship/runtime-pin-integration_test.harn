@@ -2,6 +2,8 @@ import { omit } from "std/json"
 import { NEEDS_YOU } from "./needs-you.harn"
 import { Repo, look } from "./ship.harn"
 
+const HEAD = "a".repeat(40)
+
 type Fixture = {
   source?: bool,
   source_status?: int,
@@ -18,7 +20,7 @@ fn ready_candidate(needs_you: bool = false, queued: bool = false) -> Repo {
     schema: "review.author_evidence.v1",
     repository_digest: sha256_hex("burin-labs/burin-code"),
     pr: 9,
-    head_sha: "abc",
+    head_sha: HEAD,
     replies: [],
   }
   return {
@@ -26,6 +28,7 @@ fn ready_candidate(needs_you: bool = false, queued: bool = false) -> Repo {
     defaultBranchRef: {name: "main"},
     mergeQueue: nil,
     pullRequest: {
+      body: "",
       id: "PR_1",
       number: 9,
       title: "Candidate",
@@ -34,7 +37,7 @@ fn ready_candidate(needs_you: bool = false, queued: bool = false) -> Repo {
       isCrossRepository: false,
       isInMergeQueue: queued,
       headRefName: "candidate",
-      headRefOid: "abc",
+      headRefOid: HEAD,
       baseRefName: "main",
       baseRef: {target: {oid: "1" * 40}},
       mergeStateStatus: "CLEAN",
@@ -64,7 +67,7 @@ fn ready_candidate(needs_you: bool = false, queued: bool = false) -> Repo {
         nodes: [
           {
             commit: {
-              oid: "abc",
+              oid: HEAD,
               signature: {isValid: true},
               statusCheckRollup: {
                 contexts: {
@@ -102,15 +105,25 @@ fn inspect(harness: Harness, fixture: Fixture = {}) -> dict {
         },
         {
           status: 200,
+          body: json_stringify(
+            {
+              data: {
+                repository: ready_candidate(fixture.needs_you ?? false, fixture.queued ?? false),
+              },
+            },
+          ),
+        },
+        {
+          status: 200,
           body: json_stringify({data: {mergePullRequest: {pullRequest: {state: "MERGED"}}}}),
         },
       ],
     },
   )
   const blocked_body =
-    "**Smart Ship:** Shipping is blocked: Burin main requires a released Harn tag pin; repin to the released tag and remove .harn-revision before merging. Shipping continues when that cause clears.\n\nHead: `abc`.\n\n${NEEDS_YOU}"
+    "**Smart Ship:** Shipping is blocked: Burin main requires a released Harn tag pin; repin to the released tag and remove .harn-revision before merging. Shipping continues when that cause clears.\n\nHead: `${HEAD}`.\n\n${NEEDS_YOU}"
   const resolved_body =
-    "**Smart Ship:** No longer needs you. Shipping continues through the normal checks and protected merge.\n\nHead: `abc`.\n\n${NEEDS_YOU}"
+    "**Smart Ship:** No longer needs you. Shipping continues through the normal checks and protected merge.\n\nHead: `${HEAD}`.\n\n${NEEDS_YOU}"
   harness.testing.http_mock(
     "PATCH",
     api + "/repos/${repository}/issues/comments/17",
@@ -147,7 +160,7 @@ fn inspect(harness: Harness, fixture: Fixture = {}) -> dict {
   }
   harness.testing.http_mock(
     "GET",
-    api + "/repos/${repository}/contents/.harn-revision?ref=abc",
+    api + "/repos/${repository}/contents/.harn-revision?ref=${HEAD}",
     {
       status: fixture.source_status ?? (fixture.source == true ? 200 : 404),
       body: fixture.source == true ? json_stringify(
@@ -157,7 +170,7 @@ fn inspect(harness: Harness, fixture: Fixture = {}) -> dict {
   )
   harness.testing.http_mock(
     "GET",
-    api + "/repos/${repository}/contents/.harn-version?ref=abc",
+    api + "/repos/${repository}/contents/.harn-version?ref=${HEAD}",
     {
       status: fixture.version_missing == true ? 404 : 200,
       body: fixture.version_missing == true ? "{\"message\":\"Not Found\"}" : json_stringify(
@@ -276,7 +289,7 @@ pipeline test_published_matching_runtime_reaches_the_same_main_merge(harness: Ha
   )
   assert_eq(len(writes), 1)
   const merge = schema_expect(json_parse(writes[0].body), schema_of(Merge))
-  assert_eq(merge.variables.head, "abc")
+  assert_eq(merge.variables.head, HEAD)
 }
 
 pipeline test_unmeasured_or_mismatched_main_pin_evidence_never_merges(harness: Harness) {

@@ -1,4 +1,5 @@
 import { ObservedRun, checkpoint_history } from "./checkpoint_history.harn"
+import { ScopeExecution, scope_execution } from "./selection.harn"
 import {
   Admission,
   Artifact,
@@ -21,6 +22,7 @@ import {
   qualified_artifact,
   qualified_jobs,
   registration_artifact_name,
+  qualified_named_artifact,
   reuse_producer_policy,
   sha,
 } from "./contract.harn"
@@ -29,6 +31,7 @@ import {
 pub type ProofSource = {
   json: fn(string) -> unknown,
   registration: fn(string, Artifact) -> unknown,
+  scope_execution?: fn(string, Artifact) -> unknown,
   cache_publication?: fn(string, Artifact) -> unknown,
   graphql?: fn(string) -> unknown,
 }
@@ -43,6 +46,8 @@ pub type OriginalRunInspection = {
   requested: list<JobIdentity>,
   admission: RunAdmission,
 }
+
+pub type ScopeInspection = {original: OriginalRunInspection, execution: ScopeExecution}
 
 type JobsPage = {total_count: int, jobs: list<Job>}
 
@@ -215,6 +220,38 @@ pub fn inspect_original_run(
   )
 }
 
+/** The terminal selection uses actual plan outputs unavailable at input registration. */
+pub fn inspect_scope_run(source: ProofSource, policy: ProducerPolicy, producer: Run) -> ScopeInspection {
+  const original = inspect_original_run(source, policy, producer)
+  const recorded = original.registered.registration
+  require recorded.selection != nil && source.scope_execution != nil,
+    "the source cannot emit CI scope execution proof"
+  const name = "ci-scope-execution-${producer.id}-${producer.run_attempt}"
+  const artifact = run_artifact(source, policy.repository, producer, name)
+  qualified_named_artifact(artifact, producer, name)
+  const raw = source.scope_execution(policy.repository, artifact)
+  schema_expect(raw, closed(schema_of(ScopeExecution)))
+  const execution = scope_execution(raw)
+  require execution.repository == recorded.repository && execution.workflow == recorded.workflow
+    && execution.event == recorded.event && execution.commit == recorded.commit
+    && execution.runId == recorded.runId && execution.attempt == recorded.attempt
+    && execution.tested_source == recorded.tested_source && execution.selection == recorded.selection,
+    "CI scope execution does not bind the registered source and selection"
+  const publishers = original.census.jobs.filter({ job -> job.name == "CI status" }).to_list()
+  const publisher = publishers[0]
+  require len(publishers) == 1 && publisher != nil && publisher.started_at != nil
+    && publisher.completed_at != nil, "CI scope publisher is unmeasured"
+  for name in ["Check for failures", "Retain declared scope execution"] {
+    const steps = publisher.steps.filter({ step -> step.name == name }).to_list()
+    require len(steps) == 1 && steps[0]?.status == "completed" && steps[0]?.conclusion == "success",
+      "CI scope execution was not published after the normal verdict"
+  }
+  require date_parse(artifact.created_at) >= date_parse(publisher.started_at)
+    && date_parse(artifact.created_at) <= date_parse(publisher.completed_at),
+    "CI scope execution artifact is outside its publisher lifetime"
+  return {original: original, execution: execution}
+}
+
 /** Existing reuse and history keep their same-workflow, distinct-consumer policy. */
 pub fn inspect_run(
   source: ProofSource,
@@ -258,8 +295,7 @@ pub fn historical_reuse_batch(
     "historical proof batch is malformed"
   const bounded = bounded_source(source, now, READ_BUDGET * len(requests))
   let archive_cache = {}
-  const shared: ProofSource = {
-    ...source,
+  const shared: ProofSource = source + {
     json: bounded.source.json,
     registration: fn(repo, artifact) {
       const key = "${repo}:${artifact.id}:${artifact.digest}"

@@ -217,6 +217,9 @@ pub fn live_source(net: HarnessNet, fs: HarnessFs, token: string) -> ProofSource
     registration: fn(repo, artifact) { return registration_document(
       download_document(net, fs, token, repo, artifact, "registration.json"),
     ) },
+    scope_execution: fn(repo, artifact) { return download_document(
+      net, fs, token, repo, artifact, "scope-execution.json",
+    ) },
     cache_publication: fn(repo, artifact) { return download_document(
       net,
       fs,

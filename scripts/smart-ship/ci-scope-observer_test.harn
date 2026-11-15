@@ -1,0 +1,119 @@
+import { HEAD, fixture_source } from "../ci-job-proof/declared_scope_test.harn"
+import { ProofSource } from "../ci-job-proof/reader.harn"
+import { observe_scope } from "./ci-scope.harn"
+
+pipeline test_scope_observer_qualifies_the_current_original_producer_and_never_falls_back() {
+  const no_reads: ProofSource = {
+    json: fn(_path) {
+      throw "cosmetic edits must not read CI or request work"
+    },
+    registration: fn(_repo, _artifact) {
+      throw "cosmetic edits must not read CI artifacts"
+    },
+  }
+  assert(
+    observe_scope(
+      no_reads,
+      {
+        repository: "acme/product",
+        head: HEAD,
+        body: "Cosmetic description.",
+        policy: nil,
+        checks: [],
+      },
+    ).admitted,
+  )
+  const policy = {schema: "burin.ci_selection.v1", deferredJobs: {replay: {declarable: true}}}
+  const check = {
+    name: "CI status",
+    databaseId: 99,
+    status: "COMPLETED",
+    conclusion: "SUCCESS",
+    checkSuite: {
+      id: "suite",
+      app: {id: "actions"},
+      commit: {oid: HEAD},
+      workflowRun: {
+        databaseId: 10,
+        event: "pull_request",
+        workflow: {id: "ci", name: "CI (owned PR)"},
+      },
+    },
+  }
+  for conclusion in ["success", "skipped"] {
+    const parts = fixture_source(conclusion)
+    const result = observe_scope(
+      parts.source,
+      {
+        repository: "acme/product",
+        head: HEAD,
+        body: "CI-Scope: replay",
+        policy: policy,
+        checks: [check],
+      },
+    )
+    assert_eq(result.admitted, conclusion == "success")
+    assert_eq(result.runId, 10)
+    assert_eq(result.attempt, 2)
+  }
+  const parts = fixture_source("success")
+  for producer in [
+    parts.producer + {path: ".github/workflows/unrelated.yml"},
+    parts.producer + {status: "in_progress", conclusion: nil},
+  ] {
+    const source: ProofSource = {
+      json: fn(path) {
+        assert_eq(path, "/repos/acme/product/actions/runs/10")
+        return producer
+      },
+      registration: fn(_repo, _artifact) {
+        throw "not a terminal scope producer"
+      },
+    }
+    assert(
+      !observe_scope(
+        source,
+        {
+          repository: "acme/product",
+          head: HEAD,
+          body: "CI-Scope: replay",
+          policy: policy,
+          checks: [check],
+        },
+      ).admitted,
+    )
+  }
+  assert(
+    !observe_scope(
+      parts.source,
+      {
+        repository: "acme/product",
+        head: HEAD,
+        body: "CI-Scope: replay",
+        policy: policy,
+        checks: [],
+      },
+    ).admitted,
+  )
+  const newer = check
+    + {
+      databaseId: 100,
+      checkSuite: check.checkSuite + {workflowRun: check.checkSuite.workflowRun + {databaseId: 11}},
+    }
+  assert(
+    is_err(
+      try {
+        observe_scope(
+          parts.source,
+          {
+            repository: "acme/product",
+            head: HEAD,
+            body: "CI-Scope: replay",
+            policy: policy,
+            checks: [check, newer],
+          },
+        )
+      },
+    ),
+  )
+}

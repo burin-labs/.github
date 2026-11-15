@@ -15,6 +15,9 @@ import { Check, RERUN, current_checks, generation, run_id } from "./check-admiss
 import { NEEDS_YOU, NeedsYouComment, NeedsYouCommentPage, needs_you_plan, needs_you_status } from "./needs-you.harn"
 import { WriterReview, review_admission } from "./review-admission.harn"
 import { RuntimePinAdmission, main_pin_gate, repository_runtime_admission } from "./runtime-pin.harn"
+import { ScopeObservation, observe_scope, scope_gate, scope_policy } from "./ci-scope.harn"
+import { live_source } from "../ci-job-proof/live.harn"
+import { declarable_scopes, declared_scopes, scope_declaration_names } from "../ci-job-proof/declared_scope.harn"
 
 const HOLDS = ["hold", "do-not-merge"]
 
@@ -53,7 +56,7 @@ const CONTEXTS = """totalCount pageInfo { hasNextPage endCursor }
 const QUERY = """
 query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
   nameWithOwner defaultBranchRef { name } mergeQueue { id }
-  pullRequest(number: $number) { id number title state isDraft isCrossRepository isInMergeQueue
+  pullRequest(number: $number) { id number title body state isDraft isCrossRepository isInMergeQueue
     headRefName headRefOid baseRefName baseRef { target { oid } } mergeStateStatus reviewDecision
     labels(first: 100) { totalCount nodes { name } }
     latestOpinionatedReviews(first: 100, writersOnly: true) { totalCount nodes {
@@ -92,6 +95,7 @@ pub type Pull = {
   id: string,
   number: int,
   title: string,
+  body: string?,
   state: string,
   isDraft: bool,
   isCrossRepository: bool,
@@ -353,7 +357,7 @@ fn stale_approval_note(repo: Repo, d: dict) -> string {
     + "main changed it, use the repository's approval rebind tool.\n\n${STALE_APPROVAL}${pr.headRefOid} -->"
 }
 
-pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", carry: Carry? = nil, runtime_pin: RuntimePinAdmission? = nil) {
+pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", carry: Carry? = nil, runtime_pin: RuntimePinAdmission? = nil, scope: ScopeObservation? = nil) {
   const pr = repo.pullRequest
   const seen = observe(repo, own, carry)
   const labels = pr.labels.nodes.map({ l -> l.name })
@@ -372,14 +376,20 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
   ]
   const admitted = !admission.any({ g -> g[0] == true })
   const pin_gate = main_pin_gate(repo.nameWithOwner, runtime_pin)
+  const declared = scope_gate(repo.nameWithOwner, scope)
   // Dead attempts the look closes: only for an admitted PR, and only from the whole comment
   // census; a partial one closes nothing and already reads as attempts used up.
   const f = seen + {admitted: admitted, close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0,
-    runtime_pin_required: false, runtime_pin: pin_gate.runtime}
+    runtime_pin_required: false, runtime_pin: pin_gate.runtime,
+    scope_required: false, scope: declared.observation}
   const stop = { why -> {action: "stop", reason: why, facts: f} }
   const conflict = pr.mergeStateStatus == "DIRTY"
   const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
   const cause = blocking_cause(pr.baseRefName, conflict, f.failing.map({check -> check.name}), f.pending, len(f.threads))
+  if admitted && pr.isInMergeQueue && declared.refusal != "" {
+    return {action: declared.read_required ? "stop" : "dequeue", reason: declared.refusal,
+      facts: f + {scope_required: declared.read_required}}
+  }
   // The first gate that holds stops the look, in this order.
   const gates = admission
     + [
@@ -420,6 +430,10 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
     }
     if !lease_admits(lease, repo.nameWithOwner, pr) {
       return stop("a release merge lease holds ${pr.baseRefName}: ${lease}")
+    }
+    if declared.refusal != "" {
+      return {action: scope?.admission?.refreshable == true ? "refresh_ci" : "stop", reason: declared.refusal,
+        facts: f + {scope_required: declared.read_required}}
     }
     if pin_gate.refusal != "" {
       return {action: "stop", reason: pin_gate.refusal,
@@ -1611,7 +1625,8 @@ fn reconcile_needs_you(
   }
   const merged = pr.state == "MERGED" && pr.labels.nodes.any({label -> label.name == "ship"})
   const status = needs_you_status({
-    admitted: facts.admitted, main_admitted: decision.action == "merge" || pr.isInMergeQueue, complete: facts.complete, merged: merged, checks_reported: !facts.no_checks,
+    admitted: facts.admitted, main_admitted: decision.action == "merge"
+      || (pr.isInMergeQueue && decision.action != "dequeue" && !facts.scope_required), complete: facts.complete, merged: merged, checks_reported: !facts.no_checks,
     signed: facts.signed, approved: facts.approved, conflict: pr.mergeStateStatus == "DIRTY",
     failing: len(facts.failing), pending: len(facts.pending), rerun: len(facts.rerun), threads: len(facts.threads),
   })
@@ -1685,6 +1700,87 @@ fn main(harness: Harness) {
 }
 
 /** One look at one pull request; returns what it decided. */
+fn current_scope(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  previous: Pull,
+  observation: ScopeObservation,
+) -> Pull {
+  const latest = read(harness, opts, repo, previous.number).pullRequest
+  require latest.id == previous.id && latest.headRefOid == previous.headRefOid
+    && latest.state == "OPEN" && latest.labels.nodes.any({ label -> label.name == "ship" }),
+    "pull request changed before CI scope admission"
+  const allowed = observation.allowed ?? []
+  if len(allowed) == 0 || observation.admission == nil {
+    require latest.body == previous.body, "pull request scope changed before requalification"
+  } else {
+    require declared_scopes(latest.body ?? "", allowed) == observation.admission.declared,
+      "pull request scope changed before requalification"
+  }
+  return latest
+}
+
+type Dequeued = {data: {dequeuePullRequest: {mergeQueueEntry: {pullRequest: {id: string}}?}}?, errors?: list<unknown>}
+
+pub fn transition_scope(
+  harness: Harness,
+  opts: GithubClientOptions,
+  repo: string,
+  previous: Pull,
+  observation: ScopeObservation,
+  action: string,
+) -> string {
+  const latest = current_scope(harness, opts, repo, previous, observation)
+  if action == "dequeue" {
+    require latest.isInMergeQueue, "the stale scope candidate already left the queue"
+    const removed = schema_expect(gh(harness, opts, "/graphql", "POST", {
+      query: "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{pullRequest{id}}}}",
+      variables: {id: latest.id},
+    }), schema_of(Dequeued))
+    require len(removed.errors ?? []) == 0
+      && removed.data?.dequeuePullRequest?.mergeQueueEntry?.pullRequest?.id == latest.id,
+      "removing the stale CI scope candidate was not confirmed"
+    const confirmed = current_scope(harness, opts, repo, previous, observation)
+    require !confirmed.isInMergeQueue, "the stale CI scope candidate is still queued"
+    return "removed the stale scope candidate through the normal merge queue; requalification is pending"
+  }
+  const proof = observation.admission
+  require action == "refresh_ci" && proof != nil && proof.refreshable
+    && proof.runId != nil && proof.attempt != nil,
+    "the CI selection producer cannot be refreshed"
+  const current_checks_at_head = current_checks(
+    latest.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? [], latest.headRefOid,
+  )
+  require current_checks_at_head.any({ check -> check.name == "CI status"
+    && run_id(check) == proof.runId && check.status == "COMPLETED" && check.conclusion == "SUCCESS" }),
+    "the CI producer changed before the scope refresh"
+  const producer = schema_expect(
+    gh(harness, opts, "/repos/${repo}/actions/runs/${proof.runId}"), schema_of(ScopeProducer),
+  )
+  require producer.id == proof.runId && producer.run_attempt == proof.attempt
+    && producer.head_sha == latest.headRefOid && producer.event == "pull_request"
+    && producer.path == ".github/workflows/ci-pr.yml" && producer.status == "completed",
+    "the CI producer changed before the scope refresh"
+  const key = sha256(json_stringify({head: latest.headRefOid, declared: proof.declared}))
+  const marker = "<!-- smart-ship-ci-scope-refresh:${key} -->"
+  const comments = needs_you_comments(harness, opts, repo, latest)
+  if comments.any({ comment -> comment.viewerDidAuthor == true && comment.body.contains(marker) }) {
+    return "CI scope refresh already requested at this head; awaiting measured new selection and execution"
+  }
+  const body = "**Smart Ship:** Refreshing the complete CI selection producer for declared scopes: ${proof.declared.join(", ")}. "
+    + "Source-bound review remains unchanged.\n\n${marker}"
+  const recorded = schema_expect(
+    gh(harness, opts, "/repos/${repo}/issues/${latest.number}/comments", "POST", {body: body}),
+    schema_of(NeedsYouWrite),
+  )
+  require recorded.id > 0 && recorded.body == body, "CI scope refresh intent was not confirmed"
+  gh(harness, opts, "/repos/${repo}/actions/runs/${proof.runId}/rerun", "POST")
+  return "requested a complete CI selection refresh; newly required jobs remain pending"
+}
+
+type ScopeProducer = {id: int, run_attempt: int, head_sha: string, event: string, path: string, status: string}
+
 pub fn look(harness: Harness, job: Look) {
   const repo = job.repo
   const number = job.number
@@ -1729,6 +1825,8 @@ pub fn look(harness: Harness, job: Look) {
   }
   const lease = release_lease(harness, opts, repo, pr.baseRefName)
   const own = own_workflow(harness, opts, repo, job.run_id)
+  let pin: RuntimePinAdmission? = nil
+  let observed: ScopeObservation? = nil
   let d = decide(r, lease, job.repair, own)
   let carry: Carry? = nil
   // Only a green, signed head that waits on approval reads the history for a carried approval.
@@ -1736,13 +1834,38 @@ pub fn look(harness: Harness, job: Look) {
     carry = approval_carry(harness, opts, r)
     d = decide(r, lease, job.repair, own, carry)
   }
+  if d.facts.scope_required {
+    let allowed: list<string> = []
+    let declared: list<string>? = nil
+    const scope = try {
+      const requested = scope_declaration_names(pr.body ?? "")
+      const policy = len(requested) == 0 ? nil : scope_policy(harness, opts, repo, pr.headRefOid)
+      allowed = len(requested) == 0 ? ["full"] : declarable_scopes(policy)
+      declared = declared_scopes(pr.body ?? "", allowed)
+      observe_scope(
+        live_source(harness.net, harness.fs, job.token), {
+          repository: repo, head: pr.headRefOid, body: pr.body ?? "", policy: policy,
+          checks: pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? [],
+        },
+      )
+    }
+    observed = is_ok(scope)
+      ? {admission: unwrap(scope), error: nil, allowed: allowed, declared: declared}
+      : {admission: nil, error: "CI scope proof is unavailable", declared: declared}
+    d = decide(r, lease, job.repair, own, carry, pin, observed)
+  }
   if d.facts.runtime_pin_required {
-    const pin = repository_runtime_admission(harness, opts, repo, pr.headRefOid)
-    d = decide(r, lease, job.repair, own, carry, pin)
+    pin = repository_runtime_admission(harness, opts, repo, pr.headRefOid)
+    d = decide(r, lease, job.repair, own, carry, pin, observed)
   }
   reconcile_needs_you(harness, opts, repo, pr, d)
   const logged = evidence_line(pr, d.facts.review_evidence)
   harness.stdio.println(logged)
+  if d.facts.scope != nil {
+    const proof = d.facts.scope.admission
+    const pending = proof?.unproven ?? d.facts.scope.declared
+    harness.stdio.println("CI scope evidence: pending=${pending == nil ? nil : len(pending)} names=${json_stringify(pending)} ${json_stringify(d.facts.scope)}")
+  }
   if d.facts.runtime_pin != nil {
     harness.stdio.println("Runtime pin evidence: ${json_stringify(d.facts.runtime_pin)}")
   }
@@ -1761,7 +1884,13 @@ pub fn look(harness: Harness, job: Look) {
     )
   }
   let note = d.reason
+  if ["dequeue", "refresh_ci"].contains(d.action) {
+    note = transition_scope(harness, opts, repo, pr, d.facts.scope, d.action)
+  }
   if d.action == "merge" {
+    if d.facts.scope != nil {
+      current_scope(harness, opts, repo, pr, d.facts.scope)
+    }
     // The exact head is the lease: GitHub refuses if it moved since it was judged. Branch rules still apply server side.
     const req = {
       owner: split(repo, "/")[0],
@@ -1821,5 +1950,5 @@ pub fn look(harness: Harness, job: Look) {
     }
   }
   harness.stdio.println("${repo}#${number}: ${d.action}: ${note}")
-  return d + {evidence_line: logged}
+  return d + {reason: note, evidence_line: logged}
 }

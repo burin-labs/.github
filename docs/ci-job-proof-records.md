@@ -82,6 +82,46 @@ uploads for this attempt. An empty output means no record was published.
 The `receipt` output still names only jobs whose original passing proof was
 found. Neither output lets a consumer skip the reader's checks.
 
+## Declared CI scope
+
+The optional action input `selection` records the canonical selector's measured
+result in the same source-bound registration:
+
+```json
+{"schema":"burin.ci_scope_selection.v1","fullSuite":false,"declared":[]}
+```
+
+`declared` is sorted, unique and case-sensitive. `fullSuite` records selection,
+not execution. Omitted metadata is unmeasured; an empty `declared` list is a
+measurement that the selector read no declarations. Older readers reject the
+added field and run their selected jobs rather than reusing an unknown record.
+
+The action also exposes `tested-source`, the measured checkout commit and tree.
+Burin projects that value into its existing status job. After its normal verdict
+passes, that job records the resolved selected-success contracts in
+`ci-scope-execution-<run>-<attempt>`, containing `scope-execution.json`. Planning
+outputs are final by then. The record contains the same source, attempt and
+selection as the initial registration, plus required job IDs and reported names.
+
+For Burin, Smart Ship reads the current PR body and its scope registry at the
+current head. The proof reader verifies both artifacts, the successful normal
+verdict and publication steps, and actual execution of each required job leg.
+A named scope needs its selected job's passing execution. The `full` scope needs
+measured full-suite selection and every selected job's passing execution.
+CI status alone proves neither. An older source without these records stays
+pending. Already covered declarations preserve proof, including after cosmetic
+body edits. Output-producing jobs gain no reuse permission from this evidence.
+
+An unproven scope removes a stale candidate through GitHub's normal merge queue.
+The next look can request one complete workflow rerun for that head and normalized
+scope set. It records a confirmed comment before requesting the rerun; a missing
+delivery stays pending instead of repeatedly requesting work. The whole producer,
+including selection, must run again. Rerunning only failed jobs preserves old
+selection and cannot qualify the expanded scope. The selector must read the
+current source-bound PR body even when GitHub replays an older event payload.
+Smart Ship rechecks the head and normalized scope before merging or requesting
+requalification; GitHub's protected merge and queue rules remain in force.
+
 ## Verification
 
 The [source test](../scripts/ci-job-proof/source_test.harn) measures a real

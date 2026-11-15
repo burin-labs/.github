@@ -107,8 +107,8 @@ jobs:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
-          # Read the PR and its CI logs; push a signed repair, comment, merge or enqueue.
-          permission-actions: read
+          # Read CI proof and refresh its selection producer when declared scope expands.
+          permission-actions: ${{ github.repository == 'burin-labs/burin-code' && 'write' || 'read' }}
           permission-checks: read
           permission-statuses: read
           permission-contents: write
