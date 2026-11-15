@@ -1,0 +1,97 @@
+name: Smart Ship main repair
+
+on:
+  workflow_call:
+    inputs:
+      issue:
+        type: string
+        required: true
+      red-run:
+        type: string
+        required: true
+      head:
+        type: string
+        required: true
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        required: true
+      OPENAI_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    concurrency:
+      group: smart-ship-main-repair-${{ github.repository }}-${{ inputs.issue }}
+      cancel-in-progress: false
+    env:
+      MAIN_REPAIR_ISSUE: ${{ inputs.issue }}
+      MAIN_REPAIR_RUN: ${{ inputs.red-run }}
+      MAIN_REPAIR_HEAD: ${{ inputs.head }}
+      SHIP_NONCE: ${{ github.run_id }}.${{ github.run_attempt }}
+    steps:
+      - name: Mint trusted publication authority
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-actions: read
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+      - name: Check out the trusted repair worker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: burin-labs/.github
+          ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
+          path: .smart-ship
+          sparse-checkout: scripts/smart-ship
+          persist-credentials: false
+      - name: Install Harn
+        uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b # supports compressed release archives
+        with:
+          version: "0.10.197"
+      - name: Prepare the controlled main repair
+        id: prepare
+        working-directory: .smart-ship/scripts/smart-ship
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-main-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          harn install --locked
+          harn run --no-sandbox main-repair.harn
+      - name: Repair without credentials
+        id: repair
+        if: steps.prepare.outcome == 'success'
+        timeout-minutes: 25
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-main-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$SHIP_WORK/agent"
+          cp .smart-ship/scripts/smart-ship/repair.harn "$SHIP_WORK/agent/repair.harn"
+          cd "$SHIP_WORK/pr"
+          harn run --timeout 20m --environment-policy granted \
+            --grant "openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,to=in_process" \
+            --write-root "$SHIP_WORK/pr" \
+            "$SHIP_WORK/agent/repair.harn"
+      - name: Publish a draft fix PR
+        if: always() && steps.prepare.outcome == 'success'
+        working-directory: .smart-ship/scripts/smart-ship
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SHIP_MODE: publish
+          SHIP_WORK: ${{ runner.temp }}/smart-ship-main-${{ github.run_id }}-${{ github.run_attempt }}
+        run: harn run --no-sandbox main-repair.harn

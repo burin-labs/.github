@@ -1,0 +1,351 @@
+import { shell_command_shape } from "std/command"
+import { Request, prepare_main, publish_main } from "./main-repair.harn"
+import { sh } from "./ship.harn"
+
+type Fixture = {dir: string, head: string, good: string, state: dict, request: Request}
+
+fn fixture(harness: {fs: HarnessFs, tools: HarnessTools}) -> Fixture {
+  const dir = harness.fs.mkdtemp_in_workspace("main-repair-")
+  const remote = "${dir}/o/r.git"
+  harness.fs.mkdir(remote, true)
+  const git = { args ->
+    sh(
+      harness.tools,
+      ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + args,
+      {},
+      remote,
+    )
+  }
+  git(["init", "--quiet", "--initial-branch=main"])
+  harness.fs.write_text("${remote}/test.txt", "working\n")
+  git(["add", "test.txt"])
+  git(["commit", "--quiet", "-m", "working control"])
+  const good = git(["rev-parse", "HEAD"])
+  harness.fs.write_text("${remote}/test.txt", "broken\n")
+  git(["add", "test.txt"])
+  git(["commit", "--quiet", "-m", "controlled regression"])
+  const head = git(["rev-parse", "HEAD"])
+  const state = {
+    schema: "burin.main_red_episode.v2",
+    redSha: head,
+    redRunId: 10,
+    goodSha: good,
+    jobs: ["Unit tests"],
+    culprit: head,
+    bisect: {lo: 0, hi: 0, candidates: [head]},
+    control: {sha: good, runId: 11, attempt: 1, passed: true},
+  }
+  const request: Request = {
+    repo: "o/r",
+    issue: 9,
+    red_run: 10,
+    head: head,
+    work: "${dir}/work",
+    nonce: "42.1",
+    token: "fixture-token",
+    opts: {installation_token: "fixture-token", budget: {state_dir: ""}},
+    git_host: "file://${dir}/",
+    read_log: { id -> "Actual failing assertion in job ${id}: expected true, got false" },
+  }
+  return {dir: dir, head: head, good: good, state: state, request: request}
+}
+
+fn mocks(testing: HarnessTesting, f: Fixture, overrides: dict = {}) {
+  const api = "https://api.github.com/repos/o/r"
+  testing.http_mock_clear()
+  const body = "<!-- main-red-state ${json_stringify(overrides.state ?? f.state)} -->"
+  const rows = {
+    "": {full_name: "o/r", default_branch: "main"},
+    "/git/ref/heads/main": {ref: "refs/heads/main", object: {sha: overrides.head ?? f.head}},
+    "/issues/9": {number: 9, state: overrides.issue_state ?? "open", body: body},
+    "/actions/runs/10": {
+      id: 10,
+      run_attempt: 2,
+      head_sha: f.head,
+      status: "completed",
+      conclusion: "failure",
+      path: ".github/workflows/ci-pr.yml",
+      head_branch: "main",
+      event: "push",
+    },
+    ["/actions/runs/${overrides.control_run_id ?? 11}"]: {
+      id: overrides.control_run_id ?? 11,
+      run_attempt: 1,
+      head_sha: f.good,
+      status: "completed",
+      conclusion: "success",
+      path: ".github/workflows/ci-pr.yml",
+      head_branch: overrides.control_branch ?? "ci-bisect/${substring(f.head, 0, 12)}/${f.good}",
+      event: "workflow_dispatch",
+    },
+    "/actions/runs/10/jobs?filter=latest&per_page=50&page=1": overrides.red_jobs
+      ?? {
+        total_count: 1,
+        jobs: [
+          {
+            id: 1,
+            name: "Unit tests",
+            conclusion: "failure",
+            steps: [{name: "Run tests", conclusion: "failure"}],
+          },
+        ],
+      },
+    ["/actions/runs/${overrides.control_run_id ?? 11}/jobs?filter=latest&per_page=50&page=1"]: overrides
+      .control_jobs
+      ?? {total_count: 1, jobs: [{id: 2, name: "Unit tests", conclusion: "success", steps: []}]},
+  }
+  for path in keys(rows) {
+    testing.http_mock("GET", "${api}${path}", {status: 200, body: json_stringify(rows[path])})
+  }
+  testing.http_mock(
+    "POST",
+    "${api}/git/refs",
+    {
+      status: 201,
+      body: json_stringify({ref: "refs/smart-ship/main-red/9/10", object: {sha: f.head}}),
+    },
+  )
+  testing.http_mock("POST", "${api}/issues/9/comments", {status: 201, body: "{}"})
+}
+
+pipeline test_main_repair_prepares_the_actual_controlled_checkout(harness: Harness) {
+  const f = fixture(pick(harness, ["fs", "tools"]))
+  mocks(harness.testing, f)
+  assert_eq(prepare_main(harness, f.request), {prepared: true})
+  assert_eq(harness.fs.read_text("${f.request.work}/pr/test.txt"), "broken\n")
+  const job = json_parse(harness.fs.read_text("${f.request.work}/job.json"))
+  assert_eq(job.head, f.head)
+  assert_eq(job.nonce, "42.1")
+  assert_eq(job.episode.control.sha, f.good)
+  const task = json_parse(harness.fs.read_text("${f.request.work}/pr/.git/ship-task.json"))
+  assert(contains(task.task, f.head) && contains(task.task, "Do not revert"))
+  assert(
+    contains(task.task, "Actual failing assertion in job 1"),
+    "the measured failure reaches the repair task",
+  )
+  const calls = harness.testing.http_mock_calls({include_sensitive: true})
+  const claim = calls.filter({ call -> call.method == "POST" && ends_with(call.url, "/git/refs") })
+  assert_eq(len(claim), 1, "the actual expected-absent attempt is written before model work")
+  assert(contains(claim[0].body, "refs/smart-ship/main-red/9/10"))
+}
+
+pipeline test_main_repair_refuses_stale_or_unmeasured_inputs_before_preparing(harness: Harness) {
+  const f = fixture(pick(harness, ["fs", "tools"]))
+  for scenario in [
+    {head: f.good},
+    {issue_state: "closed"},
+    {control_branch: "main"},
+    {control_run_id: 9, state: {...f.state, control: {...f.state.control, runId: 9}}},
+    {red_jobs: {total_count: 0, jobs: []}},
+    {
+      control_jobs: {
+        total_count: 1,
+        jobs: [{id: 2, name: "Other job", conclusion: "success", steps: []}],
+      },
+    },
+    {
+      control_jobs: {
+        total_count: 1,
+        jobs: [{id: 2, name: "Unit tests", conclusion: "skipped", steps: []}],
+      },
+    },
+    {state: {...f.state, control: {sha: f.good, runId: 11, attempt: 1, passed: false}}},
+  ] {
+    mocks(harness.testing, f, scenario)
+    let refused = false
+    try {
+      prepare_main(harness, f.request)
+    } catch (_) {
+      refused = true
+    }
+    assert(refused, "stale or unmeasured input must refuse")
+    assert(!harness.fs.exists(f.request.work), "refusal precedes checkout and model spend")
+    assert(
+      !harness.testing.http_mock_calls().any({ call -> call.method == "POST" }),
+      "no write is authorized",
+    )
+  }
+}
+
+pipeline test_main_repair_does_not_publish_unverified_work_or_changed_sources(harness: Harness) {
+  const f = fixture(pick(harness, ["fs", "tools"]))
+  mocks(harness.testing, f)
+  prepare_main(harness, f.request)
+  harness.fs.write_text(
+    "${f.request.work}/pr/.git/ship-result.json",
+    json_stringify({outcome: "stuck", summary: "Could not verify", spend: "$0"}),
+  )
+  assert(contains(publish_main(harness, f.request), "stuck"))
+  assert(
+    !harness.testing.http_mock_calls().any({ call -> ends_with(call.url, "/pulls") }),
+    "stuck work opens no PR",
+  )
+  harness.fs.write_text(
+    "${f.request.work}/pr/.git/ship-result.json",
+    json_stringify({outcome: "fixed", summary: "Verified", spend: "$0"}),
+  )
+  mocks(harness.testing, f, {head: f.good})
+  let refused = false
+  try {
+    publish_main(harness, f.request)
+  } catch (_) {
+    refused = true
+  }
+  assert(refused, "main moving during the repair refuses publication")
+  assert(
+    !harness.testing.http_mock_calls().any({ call -> call.method == "POST" }),
+    "no publication on the moved source",
+  )
+  mocks(harness.testing, f)
+  refused = false
+  try {
+    publish_main(harness, f.request)
+  } catch (_) {
+    refused = true
+  }
+  assert(refused, "a claimed fixed result with no code change is not a repair")
+  assert(
+    !harness.testing.http_mock_calls().any({ call -> call.method == "POST" }),
+    "empty work cannot create a branch or PR",
+  )
+}
+
+pipeline test_main_repair_publishes_only_a_source_bound_draft_fix(harness: Harness) {
+  const f = fixture(pick(harness, ["fs", "tools"]))
+  mocks(harness.testing, f)
+  prepare_main(harness, f.request)
+  harness.fs.write_text("${f.request.work}/pr/test.txt", "fixed with regression\n")
+  harness.fs.write_text(
+    "${f.request.work}/pr/.git/ship-result.json",
+    json_stringify({outcome: "fixed", summary: "Regression passed", spend: "$0"}),
+  )
+  const branch = "smart-ship/main-red-9-${substring(f.head, 0, 12)}"
+  const commit = "a" * 40
+  const api = "https://api.github.com/repos/o/r"
+  harness.testing.http_mock(
+    "GET",
+    "${api}/git/ref/heads/${branch}",
+    {
+      status: 200,
+      body: json_stringify({ref: "refs/heads/${branch}", object: {sha: f.head, type: "commit"}}),
+    },
+  )
+  harness.testing.http_mock(
+    "POST",
+    "https://api.github.com/graphql",
+    {
+      status: 200,
+      body: json_stringify(
+        {
+          data: {
+            createCommitOnBranch: {
+              commit: {
+                oid: commit,
+                url: "https://github.com/o/r/commit/${commit}",
+                signature: {isValid: true, state: "VALID", wasSignedByGitHub: true},
+              },
+              ref: {name: branch, target: {oid: commit}},
+            },
+          },
+        },
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "POST",
+    "${api}/pulls",
+    {
+      status: 201,
+      body: json_stringify(
+        {html_url: "https://github.com/o/r/pull/12", head: {sha: commit}, draft: true},
+      ),
+    },
+  )
+  const result = publish_main(harness, f.request)
+  assert(contains(result, "https://github.com/o/r/pull/12") && contains(result, commit))
+  const calls = harness.testing.http_mock_calls({include_sensitive: true})
+  const mutations = calls.filter(
+    { call -> call.method == "POST" && ends_with(call.url, "/graphql") },
+  )
+  assert_eq(len(mutations), 1, "the existing signed-commit owner publishes one repair")
+  const mutation = json_parse(mutations[0].body)
+  assert_eq(
+    mutation.variables.input.expectedHeadOid,
+    f.head,
+    "signed commit holds the reviewed source lease",
+  )
+  const pulls = calls.filter({ call -> call.method == "POST" && ends_with(call.url, "/pulls") })
+  assert_eq(len(pulls), 1)
+  const pull = json_parse(pulls[0].body)
+  assert_eq([pull.draft, pull.base, pull.head], [true, "main", branch])
+  assert(!contains(pull.body, "Closes"), "a proposed repair cannot close the episode before CI")
+  assert(
+    !calls.any(
+      { call -> contains(call.url, "/merge") || contains(call.body ?? "", "mergePullRequest") },
+    ),
+    "repair has no merge action",
+  )
+}
+
+pipeline test_main_repair_duplicate_attempt_refuses_before_model_work(harness: Harness) {
+  const f = fixture(pick(harness, ["fs", "tools"]))
+  mocks(harness.testing, f)
+  harness.testing.http_mock(
+    "POST",
+    "https://api.github.com/repos/o/r/git/refs",
+    {status: 422, body: "{\"message\":\"Reference already exists\"}"},
+  )
+  let refused = false
+  try {
+    prepare_main(harness, f.request)
+  } catch (_) {
+    refused = true
+  }
+  assert(refused, "an existing immutable attempt cannot spend again")
+  assert(!harness.fs.exists(f.request.work))
+}
+
+pipeline test_main_repair_keeps_the_existing_credential_and_deadline_boundary(harness: Harness) {
+  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const workflow = yaml_parse(
+    harness.fs.read_text("${root}/.github/workflows/smart-ship-main-repair.yml"),
+  )
+  const regular = yaml_parse(harness.fs.read_text("${root}/.github/workflows/smart-ship.yml"))
+  const job = workflow.jobs.repair
+  const agent = job.steps.find({ step -> step.id == "repair" })
+  const previous = regular.jobs.ship.steps.find({ step -> step.id == "repair" })
+  assert_eq(
+    keys(agent.env),
+    ["OPENAI_API_KEY", "SHIP_WORK"],
+    "only the model key enters the agent step",
+  )
+  assert_eq(
+    keys(job.env).sorted(),
+    ["MAIN_REPAIR_HEAD", "MAIN_REPAIR_ISSUE", "MAIN_REPAIR_RUN", "SHIP_NONCE"],
+    "job environment carries no publication credential",
+  )
+  const launches = { script ->
+    const shape = shell_command_shape(script, "bash")
+    assert_eq(shape.status, "measured")
+    return shape.segments.flat_map({ segment -> segment.stages }).filter(
+      { stage -> stage.words[0] == "harn" },
+    )
+      .map({ stage -> stage.words })
+  }
+  assert_eq(
+    launches(agent.run),
+    launches(previous.run),
+    "the same sandbox, grant and host deadline launch the existing agent",
+  )
+  assert(
+    agent["timeout-minutes"] < job["timeout-minutes"],
+    "publication has time after the agent stops",
+  )
+  const setup = job.steps.find({ step -> step.name == "Install Harn" })
+  const tested = regular.jobs.ship.steps.find({ step -> step.name == "Install Harn" })
+  assert_eq(
+    setup["with"].version,
+    tested["with"].version,
+    "repair uses the qualified released runtime",
+  )
+}

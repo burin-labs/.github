@@ -1,0 +1,20 @@
+Repair the controlled main failure in {{repo}}, tracked by issue #{{issue}}.
+The trusted responder identified culprit {{culprit}}, failed run {{red_run}},
+and a fresh passing preceding-source control {{control}}. The failing jobs are {{jobs}}.
+Your checkout starts at current main {{head}}.
+
+The trusted worker read these bounded failing-job log tails. An unreadable log
+is explicitly unmeasured, so do not infer a failure from its absence:
+{{failures}}
+
+Find and fix the cause at its owning layer. Preserve the intended behavior of the
+culprit change. Do not revert the change, weaken checks or reviews, suppress the
+failure, change credentials, or modify shipping controls. Read the repository's
+engineering instructions and choose a focused regression that reaches the failure.
+Run proportionate available checks and report exactly which ran and their results.
+If the environment cannot establish the cause or verify the fix, report stuck.
+
+You have no GitHub credentials or child network. Edit the checkout and report
+once through finish. Trusted publication will create a draft fix PR for review;
+your report cannot merge or approve it. Use outcome fixed only after the focused
+regression passes. Keep the summary concrete and include remaining blind spots.
