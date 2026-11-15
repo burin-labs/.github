@@ -121,7 +121,9 @@ jobs:
           repository: burin-labs/.github
           ref: ${{ fromJSON(toJSON(job)).workflow_sha }}
           path: .smart-ship
-          sparse-checkout: scripts
+          sparse-checkout: |
+            scripts/smart-ship
+            scripts/ci-job-proof
           persist-credentials: false
       - name: Install Harn
         uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b # supports compressed release archives

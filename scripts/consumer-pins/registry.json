@@ -69,13 +69,13 @@
     {
       "kind": "workflow",
       "name": "smart-ship.yml",
-      "paths": [".github/workflows/smart-ship.yml", "scripts/smart-ship/"],
+      "paths": [".github/workflows/smart-ship.yml", "scripts/smart-ship/", "scripts/ci-job-proof/"],
       "release_path": false
     },
     {
       "kind": "workflow",
       "name": "smart-ship-main-repair.yml",
-      "paths": [".github/workflows/smart-ship-main-repair.yml", "scripts/smart-ship/"],
+      "paths": [".github/workflows/smart-ship-main-repair.yml", "scripts/smart-ship/", "scripts/ci-job-proof/"],
       "release_path": false
     },
     {
