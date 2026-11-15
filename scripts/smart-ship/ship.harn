@@ -11,7 +11,7 @@ import {
 } from "harn-github-connector/default"
 import { github_merge_signed_staging } from "harn-github-connector/signed_merge"
 import { github_commit_worktree } from "harn-github-connector/worktree"
-import { Check, RERUN, current_checks, generation, run_id } from "./check-admission.harn"
+import { Check, RERUN, assess_checks, current_checks, run_id } from "./check-admission.harn"
 import { NEEDS_YOU, NeedsYouComment, NeedsYouCommentPage, needs_you_plan, needs_you_status } from "./needs-you.harn"
 import { WriterReview, review_admission } from "./review-admission.harn"
 import { RuntimePinAdmission, main_pin_gate, repository_runtime_admission } from "./runtime-pin.harn"
@@ -128,67 +128,10 @@ pub type Repo = {
   pullRequest: Pull,
 }
 
-type MeasurementPolicy = {
-  repository: string,
-  app: string,
-  workflow: string,
-  aggregate: string,
-  measurements: list<string>,
-}
-
-// Harn's aggregate compares each PR rehearsal with its base on the same
-// consumer commit. These checks report measurements, not independent gates.
-const CONSUMER_MEASUREMENTS: MeasurementPolicy = {
-  repository: "burin-labs/harn",
-  app: "MDM6QXBwMTUzNjg=",
-  workflow: "W_kwDORxdAHc4PAxHq",
-  aggregate: "CI status",
-  measurements: [
-    "Consumer check / Consumer canary",
-    "Consumer check retry / Consumer canary",
-    "Consumer base check / Consumer canary",
-    "Consumer base check retry / Consumer canary",
-  ],
-}
-
 type Response = {data: {repository: Repo}}
 
 fn complete(page: Page<any>) -> bool {
   return len(page.nodes) == page.totalCount
-}
-
-/** Negative measurements delegated to their exact, successful owning aggregate. */
-fn aggregate_measurements(repo: Repo, checks: list<Check>) -> list<Check> {
-  const policy = CONSUMER_MEASUREMENTS
-  if repo.nameWithOwner != policy.repository {
-    return []
-  }
-  const head = repo.pullRequest.headRefOid
-  const aggregates = checks.filter({ c -> c.name == policy.aggregate }).to_list()
-  if len(aggregates) != 1 {
-    return []
-  }
-  const aggregate = aggregates[0]
-  if aggregate == nil {
-    return []
-  }
-  const suite = aggregate.checkSuite
-  const run = suite?.workflowRun
-  const key = generation(aggregate, head)
-  if key == nil || suite?.id == nil || suite.status != "COMPLETED"
-    || suite.app?.id != policy.app || run?.workflow?.id != policy.workflow
-    || run.event != "pull_request" || aggregate.status != "COMPLETED"
-    || aggregate.conclusion != "SUCCESS" {
-    return []
-  }
-  const read = checks.filter({ c -> c.checkSuite?.id == suite.id }).to_list()
-  if len(read) != (suite.checkRuns?.totalCount ?? -1)
-    || len(read.map({ c -> c.databaseId }).unique()) != len(read)
-    || !read.all({ c -> c.databaseId != nil && c.status == "COMPLETED"
-      && generation(c, head) == key && run_id(c) == run_id(aggregate) }) {
-    return []
-  }
-  return read.filter({ c -> c.conclusion == "FAILURE" && policy.measurements.contains(c.name) }).to_list()
 }
 
 /**
@@ -235,11 +178,12 @@ pub fn observe(repo: Repo, own: string = "", carry: Carry? = nil) {
   const pr = repo.pullRequest
   const head = pr.commits.nodes[0]?.commit
   const rollup = head?.statusCheckRollup?.contexts ?? {totalCount: 0, nodes: []}
-  const checks = current_checks(
+  const assessment = assess_checks(
     rollup.nodes.filter({ c -> own == "" || c.checkSuite?.workflowRun?.workflow?.id != own }),
-    pr.headRefOid,
+    {repository: repo.nameWithOwner, head_sha: pr.headRefOid},
   )
-  const measurements = aggregate_measurements(repo, checks)
+  const checks = assessment.current
+  const measurements = assessment.measurements
   const live = review_admission(
     pr.latestOpinionatedReviews.nodes,
     {repository: repo.nameWithOwner, pr: pr.number, head_sha: pr.headRefOid},
@@ -271,8 +215,7 @@ pub fn observe(repo: Repo, own: string = "", carry: Carry? = nil) {
     signature_state: head?.signature?.state ?? (head?.signature == nil ? "MISSING" : "UNMEASURED"),
     no_checks: len(checks) == 0,
     measurements: measurements,
-    failing: checks.filter({ c -> RED.contains(outcome(c))
-      && !measurements.any({ m -> m.databaseId == c.databaseId && m.checkSuite?.id == c.checkSuite?.id }) }),
+    failing: assessment.gating.filter({ c -> RED.contains(outcome(c)) }),
     rerun: checks.filter({ c -> RERUN.contains(outcome(c)) }).map({ c -> c.name }),
     pending: checks.filter(
       { c ->

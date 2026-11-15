@@ -24,8 +24,9 @@ contract, local command, and pinned action syntax.
 ## Check admission
 
 [`burin-ci-checks/check_admission`](docs/check-admission.md) exposes Smart Ship's
-current-check selection for read-only adapters. Callers supply a complete check
-census for one stable head and retain observed, pending, and failing counts.
+current-check selection and owning-aggregate assessment for read-only adapters.
+Callers supply a complete check census for one stable head and retain observed,
+delegated measurement, pending, and failing counts.
 
 ## Selective Rust tests
 

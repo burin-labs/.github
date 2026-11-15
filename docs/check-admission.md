@@ -20,6 +20,20 @@ declared check observed and terminal.
 
 ## Types and helpers
 
+`assess_checks(checks: list<Check>, source: CheckSource) -> CheckAssessment`
+returns `current`, `measurements`, and `gating` lists in input order. `source`
+names the repository and `head_sha`. Callers must supply the same complete
+census required by `current_checks`; an empty assessment is not a passing CI
+verdict.
+
+Harn's consumer rehearsal jobs are measurements owned by its `CI status`
+aggregate. A failed measurement leaves `gating` only when that aggregate
+succeeded in the same complete, terminal suite, with the exact configured app,
+workflow, head, run, and pull-request event. The failed observation remains in
+both `current` and `measurements`. Other failures, missing identity, partial
+suites, and unsuccessful aggregates remain gates. Smart Ship and read-only
+adapters consume this same assessment.
+
 [`Check`](../scripts/smart-ship/check-admission.harn) declares the accepted
 GitHub metadata. Its optional identity fields allow incomplete evidence to
 remain visible instead of hiding another attempt.
