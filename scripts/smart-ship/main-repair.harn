@@ -14,6 +14,7 @@ type SourceControl = {sha: string, runId: int, attempt: int, passed: bool}
 
 type MainEpisode = {
   schema: string,
+  targetBranch?: string,
   redSha: string,
   redRunId: int,
   jobs: list<string>,
@@ -24,7 +25,13 @@ type MainEpisode = {
   testing?: unknown,
 }
 
-type Issue = {number: int, state: string, body: string, pull_request?: unknown}
+type Issue = {
+  number: int,
+  state: string,
+  body: string,
+  pull_request?: unknown,
+  labels?: list<{name: string}>,
+}
 
 type Repository = {full_name: string, default_branch: string}
 
@@ -61,12 +68,14 @@ type Prepared = {
   red_run: int,
   head: string,
   base: string,
+  target_branch: string,
   branch: string,
   episode: MainEpisode,
 }
 
 pub type Request = {
   repo: string,
+  target_branch?: string,
   issue: int,
   red_run: int,
   head: string,
@@ -160,11 +169,37 @@ fn named_jobs_measured(harness: Harness, request: Request, state: MainEpisode) {
   }
 }
 
-fn current(harness: Harness, request: Request) -> {state: MainEpisode, base: string} {
+type RepairTarget = {branch: string, label: string, attempt_prefix: string, rehearsal: bool}
+
+fn repair_target(request: Request) -> RepairTarget {
+  require regex_match("^[0-9a-f]{40}$", request.head) != nil, "the repair head is not a full commit"
+  const branch = request.target_branch ?? "main"
+  if branch == "main" {
+    return {
+      branch: branch,
+      label: "main-red",
+      attempt_prefix: "refs/smart-ship/main-red",
+      rehearsal: false,
+    }
+  }
+  require branch == "ci-bisect/${substring(request.head, 0, 12)}/${request.head}",
+    "the rehearsal target must be the exact admitted bisect source"
+  return {
+    branch: branch,
+    label: "main-red-rehearsal-${substring(request.head, 0, 12)}",
+    attempt_prefix: "refs/smart-ship/main-red-rehearsal/${request.head}",
+    rehearsal: true,
+  }
+}
+
+fn current(
+  harness: Harness,
+  request: Request,
+) -> {state: MainEpisode, base: string, target: RepairTarget} {
+  const target = repair_target(request)
   require regex_match("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", request.repo) != nil
     && request.issue > 0
-    && request.red_run > 0
-    && regex_match("^[0-9a-f]{40}$", request.head) != nil,
+    && request.red_run > 0,
     "invalid main repair request identity"
   const repository = schema_expect(
     gh(harness, request.opts, "/repos/${request.repo}"),
@@ -173,11 +208,11 @@ fn current(harness: Harness, request: Request) -> {state: MainEpisode, base: str
   require repository.full_name == request.repo && repository.default_branch == "main",
     "the main repair repository changed"
   const ref = schema_expect(
-    gh(harness, request.opts, "/repos/${request.repo}/git/ref/heads/main"),
+    gh(harness, request.opts, "/repos/${request.repo}/git/ref/heads/${target.branch}"),
     schema_of(Ref),
   )
-  require ref.ref == "refs/heads/main" && ref.object.sha == request.head,
-    "main moved before repair publication"
+  require ref.ref == "refs/heads/${target.branch}" && ref.object.sha == request.head,
+    "the repair target moved before publication"
   const issue = schema_expect(
     gh(harness, request.opts, "/repos/${request.repo}/issues/${request.issue}"),
     schema_of(Issue),
@@ -185,7 +220,13 @@ fn current(harness: Harness, request: Request) -> {state: MainEpisode, base: str
   require issue.number == request.issue && issue.state == "open" && issue.pull_request == nil,
     "the main-red issue moved or closed"
   const state = episode(issue.body)
-  require state.redRunId == request.red_run, "the main-red episode changed"
+  require state.redRunId == request.red_run && (state.targetBranch ?? "main") == target.branch,
+    "the main-red episode target changed"
+  if target.rehearsal {
+    require state.redSha == request.head
+      && (issue.labels ?? []).any({ label -> label.name == target.label }),
+      "the rehearsal episode has no matching source or isolated label"
+  }
   const red = schema_expect(
     gh(harness, request.opts, "/repos/${request.repo}/actions/runs/${state.redRunId}"),
     schema_of(Run),
@@ -194,15 +235,19 @@ fn current(harness: Harness, request: Request) -> {state: MainEpisode, base: str
     gh(harness, request.opts, "/repos/${request.repo}/actions/runs/${state.control.runId}"),
     schema_of(Run),
   )
-  require run_pair_matches(red, control, state), "the red or preceding-source control run changed"
+  require run_pair_matches(red, control, state, target),
+    "the red or preceding-source control run changed"
   named_jobs_measured(harness, request, state)
-  return {state: state, base: repository.default_branch}
+  return {state: state, base: target.branch, target: target}
 }
 
-fn run_pair_matches(red: Run, control: Run, state: MainEpisode) -> bool {
-  const red_origin =
+fn run_pair_matches(red: Run, control: Run, state: MainEpisode, target: RepairTarget) -> bool {
+  const red_origin = if target.rehearsal {
+    red.event == "workflow_dispatch" && red.head_branch == target.branch
+  } else {
     (red.head_branch == "main" && ["push", "workflow_dispatch"].contains(red.event))
-    || (red.event == "workflow_dispatch" && red.head_branch == "ci-checkpoint/${state.redSha}")
+      || (red.event == "workflow_dispatch" && red.head_branch == "ci-checkpoint/${state.redSha}")
+  }
   return red_origin && red.id == state.redRunId && red.head_sha == state.redSha
     && red.status == "completed"
     && red.conclusion == "failure"
@@ -222,7 +267,7 @@ pub fn prepare_main(harness: Harness, request: Request) -> {prepared: bool} {
   const observed = current(harness, request)
   require request.nonce != "" && !harness.fs.exists(request.work),
     "the main repair work directory is occupied"
-  const attempt_ref = "refs/smart-ship/main-red/${request.issue}/${request.red_run}"
+  const attempt_ref = "${observed.target.attempt_prefix}/${request.issue}/${request.red_run}"
   const admitted = schema_expect(
     gh(
       harness,
@@ -283,6 +328,7 @@ pub fn prepare_main(harness: Harness, request: Request) -> {prepared: bool} {
     red_run: request.red_run,
     head: request.head,
     base: observed.base,
+    target_branch: observed.target.branch,
     branch: "smart-ship/main-red-${request.issue}-${substring(request.head, 0, 12)}",
     episode: observed.state,
   }
@@ -309,6 +355,8 @@ pub fn publish_main(harness: Harness, request: Request) -> string {
   require job.nonce == request.nonce && job.repo == request.repo && job.issue == request.issue
     && job.red_run == request.red_run
     && job.head == request.head
+    && job.target_branch == observed.target.branch
+    && job.base == observed.target.branch
     && job.episode == observed.state,
     "the prepared main repair does not match this publication"
   const result = "${request.work}/pr/.git/ship-result.json"
@@ -369,6 +417,7 @@ fn main(harness: Harness) {
   const token = harness.env.get("GH_TOKEN") ?? ""
   const request: Request = {
     repo: repo,
+    target_branch: harness.env.get("MAIN_REPAIR_TARGET_BRANCH") ?? "main",
     issue: to_int(harness.env.get("MAIN_REPAIR_ISSUE") ?? "") ?? 0,
     red_run: to_int(harness.env.get("MAIN_REPAIR_RUN") ?? "") ?? 0,
     head: harness.env.get("MAIN_REPAIR_HEAD") ?? "",

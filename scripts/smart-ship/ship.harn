@@ -796,7 +796,7 @@ pub fn checkout(
   sh(tools, ["git", "checkout", "--quiet", "--detach", head], env, work + "/pristine")
   sh(tools, ["git", "clone", "--quiet", "--shared", work + "/pristine", work + "/pr"])
   sh(tools, ["git", "checkout", "--quiet", "--detach", head], {}, work + "/pr")
-  const base_oid = sh(tools, ["git", "rev-parse", "origin/" + base], {}, work + "/pr")
+  const base_oid = sh(tools, ["git", "rev-parse", "origin/" + base], {}, work + "/pristine")
   if !dirty {
     return {base_oid: base_oid, conflicted: [], sides: ""}
   }
