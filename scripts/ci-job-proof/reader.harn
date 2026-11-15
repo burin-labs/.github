@@ -602,6 +602,9 @@ fn discover_positive(
         )
     }
     if is_err(run) {
+      if bounded.exhausted() {
+        return result(admitted, probed, "discovery_budget_exhausted")
+      }
       continue
     }
     const open = wanted.filter(
@@ -610,6 +613,9 @@ fn discover_positive(
       .to_list()
     const outcome = try {
       inspect_run(bounded.source, current, unwrap(run), open)
+    }
+    if is_err(outcome) && bounded.exhausted() {
+      return result(admitted, probed, "discovery_budget_exhausted")
     }
     if is_ok(outcome) {
       const measured = unwrap(outcome)
