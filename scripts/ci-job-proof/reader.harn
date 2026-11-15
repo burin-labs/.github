@@ -1,5 +1,4 @@
 import { ObservedRun, checkpoint_history } from "./checkpoint_history.harn"
-import { ScopeExecution, scope_execution } from "./selection.harn"
 import {
   Admission,
   Artifact,
@@ -26,6 +25,7 @@ import {
   reuse_producer_policy,
   sha,
 } from "./contract.harn"
+import { ScopeExecution, scope_execution } from "./selection.harn"
 
 /** Artifact transport verifies each downloaded archive before decoding its document. */
 pub type ProofSource = {
@@ -241,8 +241,8 @@ pub fn inspect_scope_run(source: ProofSource, policy: ProducerPolicy, producer: 
   const publisher = publishers[0]
   require len(publishers) == 1 && publisher != nil && publisher.started_at != nil
     && publisher.completed_at != nil, "CI scope publisher is unmeasured"
-  for name in ["Check for failures", "Retain declared scope execution"] {
-    const steps = publisher.steps.filter({ step -> step.name == name }).to_list()
+  for step_name in ["Check for failures", "Retain declared scope execution"] {
+    const steps = publisher.steps.filter({ step -> step.name == step_name }).to_list()
     require len(steps) == 1 && steps[0]?.status == "completed" && steps[0]?.conclusion == "success",
       "CI scope execution was not published after the normal verdict"
   }

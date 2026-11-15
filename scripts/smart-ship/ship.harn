@@ -379,16 +379,24 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
   const declared = scope_gate(repo.nameWithOwner, scope)
   // Dead attempts the look closes: only for an admitted PR, and only from the whole comment
   // census; a partial one closes nothing and already reads as attempts used up.
-  const f = seen + {admitted: admitted, close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0,
-    runtime_pin_required: false, runtime_pin: pin_gate.runtime,
-    scope_required: false, scope: declared.observation}
+  const f = seen + {
+    admitted: admitted,
+    close: admitted && complete(pr.comments) && seen.open > 0 ? seen.open : 0,
+    runtime_pin_required: false,
+    runtime_pin: pin_gate.runtime,
+    scope_required: false,
+    scope: declared.observation,
+  }
   const stop = { why -> {action: "stop", reason: why, facts: f} }
   const conflict = pr.mergeStateStatus == "DIRTY"
   const blocked = conflict || len(f.failing) > 0 || len(f.threads) > 0
   const cause = blocking_cause(pr.baseRefName, conflict, f.failing.map({check -> check.name}), f.pending, len(f.threads))
   if admitted && pr.isInMergeQueue && declared.refusal != "" {
-    return {action: declared.read_required ? "stop" : "dequeue", reason: declared.refusal,
-      facts: f + {scope_required: declared.read_required}}
+    return {
+      action: declared.read_required ? "stop" : "dequeue",
+      reason: declared.refusal,
+      facts: f + {scope_required: declared.read_required},
+    }
   }
   // The first gate that holds stops the look, in this order.
   const gates = admission
@@ -432,12 +440,18 @@ pub fn decide(repo: Repo, lease: string, can_repair: bool, own: string = "", car
       return stop("a release merge lease holds ${pr.baseRefName}: ${lease}")
     }
     if declared.refusal != "" {
-      return {action: scope?.admission?.refreshable == true ? "refresh_ci" : "stop", reason: declared.refusal,
-        facts: f + {scope_required: declared.read_required}}
+      return {
+        action: scope?.admission?.refreshable == true ? "refresh_ci" : "stop",
+        reason: declared.refusal,
+        facts: f + {scope_required: declared.read_required},
+      }
     }
     if pin_gate.refusal != "" {
-      return {action: "stop", reason: pin_gate.refusal,
-        facts: f + {runtime_pin_required: pin_gate.read_required}}
+      return {
+        action: "stop",
+        reason: pin_gate.refusal,
+        facts: f + {runtime_pin_required: pin_gate.read_required},
+      }
     }
     return {action: "merge", reason: "approved and green", facts: f}
   }
@@ -1699,7 +1713,6 @@ fn main(harness: Harness) {
   require d.action != "publish_failed", "publishing the repair failed: " + to_string(d?.error)
 }
 
-/** One look at one pull request; returns what it decided. */
 fn current_scope(
   harness: Harness,
   opts: GithubClientOptions,
@@ -1734,10 +1747,13 @@ pub fn transition_scope(
   const latest = current_scope(harness, opts, repo, previous, observation)
   if action == "dequeue" {
     require latest.isInMergeQueue, "the stale scope candidate already left the queue"
-    const removed = schema_expect(gh(harness, opts, "/graphql", "POST", {
-      query: "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{pullRequest{id}}}}",
-      variables: {id: latest.id},
-    }), schema_of(Dequeued))
+    const removed = schema_expect(
+      gh(harness, opts, "/graphql", "POST", {
+        query: "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{pullRequest{id}}}}",
+        variables: {id: latest.id},
+      }),
+      schema_of(Dequeued),
+    )
     require len(removed.errors ?? []) == 0
       && removed.data?.dequeuePullRequest?.mergeQueueEntry?.pullRequest?.id == latest.id,
       "removing the stale CI scope candidate was not confirmed"
@@ -1752,8 +1768,10 @@ pub fn transition_scope(
   const current_checks_at_head = current_checks(
     latest.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? [], latest.headRefOid,
   )
-  require current_checks_at_head.any({ check -> check.name == "CI status"
-    && run_id(check) == proof.runId && check.status == "COMPLETED" && check.conclusion == "SUCCESS" }),
+  require current_checks_at_head.any(
+    { check -> check.name == "CI status"
+      && run_id(check) == proof.runId && check.status == "COMPLETED" && check.conclusion == "SUCCESS" },
+  ),
     "the CI producer changed before the scope refresh"
   const producer = schema_expect(
     gh(harness, opts, "/repos/${repo}/actions/runs/${proof.runId}"), schema_of(ScopeProducer),
@@ -1781,6 +1799,7 @@ pub fn transition_scope(
 
 type ScopeProducer = {id: int, run_attempt: int, head_sha: string, event: string, path: string, status: string}
 
+/** One look at one pull request; returns what it decided. */
 pub fn look(harness: Harness, job: Look) {
   const repo = job.repo
   const number = job.number
@@ -1871,7 +1890,8 @@ pub fn look(harness: Harness, job: Look) {
   }
   harness.stdio.println("Check evidence: failing=${len(d.facts.failing)} [${d.facts.failing.map({ c -> c.name }).join(", ")}] "
     + "pending=${len(d.facts.pending)} [${d.facts.pending.join(", ")}] "
-    + "aggregate_measurements=[${d.facts.measurements.map({ c -> c.name }).join(", ")}].")
+    + "aggregate_measurements=[${d.facts.measurements.map({ c -> c.name }).join(", ")}].",
+  )
   // GitHub still shows such a PR as approved, so the wait is said on the PR, not only in the log.
   const stale = stale_approval_note(r, d)
   if stale != "" {

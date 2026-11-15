@@ -400,10 +400,17 @@ pub fn unexecuted_selection(
 ) -> list<string> {
   coherent_jobs(jobs, declared, producer)
   const registrar = successful_registrar(registered.registration, jobs)
-  return required.filter({ job -> executed(job,
-    required.filter({ other -> other.id != job.id }).to_list(), jobs,
-    date_parse(registered.artifact.created_at), date_parse(registrar.completed_at)) == nil
-  }).map({ job -> job.id }).to_list()
+  return required.filter(
+    { job ->
+      executed(
+        job,
+        required.filter({ other -> other.id != job.id }).to_list(),
+        jobs,
+        date_parse(registered.artifact.created_at),
+        date_parse(registrar.completed_at),
+      ) == nil
+    },
+  ).map({ job -> job.id }).to_list()
 }
 
 /**

@@ -101,7 +101,7 @@ pub fn declared_scope_admission(
   const unproven = declared.filter(
     { name ->
       selection == nil || !aggregate
-        || (name == "full" ? selection?.fullSuite != true || unexecuted == nil
+        || (name == "full" ? selection.fullSuite != true || unexecuted == nil
           || len(unexecuted) > 0 : !passed.contains(name))
     },
   )
