@@ -693,6 +693,32 @@ pipeline test_discovery_stops_at_its_deadline() {
   assert_eq(result.admitted, [])
 }
 
+pipeline test_final_inspection_expiry_is_not_a_measured_empty_discovery() {
+  const samples = [producer(run(25, "push"), {lint: {digest: DIGEST}}, ["Lint"])]
+  const original = source(samples, fn(_endpoint) { return nil })
+  const positive = discover(original, current(), wanted(), nil, fn() { return 0 })
+  assert_eq(len(positive.admitted), 1)
+  assert_eq(positive.reason, "qualified")
+  let now = 0
+  let censuses = 0
+  const delayed: ProofSource = original
+    + {
+      json: fn(endpoint) {
+        const value = original.json(endpoint)
+        if endpoint.contains("/runs/25/") && endpoint.contains("/jobs?") {
+          censuses += 1
+          now = 45000
+        }
+        return value
+      },
+    }
+  const result = discover(delayed, current(), wanted(), nil, fn() { return now })
+  assert_eq(censuses, 1)
+  assert_eq(result.probed, 1)
+  assert_eq(result.admitted, [])
+  assert_eq(result.reason, "discovery_budget_exhausted")
+}
+
 pipeline test_two_attempts_of_one_run_are_two_producers() {
   const rerun = run(7, "push") + {run_attempt: 2}
   const producers = [
