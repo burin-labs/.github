@@ -147,21 +147,50 @@ test("Retry-After and immutable identity cannot escape the bound", async () => {
   }
 });
 
-test("native fetch aborts a stalled body within the remaining shared deadline", async () => {
+test("native fetch aborts a stalled body with the measured remaining shared budget", { timeout: 30_000 }, async t => {
+  const controller = new AbortController();
+  const budgets = [];
+  t.mock.method(AbortSignal, "timeout", budget => {
+    budgets.push(budget);
+    assert.equal(budget, 250);
+    return controller.signal;
+  });
+  let requests = 0;
   const server = createServer((_request, reply) => {
+    requests += 1;
     reply.writeHead(200, { "content-type": "application/json" });
     reply.write('{"repository":');
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-  const started = performance.now();
   let clockReads = 0;
+  let bodyReads = 0;
   try {
     await assert.rejects(readBaseline(request, {
       now: () => clockReads++ === 0 ? 0 : 59_750,
-      fetch: (_url, options) => fetch(`http://127.0.0.1:${server.address().port}`, options),
-    }), /incomplete|unmeasured/);
-    assert.ok(performance.now() - started < 2000, "native body abort exceeded its remaining deadline");
+      fetch: async (_url, options) => {
+        assert.equal(options.signal, controller.signal);
+        const native = await fetch(`http://127.0.0.1:${server.address().port}`, options);
+        assert.equal(native.status, 200);
+        const reader = native.body.getReader();
+        return { status: native.status, headers: native.headers, body: { getReader: () => ({
+          read: async () => {
+            bodyReads += 1;
+            const reading = reader.read();
+            if (bodyReads === 2) controller.abort();
+            const chunk = await reading;
+            assert.equal(new TextDecoder().decode(chunk.value), '{"repository":');
+            return chunk;
+          },
+          cancel: () => reader.cancel(),
+        }) } };
+      },
+    }), /body is incomplete/);
+    assert.deepEqual(budgets, [250]);
+    assert.equal(requests, 1);
+    assert.equal(bodyReads, 2);
+    assert.equal(clockReads, 2);
   } finally {
+    controller.abort();
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   }
