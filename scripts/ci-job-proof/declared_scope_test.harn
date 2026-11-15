@@ -156,6 +156,7 @@ fn fixture(
   return {
     original: inspect_original_run(parts.source, parts.policy, parts.producer),
     execution: parts.execution,
+    restored: {jobs: [], pending: []},
   }
 }
 
@@ -237,7 +238,7 @@ pipeline test_scope_boundary_normalizes_only_supported_declarations() {
 
 pipeline test_terminal_scope_artifact_binds_the_original_source_and_normal_verdict() {
   const parts = fixture_source("success")
-  const measured = inspect_scope_run(parts.source, parts.policy, parts.producer)
+  const measured = inspect_scope_run(parts.source, parts.policy, parts.producer, { -> 0 })
   assert_eq(measured.execution.requiredJobs, [{id: "replay", names: ["Replay"]}])
   for wrong in [
     parts.execution + {commit: "f".repeat(40)},
@@ -252,7 +253,7 @@ pipeline test_terminal_scope_artifact_binds_the_original_source_and_normal_verdi
     assert(
       is_err(
         try {
-          inspect_scope_run(source, parts.policy, parts.producer)
+          inspect_scope_run(source, parts.policy, parts.producer, { -> 0 })
         },
       ),
     )
@@ -312,7 +313,7 @@ pipeline test_terminal_scope_artifact_binds_the_original_source_and_normal_verdi
     assert(
       is_err(
         try {
-          inspect_scope_run(source, parts.policy, parts.producer)
+          inspect_scope_run(source, parts.policy, parts.producer, { -> 0 })
         },
       ),
       cohort,

@@ -11,6 +11,7 @@ pub type DeclaredScopeAdmission = {
   refreshable: bool,
   required_jobs: int?,
   unexecuted_jobs: list<string>?,
+  reused_jobs: list<string>,
 }
 
 type ScopePolicy = {schema: string, deferredJobs: dict<string, {declarable: bool}>}
@@ -76,6 +77,7 @@ pub fn declared_scope_admission(
     refreshable: false,
     required_jobs: nil,
     unexecuted_jobs: nil,
+    reused_jobs: [],
   }
   if len(declared) == 0 || proof == nil {
     return pending
@@ -89,6 +91,7 @@ pub fn declared_scope_admission(
     && status[0]?.conclusion == "success"
   const selection = record.selection == nil ? nil : scope_selection(record.selection)
   const execution = scope_execution(proof.execution)
+  const reused = proof.restored.jobs.map({ job -> job.id }).unique().sorted()
   const unexecuted = selection == nil ? nil : unexecuted_selection(
     inspection.producer,
     inspection.registered,
@@ -96,6 +99,8 @@ pub fn declared_scope_admission(
     inspection.census.declared,
     execution.requiredJobs,
   )
+    .filter({ id -> !reused.contains(id) })
+    .to_list()
   const selected = execution.requiredJobs.map({ job -> job.id })
   const passed = selected.filter({ id -> unexecuted != nil && !unexecuted.contains(id) })
   const unproven = declared.filter(
@@ -115,5 +120,6 @@ pub fn declared_scope_admission(
     refreshable: selection != nil && aggregate && len(unproven) > 0,
     required_jobs: selection == nil ? nil : len(execution.requiredJobs),
     unexecuted_jobs: unexecuted,
+    reused_jobs: reused,
   }
 }

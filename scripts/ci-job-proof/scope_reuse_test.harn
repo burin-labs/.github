@@ -1,0 +1,190 @@
+import { assert_error_contains } from "std/testing"
+import { Job, ProducerPolicy, Run } from "./contract.harn"
+import { declared_scope_admission } from "./declared_scope.harn"
+import { fixture } from "./history_test.harn"
+import { ProofSource, historical_reuse, inspect_scope_run } from "./reader.harn"
+
+const SELECTION = {schema: "burin.ci_scope_selection.v1", fullSuite: true, declared: ["full"]}
+
+type JobsPage = {total_count: int, jobs: list<Job>}
+
+const POLICY: ProducerPolicy = {
+  repository: "acme/product",
+  workflow: "ci.yml",
+  events: ["pull_request"],
+  registrarJob: "Changes",
+  registrarStep: "Register",
+}
+
+pipeline test_scope_uses_the_existing_authenticated_original_execution_for_every_reused_leg(
+  harness: Harness,
+) {
+  const sample = fixture(
+    harness.fs,
+    "skipped",
+    "success",
+    "a".repeat(64),
+    true,
+    {selection: SELECTION, event: "pull_request", legs: 2},
+  )
+  try {
+    const original = historical_reuse(sample.source, sample.current, sample.main, { -> 0 })
+    assert_eq(original.pending, [])
+    assert_eq(len(original.jobs), 2)
+    assert(original.jobs.all({ proof -> proof.provenance == {runId: 10, attempt: 1} }))
+    const scope = inspect_scope_run(sample.source, POLICY, sample.main, { -> 0 })
+    for requested in [["calibration"], ["full"]] {
+      const admitted = declared_scope_admission(requested, sample.main.head_sha, scope)
+      assert(admitted.admitted)
+      assert_eq(admitted.unexecuted_jobs, [])
+      assert_eq(admitted.reused_jobs, ["calibration"])
+    }
+  } finally {
+    harness.fs.delete(sample.directory)
+  }
+}
+
+pipeline test_scope_never_replaces_failed_current_work_or_unqualified_original_provenance(
+  harness: Harness,
+) {
+  for cohort in [
+    "current-failure",
+    "current-cancelled",
+    "original-failure",
+    "original-cancelled",
+    "changed-digest",
+    "no-phase",
+    "no-pointer",
+  ] {
+    const sample = fixture(
+      harness.fs,
+      cohort == "current-failure" ? "failure" : cohort == "current-cancelled" ? "cancelled" : "skipped",
+      cohort == "original-failure" ? "failure" : cohort == "original-cancelled" ? "cancelled" : "success",
+      cohort == "changed-digest" ? "b".repeat(64) : "a".repeat(64),
+      cohort != "no-phase",
+      {selection: SELECTION, event: "pull_request", legs: 2, pointer: cohort != "no-pointer"},
+    )
+    try {
+      const scope = inspect_scope_run(sample.source, POLICY, sample.main, { -> 0 })
+      const admitted = declared_scope_admission(["full"], sample.main.head_sha, scope)
+      assert(!admitted.admitted, cohort)
+      assert_eq(admitted.reused_jobs, [], cohort)
+      assert_eq(admitted.unexecuted_jobs, ["calibration"], cohort)
+    } finally {
+      harness.fs.delete(sample.directory)
+    }
+  }
+}
+
+pipeline test_scope_refuses_changed_attempt_workflow_and_incomplete_original_census(
+  harness: Harness,
+) {
+  for cohort in ["attempt", "workflow", "census", "second-leg-failure", "second-leg-no-phase"] {
+    const sample = fixture(
+      harness.fs,
+      "skipped",
+      "success",
+      "a".repeat(64),
+      true,
+      {selection: SELECTION, event: "pull_request", legs: 2},
+    )
+    const source: ProofSource = sample.source
+      + {
+        json: fn(path) {
+          const raw = sample.source.json(path)
+          if path.ends_with("/runs/10/attempts/1") {
+            const run = schema_expect(raw, schema_of(Run))
+            return cohort == "attempt" ? run + {run_attempt: 2} : cohort == "workflow" ? run
+              + {path: ".github/workflows/other.yml"} : run
+          }
+          if path.contains("/runs/10/") && path.contains("/jobs?") {
+            const page = schema_expect(raw, schema_of(JobsPage))
+            return page
+              + {
+                total_count: cohort == "census" ? page.total_count + 1 : page.total_count,
+                jobs: page.jobs.map(
+                  { job ->
+                    job.name != "Calibration 2" ? job : job
+                      + {
+                        conclusion: cohort == "second-leg-failure" ? "failure" : job.conclusion,
+                        steps: cohort == "second-leg-no-phase" ? [] : job.steps,
+                      }
+                  },
+                ),
+              }
+          }
+          return raw
+        },
+      }
+    try {
+      const measured = try {
+        inspect_scope_run(source, POLICY, sample.main, { -> 0 })
+      }
+      if is_ok(measured) {
+        const admitted = declared_scope_admission(["full"], sample.main.head_sha, unwrap(measured))
+        assert(!admitted.admitted, cohort)
+        assert_eq(admitted.reused_jobs, [], cohort)
+      } else {
+        assert(["attempt", "workflow", "census"].contains(cohort), cohort)
+      }
+    } finally {
+      harness.fs.delete(sample.directory)
+    }
+  }
+}
+
+pipeline test_output_producers_still_require_current_execution(harness: Harness) {
+  for result in ["success", "skipped", "failure"] {
+    const sample = fixture(
+      harness.fs,
+      "skipped",
+      "success",
+      "a".repeat(64),
+      true,
+      {selection: SELECTION, event: "pull_request", legs: 2, output: result},
+    )
+    try {
+      const scope = inspect_scope_run(sample.source, POLICY, sample.main, { -> 0 })
+      const admitted = declared_scope_admission(["full"], sample.main.head_sha, scope)
+      assert_eq(admitted.admitted, result == "success")
+      assert_eq(admitted.reused_jobs, ["calibration"])
+      assert_eq(admitted.unexecuted_jobs, result == "success" ? [] : ["plan"])
+      assert_eq(admitted.required_jobs, 2)
+    } finally {
+      harness.fs.delete(sample.directory)
+    }
+  }
+}
+
+pipeline test_scope_provenance_uses_the_existing_shared_elapsed_budget(harness: Harness) {
+  const sample = fixture(
+    harness.fs,
+    "skipped",
+    "success",
+    "a".repeat(64),
+    true,
+    {selection: SELECTION, event: "pull_request", legs: 2},
+  )
+  let now = 0
+  let originals = 0
+  const source: ProofSource = sample.source
+    + {
+      json: fn(path) {
+        const value = sample.source.json(path)
+        if path.ends_with("/runs/10/attempts/1") {
+          originals += 1
+          now = 45000
+        }
+        return value
+      },
+    }
+  try {
+    assert_error_contains(
+      fn() { inspect_scope_run(source, POLICY, sample.main, { -> now }) },
+      "budget exhausted",
+    )
+    assert_eq(originals, 1, "the bound must be reached through a measured original producer")
+  } finally {
+    harness.fs.delete(sample.directory)
+  }
+}

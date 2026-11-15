@@ -108,6 +108,13 @@ current head. The proof reader verifies both artifacts, the successful normal
 verdict and publication steps, and actual execution of each required job leg.
 A named scope needs its selected job's passing execution. The `full` scope needs
 measured full-suite selection and every selected job's passing execution.
+If a selected job was reused, the same bounded provenance reader resolves its
+registered input digest to the original run and attempt, verifies every job leg
+and measured phase, and reports its logical ID in `reused_jobs`. A skip without
+that qualified chain remains unexecuted. A failed current job cannot be replaced
+by old proof. Output-producing jobs still need current execution because they
+have no reusable identity. The observer supplies its real clock to the existing
+read-count, run-count and elapsed-time bounds.
 CI status alone proves neither. An older source without these records stays
 pending. Already covered declarations preserve proof, including after cosmetic
 body edits. Output-producing jobs gain no reuse permission from this evidence.

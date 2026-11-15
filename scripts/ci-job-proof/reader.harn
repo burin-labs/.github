@@ -20,8 +20,8 @@ import {
   leg_of,
   qualified_artifact,
   qualified_jobs,
-  registration_artifact_name,
   qualified_named_artifact,
+  registration_artifact_name,
   reuse_producer_policy,
   sha,
 } from "./contract.harn"
@@ -47,7 +47,11 @@ pub type OriginalRunInspection = {
   admission: RunAdmission,
 }
 
-pub type ScopeInspection = {original: OriginalRunInspection, execution: ScopeExecution}
+pub type ScopeInspection = {
+  original: OriginalRunInspection,
+  execution: ScopeExecution,
+  restored: HistoricalReuse,
+}
 
 type JobsPage = {total_count: int, jobs: list<Job>}
 
@@ -221,26 +225,36 @@ pub fn inspect_original_run(
 }
 
 /** The terminal selection uses actual plan outputs unavailable at input registration. */
-pub fn inspect_scope_run(source: ProofSource, policy: ProducerPolicy, producer: Run) -> ScopeInspection {
-  const original = inspect_original_run(source, policy, producer)
+pub fn inspect_scope_run(
+  source: ProofSource,
+  policy: ProducerPolicy,
+  producer: Run,
+  now: fn() -> int,
+) -> ScopeInspection {
+  const bounded = bounded_source(source, now)
+  const original = inspect_original_run(bounded.source, policy, producer)
   const recorded = original.registered.registration
-  require recorded.selection != nil && source.scope_execution != nil,
+  require recorded.selection != nil && bounded.source.scope_execution != nil,
     "the source cannot emit CI scope execution proof"
   const name = "ci-scope-execution-${producer.id}-${producer.run_attempt}"
-  const artifact = run_artifact(source, policy.repository, producer, name)
+  const artifact = run_artifact(bounded.source, policy.repository, producer, name)
   qualified_named_artifact(artifact, producer, name)
-  const raw = source.scope_execution(policy.repository, artifact)
+  const raw = bounded.source.scope_execution(policy.repository, artifact)
   schema_expect(raw, closed(schema_of(ScopeExecution)))
   const execution = scope_execution(raw)
   require execution.repository == recorded.repository && execution.workflow == recorded.workflow
-    && execution.event == recorded.event && execution.commit == recorded.commit
-    && execution.runId == recorded.runId && execution.attempt == recorded.attempt
-    && execution.tested_source == recorded.tested_source && execution.selection == recorded.selection,
+    && execution.event == recorded.event
+    && execution.commit == recorded.commit
+    && execution.runId == recorded.runId
+    && execution.attempt == recorded.attempt
+    && execution.tested_source == recorded.tested_source
+    && execution.selection == recorded.selection,
     "CI scope execution does not bind the registered source and selection"
   const publishers = original.census.jobs.filter({ job -> job.name == "CI status" }).to_list()
   const publisher = publishers[0]
   require len(publishers) == 1 && publisher != nil && publisher.started_at != nil
-    && publisher.completed_at != nil, "CI scope publisher is unmeasured"
+    && publisher.completed_at != nil,
+    "CI scope publisher is unmeasured"
   for step_name in ["Check for failures", "Retain declared scope execution"] {
     const steps = publisher.steps.filter({ step -> step.name == step_name }).to_list()
     require len(steps) == 1 && steps[0]?.status == "completed" && steps[0]?.conclusion == "success",
@@ -249,7 +263,13 @@ pub fn inspect_scope_run(source: ProofSource, policy: ProducerPolicy, producer: 
   require date_parse(artifact.created_at) >= date_parse(publisher.started_at)
     && date_parse(artifact.created_at) <= date_parse(publisher.completed_at),
     "CI scope execution artifact is outside its publisher lifetime"
-  return {original: original, execution: execution}
+  const required = execution.requiredJobs.map({ job -> job.id })
+  const wanted = original.requested.filter({ identity -> required.contains(identity.id) }).to_list()
+  return {
+    original: original,
+    execution: execution,
+    restored: restore_provenance(bounded, recorded, original, wanted),
+  }
 }
 
 /** Existing reuse and history keep their same-workflow, distinct-consumer policy. */
@@ -295,18 +315,19 @@ pub fn historical_reuse_batch(
     "historical proof batch is malformed"
   const bounded = bounded_source(source, now, READ_BUDGET * len(requests))
   let archive_cache = {}
-  const shared: ProofSource = source + {
-    json: bounded.source.json,
-    registration: fn(repo, artifact) {
-      const key = "${repo}:${artifact.id}:${artifact.digest}"
-      if archive_cache[key] != nil {
-        return archive_cache[key]
-      }
-      const value = bounded.source.registration(repo, artifact)
-      archive_cache = archive_cache + {[key]: value}
-      return value
-    },
-  }
+  const shared: ProofSource = source
+    + {
+      json: bounded.source.json,
+      registration: fn(repo, artifact) {
+        const key = "${repo}:${artifact.id}:${artifact.digest}"
+        if archive_cache[key] != nil {
+          return archive_cache[key]
+        }
+        const value = bounded.source.registration(repo, artifact)
+        archive_cache = archive_cache + {[key]: value}
+        return value
+      },
+    }
   return requests.map(
     { request ->
       const measured = try {
@@ -362,11 +383,24 @@ pub fn historical_reuse(
     return {jobs: [], pending: []}
   }
   const root = inspect_registered_run(bounded.source, policy, producer, registered)
-  const wanted = root.requested.filter(
+  const selected = root.requested.filter(
+    { identity -> names == nil || names.any({ name -> leg_of(identity.names, name) }) },
+  )
+    .to_list()
+  return restore_provenance(bounded, current, root, selected)
+}
+
+/** Every observer resolves skipped claims through the same original execution qualifier. */
+fn restore_provenance(
+  bounded: BudgetSource,
+  current: RunContext,
+  root: OriginalRunInspection,
+  selected: list<JobIdentity>,
+) -> HistoricalReuse {
+  const wanted = selected.filter(
     { identity ->
       const matches = root.census.jobs.filter({ job -> leg_of(identity.names, job.name) }).to_list()
-      return (names == nil || names.any({ name -> leg_of(identity.names, name) }))
-        && root.admission.deferred.any({ pointer -> pointer.id == identity.id })
+      return root.admission.deferred.any({ pointer -> pointer.id == identity.id })
         && len(matches) > 0
         && matches.all({ job -> job.conclusion == "skipped" })
     },
@@ -460,22 +494,33 @@ fn bounded_source(source: ProofSource, now: fn() -> int, limit: int = READ_BUDGE
     }
     reads = reads + 1
   }
-  return {
-    source: {
-      json: fn(endpoint) {
-        if memo[endpoint] != nil {
-          return memo[endpoint]
-        }
-        take()
-        const result = source.json(endpoint)
-        memo = memo + {[endpoint]: result}
-        return result
-      },
-      registration: fn(repo, artifact) {
-        take()
-        return source.registration(repo, artifact)
-      },
+  let wrapped: ProofSource = {
+    json: fn(endpoint) {
+      if memo[endpoint] != nil {
+        return memo[endpoint]
+      }
+      take()
+      const result = source.json(endpoint)
+      memo = memo + {[endpoint]: result}
+      return result
     },
+    registration: fn(repo, artifact) {
+      take()
+      return source.registration(repo, artifact)
+    },
+  }
+  if source.scope_execution != nil {
+    const read_scope = source.scope_execution
+    wrapped = wrapped
+      + {
+        scope_execution: fn(repo, artifact) {
+          take()
+          return read_scope(repo, artifact)
+        },
+      }
+  }
+  return {
+    source: wrapped,
     reads: fn() { return reads },
     exhausted: fn() { return reads >= limit || now() >= expires_at },
   }

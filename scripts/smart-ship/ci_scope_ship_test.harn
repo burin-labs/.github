@@ -16,6 +16,7 @@ const PENDING = {
   refreshable: true,
   required_jobs: nil,
   unexecuted_jobs: nil,
+  reused_jobs: [],
 }
 
 const SCOPE: ScopeObservation = {admission: PENDING, error: nil, allowed: ["full", "replay"]}

@@ -47,7 +47,11 @@ pub fn scope_gate(repository: string, observed: ScopeObservation?) -> ScopeGate 
 }
 
 /** Read one latest original attempt through the same job-proof qualifier that owns reuse. */
-pub fn observe_scope(source: ProofSource, request: ScopeRequest) -> DeclaredScopeAdmission {
+pub fn observe_scope(
+  source: ProofSource,
+  request: ScopeRequest,
+  now: fn() -> int,
+) -> DeclaredScopeAdmission {
   const {repository, head, body, policy, checks} = request
   if len(scope_declaration_names(body)) == 0 {
     return declared_scope_admission([], head, nil)
@@ -84,7 +88,11 @@ pub fn observe_scope(source: ProofSource, request: ScopeRequest) -> DeclaredScop
       registrarJob: "Detect changes",
       registrarStep: "Resolve CI job proof reuse",
     }
-    return declared_scope_admission(declared, head, inspect_scope_run(source, expected, producer))
+    return declared_scope_admission(
+      declared,
+      head,
+      inspect_scope_run(source, expected, producer, now),
+    )
   }
   return declared_scope_admission(declared, head, nil)
 }

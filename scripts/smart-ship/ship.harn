@@ -1866,6 +1866,7 @@ pub fn look(harness: Harness, job: Look) {
           repository: repo, head: pr.headRefOid, body: pr.body ?? "", policy: policy,
           checks: pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? [],
         },
+        { -> harness.clock.now_ms() },
       )
     }
     observed = is_ok(scope)

@@ -1,14 +1,26 @@
 import { Registration, Run } from "./contract.harn"
-import { registration_from_archive } from "./live.harn"
+import { document_from_archive, registration_from_archive } from "./live.harn"
 import { ProofSource, historical_reuse, historical_reuse_batch } from "./reader.harn"
+import { ScopeSelection } from "./selection.harn"
 
-fn fixture(
+type ScopeFixture = {
+  selection?: ScopeSelection,
+  event?: string,
+  legs?: int,
+  output?: string,
+  pointer?: bool,
+}
+
+pub fn fixture(
   fs: HarnessFs,
   main_result: string,
   original_result: string,
   original_digest: string,
   observed: bool = true,
+  scope: ScopeFixture = {},
 ) {
+  const selection = scope.selection
+  const legs = scope.legs ?? 1
   const current: Registration = {
     schema: "burin.ci_job_proof_registration.v3",
     tested_source: {commit: "e".repeat(40), tree: "f".repeat(40)},
@@ -34,7 +46,7 @@ fn fixture(
     repository: {full_name: "acme/product"},
     head_repository: {full_name: "acme/product"},
   }
-  const main: Run = {...original, id: 20, head_sha: "b".repeat(40), event: "push"}
+  const main: Run = {...original, id: 20, head_sha: "b".repeat(40), event: scope.event ?? "push"}
   let pages = {}
   let paths = {}
   for run in [original, main] {
@@ -46,13 +58,15 @@ fn fixture(
       jobs: [
         {
           id: "calibration",
-          names: ["Calibration"],
+          names: legs == 1 ? ["Calibration"] : ["^Calibration [1-9][0-9]*$"],
           digest: run.id == 20 ? "a".repeat(64) : original_digest,
-          provenance: run.id == 20 ? {runId: 10, attempt: 1} : nil,
+          provenance: run.id == 20 && scope.pointer != false ? {runId: 10, attempt: 1} : nil,
         },
       ],
     }
-    const archive = zip_create([{path: "registration.json", content: json_stringify(recorded)}])
+    const registration = selection != nil && run.id == 20 ? recorded
+      + {selection: selection} : recorded
+    const archive = zip_create([{path: "registration.json", content: json_stringify(registration)}])
     const path = directory + "/" + to_string(run.id) + ".zip"
     fs.write_bytes(path, archive)
     const artifact = {
@@ -81,21 +95,87 @@ fn fixture(
         completed_at: "2026-10-09T10:00:01Z",
         steps: [{name: "Register", status: "completed", conclusion: "success"}],
       },
-      {
-        ...base,
-        id: run.id + 2,
-        name: "Calibration",
-        conclusion: run.id == 20 ? main_result : original_result,
-        steps: run.id == 20 || !observed ? [] : [
-          {name: "Replay", status: "completed", conclusion: original_result},
-        ],
-      },
     ]
+      + range(0, legs).map(
+        { leg ->
+          {
+            ...base,
+            id: run.id + 2 + leg,
+            name: legs == 1 ? "Calibration" : "Calibration ${leg + 1}",
+            conclusion: run.id == 20 ? main_result : original_result,
+            steps: run.id == 20 || !observed ? [] : [
+              {name: "Replay", status: "completed", conclusion: original_result},
+            ],
+          }
+        },
+      )
+        .to_list()
     const prefix = "/repos/acme/product/actions/runs/" + to_string(run.id)
+    let artifacts = [artifact]
+    let jobs = rows
+    if selection != nil && run.id == 20 {
+      const execution = {
+        schema: "burin.ci_scope_execution.v1",
+        repository: recorded.repository,
+        workflow: recorded.workflow,
+        event: recorded.event,
+        commit: recorded.commit,
+        runId: recorded.runId,
+        attempt: recorded.attempt,
+        tested_source: recorded.tested_source,
+        selection: selection,
+        requiredJobs: [{id: "calibration", names: recorded.jobs[0].names}]
+          + (scope.output == nil ? [] : [{id: "plan", names: ["Plan"]}]),
+      }
+      const payload = zip_create(
+        [{path: "scope-execution.json", content: json_stringify(execution)}],
+      )
+      const execution_path = directory + "/scope.zip"
+      fs.write_bytes(execution_path, payload)
+      const execution_artifact = artifact
+        + {
+          id: 200,
+          name: "ci-scope-execution-20-1",
+          size_in_bytes: len(payload),
+          digest: "sha256:" + sha256(payload),
+          created_at: "2026-10-09T10:00:02Z",
+        }
+      artifacts = artifacts + [execution_artifact]
+      paths = paths + {"200": execution_path}
+      jobs = jobs
+        + [
+          {
+            ...base,
+            id: 1000,
+            name: "CI status",
+            steps: [
+              {name: "Check for failures", status: "completed", conclusion: "success"},
+              {name: "Retain declared scope execution", status: "completed", conclusion: "success"},
+            ],
+          },
+        ]
+      if scope.output != nil {
+        jobs = jobs
+          + [
+            {
+              ...base,
+              id: 1001,
+              name: "Plan",
+              conclusion: scope.output,
+              steps: scope.output == "skipped" ? [] : [
+                {name: "Plan current outputs", status: "completed", conclusion: scope.output},
+              ],
+            },
+          ]
+      }
+    }
     pages = pages
       + {
-        [prefix + "/artifacts?per_page=100&page=1"]: {total_count: 1, artifacts: [artifact]},
-        [prefix + "/attempts/1/jobs?per_page=30&page=1"]: {total_count: 2, jobs: rows},
+        [prefix + "/artifacts?per_page=100&page=1"]: {
+          total_count: len(artifacts),
+          artifacts: artifacts,
+        },
+        [prefix + "/attempts/1/jobs?per_page=30&page=1"]: {total_count: len(jobs), jobs: jobs},
         [prefix + "/attempts/1"]: run,
       }
     paths = paths + {[to_string(artifact.id)]: path}
@@ -111,6 +191,12 @@ fn fixture(
       fs,
       paths[to_string(artifact.id)],
       artifact.digest,
+    ) },
+    scope_execution: fn(_repo, artifact) { return document_from_archive(
+      fs,
+      paths[to_string(artifact.id)],
+      artifact.digest,
+      "scope-execution.json",
     ) },
   }
   return {source: source, current: current, main: main, directory: directory}

@@ -21,6 +21,7 @@ pipeline test_scope_observer_qualifies_the_current_original_producer_and_never_f
         policy: nil,
         checks: [],
       },
+      { -> 0 },
     ).admitted,
   )
   const policy = {schema: "burin.ci_selection.v1", deferredJobs: {replay: {declarable: true}}}
@@ -51,6 +52,7 @@ pipeline test_scope_observer_qualifies_the_current_original_producer_and_never_f
         policy: policy,
         checks: [check],
       },
+      { -> 0 },
     )
     assert_eq(result.admitted, conclusion == "success")
     assert_eq(result.runId, 10)
@@ -80,6 +82,7 @@ pipeline test_scope_observer_qualifies_the_current_original_producer_and_never_f
           policy: policy,
           checks: [check],
         },
+        { -> 0 },
       ).admitted,
     )
   }
@@ -93,6 +96,7 @@ pipeline test_scope_observer_qualifies_the_current_original_producer_and_never_f
         policy: policy,
         checks: [],
       },
+      { -> 0 },
     ).admitted,
   )
   const newer = check
@@ -112,6 +116,7 @@ pipeline test_scope_observer_qualifies_the_current_original_producer_and_never_f
             policy: policy,
             checks: [check, newer],
           },
+          { -> 0 },
         )
       },
     ),
