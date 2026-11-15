@@ -20,7 +20,14 @@ An existing attempt, changed source, closed issue, missing job or skipped contro
 refuses before inference spend.
 
 The agent receives the current checkout and bounded failure logs. It has no
-GitHub credential or child network. The existing Smart Ship agent allows at
+GitHub credential or child network. Before that boundary, the Burin caller
+installs the checkout's pinned Node runtime, reuses its integrity-checked pnpm
+installer, and installs frozen dependencies with lifecycle scripts disabled.
+This setup step has no publication credential or model key. The package manager
+lives inside the repair checkout's private Git directory and is available on
+the agent's command path. A failed setup cannot start the repair agent.
+
+The existing Smart Ship agent allows at
 most 60 turns, $2, and 20 minutes. Publication runs outside that sandbox, rechecks
 the source and episode, stages through Smart Ship's existing file policy, and
 uses the existing signed-commit adapter. Only a nonempty repair reported as
