@@ -12,6 +12,10 @@ on:
       head:
         type: string
         required: true
+      target_branch:
+        type: string
+        required: false
+        default: main
     secrets:
       RELEASE_APP_CLIENT_ID:
         required: true
@@ -35,6 +39,7 @@ jobs:
       MAIN_REPAIR_ISSUE: ${{ inputs.issue }}
       MAIN_REPAIR_RUN: ${{ inputs.red-run }}
       MAIN_REPAIR_HEAD: ${{ inputs.head }}
+      MAIN_REPAIR_TARGET_BRANCH: ${{ inputs.target_branch }}
       SHIP_NONCE: ${{ github.run_id }}.${{ github.run_attempt }}
     steps:
       - name: Mint trusted publication authority

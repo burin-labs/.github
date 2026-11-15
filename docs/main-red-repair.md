@@ -32,3 +32,15 @@ outcome. A timeout, missing report or refused publication leaves its checkout
 under the run's `SHIP_WORK` directory for investigation while the runner retains
 it. It does not dispatch another attempt automatically. Keep the episode open
 until a later run actually passes its failing jobs.
+
+To rehearse against a real failing test branch, keep the caller on trusted
+`main` and pass `target_branch: ci-bisect/<sha12>/<sha40>`. Both SHA components
+must identify the requested head. The episode must record that exact
+`targetBranch` and carry `main-red-rehearsal-<sha12>`. Its failed run must be an
+actual `workflow_dispatch` on that branch at that source. The preceding-source
+control uses the existing bisect branch contract.
+
+The worker derives the attempt namespace from the full target SHA and opens
+its draft PR against the test branch. It checks that target again before
+publication. Omitting `target_branch` keeps the normal `main` behavior; labels,
+PR bases and attempt namespaces aren't independent inputs.
