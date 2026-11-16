@@ -1,0 +1,454 @@
+/** Structural API fixtures cross the real connector and physical store-lock boundaries. */
+import { command_run } from "std/command"
+import { lifecycle_github_readers } from "./lifecycle-github.harn"
+import {
+  RECOVERY_SCHEMA,
+  RecoveryRecord,
+  RecoveryStoreLock,
+  recovery_store_lock,
+} from "./recovery.harn"
+import { GithubClientOptions } from "harn-github-connector/default"
+
+const API = "https://api.github.com/repos/o/r"
+
+pipeline test_lifecycle_github_authenticates_repo_and_exact_producer_custody(harness: Harness) {
+  for mode in [
+    "positive",
+    "repo403",
+    "repo404",
+    "repo500",
+    "repo-malformed",
+    "repo-foreign",
+    "producer-foreign",
+    "attempt-foreign",
+    "custody-changed",
+    "source-changed",
+    "producer-running",
+  ] {
+    fixture_run(harness, mode)
+  }
+}
+
+pipeline test_lifecycle_github_separates_archive_404_from_unreadable_or_changed_state(
+  harness: Harness,
+) {
+  for mode in [
+    "archive404",
+    "archive403",
+    "archive500",
+    "archive-malformed",
+    "archive-changed",
+    "delete500",
+    "readback500",
+    "readback-present",
+  ] {
+    fixture_run(harness, mode)
+  }
+}
+
+pipeline test_lifecycle_github_requires_unique_owned_record_and_content_addressed_ref(
+  harness: Harness,
+) {
+  for mode in [
+    "missing-record",
+    "duplicate-record",
+    "foreign-identity",
+    "mutable-wip",
+    "different-sha",
+  ] {
+    fixture_run(harness, mode)
+  }
+}
+
+pipeline test_lifecycle_github_rechecks_lock_and_preserves_prior_mutation_authority(
+  harness: Harness,
+) {
+  for mode in ["unlock-source", "withdraw-authority", "unlock-authority"] {
+    fixture_run(harness, mode)
+  }
+}
+
+pipeline test_lifecycle_github_reauthenticates_live_content_after_delete(harness: Harness) {
+  for mode in ["repo-after-delete", "custody-after-delete403", "custody-after-delete-changed"] {
+    fixture_run(harness, mode)
+  }
+}
+
+pipeline test_lifecycle_github_never_deletes_the_only_confirmed_archive_custody(harness: Harness) {
+  for mode in ["archive-is-custody", "keeper-after-authority"] {
+    fixture_run(harness, mode)
+  }
+}
+
+pipeline test_lifecycle_github_reauthenticates_and_repeats_an_initial_archive_404(
+  harness: Harness,
+) {
+  for mode in [
+    "initial404-repo403",
+    "initial404-custody403",
+    "initial404-custody-changed",
+    "initial404-readback500",
+    "initial404-readback-present",
+  ] {
+    fixture_run(harness, mode)
+  }
+}
+
+fn receipt() -> RecoveryRecord {
+  return {
+    schema: RECOVERY_SCHEMA,
+    identity: {
+      repository: "o/r",
+      number: 9,
+      run_id: 123,
+      run_attempt: 1,
+      nonce: "a" * 32,
+      head: "b" * 40,
+    },
+    snapshot: {tree: "d" * 40, agent_index_sha256: "c" * 64},
+    custody: {reference: "refs/smart-ship/wip/9", sha: "e" * 40, tree: "d" * 40},
+    archives: [{reference: "refs/smart-ship/previous/9/${"e" * 40}", sha: "e" * 40}],
+  }
+}
+
+fn fixture_run(harness: Harness, mode: string) {
+  const parent = harness.fs.mkdtemp_in_workspace("lifecycle-github-")
+  const root = "${parent}/store"
+  const entry = "${parent}/transaction.harn"
+  const source = harness.fs.source_dir()
+  harness.fs.write_text(
+    entry,
+    "import { github_fixture } from " + json_stringify("${source}/lifecycle-github_test.harn")
+      + "\nfn main(harness: Harness) { github_fixture(harness) }\n",
+  )
+  const runtime = harness.process.find_executable("harn") ?? ""
+  require runtime != ""
+  const result = command_run(
+    harness.tools,
+    {
+      argv: [
+        "flock",
+        "--exclusive",
+        "--nonblock",
+        "--no-fork",
+        "${root}.lock",
+        runtime,
+        "run",
+        "--no-sandbox",
+        entry,
+        "--",
+        root,
+        mode,
+      ],
+      sandbox_profile: "workspace_paths",
+    },
+    {timeout_ms: 30000, max_inline_bytes: 65536},
+  )
+  assert(result.success, "${mode}: ${result.stderr}")
+  assert(
+    result.stdout.contains("github-${mode}-confirmed"),
+    "reach the actual authenticated reader case",
+  )
+}
+
+fn mock(testing: HarnessTesting, path: string, status: int, body: unknown) {
+  testing.http_mock("GET", "${API}${path}", {status: status, body: json_stringify(body)})
+}
+
+pub fn github_fixture(harness: Harness) -> nil {
+  require len(argv) == 2
+  const root = argv[0] ?? ""
+  const mode = argv[1] ?? ""
+  const caps = pick(harness, ["fs", "tools"])
+  const lock = recovery_store_lock(caps, root, "f" * 32)
+  const record = receipt()
+  const id = record.identity
+  const archive = record.archives[0]
+  require archive != nil
+  const work = "${root}/123-1-9/work"
+  harness.fs.mkdir(work, true)
+  harness.fs.write_text("${work}/.owner", "${id.nonce}\n")
+  harness.fs.write_text("${work}/recovery.json", json_stringify(record))
+  if mode == "missing-record" {
+    harness.fs.delete("${work}/recovery.json")
+  }
+  if mode == "duplicate-record" {
+    const copy = "${root}/123-1-9-${id.nonce}/work"
+    harness.fs.mkdir(copy, true)
+    harness.fs.write_text("${copy}/.owner", "${id.nonce}\n")
+    harness.fs.write_text("${copy}/recovery.json", json_stringify(record))
+  }
+  setup_http(pick(harness, ["testing"]), record, mode)
+  exercise(harness, lock, work, record, mode)
+}
+
+fn setup_http(harness: {testing: HarnessTesting}, record: RecoveryRecord, mode: string) {
+  harness.testing.http_mock_clear()
+  const repo_status =
+    mode == "repo403" ? 403 : mode == "repo404" ? 404 : mode == "repo500" ? 500 : 200
+  mock(
+    harness.testing,
+    "",
+    repo_status,
+    mode == "repo-malformed" ? {} : {
+      id: 100,
+      full_name: mode == "repo-foreign" ? "other/r" : "o/r",
+    },
+  )
+  mock(
+    harness.testing,
+    "/actions/runs/123/attempts/1",
+    200,
+    {
+      id: mode == "producer-foreign" ? 124 : 123,
+      run_attempt: mode == "attempt-foreign" ? 2 : 1,
+      status: mode == "producer-running" ? "in_progress" : "completed",
+      repository: {full_name: "o/r"},
+    },
+  )
+  if ["repo-after-delete", "initial404-repo403"].contains(mode) {
+    const before = {status: 200, body: json_stringify({id: 100, full_name: "o/r"})}
+    harness.testing.http_mock(
+      "GET",
+      API,
+      {
+        responses: (mode == "repo-after-delete" ? [before, before] : [before])
+          + [{status: 403, body: "{\"message\":\"Resource not accessible by integration\"}"}],
+      },
+    )
+  }
+  custody_http(harness.testing, record, mode)
+  archive_http(harness.testing, record, mode)
+}
+
+fn custody_http(testing: HarnessTesting, record: RecoveryRecord, mode: string) {
+  const custody_sha = ["custody-changed", "archive-is-custody"].contains(mode) ? "f" * 40 : record
+    .custody.sha
+  mock(
+    testing,
+    "/git/ref/${url_encode("smart-ship/wip/9")}",
+    200,
+    {ref: record.custody.reference, object: {sha: custody_sha, type: "commit"}},
+  )
+  mock(
+    testing,
+    "/git/commits/${custody_sha}",
+    200,
+    {sha: custody_sha, tree: {sha: record.custody.tree}},
+  )
+  if [
+    "custody-after-delete403",
+    "initial404-custody403",
+    "custody-after-delete-changed",
+    "initial404-custody-changed",
+    "keeper-after-authority",
+  ]
+    .contains(mode) {
+    const forbidden = ["custody-after-delete403", "initial404-custody403"].contains(mode)
+    const before = {
+      status: 200,
+      body: json_stringify(
+        {ref: record.custody.reference, object: {sha: record.custody.sha, type: "commit"}},
+      ),
+    }
+    const after = {
+      status: forbidden ? 403 : 200,
+      body: json_stringify(
+        forbidden ? {message: "Resource not accessible by integration"} : {
+          ref: record.custody.reference,
+          object: {sha: "f" * 40, type: "commit"},
+        },
+      ),
+    }
+    testing.http_mock(
+      "GET",
+      "${API}/git/ref/${url_encode("smart-ship/wip/9")}",
+      {
+        responses: (starts_with(mode, "custody-after-delete") ? [before, before] : [before])
+          + [after],
+      },
+    )
+    mock(
+      testing,
+      "/git/commits/${"f" * 40}",
+      200,
+      {sha: "f" * 40, tree: {sha: record.custody.tree}},
+    )
+  }
+  if ["archive-is-custody", "keeper-after-authority"].contains(mode) {
+    mock(
+      testing,
+      "/git/ref/${url_encode("smart-ship/previous/9/${record.custody.sha}")}",
+      200,
+      {
+        ref: "refs/smart-ship/previous/9/${record.custody.sha}",
+        object: {sha: record.custody.sha, type: "commit"},
+      },
+    )
+    mock(
+      testing,
+      "/git/commits/${record.custody.sha}",
+      200,
+      {sha: record.custody.sha, tree: {sha: record.custody.tree}},
+    )
+  }
+}
+
+fn archive_http(testing: HarnessTesting, record: RecoveryRecord, mode: string) {
+  const archive = record.archives[0]
+  require archive != nil
+  const archive_path = "/git/ref/${url_encode("smart-ship/previous/9/${archive.sha}")}"
+  const archive_body = {
+    ref: archive.reference,
+    object: {sha: mode == "archive-changed" ? "f" * 40 : archive.sha, type: "commit"},
+  }
+  const initial_status = mode == "archive404" ? 404 : mode == "archive403" ? 403 : mode
+    == "archive500" ? 500 : 200
+  if [
+    "positive",
+    "delete500",
+    "readback500",
+    "readback-present",
+    "repo-after-delete",
+    "custody-after-delete403",
+    "custody-after-delete-changed",
+  ]
+    .contains(mode)
+    || starts_with(mode, "initial404-") {
+    const next_status = ["readback500", "initial404-readback500"].contains(mode) ? 500 : [
+      "readback-present",
+      "initial404-readback-present",
+    ]
+      .contains(mode) ? 200 : 404
+    testing.http_mock(
+      "GET",
+      "${API}${archive_path}",
+      {
+        responses: [
+          {
+            status: starts_with(mode, "initial404-") ? 404 : 200,
+            body: json_stringify(archive_body),
+          },
+          {
+            status: next_status,
+            body: json_stringify(next_status == 200 ? archive_body : {message: "Not Found"}),
+          },
+        ],
+      },
+    )
+  } else {
+    mock(testing, archive_path, initial_status, mode == "archive-malformed" ? {} : archive_body)
+  }
+  testing.http_mock(
+    "DELETE",
+    "${API}/git/${archive.reference}",
+    {status: mode == "delete500" ? 500 : 204, body: mode == "delete500" ? "{}" : ""},
+  )
+}
+
+fn exercise(
+  harness: Harness,
+  lock: RecoveryStoreLock,
+  work: string,
+  record: RecoveryRecord,
+  mode: string,
+) {
+  const id = record.identity
+  const archive = record.archives[0]
+  require archive != nil
+  const options: GithubClientOptions = {
+    installation_token: "inert-token",
+    budget: {state_dir: ""},
+    retry: {max_attempts: 1},
+    authorize_mutation: { ->
+      if mode == "unlock-authority" {
+        assert(command_run(harness.tools, ["flock", "--unlock", lock.descriptor]).success)
+      }
+      return Ok(mode != "withdraw-authority")
+    },
+  }
+  let source_calls = 0
+  const readers = lifecycle_github_readers(
+    harness,
+    options,
+    lock,
+    "o/r",
+    { path, identity ->
+      source_calls += 1
+      assert_eq(path, work)
+      assert_eq(identity, id)
+      if mode == "unlock-source" {
+        assert(command_run(harness.tools, ["flock", "--unlock", lock.descriptor]).success)
+      }
+      return mode == "source-changed" ? record.snapshot + {tree: "f" * 40} : record.snapshot
+    },
+  )
+  if mode == "positive" {
+    const observed = readers.observe(record)
+    assert_eq(observed.repository, "o/r")
+    assert_eq(observed.run_id, id.run_id)
+    assert_eq(observed.run_attempt, id.run_attempt)
+    assert_eq(observed.run_status, "completed")
+    assert_eq(observed.custody, record.custody)
+  }
+  const remove = readers.archive_remove
+  require remove != nil
+  const selected_id = mode == "foreign-identity" ? id + {repository: "other/r"} : id
+  const selected_archive = mode == "mutable-wip" ? archive
+    + {reference: record.custody.reference} : mode == "different-sha" ? archive
+    + {sha: "f" * 40} : archive
+  const result = try {
+    remove(selected_id, selected_archive)
+  }
+  const calls = harness.testing.http_mock_calls({include_sensitive: true})
+  const writes = calls.filter({ call -> call.method == "DELETE" })
+  assert(
+    calls.all({ call -> call.headers.authorization == "Bearer inert-token" }),
+    "every observed GitHub request must carry the configured authority",
+  )
+  if ["producer-running", "custody-changed", "archive-is-custody"].contains(mode) {
+    assert_eq(source_calls, 0, "unconfirmed producer or custody must not reach source staging")
+  }
+  if ["positive", "archive404"].contains(mode) {
+    const value = unwrap(result)
+    assert_eq(value.reference, archive.reference)
+    assert(value.absent)
+    assert_eq(value.observed_sha, mode == "positive" ? archive.sha : nil)
+    assert_eq(len(writes), mode == "positive" ? 1 : 0)
+    assert_eq(
+      len(
+        calls.filter(
+          { call ->
+            call.url == "${API}/git/ref/${url_encode("smart-ship/previous/9/${archive.sha}")}"
+          },
+        ),
+      ),
+      2,
+      "absence requires the fresh authenticated archive readback",
+    )
+    assert(
+      calls.any({ call -> call.method == "GET" && call.url == API }),
+      "repository authentication must actually fire",
+    )
+  } else {
+    assert(is_err(result), "${mode} must remain unknown/refused, never measured archive absence")
+    assert_eq(
+      len(writes),
+      [
+        "delete500",
+        "readback500",
+        "readback-present",
+        "repo-after-delete",
+        "custody-after-delete403",
+        "custody-after-delete-changed",
+      ]
+        .contains(mode) ? 1 : 0,
+    )
+  }
+  assert(
+    writes.all({ call -> call.url == "${API}/git/${archive.reference}" }),
+    "only the exact content-addressed ref may be mutated",
+  )
+  assert(harness.fs.exists("${work}/.owner"), "this adapter never removes local work")
+  harness.stdio.println("github-${mode}-confirmed")
+}

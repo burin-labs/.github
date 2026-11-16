@@ -1,0 +1,184 @@
+/** Authenticated GitHub readers for the physically locked recovery lifecycle. */
+import { ArchiveRemoval, LifecycleReaders } from "./lifecycle.harn"
+import {
+  RecoveryIdentity,
+  RecoveryObservation,
+  RecoveryRecord,
+  RecoveryReference,
+  RecoverySnapshot,
+  RecoveryStoreLock,
+  recovery_custody_decision,
+  recovery_entry,
+  recovery_observation,
+  recovery_record,
+  recovery_store_assert_owned,
+  recovery_store_entries,
+} from "./recovery.harn"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+type Repository = {id: int, full_name: string}
+
+type Reference = {ref: string, object: {sha: string, type: string}}
+
+type SourceReader = fn(string, RecoveryIdentity) -> RecoverySnapshot
+
+type OwnedRecord = {work: string, record: RecoveryRecord}
+
+const MAX_STORE_ENTRIES = 1024
+
+fn authenticate(harness: Harness, options: GithubClientOptions, repository: string) {
+  const response = api_call(harness, {path: "/repos/${repository}", options: options})
+  require is_ok(response), "recovery repository authentication is unavailable"
+  const measured = schema_expect(unwrap(response), schema_of(Repository))
+  require measured.id > 0 && measured.full_name == repository,
+    "recovery repository identity changed"
+}
+
+fn observation(
+  harness: Harness,
+  options: GithubClientOptions,
+  repository: string,
+  record: RecoveryRecord,
+) -> RecoveryObservation {
+  const validated = recovery_record(record)
+  require validated.identity.repository == repository,
+    "recovery repository does not match trusted workflow"
+  authenticate(harness, options, repository)
+  return recovery_observation(harness, options, validated)
+}
+
+fn owned(fs: HarnessFs, lock: RecoveryStoreLock, identity: RecoveryIdentity) -> OwnedRecord {
+  const names = recovery_store_entries(fs, lock)
+  require len(names) <= MAX_STORE_ENTRIES, "recovery store census exceeds the whole-reader bound"
+  let matches: list<OwnedRecord> = []
+  for name in names {
+    const entry = recovery_entry(fs, lock, name)
+    const record = entry.record
+    if record != nil && record.identity == identity {
+      matches.push({work: "${lock.root}/${name}/work", record: record})
+    }
+  }
+  require len(matches) == 1, "recovery archive has no unique owned source record"
+  const selected = matches[0]
+  if selected == nil {
+    throw "recovery archive source is unmeasured"
+  }
+  return selected
+}
+
+fn archive_path(repository: string, archive: RecoveryReference) -> string {
+  return "/repos/${repository}/git/ref/${url_encode(join(split(archive.reference, "/")[1:], "/"))}"
+}
+
+fn custody(
+  harness: Harness,
+  options: GithubClientOptions,
+  repository: string,
+  record: RecoveryRecord,
+) -> RecoveryObservation {
+  const observed = observation(harness, options, repository, record)
+  const remote = recovery_custody_decision(record, observed, record.snapshot)
+  require remote.eligible, remote.reason
+  return observed
+}
+
+fn absent(
+  harness: Harness,
+  options: GithubClientOptions,
+  repository: string,
+  record: RecoveryRecord,
+  path: string,
+) -> bool {
+  // Metadata access alone cannot distinguish content absence from lost repository visibility.
+  custody(harness, options, repository, record)
+  const response = api_call(harness, {path: path, options: options})
+  require is_err(response) && unwrap_err(response).http_status == 404,
+    "recovery archive absence is unconfirmed"
+  return true
+}
+
+fn remove_archive(
+  harness: Harness,
+  options: GithubClientOptions,
+  lock: RecoveryStoreLock,
+  repository: string,
+  source: SourceReader,
+  identity: RecoveryIdentity,
+  archive: RecoveryReference,
+) -> ArchiveRemoval {
+  require identity.repository == repository, "recovery archive repository changed"
+  const selected = owned(harness.fs, lock, identity)
+  const record = selected.record
+  require record.archives.contains(archive) && archive.sha == record.custody.sha,
+    "recovery archive does not match confirmed source custody"
+  // Refuse active or changed remote custody before invoking Git's source-staging owner.
+  const observed = custody(harness, options, repository, record)
+  require observed.custody.reference != archive.reference,
+    "the archive is the confirmed source custody reference"
+  recovery_store_assert_owned(harness.fs, lock)
+  const current = source(selected.work, identity)
+  const decision = recovery_custody_decision(record, observed, current)
+  require decision.eligible, decision.reason
+  const path = archive_path(repository, archive)
+  const response = api_call(harness, {path: path, options: options})
+  if is_err(response) {
+    require unwrap_err(response).http_status == 404, "recovery archive read is unavailable"
+    return {
+      reference: archive.reference,
+      observed_sha: nil,
+      absent: absent(harness, options, repository, record, path),
+    }
+  }
+  const reference = schema_expect(unwrap(response), schema_of(Reference))
+  require reference.ref == archive.reference && reference.object.sha == archive.sha
+    && reference.object.type == "commit",
+    "recovery archive object changed"
+  // Preserve the caller's existing mutation authority and add the live physical lock witness.
+  const prior = options.authorize_mutation
+  const guarded: GithubClientOptions = options
+    + {
+      retry_unsafe: false,
+      authorize_mutation: { ->
+        if prior != nil {
+          const authorized = prior()
+          if is_err(authorized) || !unwrap(authorized) {
+            return authorized
+          }
+        }
+        const latest = custody(harness, options, repository, record)
+        require latest.custody.reference != archive.reference,
+          "the archive became the confirmed source custody reference"
+        recovery_store_assert_owned(harness.fs, lock)
+        return Ok(true)
+      },
+    }
+  recovery_store_assert_owned(harness.fs, lock)
+  const deleted = api_call(
+    harness,
+    {path: "/repos/${repository}/git/${archive.reference}", method: "DELETE", options: guarded},
+  )
+  require is_ok(deleted), "recovery archive removal is unconfirmed"
+  return {
+    reference: archive.reference,
+    observed_sha: archive.sha,
+    absent: absent(harness, options, repository, record, path),
+  }
+}
+
+/** Source capture stays with ship; this factory adds no Git or worker ownership policy. */
+pub fn lifecycle_github_readers(
+  harness: Harness,
+  options: GithubClientOptions,
+  lock: RecoveryStoreLock,
+  repository: string,
+  source: SourceReader,
+) -> LifecycleReaders {
+  require repository != "", "trusted recovery repository is required"
+  return {
+    observe: { record -> observation(harness, options, repository, record) },
+    source: source,
+    archive_remove: { identity, archive ->
+      remove_archive(harness, options, lock, repository, source, identity, archive)
+    },
+  }
+}

@@ -1,59 +1,221 @@
 import { shell_command_shape } from "std/command"
 
 fn repair_workflow(fs: HarnessFs) -> dict {
-  const root = path_normalize(path_join(fs.cwd(), "../.."))
+  const root = path_normalize(path_join(fs.source_dir(), "../.."))
   return yaml_parse(fs.read_text(path_join(root, ".github/workflows/smart-ship.yml")))
 }
 
+fn workflow_step(fs: HarnessFs, name: string) -> dict {
+  const selected = repair_workflow(fs).jobs.ship.steps.filter({ step -> step.name == name })
+  assert_eq(len(selected), 1, "the actual workflow must contain one ${name} step")
+  return selected[0]
+}
+
+fn launch_words(fs: HarnessFs, name: string, program: string) -> list<string> {
+  const shape = shell_command_shape(workflow_step(fs, name).run, "bash")
+  assert_eq(shape.status, "measured", "the actual ${name} launch must be structurally readable")
+  let launches: list<list<string>> = []
+  for segment in shape.segments {
+    for stage in segment.stages {
+      if stage.words[0] == program {
+        launches.push(stage.words)
+      }
+    }
+  }
+  assert_eq(len(launches), 1, "one selected process owns ${name}")
+  const selected = launches[0]
+  if selected == nil {
+    throw "the selected workflow launch is missing"
+  }
+  return selected
+}
+
 pipeline test_smart_ship_repair_runtime_has_process_cleanup_fixes(harness: Harness) {
-  const workflow = repair_workflow(harness.fs)
-  const setup = workflow.jobs.ship.steps.find({ step -> step.name == "Install Harn" })
-  const version = to_string(setup["with"].version).split(".")
-  assert_eq(len(version), 3, "the repair runtime is an exact published release")
-  assert_eq(version[0:2], ["0", "10"], "the package supports the 0.10 release series")
-  assert(
-    (to_int(version[2]) ?? 0) >= 197,
-    "repair cancellation needs the released process cleanup fixes",
-  )
-  const root = path_normalize(path_join(harness.fs.cwd(), "../.."))
+  const setup = workflow_step(harness.fs, "Install Harn")
+  assert_eq(setup.id, "harn", "every process selects the installed runtime output")
+  assert_eq(setup["with"].version, "0.10.200", "the worker is qualified on this published runtime")
+  const root = path_normalize(path_join(harness.fs.source_dir(), "../.."))
   const ci = yaml_parse(harness.fs.read_text(path_join(root, ".github/workflows/ci.yml")))
   const tested = ci.jobs["smart-ship"].steps.find(
     { step -> step.name == "Install the Smart Ship runtime" },
   )
   assert_eq(tested["with"].version, setup["with"].version, "CI exercises the workflow's runtime")
+  const main_repair = yaml_parse(
+    harness.fs.read_text(path_join(root, ".github/workflows/smart-ship-main-repair.yml")),
+  )
+  const main_runtime = main_repair.jobs.repair.steps.find({ step -> step.name == "Install Harn" })
+  assert_eq(
+    main_runtime["with"].version,
+    setup["with"].version,
+    "the main-repair caller imports the same published-runtime package",
+  )
 }
 
 pipeline test_smart_ship_repair_has_a_host_deadline_before_actions_deadlines(harness: Harness) {
   const job = repair_workflow(harness.fs).jobs.ship
-  const repair = job.steps.find({ step -> step.id == "repair" })
-  const shape = shell_command_shape(repair.run, "bash")
-  assert_eq(shape.status, "measured", "the actual repair launch must be structurally readable")
-  let launches = []
-  for segment in shape.segments {
-    for stage in segment.stages {
-      if stage.words[0] == "harn" && stage.words[1] == "run" {
-        launches = launches + [stage.words]
-      }
-    }
-  }
-  assert_eq(len(launches), 1, "one Harn process owns the repair")
-  const words = launches[0]
-  assert_eq(words[2], "--timeout", "the repair must use Harn's hard wall-clock limit")
-  const duration = words[3]
+  const repair = workflow_step(harness.fs, "Repair without credentials")
+  const words = launch_words(harness.fs, "Repair without credentials", "$SHIP_HARN")
+  assert_eq(words[0:5], ["$SHIP_HARN", "run", "--standalone", "--no-sandbox", "--timeout"])
+  const duration = words[5]
   assert(duration.ends_with("m"), "the workflow states its repair limit in whole minutes")
   const minutes = to_int(duration[0:len(duration) - 1]) ?? 0
   assert(
-    minutes > 0 && minutes < repair["timeout-minutes"],
-    "the host can clean up before Actions stops the step",
+    minutes > 21 && minutes < repair["timeout-minutes"],
+    "the worker can record retirement before Actions stops the step",
   )
   assert(
     repair["timeout-minutes"] < job["timeout-minutes"],
     "publication retains time after the repair step",
   )
-  assert(words.contains("--environment-policy"), "the repair keeps its environment boundary")
+  assert_eq(words[6:8], ["--environment-policy", "granted"])
+  assert_eq(words[len(words) - 1], ".smart-ship/scripts/smart-ship/worker.harn")
+  assert(words.contains("openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,for=harn"))
+  for name in [
+    "SHIP_WORK",
+    "SHIP_NONCE",
+    "SHIP_PR",
+    "GITHUB_REPOSITORY",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_ATTEMPT",
+  ] {
+    assert(words.contains("${name.lower()}=env:${name},expose=${name},to=in_process"), name)
+  }
   assert_eq(
     keys(repair.env).sorted(),
-    ["OPENAI_API_KEY", "SHIP_WORK"],
-    "no control credential enters the repair",
+    ["OPENAI_API_KEY", "SHIP_HARN", "SHIP_NONCE", "SHIP_PR", "SHIP_WORK"],
+    "no control credential enters the worker step",
   )
+  assert_eq(repair.env.SHIP_WORK, "\${{ steps.look.outputs.work }}")
+  assert_eq(repair.env.SHIP_NONCE, "\${{ steps.look.outputs.nonce }}")
+  assert_eq(repair.env.SHIP_PR, "\${{ matrix.pr }}")
+  assert_eq(repair.env.SHIP_HARN, "\${{ steps.harn.outputs.path }}")
+}
+
+pipeline test_smart_ship_trusted_transactions_hold_one_persistent_kernel_lock(harness: Harness) {
+  const retained = "\${{ runner.temp }}/../.smart-ship-retained"
+  const runtime = "\${{ steps.harn.outputs.path }}"
+  for name in ["Look at the pull request", "Publish the repair", "Finalize recovery custody"] {
+    const step = workflow_step(harness.fs, name)
+    assert_eq(step.env.SHIP_RETAIN_ROOT, retained)
+    assert_eq(step.env.SHIP_HARN, runtime)
+    assert_eq(step.env.GH_TOKEN, "\${{ steps.app.outputs.token }}")
+    assert_eq(step.env.REPO, "\${{ github.repository }}")
+    assert_eq(step.env.PR, "\${{ matrix.pr }}")
+    assert_eq(
+      launch_words(harness.fs, name, "flock"),
+      [
+        "flock",
+        "--exclusive",
+        "--nonblock",
+        "--conflict-exit-code",
+        "75",
+        "--no-fork",
+        "$SHIP_RETAIN_ROOT.lock",
+        "$SHIP_HARN",
+        "run",
+        "--no-sandbox",
+        "ship.harn",
+      ],
+    )
+  }
+  const publish = workflow_step(harness.fs, "Publish the repair")
+  const finalize = workflow_step(harness.fs, "Finalize recovery custody")
+  assert_eq(publish.env.SHIP_MODE, "publish")
+  assert_eq(finalize.env.SHIP_MODE, "finalize")
+  assert_eq(finalize.if, "always() && steps.look.outputs.nonce != ''")
+  const names = repair_workflow(harness.fs).jobs.ship.steps.map({ step -> step.name })
+  assert(
+    !names.contains("Remove the checkouts"),
+    "the lifecycle owner alone may remove retained work",
+  )
+  assert(
+    !names.contains("Remove Smart Ship's scripts"),
+    "controller copies are not a recovery policy",
+  )
+}
+
+@heavy(threads: 2)
+pipeline test_selected_worker_step_reaches_actual_retirement_and_preserves_failure(
+  harness: Harness,
+) {
+  const source = path_normalize(path_join(harness.fs.source_dir(), "../.."))
+  const runtime = harness.process.find_executable("harn") ?? ""
+  assert(runtime != "", "the selected published runtime must be available")
+  const repair = workflow_step(harness.fs, "Repair without credentials")
+  for failing in [false, true] {
+    const workspace = harness.fs.mkdtemp_in_workspace("smart-ship-selected-worker-")
+    const work = "${workspace}/retained/123-1-9-${"a" * 32}/work"
+    harness.fs.mkdir("${work}/agent", true)
+    harness.fs.mkdir("${work}/pr", true)
+    assert(
+      harness.process.run({program: "ln", args: ["-s", source, "${workspace}/.smart-ship"]})
+        .success,
+    )
+    const identity = {
+      repository: "o/r",
+      number: 9,
+      run_id: 123,
+      run_attempt: 1,
+      nonce: "a" * 32,
+      head: "b" * 40,
+    }
+    harness.fs.write_text("${work}/.owner", "${identity.nonce}\n")
+    harness.fs.write_text(
+      "${work}/job.json",
+      json_stringify({nonce: identity.nonce, head: identity.head, recovery: identity}),
+    )
+    harness.fs.write_text(
+      "${work}/agent/repair.harn",
+      """
+fn main(harness: Harness) {
+  assert(harness.env.get("OPENAI_API_KEY") == "inert-workflow-model", "the inner model grant must be reached")
+  assert(harness.env.get("GH_TOKEN") == nil, "an ambient controller token must not enter the inner worker")
+  const child = harness.process.run({program: "/usr/bin/env"})
+  assert(child.success)
+  assert(!child.stdout.contains("OPENAI_API_KEY") && !child.stdout.contains("GH_TOKEN"), "the inner command must receive neither credential")
+  harness.stdio.println("private-workflow-worker-output")
+"""
+        + (failing ? "  throw \"controlled inner failure\"\n}\n" : "}\n"),
+    )
+    const script = "${workspace}/worker-step.sh"
+    harness.fs.write_text(script, repair.run)
+    const ran = harness.process.run(
+      {
+        program: "bash",
+        args: [script],
+        cwd: workspace,
+        timeout_ms: 90000,
+        env: {
+          PATH: harness.env.get("PATH") ?? "",
+          SHIP_HARN: runtime,
+          SHIP_WORK: work,
+          SHIP_NONCE: identity.nonce,
+          SHIP_PR: "9",
+          GITHUB_REPOSITORY: "o/r",
+          GITHUB_RUN_ID: "123",
+          GITHUB_RUN_ATTEMPT: "1",
+          OPENAI_API_KEY: "inert-workflow-model",
+          GH_TOKEN: "inert-ambient-controller",
+        },
+      },
+    )
+    assert_eq(ran.success, !failing, ran.stderr)
+    const report = json_parse(ran.stdout)
+    assert(
+      report.retired,
+      "the selected YAML must reach actual worker retirement before its exit projection",
+    )
+    assert_eq(report.receipt.identity, identity)
+    assert_eq(report.receipt.runtime.executable, runtime)
+    assert_eq(report.receipt.runtime.version, "0.10.200")
+    assert_eq(report.receipt.exit_code == 0, !failing)
+    assert(harness.fs.exists("${work}/job.json"), "the worker never removes retained source")
+    assert(
+      !ran.stdout.contains("private-workflow-worker-output"),
+      "private inner output stays out of workflow output",
+    )
+    assert(
+      !ran.stdout.contains("inert-workflow-model") && !ran.stderr.contains("inert-workflow-model"),
+    )
+  }
 }

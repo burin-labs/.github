@@ -1,0 +1,296 @@
+/**
+ * Trusted outer owner for one sandboxed repair. Run this entry without the outer
+ * OS sandbox, with an explicit granted environment and the model key for=harn.
+ * The fixed inner entry retains its own sandbox and an in-process model grant.
+ * for= matches a basename; the workflow-selected immutable path supplies identity.
+ */
+import { command_run } from "std/command"
+import { replace_text } from "std/fs"
+import { RecoveryIdentity } from "./recovery.harn"
+
+type WorkerCapabilities = {fs: HarnessFs, tools: HarnessTools}
+
+pub type WorkerRuntime = {
+  executable: string,
+  version: string,
+  source_revision: string,
+  sha256: string,
+  file_identity: string,
+}
+
+pub type WorkerReceipt = {
+  schema: "smart-ship.worker.v1",
+  identity: RecoveryIdentity,
+  runtime: WorkerRuntime,
+  status: string,
+  exit_code: int?,
+  timed_out: bool,
+  process_cleanup: unknown,
+}
+
+pub type WorkerRetirement = {retired: bool, reason: string, receipt: WorkerReceipt?}
+
+type PreparedWorker = {nonce: string, head: string, recovery: RecoveryIdentity?}
+
+type WorkerVersion = {ok: bool, data: {version: string, source_revision: string}}
+
+type CleanupWitness = {
+  root_pid: int?,
+  survivor_count: int?,
+  omitted_child_count: int,
+  census_complete: bool,
+  guardian_custody_complete: bool,
+}
+
+type WorkerSource = {
+  work: string,
+  owner: string,
+  job: string,
+  agent: string,
+  pr: string,
+  entry: string,
+}
+
+const RECEIPT_LIMIT = 1048576
+
+fn oid(value: string) -> bool {
+  return regex_match("^[0-9a-f]{40}$", value) != nil
+}
+
+fn file_identity(fs: HarnessFs, path: string, limit: int) -> string {
+  const info = fs.stat(path, {follow_symlinks: false})
+  const identity = info.identity ?? ""
+  require info.is_file && !info.is_symlink && info.size > 0 && info.size <= limit && identity != "",
+    "worker file identity is unconfirmed"
+  return identity
+}
+
+fn directory_identity(fs: HarnessFs, path: string) -> string {
+  const info = fs.stat(path, {follow_symlinks: false})
+  const identity = info.identity ?? ""
+  require info.is_dir && !info.is_symlink && identity != "",
+    "worker directory identity is unconfirmed"
+  return identity
+}
+
+/** The caller supplies the executable from trusted setup, never prepared job data. */
+pub fn worker_runtime(caps: WorkerCapabilities, executable: string) -> WorkerRuntime {
+  require starts_with(executable, "/") && ends_with(executable, "/harn"),
+    "the workflow Harn executable is unconfirmed"
+  const identity = file_identity(caps.fs, executable, 2147483648)
+  const digest = sha256(caps.fs.read_bytes(executable))
+  const result = command_run(
+    caps.tools,
+    [executable, "version", "--json"],
+    {timeout_ms: 30000, max_inline_bytes: 65536},
+  )
+  require result.success && !(result.stdout_truncated ?? false),
+    "worker runtime version is unconfirmed"
+  const version = schema_expect(json_parse(result.stdout), schema_of(WorkerVersion))
+  require version.ok && regex_match("^[0-9]+\\.[0-9]+\\.[0-9]+$", version.data.version) != nil
+    && oid(version.data.source_revision)
+    && file_identity(caps.fs, executable, 2147483648) == identity
+    && sha256(caps.fs.read_bytes(executable)) == digest,
+    "worker runtime changed during measurement"
+  return {
+    executable: executable,
+    version: version.data.version,
+    source_revision: version.data.source_revision,
+    sha256: digest,
+    file_identity: identity,
+  }
+}
+
+/** Refuse changed bytes before executing even the version command. */
+fn confirm_runtime(caps: WorkerCapabilities, runtime: WorkerRuntime) {
+  require file_identity(caps.fs, runtime.executable, 2147483648) == runtime.file_identity
+    && sha256(caps.fs.read_bytes(runtime.executable)) == runtime.sha256,
+    "workflow runtime file changed"
+  require worker_runtime(caps, runtime.executable) == runtime, "workflow runtime identity changed"
+}
+
+fn source(caps: WorkerCapabilities, work: string, identity: RecoveryIdentity) -> WorkerSource {
+  require starts_with(work, "/") && !ends_with(work, "/")
+    && !split(work, "/").any({ part -> [".", ".."].contains(part) })
+    && regex_match("^[^/]+/[^/]+$", identity.repository) != nil
+    && identity.number > 0
+    && identity.run_id > 0
+    && identity.run_attempt > 0
+    && regex_match("^[0-9a-f]{32}$", identity.nonce) != nil
+    && oid(identity.head),
+    "worker identity is unconfirmed"
+  const work_identity = directory_identity(caps.fs, work)
+  const agent_identity = directory_identity(caps.fs, "${work}/agent")
+  const pr_identity = directory_identity(caps.fs, "${work}/pr")
+  const owner = file_identity(caps.fs, "${work}/.owner", 33)
+  require caps.fs.read_text("${work}/.owner") == "${identity.nonce}\n",
+    "worker ownership is unconfirmed"
+  const job = file_identity(caps.fs, "${work}/job.json", RECEIPT_LIMIT)
+  const prepared = schema_expect(
+    json_parse(caps.fs.read_text("${work}/job.json")),
+    schema_of(PreparedWorker),
+  )
+  require prepared.nonce == identity.nonce && prepared.head == identity.head
+    && prepared.recovery == identity,
+    "prepared worker identity does not match the workflow"
+  return {
+    work: work_identity,
+    owner: owner,
+    job: job,
+    agent: agent_identity,
+    pr: pr_identity,
+    entry: file_identity(caps.fs, "${work}/agent/repair.harn", RECEIPT_LIMIT),
+  }
+}
+
+fn flushed(
+  caps: WorkerCapabilities,
+  work: string,
+  receipt: WorkerReceipt,
+  expected: string = "",
+) -> string {
+  const text = json_stringify(receipt)
+  const path = "${work}/worker.json"
+  const written = expected == "" ? replace_text(
+    caps.fs,
+    path,
+    text,
+    {create: true, overwrite: false, durability: "flush"},
+  ) : replace_text(caps.fs, path, text, {expected_sha256: expected, durability: "flush"})
+  const digest = "sha256:${sha256(text)}"
+  require ["created", "replaced"].contains(written.status) && written.after_sha256 == digest
+    && written.file_synced
+    && written.namespace_synced
+    && file_identity(caps.fs, path, RECEIPT_LIMIT) != ""
+    && caps.fs.read_text(path) == text,
+    "worker receipt was not durably confirmed"
+  return digest
+}
+
+/**
+ * Only trusted callers select runtime/timeout. There is no caller-selected argv,
+ * provider, source entry, network grant, receipt path or sandbox switch.
+ */
+pub fn run_worker(
+  caps: WorkerCapabilities,
+  work: string,
+  identity: RecoveryIdentity,
+  runtime: WorkerRuntime,
+  timeout_ms: int = 1260000,
+) -> WorkerReceipt {
+  require timeout_ms > 0 && timeout_ms <= 1260000, "worker deadline is unconfirmed"
+  const before = source(caps, work, identity)
+  confirm_runtime(caps, runtime)
+  const initial: WorkerReceipt = {
+    schema: "smart-ship.worker.v1",
+    identity: identity,
+    runtime: runtime,
+    status: "starting",
+    exit_code: nil,
+    timed_out: false,
+    process_cleanup: nil,
+  }
+  // Reserve the one receipt atomically before launch. Outer death leaves unknown retirement.
+  const reservation = flushed(caps, work, initial)
+  const result = command_run(
+    caps.tools,
+    {
+      argv: [
+        runtime.executable,
+        "run",
+        "--standalone",
+        "--timeout",
+        "20m",
+        "--environment-policy",
+        "granted",
+        "--grant",
+        "openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,to=in_process",
+        "--write-root",
+        "${work}/pr",
+        "${work}/agent/repair.harn",
+      ],
+      cwd: "${work}/pr",
+    },
+    {timeout_ms: timeout_ms, max_inline_bytes: 1048576},
+  )
+  require source(caps, work, identity) == before,
+    "worker source ownership changed before receipt publication"
+  confirm_runtime(caps, runtime)
+  const receipt: WorkerReceipt = {
+    schema: "smart-ship.worker.v1",
+    identity: identity,
+    runtime: runtime,
+    status: result.status,
+    exit_code: result.exit_code,
+    timed_out: result.timed_out,
+    process_cleanup: result.process_cleanup,
+  }
+  flushed(caps, work, receipt, reservation)
+  return receipt
+}
+
+/** A successful worker outcome and measured descendant retirement are independent. */
+pub fn worker_retirement(
+  caps: WorkerCapabilities,
+  work: string,
+  identity: RecoveryIdentity,
+  runtime: WorkerRuntime,
+) -> WorkerRetirement {
+  const observed = try {
+    source(caps, work, identity)
+    confirm_runtime(caps, runtime)
+    const path = "${work}/worker.json"
+    file_identity(caps.fs, path, RECEIPT_LIMIT)
+    const receipt = schema_expect(json_parse(caps.fs.read_text(path)), schema_of(WorkerReceipt))
+    // Historical installation path/inode are audit data, not artifact identity.
+    require receipt.identity == identity && receipt.runtime.version == runtime.version
+      && receipt.runtime.source_revision == runtime.source_revision
+      && receipt.runtime.sha256 == runtime.sha256,
+      "worker receipt identity changed"
+    receipt
+  }
+  if is_err(observed) {
+    return {retired: false, reason: "worker receipt or ownership is unconfirmed", receipt: nil}
+  }
+  const receipt = unwrap(observed)
+  const measured = schema_parse(receipt.process_cleanup, schema_of(CleanupWitness))
+  if !["completed", "timed_out", "killed", "failed"].contains(receipt.status) || is_err(measured) {
+    return {retired: false, reason: "worker terminal cleanup is unmeasured", receipt: receipt}
+  }
+  const report = unwrap(measured)
+  const retired = report.root_pid != nil && report.root_pid > 0 && report.survivor_count == 0
+    && report.omitted_child_count == 0
+    && (report.census_complete || report.guardian_custody_complete)
+  return {
+    retired: retired,
+    reason:
+      retired ? "canonical command owner confirmed retirement" : "canonical command owner did not confirm retirement",
+    receipt: receipt,
+  }
+}
+
+/** No executable, source, authority or deadline can be selected through script arguments. */
+fn main(harness: Harness) {
+  require len(argv) == 0, "the trusted worker entry accepts no script arguments"
+  const work = harness.env.get("SHIP_WORK") ?? ""
+  directory_identity(harness.fs, work)
+  file_identity(harness.fs, "${work}/job.json", RECEIPT_LIMIT)
+  const prepared = schema_expect(
+    json_parse(harness.fs.read_text("${work}/job.json")),
+    schema_of(PreparedWorker),
+  )
+  const identity = prepared.recovery
+  require identity != nil && identity.repository == harness.env.get("GITHUB_REPOSITORY")
+    && to_string(identity.run_id) == harness.env.get("GITHUB_RUN_ID")
+    && to_string(identity.run_attempt) == harness.env.get("GITHUB_RUN_ATTEMPT")
+    && to_string(identity.number) == harness.env.get("SHIP_PR")
+    && identity.nonce == harness.env.get("SHIP_NONCE"),
+    "worker identity does not match this workflow attempt"
+  const caps = pick(harness, ["fs", "tools"])
+  const executable = harness.process.find_executable("harn") ?? ""
+  const runtime = worker_runtime(caps, executable)
+  const receipt = run_worker(caps, work, identity, runtime)
+  harness.stdio.println(json_stringify(worker_retirement(caps, work, identity, runtime)))
+  require receipt.status == "completed" && receipt.exit_code == 0 && !receipt.timed_out,
+    "repair worker failed: status=${receipt.status}, exit_code=${receipt.exit_code}, timed_out=${receipt.timed_out}"
+}

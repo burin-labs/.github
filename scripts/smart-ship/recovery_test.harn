@@ -1,0 +1,672 @@
+import {
+  CommandResult,
+  command_cancel,
+  command_run,
+  command_wait,
+  command_wait_for_output,
+} from "std/command"
+import {
+  RECOVERY_SCHEMA,
+  RecoveryObservation,
+  RecoveryRecord,
+  recovery_archives,
+  recovery_custody_decision,
+  recovery_entry,
+  recovery_observation,
+  recovery_record,
+  recovery_store_assert_owned,
+  recovery_store_entries,
+  recovery_store_lock,
+} from "./recovery.harn"
+
+pipeline test_recovery_archives_require_a_whole_exact_nonduplicated_census(harness: Harness) {
+  const identity = receipt().identity
+  const path = "https://api.github.com/repos/o/r/git/matching-refs/smart-ship/previous/9/"
+  const options = {installation_token: "fixture-token", budget: {state_dir: ""}}
+  const first = {
+    ref: "refs/smart-ship/previous/9/${"e" * 40}",
+    object: {sha: "e" * 40, type: "commit"},
+  }
+  const second = {
+    ref: "refs/smart-ship/previous/9/${"f" * 40}",
+    object: {sha: "f" * 40, type: "commit"},
+  }
+  harness.testing.http_mock("GET", path, {status: 200, body: json_stringify([first, second])})
+  const known = recovery_archives(harness, options, identity)
+  assert_eq(len(known), 2, "reach a known nonempty inventory through the actual reader")
+  const first_known = known[0]
+  if first_known == nil {
+    throw "the measured nonempty inventory must retain its first checkpoint"
+  }
+  assert_eq(first_known.sha, "e" * 40)
+  for rows in [
+    [],
+    [first, first],
+    [first + {ref: second.ref}],
+    [first + {ref: "refs/smart-ship/previous/90/${"e" * 40}"}],
+    [first + {object: first.object + {type: "tag"}}],
+  ] {
+    harness.testing.http_mock_clear()
+    harness.testing.http_mock("GET", path, {status: 200, body: json_stringify(rows)})
+    const observed = try {
+      recovery_archives(harness, options, identity)
+    }
+    if len(rows) == 0 {
+      assert_eq(unwrap(observed), [], "a measured empty inventory remains distinct from failure")
+    } else {
+      assert(is_err(observed), "malformed or foreign archive identity must retain checkpoints")
+    }
+  }
+  harness.testing.http_mock_clear()
+  let at_cap = []
+  for index in 0..100 {
+    const sha = "${"a" * 38}${index < 10 ? "0" : ""}${index}"
+    at_cap.push({ref: "refs/smart-ship/previous/9/${sha}", object: {sha: sha, type: "commit"}})
+  }
+  harness.testing.http_mock("GET", path, {status: 200, body: json_stringify(at_cap)})
+  assert(
+    is_err(
+      try {
+        recovery_archives(harness, options, identity)
+      },
+    ),
+    "a full inventory page must not authorize pruning a possibly partial census",
+  )
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock("GET", path, {status: 500, body: "{}"})
+  assert(
+    is_err(
+      try {
+        recovery_archives(harness, options, identity)
+      },
+    ),
+    "an unavailable census must not become a measured empty inventory",
+  )
+}
+
+pipeline test_recovery_observes_the_exact_producer_and_live_reference(harness: Harness) {
+  const record = receipt()
+  const api = "https://api.github.com/repos/o/r"
+  const options = {installation_token: "fixture-token", budget: {state_dir: ""}}
+  for state in ["confirmed", "running", "moved-ref", "missing-ref", "foreign-attempt"] {
+    harness.testing.http_mock_clear()
+    harness.testing.http_mock(
+      "GET",
+      "${api}/actions/runs/123/attempts/1",
+      {
+        status: 200,
+        body: json_stringify(
+          {
+            id: 123,
+            run_attempt: state == "foreign-attempt" ? 2 : 1,
+            status: state == "running" ? "in_progress" : "completed",
+            repository: {full_name: "o/r"},
+          },
+        ),
+      },
+    )
+    const sha = state == "moved-ref" ? "f" * 40 : record.custody.sha
+    harness.testing.http_mock(
+      "GET",
+      "${api}/git/ref/${url_encode("smart-ship/wip/9")}",
+      {
+        status: state == "missing-ref" ? 404 : 200,
+        body: json_stringify({ref: record.custody.reference, object: {sha: sha, type: "commit"}}),
+      },
+    )
+    harness.testing.http_mock(
+      "GET",
+      "${api}/git/commits/${sha}",
+      {status: 200, body: json_stringify({sha: sha, tree: {sha: record.custody.tree}})},
+    )
+    harness.testing.http_mock(
+      "GET",
+      "${api}/git/ref/${url_encode("smart-ship/previous/9/${record.custody.sha}")}",
+      {status: 404, body: "{\"message\":\"Not Found\"}"},
+    )
+    const measured = try {
+      recovery_observation(harness, options, record)
+    }
+    if ["missing-ref", "foreign-attempt"].contains(state) {
+      assert(is_err(measured), "${state} must remain unmeasured")
+    } else {
+      const decision = recovery_custody_decision(record, unwrap(measured), record.snapshot)
+      assert_eq(decision.eligible, state == "confirmed", state)
+    }
+    const calls = harness.testing.http_mock_calls({include_sensitive: true})
+    assert(
+      len(calls) > 0 && calls.all({ call -> call.method == "GET" }),
+      "custody observation must never mutate remote recovery state",
+    )
+  }
+}
+
+pipeline test_recovery_keeps_archived_custody_when_the_next_attempt_moves_wip(harness: Harness) {
+  const record = receipt()
+  const archive = "refs/smart-ship/previous/9/${record.custody.sha}"
+  for state in ["live", "advanced", "missing"] {
+    const observed = archived_observation(harness, state)
+    assert_eq(observed.custody.reference, state == "live" ? record.custody.reference : archive)
+    const decision = recovery_custody_decision(record, observed, record.snapshot)
+    assert(
+      decision.eligible,
+      "a later attempt must not strand work whose exact archive remains live",
+    )
+  }
+}
+
+pipeline test_recovery_archived_custody_rejects_foreign_or_unmeasured_source(harness: Harness) {
+  const record = receipt()
+  assert(
+    recovery_custody_decision(record, archived_observation(harness, "advanced"), record.snapshot)
+      .eligible,
+  )
+  for state in ["foreign-ref", "foreign-sha", "foreign-tree", "archive-missing", "archive-error"] {
+    const observed = try {
+      archived_observation(harness, state)
+    }
+    assert(
+      is_err(observed)
+        || !recovery_custody_decision(record, unwrap(observed), record.snapshot).eligible,
+      "${state} must never authorize archived-source cleanup",
+    )
+  }
+}
+
+fn archived_observation(harness: Harness, state: string) -> RecoveryObservation {
+  const record = receipt()
+  const api = "https://api.github.com/repos/o/r"
+  const archive = "refs/smart-ship/previous/9/${record.custody.sha}"
+  harness.testing.http_mock_clear()
+  harness.testing.http_mock(
+    "GET",
+    "${api}/actions/runs/123/attempts/1",
+    {
+      status: 200,
+      body: json_stringify(
+        {id: 123, run_attempt: 1, status: "completed", repository: {full_name: "o/r"}},
+      ),
+    },
+  )
+  const sha = state == "live" ? record.custody.sha : "f" * 40
+  harness.testing.http_mock(
+    "GET",
+    "${api}/git/ref/${url_encode("smart-ship/wip/9")}",
+    {
+      status: state == "missing" ? 404 : 200,
+      body: json_stringify({ref: record.custody.reference, object: {sha: sha, type: "commit"}}),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    "${api}/git/ref/${url_encode("smart-ship/previous/9/${record.custody.sha}")}",
+    {
+      status: state == "archive-missing" ? 404 : state == "archive-error" ? 500 : 200,
+      body: json_stringify(
+        {
+          ref: state == "foreign-ref" ? "${archive}-suffix" : archive,
+          object: {sha: state == "foreign-sha" ? "f" * 40 : record.custody.sha, type: "commit"},
+        },
+      ),
+    },
+  )
+  for commit in [sha, record.custody.sha].unique() {
+    harness.testing.http_mock(
+      "GET",
+      "${api}/git/commits/${commit}",
+      {
+        status: 200,
+        body: json_stringify(
+          {sha: commit, tree: {sha: state == "foreign-tree" ? "f" * 40 : record.custody.tree}},
+        ),
+      },
+    )
+  }
+  return recovery_observation(
+    harness,
+    {installation_token: "fixture-token", budget: {state_dir: ""}, retry: {max_attempts: 1}},
+    record,
+  )
+}
+
+pipeline test_recovery_store_serializes_attempts_and_releases_only_its_own_lock(harness: Harness) {
+  const parent = harness.fs.mkdtemp_in_workspace("smart-ship-recovery-lock-")
+  const root = "${parent}/retained"
+  const first = fixture_run(harness, root, "census")
+  assert(first.success, first.stderr)
+  assert(
+    first.stdout.contains("recovery-census-confirmed"),
+    "the actual locked transaction must run",
+  )
+  const inode = harness.fs.stat("${root}.lock").identity
+  assert(inode != nil)
+  const next = fixture_run(harness, root, "census")
+  assert(next.success, next.stderr)
+  assert_eq(
+    harness.fs.stat("${root}.lock").identity,
+    inode,
+    "completed transactions release the kernel lock without replacing or deleting its inode",
+  )
+  assert(harness.fs.exists("${root}/123-1-9"), "kernel release preserves all entries")
+}
+
+fn census_fixture(harness: Harness, root: string) {
+  const caps = pick(harness, ["fs", "tools"])
+  const lock = recovery_store_lock(caps, root, "a" * 32)
+  if !harness.fs.exists("${root}/123-1-9") {
+    assert_eq(recovery_store_entries(harness.fs, lock), [])
+    harness.fs.mkdir("${root}/123-1-9")
+    harness.fs.mkdir("${root}/unmeasured\nentry")
+  }
+  assert_eq(recovery_store_entries(harness.fs, lock), ["123-1-9", "unmeasured\nentry"])
+  for changed in [
+    lock + {process_id: lock.process_id + 1},
+    lock + {descriptor: "999999"},
+    lock + {path: "${root}.other"},
+    lock + {root: "${root}/123-1-9"},
+  ] {
+    assert(
+      is_err(
+        try {
+          recovery_store_assert_owned(harness.fs, changed)
+        },
+      ),
+      "a forged handle must not substitute for the live physical witness",
+    )
+  }
+  harness.stdio.println("recovery-census-confirmed")
+}
+
+pipeline test_recovery_store_refuses_a_reused_root_while_the_lock_is_held(harness: Harness) {
+  const parent = harness.fs.mkdtemp_in_workspace("smart-ship-recovery-reused-")
+  const root = "${parent}/retained"
+  const result = fixture_run(harness, root, "reused-root")
+  assert(result.success, result.stderr)
+  assert(result.stdout.contains("recovery-reused-root-refused"))
+}
+
+fn reused_root_fixture(harness: Harness, root: string) {
+  const caps = pick(harness, ["fs", "tools"])
+  const lock = recovery_store_lock(caps, root, "a" * 32)
+  assert_eq(recovery_store_entries(harness.fs, lock), [])
+  assert(harness.process.run({program: "mv", args: ["--", root, "${root}.original"]}).success)
+  harness.fs.mkdir(root)
+  harness.fs.write_text("${root}/unconfirmed", "keep replacement work")
+  assert(
+    is_err(
+      try {
+        recovery_store_entries(harness.fs, lock)
+      },
+    ),
+  )
+  assert(
+    is_err(
+      try {
+        recovery_store_assert_owned(harness.fs, lock)
+      },
+    ),
+  )
+  assert_eq(harness.fs.read_text("${root}/unconfirmed"), "keep replacement work")
+  assert(harness.fs.exists(lock.path), "unconfirmed ownership must preserve the lock")
+  harness.stdio.println("recovery-reused-root-refused")
+}
+
+pipeline test_recovery_entry_preserves_missing_malformed_and_mismatched_records(harness: Harness) {
+  const parent = harness.fs.mkdtemp_in_workspace("smart-ship-recovery-record-")
+  const result = fixture_run(harness, "${parent}/retained", "entries")
+  assert(result.success, result.stderr)
+  assert(result.stdout.contains("recovery-entry-refusals-confirmed"))
+}
+
+fn entries_fixture(harness: Harness, root: string) {
+  const caps = pick(harness, ["fs", "tools"])
+  const lock = recovery_store_lock(caps, root, "b" * 32)
+  const work = "${lock.root}/123-1-9/work"
+  harness.fs.mkdir(work, true)
+  const record = receipt()
+  harness.fs.write_text("${work}/.owner", "${record.identity.nonce}\n")
+  harness.fs.write_text("${work}/recovery.json", json_stringify(record))
+  assert_eq(
+    recovery_entry(harness.fs, lock, "123-1-9").record,
+    record,
+    "reach a whole nonempty owned record before testing refusals",
+  )
+  assert_eq(recovery_entry(harness.fs, lock, "legacy").record, nil)
+  assert_eq(recovery_entry(harness.fs, lock, "../123-1-9").record, nil)
+  for changed in [
+    "{}",
+    "partial",
+    json_stringify(record + {identity: record.identity + {number: 10}}),
+  ] {
+    harness.fs.write_text("${work}/recovery.json", changed)
+    assert_eq(recovery_entry(harness.fs, lock, "123-1-9").record, nil)
+    assert_eq(
+      harness.fs.read_text("${work}/recovery.json"),
+      changed,
+      "an unconfirmed record must not be rewritten or removed",
+    )
+  }
+  harness.fs.write_text("${work}/recovery.json", json_stringify(record))
+  harness.fs.write_text("${work}/.owner", "${"f" * 32}\n")
+  assert_eq(recovery_entry(harness.fs, lock, "123-1-9").record, nil)
+  assert(harness.fs.exists(work), "ownership mismatch preserves the work directory")
+  harness.stdio.println("recovery-entry-refusals-confirmed")
+}
+
+fn receipt() -> RecoveryRecord {
+  return {
+    schema: RECOVERY_SCHEMA,
+    identity: {
+      repository: "o/r",
+      number: 9,
+      run_id: 123,
+      run_attempt: 1,
+      nonce: "a" * 32,
+      head: "b" * 40,
+    },
+    snapshot: {tree: "c" * 40, agent_index_sha256: "d" * 64},
+    custody: {reference: "refs/smart-ship/wip/9", sha: "e" * 40, tree: "c" * 40},
+    archives: [{reference: "refs/smart-ship/previous/9/${"f" * 40}", sha: "f" * 40}],
+  }
+}
+
+pipeline test_recovery_requires_terminal_identity_live_custody_and_unchanged_source() {
+  const record = recovery_record(receipt())
+  const observed = {
+    repository: "o/r",
+    run_id: 123,
+    run_attempt: 1,
+    run_status: "completed",
+    custody: record.custody,
+  }
+  const positive = recovery_custody_decision(record, observed, record.snapshot)
+  assert(positive.eligible, positive.reason)
+  for changed in [
+    {repository: "other/r"},
+    {run_id: 124},
+    {run_attempt: 2},
+    {run_status: "in_progress"},
+    {run_status: ""},
+    {custody: record.custody + {reference: "refs/smart-ship/wip/90"}},
+    {custody: record.custody + {sha: "f" * 40}},
+    {custody: record.custody + {tree: "f" * 40}},
+  ] {
+    const decision = recovery_custody_decision(record, observed + changed, record.snapshot)
+    assert(!decision.eligible, json_stringify(changed))
+  }
+  for snapshot in [
+    record.snapshot + {tree: "f" * 40},
+    record.snapshot + {agent_index_sha256: "f" * 64},
+  ] {
+    const decision = recovery_custody_decision(record, observed, snapshot)
+    assert(!decision.eligible, "post-checkpoint source changes must preserve the recovery entry")
+  }
+}
+
+fn fixture_argv(
+  harness: {fs: HarnessFs, process: HarnessProcess},
+  root: string,
+  mode: string,
+) -> list<string> {
+  const runtime = harness.process.find_executable("harn") ?? ""
+  assert(runtime != "", "the actual selected Harn runtime is required")
+  const entry = "${dirname(root)}/transaction.harn"
+  harness.fs.write_text(
+    entry,
+    "import { recovery_fixture } from \"${harness.fs.source_dir()}/recovery_test.harn\"\n"
+      + "fn main(harness: Harness) { recovery_fixture(harness) }\n",
+  )
+  return [
+    runtime,
+    "run",
+    "--read-only-root",
+    "/proc/self",
+    "--write-root",
+    dirname(root),
+    entry,
+    "--",
+    root,
+    mode,
+  ]
+}
+
+fn fixture_run(harness: Harness, root: string, mode: string) -> CommandResult {
+  return command_run(
+    harness.tools,
+    {
+      argv: [
+        "flock",
+        "--exclusive",
+        "--nonblock",
+        "--conflict-exit-code",
+        "75",
+        "--no-fork",
+        "${root}.lock",
+      ]
+        + fixture_argv(pick(harness, ["fs", "process"]), root, mode),
+      sandbox_profile: "workspace_paths",
+    },
+    {timeout_ms: 30000, max_inline_bytes: 65536},
+  )
+}
+
+pipeline test_recovery_store_refuses_absent_unheld_shared_and_wrong_inode_locks(harness: Harness) {
+  for mode in ["absent", "unheld", "shared", "wrong-inode", "symlink", "legacy-directory"] {
+    const parent = harness.fs.mkdtemp_in_workspace("smart-ship-recovery-refusal-")
+    const root = "${parent}/retained"
+    if mode == "legacy-directory" {
+      harness.fs.mkdir("${root}.lock")
+    } else if mode != "absent" {
+      harness.fs.write_text("${root}.lock", "preserved lock bytes")
+    }
+    let arguments = fixture_argv(pick(harness, ["fs", "process"]), root, "admit")
+    if mode == "shared" {
+      arguments = ["flock", "--shared", "--no-fork", "${root}.lock"] + arguments
+    } else if mode == "wrong-inode" {
+      arguments = ["flock", "--exclusive", "--no-fork", "${root}.other"] + arguments
+    } else if mode == "symlink" {
+      assert(
+        harness.process.run({program: "mv", args: ["--", "${root}.lock", "${root}.target"]})
+          .success,
+      )
+      assert(
+        harness.process.run({program: "ln", args: ["-s", "${root}.target", "${root}.lock"]})
+          .success,
+      )
+      arguments = ["flock", "--exclusive", "--no-fork", "${root}.lock"] + arguments
+    }
+    const result = command_run(
+      harness.tools,
+      {argv: arguments, sandbox_profile: "workspace_paths"},
+      {timeout_ms: 30000, max_inline_bytes: 65536},
+    )
+    assert(
+      result.stdout.contains("recovery-admission-reached"),
+      "${mode} must reach the owning admission",
+    )
+    assert(!result.success, "${mode} must refuse")
+    assert(!harness.fs.exists(root), "refused admission must not create or change the store")
+    if mode != "absent" && mode != "legacy-directory" {
+      assert_eq(harness.fs.read_text("${root}.lock"), "preserved lock bytes")
+    }
+  }
+}
+
+pipeline test_recovery_store_kernel_lock_releases_after_interrupted_owner(harness: Harness) {
+  const parent = harness.fs.mkdtemp_in_workspace("smart-ship-recovery-interrupted-")
+  const root = "${parent}/retained"
+  assert(harness.process.run({program: "mkfifo", args: ["--", "${root}.release"]}).success)
+  const process = command_run(
+    harness.tools,
+    {
+      argv: [
+        "flock",
+        "--exclusive",
+        "--nonblock",
+        "--conflict-exit-code",
+        "75",
+        "--no-fork",
+        "${root}.lock",
+      ]
+        + fixture_argv(pick(harness, ["fs", "process"]), root, "blocked"),
+      sandbox_profile: "workspace_paths",
+    },
+    {background: true, hard_timeout_ms: 60000, max_inline_bytes: 65536},
+  )
+  defer {
+    command_cancel(harness.tools, process, {wait_result_ms: 5000})
+  }
+  const ready = command_wait_for_output(
+    harness.tools,
+    process,
+    "recovery-owner-ready",
+    {timeout_ms: 30000},
+  )
+  assert(ready.matched, ready.result.stderr)
+  const identity = harness.fs.stat("${root}.lock").identity
+  assert(identity != nil)
+  const contender = command_run(
+    harness.tools,
+    ["flock", "--exclusive", "--nonblock", "--conflict-exit-code", "75", "${root}.lock", "true"],
+    {timeout_ms: 10000},
+  )
+  assert_eq(contender.exit_code, 75, "known live owner must exclude a fresh open-file description")
+  command_cancel(harness.tools, process, {wait_result_ms: 5000})
+  const stopped = command_wait(harness.tools, process, {timeout_ms: 10000})
+  assert(stopped.exit_code != nil, "the exact owned process must be terminal before recovery")
+  const next = fixture_run(harness, root, "census")
+  assert(next.success, next.stderr)
+  assert(
+    next.stdout.contains("recovery-census-confirmed"),
+    "recovery must reach the real admission after interruption",
+  )
+  assert_eq(
+    harness.fs.stat("${root}.lock").identity,
+    identity,
+    "interruption releases the kernel lock while its persistent inode remains unchanged",
+  )
+}
+
+pipeline test_recovery_store_rechecks_kernel_witness_after_an_inherited_child_unlocks(
+  harness: Harness,
+) {
+  const parent = harness.fs.mkdtemp_in_workspace("smart-ship-recovery-unlocked-")
+  const root = "${parent}/retained"
+  const result = fixture_run(harness, root, "unlock")
+  assert(result.success, result.stderr)
+  assert(
+    result.stdout.contains("recovery-lost-kernel-lock-refused"),
+    "the physical assertion must reread kernel state after a real inherited-descriptor unlock",
+  )
+  assert(
+    harness.fs.exists("${root}.lock"),
+    "lost kernel ownership never removes the persistent file",
+  )
+}
+
+pipeline test_recovery_store_refuses_a_replaced_lock_inode_after_admission(harness: Harness) {
+  const parent = harness.fs.mkdtemp_in_workspace("smart-ship-recovery-replaced-lock-")
+  const root = "${parent}/retained"
+  const result = fixture_run(harness, root, "replaced-lock")
+  assert(result.success, result.stderr)
+  assert(result.stdout.contains("recovery-replaced-lock-refused"))
+  assert_eq(harness.fs.read_text("${root}.lock"), "preserve replacement")
+  assert(harness.fs.exists("${root}.lock.original"), "the originally held inode must also remain")
+}
+
+pub fn recovery_fixture(harness: Harness) -> nil {
+  require len(argv) == 2, "recovery fixture needs a root and case"
+  const root = argv[0] ?? ""
+  const mode = argv[1] ?? ""
+  if mode == "census" {
+    census_fixture(harness, root)
+  } else if mode == "reused-root" {
+    reused_root_fixture(harness, root)
+  } else if mode == "entries" {
+    entries_fixture(harness, root)
+  } else {
+    harness.stdio.println("recovery-admission-reached")
+    const lock = recovery_store_lock(pick(harness, ["fs", "tools"]), root, "a" * 32)
+    recovery_store_assert_owned(harness.fs, lock)
+    if mode == "replaced-lock" {
+      assert(
+        harness.process.run({program: "mv", args: ["--", lock.path, "${lock.path}.original"]})
+          .success,
+      )
+      harness.fs.write_text(lock.path, "preserve replacement")
+      assert(
+        is_err(
+          try {
+            recovery_store_assert_owned(harness.fs, lock)
+          },
+        ),
+      )
+      assert(
+        is_err(
+          try {
+            recovery_store_entries(harness.fs, lock)
+          },
+        ),
+      )
+      harness.stdio.println("recovery-replaced-lock-refused")
+    }
+    if mode == "unlock" {
+      const unlocked = command_run(
+        harness.tools,
+        {argv: ["flock", "--unlock", lock.descriptor], sandbox_profile: "workspace_paths"},
+        {timeout_ms: 10000},
+      )
+      assert(unlocked.success, unlocked.stderr)
+      const contender = command_run(
+        harness.tools,
+        ["flock", "--exclusive", "--nonblock", "--conflict-exit-code", "75", lock.path, "true"],
+        {timeout_ms: 10000},
+      )
+      assert_eq(
+        contender.exit_code,
+        0,
+        "the actual child must have released the shared open-file lock",
+      )
+      assert(
+        is_err(
+          try {
+            recovery_store_assert_owned(harness.fs, lock)
+          },
+        ),
+        "an unchanged file and FD must not stand in for a fresh exclusive kernel lock",
+      )
+      harness.stdio.println("recovery-lost-kernel-lock-refused")
+    }
+    if mode == "blocked" {
+      harness.stdio.println("recovery-owner-ready")
+      harness.fs.read_text("${root}.release")
+    }
+  }
+  return nil
+}
+
+pipeline test_recovery_receipts_refuse_unknown_and_cross_pr_custody() {
+  const record = receipt()
+  assert_eq(recovery_record(record), record)
+  for malformed in [
+    {},
+    record + {schema: "legacy"},
+    record + {identity: record.identity + {repository: "../other"}},
+    record + {identity: record.identity + {run_id: 0}},
+    record + {identity: record.identity + {nonce: ""}},
+    record + {snapshot: record.snapshot + {tree: ""}},
+    record + {custody: record.custody + {tree: "f" * 40}},
+    record + {custody: record.custody + {reference: "refs/smart-ship/wip/90"}},
+    record + {archives: [{reference: "refs/smart-ship/previous/90/${"f" * 40}", sha: "f" * 40}]},
+    record + {archives: record.archives + record.archives},
+  ] {
+    assert(
+      is_err(
+        try {
+          recovery_record(malformed)
+        },
+      ),
+      json_stringify(malformed),
+    )
+  }
+}

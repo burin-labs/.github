@@ -1,0 +1,647 @@
+/** Real locked lifecycle transactions, with inert source and archive readers. */
+import { CommandResult, command_run } from "std/command"
+import {
+  ArchiveDisposition,
+  ArchiveRemoval,
+  LifecycleCensus,
+  LifecycleReaders,
+  reclaim_entries,
+  reserve_attempt,
+} from "./lifecycle.harn"
+import {
+  RECOVERY_SCHEMA,
+  RecoveryCustody,
+  RecoveryIdentity,
+  RecoveryRecord,
+  RecoveryReference,
+  RecoverySnapshot,
+  RecoveryStoreLock,
+  recovery_store_lock,
+} from "./recovery.harn"
+import { WorkerReceipt, WorkerRuntime, worker_retirement, worker_runtime } from "./worker.harn"
+
+type JournalProgress = {
+  schema: string,
+  intent: unknown,
+  archives?: list<ArchiveDisposition>,
+  result: unknown,
+}
+
+type LifecycleTestNames = list<string>
+
+type CompletedJournal = {intent: {custody: RecoveryCustody}, result: {status: string}}
+
+pipeline test_lifecycle_counts_full_store_and_reserves_before_model(harness: Harness) {
+  run_case(harness, "capacity")
+}
+
+pipeline test_lifecycle_rechecks_source_before_removing_owned_work(harness: Harness) {
+  run_case(harness, "source-changed")
+  run_case(harness, "source-mutates")
+}
+
+pipeline test_lifecycle_preserves_running_producer_and_null_worker_cleanup(harness: Harness) {
+  run_case(harness, "producer-active")
+  run_case(harness, "worker-null")
+}
+
+pipeline test_lifecycle_resumes_one_durable_intent_and_preserves_unknown_absence(harness: Harness) {
+  run_case(harness, "resume")
+  run_case(harness, "interrupted-absence")
+}
+
+pipeline test_lifecycle_recovers_same_intent_after_actual_transaction_owner_death(
+  harness: Harness,
+) {
+  const root = fixture(harness)
+  const crashed = transaction(harness, root, "crash-intent")
+  assert(crashed.success, crashed.stderr)
+  assert(crashed.stdout.contains("lifecycle-exact-owner-SIGKILL"))
+  assert(harness.fs.exists("${root}/123-1-9/work"))
+  const journal = harness.fs.list_dir("${root}.lifecycle")
+  assert_eq(len(journal), 1, "the real killed process must have durably reserved one intent")
+  const inode = harness.fs.stat("${root}.lock").identity
+  const recovered = transaction(harness, root, "recover-intent")
+  assert(recovered.success, recovered.stderr)
+  assert(recovered.stdout.contains("lifecycle-recover-intent-confirmed"))
+  assert_eq(harness.fs.list_dir("${root}.lifecycle"), journal)
+  assert_eq(harness.fs.stat("${root}.lock").identity, inode)
+}
+
+pipeline test_lifecycle_only_removes_archives_matching_fresh_custody(harness: Harness) {
+  run_case(harness, "archives")
+  run_case(harness, "archive-already-absent")
+}
+
+pipeline test_lifecycle_reclaims_local_work_but_keeps_its_only_archive_custody(harness: Harness) {
+  run_case(harness, "archive-is-custody")
+}
+
+pipeline test_lifecycle_retains_unconfirmed_archive_for_fresh_retry(harness: Harness) {
+  run_case(harness, "archive-unknown")
+}
+
+pipeline test_lifecycle_preserves_work_when_archive_capability_is_missing(harness: Harness) {
+  run_case(harness, "archive-missing")
+}
+
+pipeline test_lifecycle_does_not_turn_archive_read_error_into_absence(harness: Harness) {
+  run_case(harness, "archive-error")
+}
+
+pipeline test_lifecycle_resumes_lost_archive_delete_response_without_claiming_deletion(
+  harness: Harness,
+) {
+  run_case(harness, "archive-lost-response")
+}
+
+pipeline test_lifecycle_refuses_mismatched_archive_sha_before_retry(harness: Harness) {
+  run_case(harness, "archive-wrong-sha")
+}
+
+pipeline test_lifecycle_rechecks_physical_lock_before_mutation(harness: Harness) {
+  run_case(harness, "unlock")
+  run_case(harness, "unlock-before-source")
+}
+
+pipeline test_lifecycle_refuses_symlinked_ledger_and_replaced_work(harness: Harness) {
+  run_case(harness, "ledger-symlink")
+  run_case(harness, "replaced-work")
+}
+
+fn module_dir(fs: HarnessFs) -> string {
+  const root = fs.project_root() ?? ""
+  require root != ""
+  return fs.exists("${root}/lifecycle.harn") ? root : "${root}/scripts/smart-ship"
+}
+
+fn identity() -> RecoveryIdentity {
+  return {
+    repository: "o/r",
+    number: 9,
+    run_id: 123,
+    run_attempt: 1,
+    nonce: "a" * 32,
+    head: "b" * 40,
+  }
+}
+
+fn fixture(harness: Harness) -> string {
+  const parent = harness.fs.mkdtemp_in_workspace("smart-ship-lifecycle-")
+  const root = "${parent}/store"
+  const work = "${root}/123-1-9/work"
+  harness.fs.mkdir("${work}/agent", true)
+  harness.fs.mkdir("${work}/pr/.git", true)
+  harness.fs.mkdir("${parent}/home")
+  const id = identity()
+  harness.fs.write_text("${work}/.owner", "${id.nonce}\n")
+  harness.fs.write_text(
+    "${work}/job.json",
+    json_stringify({nonce: id.nonce, head: id.head, recovery: id}),
+  )
+  harness.fs.write_text("${work}/agent/repair.harn", "fn main(harness: Harness) {}\n")
+  harness.fs.write_text("${work}/pr/source.txt", "preserved authored source")
+  const record: RecoveryRecord = {
+    schema: RECOVERY_SCHEMA,
+    identity: id,
+    snapshot: {tree: "d" * 40, agent_index_sha256: sha256("preserved authored source")},
+    custody: {reference: "refs/smart-ship/wip/9", sha: "e" * 40, tree: "d" * 40},
+    archives: [
+      {reference: "refs/smart-ship/previous/9/${"e" * 40}", sha: "e" * 40},
+      {reference: "refs/smart-ship/previous/9/${"f" * 40}", sha: "f" * 40},
+    ],
+  }
+  harness.fs.write_text("${work}/recovery.json", json_stringify(record))
+  const runtime = harness.process.find_executable("harn") ?? ""
+  assert(runtime != "")
+  const entry = "${parent}/worker.harn"
+  harness.fs.write_text(
+    entry,
+    "import { run_worker, worker_runtime } from "
+      + json_stringify("${module_dir(harness.fs)}/worker.harn")
+      + "\nimport { RecoveryIdentity } from "
+      + json_stringify("${module_dir(harness.fs)}/recovery.harn")
+      + "\nfn main(harness: Harness) {\n const caps = pick(harness, [\"fs\", \"tools\"])\n"
+      + " const id = schema_expect(json_parse("
+      + json_stringify(json_stringify(id))
+      + "), schema_of(RecoveryIdentity))\n"
+      + " const receipt = run_worker(caps, "
+      + json_stringify(work)
+      + ", id, worker_runtime(caps, "
+      + json_stringify(runtime)
+      + "), 30000)\n require receipt.exit_code == 0\n}\n",
+  )
+  const driver = "${parent}/worker.py"
+  harness.fs.write_text(
+    driver,
+    """
+import os, subprocess, sys
+runtime, entry, home = sys.argv[1:]
+environment = {"PATH": os.path.dirname(runtime) + ":/usr/bin:/bin", "HOME": home,
+               "INERT_KEY": "lifecycle-fixture-no-provider"}
+result = subprocess.run([runtime, "run", "--no-sandbox", "--environment-policy", "granted",
+                         "--grant", "openai=env:INERT_KEY,expose=OPENAI_API_KEY,for=harn", entry],
+                        env=environment, capture_output=True, timeout=60)
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+raise SystemExit(result.returncode)
+""",
+  )
+  const executed = command_run(
+    harness.tools,
+    ["python3", driver, runtime, entry, "${parent}/home"],
+    {timeout_ms: 70000, max_inline_bytes: 65536},
+  )
+  assert(executed.success, executed.stderr)
+  const receipt = schema_expect(
+    json_parse(harness.fs.read_text("${work}/worker.json")),
+    schema_of(WorkerReceipt),
+  )
+  assert_eq(
+    receipt.status,
+    "completed",
+    "reach an actual terminal worker before locked lifecycle tests",
+  )
+  assert_eq(receipt.exit_code, 0)
+  const caps = pick(harness, ["fs", "tools"])
+  const retired = worker_retirement(caps, work, id, worker_runtime(caps, runtime))
+  assert(retired.retired, retired.reason)
+  return root
+}
+
+fn run_case(harness: Harness, mode: string) {
+  const root = fixture(harness)
+  const result = transaction(harness, root, mode)
+  assert(result.success, "${mode}: ${result.stderr}")
+  assert(
+    result.stdout.contains("lifecycle-${mode}-confirmed"),
+    "the actual locked case must finish",
+  )
+}
+
+fn transaction(harness: Harness, root: string, mode: string) -> CommandResult {
+  const entry = "${dirname(root)}/transaction.harn"
+  harness.fs.write_text(
+    entry,
+    "import { lifecycle_fixture } from "
+      + json_stringify("${module_dir(harness.fs)}/lifecycle_test.harn")
+      + "\nfn main(harness: Harness) { lifecycle_fixture(harness) }\n",
+  )
+  const runtime = harness.process.find_executable("harn") ?? ""
+  let arguments = [
+    "flock",
+    "--exclusive",
+    "--nonblock",
+    "--conflict-exit-code",
+    "75",
+    "--no-fork",
+    "${root}.lock",
+    runtime,
+    "run",
+    "--standalone",
+    "--no-sandbox",
+    entry,
+    "--",
+    root,
+    mode,
+  ]
+  if mode == "crash-intent" {
+    const driver = "${dirname(root)}/crash.py"
+    harness.fs.write_text(
+      driver,
+      """
+import signal, subprocess, sys
+result = subprocess.run(sys.argv[1:], capture_output=True, timeout=60)
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+assert result.returncode == -signal.SIGKILL, "the exact transaction owner was not killed"
+print("lifecycle-exact-owner-SIGKILL")
+""",
+    )
+    arguments = ["python3", driver] + arguments
+  }
+  return command_run(
+    harness.tools,
+    {argv: arguments, sandbox_profile: "workspace_paths"},
+    {timeout_ms: 70000, max_inline_bytes: 65536},
+  )
+}
+
+fn source(fs: HarnessFs, work: string) -> RecoverySnapshot {
+  return {
+    tree: "d" * 40,
+    agent_index_sha256: sha256(join(fs.read_lines("${work}/pr/source.txt"), "\n")),
+  }
+}
+
+fn retained(fs: HarnessFs, root: string, mode: string, calls: int, census: LifecycleCensus) {
+  assert_eq(census.reclaimed_entries, 0)
+  assert_eq(census.remaining_entries, 1)
+  assert(fs.exists("${root}/123-1-9"))
+  if ["producer-active", "worker-null"].contains(mode) {
+    assert_eq(calls, 0, "unretired work must not reach the source-staging reader")
+  }
+  if mode == "source-mutates" {
+    assert_eq(len(census.pending_intents), 1)
+  }
+  if mode == "replaced-work" {
+    assert(fs.exists("${root}/123-1-9/work.retained/pr/source.txt"))
+  }
+}
+
+fn lock_refused(fs: HarnessFs, root: string, mode: string, calls: int) {
+  assert(fs.exists("${root}/123-1-9/work"))
+  assert_eq(fs.list_dir("${root}.lifecycle"), [])
+  if mode == "unlock-before-source" {
+    assert_eq(calls, 0, "a lost lock must refuse before the source-staging capability")
+  }
+}
+
+fn interrupt(
+  harness: {fs: HarnessFs, tools: HarnessTools},
+  lock: RecoveryStoreLock,
+  mode: string,
+  calls: int,
+) {
+  if calls != 2 {
+    return
+  }
+  if mode == "crash-intent" {
+    // The core-bound current PID is the exact private test owner, not a process census.
+    command_run(harness.tools, ["kill", "-KILL", to_string(lock.process_id)])
+    throw "the intended transaction owner survived SIGKILL"
+  }
+  if ["resume", "interrupted-absence"].contains(mode) {
+    if mode == "interrupted-absence" {
+      harness.fs.delete("${lock.root}/123-1-9")
+    }
+    throw "inert interruption after durable intent"
+  }
+}
+
+fn archive_response(
+  fs: HarnessFs,
+  path: string,
+  archive: RecoveryReference,
+  mode: string,
+  calls: int,
+) -> ArchiveRemoval {
+  if !fs.exists(path) {
+    // Inert authenticated-404 capability: production performs the repository/custody GETs.
+    return {reference: archive.reference, observed_sha: nil, absent: true}
+  }
+  assert_eq(fs.read_text(path), archive.sha, "reach the known non-null archive before retirement")
+  if calls == 1 {
+    if mode == "archive-unknown" {
+      return {reference: archive.reference, observed_sha: nil, absent: false}
+    }
+    if mode == "archive-error" {
+      throw "inert unreadable archive response; not a measured 404"
+    }
+    if mode == "archive-wrong-sha" {
+      return {reference: archive.reference, observed_sha: "0" * 40, absent: true}
+    }
+    if mode == "archive-lost-response" {
+      fs.delete(path)
+      throw "inert DELETE response lost after exact archive removal"
+    }
+  }
+  fs.delete(path)
+  return {reference: archive.reference, observed_sha: archive.sha, absent: !fs.exists(path)}
+}
+
+fn archive_retry(
+  caps: {fs: HarnessFs, tools: HarnessTools},
+  lock: RecoveryStoreLock,
+  runtime: WorkerRuntime,
+  readers: LifecycleReaders,
+  census: LifecycleCensus,
+  mode: string,
+) {
+  assert_eq(
+    census.reclaimed_entries,
+    0,
+    "an unconfirmed eligible archive must retain local retry evidence",
+  )
+  assert_eq(census.remaining_entries, 1)
+  assert_eq(len(census.pending_intents), 1)
+  assert(caps.fs.exists("${lock.root}/123-1-9/work/worker.json"))
+  const row = census.entries[0]
+  require row != nil
+  assert_eq(row.reason, "eligible archive retirement remains unconfirmed")
+  const exact = row.archives[0]
+  const other = row.archives[1]
+  require exact != nil && other != nil
+  assert_eq(exact.status, "unconfirmed")
+  assert_eq(other.status, "retained")
+  const names = schema_expect(
+    caps.fs.list_dir("${lock.root}.lifecycle"),
+    schema_of(LifecycleTestNames),
+  )
+  assert_eq(len(names), 1)
+  const name = names[0] ?? ""
+  const path = "${lock.root}.lifecycle/${name}"
+  const progress = schema_expect(
+    json_parse(join(caps.fs.read_lines(path), "\n")),
+    schema_of(JournalProgress),
+  )
+  assert_eq(progress.result, nil, "an unconfirmed archive must not complete the cleanup journal")
+  assert_eq(progress.archives, row.archives, "named archive outcomes must be durably CAS-flushed")
+  if mode == "archive-unknown" {
+    // An old unfinished journal has no progress field; absence must grant no archive credit.
+    caps.fs.write_text(
+      path,
+      json_stringify({schema: progress.schema, intent: progress.intent, result: nil}),
+    )
+  }
+  const retried = reclaim_entries(caps, lock, runtime, readers)
+  assert_eq(retried.reclaimed_entries, 1)
+  assert_eq(retried.remaining_entries, 0)
+  assert_eq(retried.pending_intents, [])
+  assert_eq(caps.fs.list_dir("${lock.root}.lifecycle"), names)
+  const retried_row = retried.entries[0]
+  require retried_row != nil
+  const retried_archive = retried_row.archives[0]
+  require retried_archive != nil
+  assert_eq(retried_archive.status, mode == "archive-lost-response" ? "already_absent" : "removed")
+}
+
+fn reclaimed(
+  caps: {fs: HarnessFs, tools: HarnessTools},
+  lock: RecoveryStoreLock,
+  runtime: WorkerRuntime,
+  readers: LifecycleReaders,
+  census: LifecycleCensus,
+  mode: string,
+  archive_calls: int,
+) -> nil {
+  assert_eq(census.reclaimed_entries, 1)
+  assert_eq(census.remaining_entries, 0)
+  assert_eq(archive_calls, mode == "archive-is-custody" ? 0 : 1)
+  const row = census.entries[0]
+  require row != nil
+  assert_eq(len(row.archives), 2)
+  const exact = row.archives[0]
+  const other = row.archives[1]
+  require exact != nil && other != nil
+  assert_eq(
+    exact.status,
+    mode == "archive-is-custody" ? "retained" : mode == "archive-already-absent" ? "already_absent" : "removed",
+  )
+  if mode == "archive-is-custody" {
+    assert_eq(
+      caps.fs.read_text("${dirname(lock.root)}/archive-sha"),
+      "e" * 40,
+      "the only confirmed copy must remain after local reclamation",
+    )
+  }
+  assert_eq(other.status, "retained")
+  const names = caps.fs.list_dir("${lock.root}.lifecycle")
+  assert_eq(len(names), 1, "exactly one durable intent/result per entry")
+  const journal = schema_expect(
+    json_parse(join(caps.fs.read_lines("${lock.root}.lifecycle/${names[0]}"), "\n")),
+    schema_of(CompletedJournal),
+  )
+  assert_eq(journal.result.status, "removed")
+  assert_eq(
+    journal.intent.custody,
+    {
+      reference:
+        mode == "archive-is-custody" ? "refs/smart-ship/previous/9/${"e" * 40}" : "refs/smart-ship/wip/9",
+      sha: "e" * 40,
+      tree: "d" * 40,
+    },
+    "the journal must record the measured keeper",
+  )
+  const again = reclaim_entries(caps, lock, runtime, readers)
+  assert_eq(again.reclaimed_entries, 0)
+  assert_eq(again.pending_intents, [])
+  assert_eq(caps.fs.list_dir("${lock.root}.lifecycle"), names)
+}
+
+pub fn lifecycle_fixture(harness: Harness) -> nil {
+  require len(argv) == 2
+  const root = argv[0] ?? ""
+  const mode = argv[1] ?? ""
+  const caps = pick(harness, ["fs", "tools"])
+  const runtime = worker_runtime(caps, harness.process.find_executable("harn") ?? "")
+  const lock = recovery_store_lock(caps, root, "c" * 32)
+  const work = "${root}/123-1-9/work"
+  let calls = 0
+  let archive_calls = 0
+  const readers: LifecycleReaders = {
+    observe: { record ->
+      if mode == "unlock-before-source" {
+        assert(command_run(harness.tools, ["flock", "--unlock", lock.descriptor]).success)
+      }
+      {
+        repository: record.identity.repository,
+        run_id: record.identity.run_id,
+        run_attempt: record.identity.run_attempt,
+        run_status: mode == "producer-active" ? "in_progress" : "completed",
+        custody: mode == "archive-is-custody" ? record.custody
+          + {reference: "refs/smart-ship/previous/9/${record.custody.sha}"} : record.custody,
+      }
+    },
+    source: { path, id ->
+      calls += 1
+      const current = source(harness.fs, path)
+      if mode == "source-mutates" && calls == 1 {
+        harness.fs.write_text("${path}/pr/source.txt", "authored after checkpoint")
+      }
+      interrupt(pick(harness, ["fs", "tools"]), lock, mode, calls)
+      if mode == "replaced-work" && calls == 1 {
+        assert(command_run(harness.tools, ["mv", "--", path, "${path}.retained"]).success)
+        harness.fs.mkdir(path)
+      }
+      if mode == "unlock" && calls == 1 {
+        const unlocked = command_run(harness.tools, ["flock", "--unlock", lock.descriptor])
+        assert(unlocked.success, unlocked.stderr)
+      }
+      return current
+    },
+    archive_remove: { id, archive ->
+      archive_calls += 1
+      assert_eq(id, identity())
+      assert_eq(
+        archive.sha,
+        "e" * 40,
+        "different-SHA archives must not reach the removal capability",
+      )
+      return archive_response(
+        harness.fs,
+        "${dirname(root)}/archive-sha",
+        archive,
+        mode,
+        archive_calls,
+      )
+    },
+  }
+  harness.fs.write_text("${dirname(root)}/archive-sha", "e" * 40)
+  if mode == "archive-already-absent" {
+    assert_eq(harness.fs.read_text("${dirname(root)}/archive-sha"), "e" * 40)
+    harness.fs.delete("${dirname(root)}/archive-sha")
+  }
+  if mode == "source-changed" {
+    harness.fs.write_text("${work}/pr/source.txt", "new authored source")
+  }
+  if mode == "worker-null" {
+    const receipt = schema_expect(
+      json_parse(harness.fs.read_text("${work}/worker.json")),
+      schema_of(WorkerReceipt),
+    )
+    harness.fs.write_text("${work}/worker.json", json_stringify(receipt + {process_cleanup: nil}))
+  }
+  if mode == "ledger-symlink" {
+    const outside = "${dirname(root)}/keep"
+    harness.fs.mkdir(outside)
+    harness.fs.write_text("${outside}/authored.txt", "keep")
+    assert(command_run(harness.tools, ["ln", "-s", outside, "${root}.lifecycle"]).success)
+    assert(
+      is_err(
+        try {
+          reclaim_entries(caps, lock, runtime, readers)
+        },
+      ),
+    )
+    assert(harness.fs.exists(work))
+    assert_eq(harness.fs.read_text("${outside}/authored.txt"), "keep")
+  } else if mode == "capacity" {
+    const original = schema_expect(
+      json_parse(harness.fs.read_text("${work}/worker.json")),
+      schema_of(WorkerReceipt),
+    )
+    const record = schema_expect(
+      json_parse(harness.fs.read_text("${work}/recovery.json")),
+      schema_of(RecoveryRecord),
+    )
+    const starting_id = record.identity + {run_id: 124}
+    const starting = "${root}/124-1-9/work"
+    harness.fs.mkdir("${starting}/pr", true)
+    harness.fs.write_text("${starting}/.owner", "${starting_id.nonce}\n")
+    harness.fs.write_text(
+      "${starting}/job.json",
+      json_stringify({nonce: starting_id.nonce, head: starting_id.head, recovery: starting_id}),
+    )
+    harness.fs.write_text(
+      "${starting}/recovery.json",
+      json_stringify(record + {identity: starting_id}),
+    )
+    harness.fs.write_text(
+      "${starting}/worker.json",
+      json_stringify(original + {identity: starting_id, status: "starting", process_cleanup: nil}),
+    )
+    harness.fs.mkdir("${root}/legacy")
+    const admission = reserve_attempt(caps, lock, identity() + {run_id: 125}, 3, runtime, readers)
+    assert(admission.admitted)
+    assert_eq(admission.census.observed_entries, 3)
+    assert_eq(admission.census.reclaimed_entries, 1)
+    assert_eq(admission.census.remaining_entries, 3)
+    const reservation = admission.reservation
+    require reservation != nil
+    assert(harness.fs.exists("${reservation.work}/.owner"))
+    assert(harness.fs.exists("${root}/${reservation.name}/reservation.json"))
+    assert(!harness.fs.exists("${reservation.work}/agent"), "reservation must precede model setup")
+    assert(harness.fs.exists(starting) && harness.fs.exists("${root}/legacy"))
+    const full = reserve_attempt(caps, lock, identity() + {run_id: 126}, 3, runtime, readers)
+    assert(!full.admitted && full.reservation == nil)
+    assert_eq(full.census.remaining_entries, 3)
+  } else {
+    const selected = mode == "archive-missing" ? readers + {archive_remove: nil} : readers
+    const observed = try {
+      reclaim_entries(caps, lock, runtime, selected)
+    }
+    if ["unlock", "unlock-before-source"].contains(mode) {
+      assert(is_err(observed), "a physically lost lock must stop the transaction")
+      lock_refused(harness.fs, root, mode, calls)
+    } else {
+      const census = unwrap(observed)
+      if [
+        "archive-unknown",
+        "archive-missing",
+        "archive-error",
+        "archive-lost-response",
+        "archive-wrong-sha",
+      ]
+        .contains(mode) {
+        archive_retry(caps, lock, runtime, readers, census, mode)
+        assert_eq(
+          archive_calls,
+          mode == "archive-missing" ? 1 : 2,
+          "retry must reobserve the archive",
+        )
+      } else if ["archives", "archive-already-absent", "recover-intent", "archive-is-custody"].contains(
+        mode,
+      ) {
+        reclaimed(caps, lock, runtime, readers, census, mode, archive_calls)
+      } else if mode == "resume" {
+        assert_eq(census.reclaimed_entries, 0)
+        assert_eq(census.remaining_entries, 1)
+        assert_eq(len(census.pending_intents), 1)
+        const names = harness.fs.list_dir("${root}.lifecycle")
+        const resumed = reclaim_entries(caps, lock, runtime, readers)
+        assert_eq(resumed.reclaimed_entries, 1)
+        assert_eq(resumed.remaining_entries, 0)
+        assert_eq(resumed.pending_intents, [])
+        assert_eq(
+          harness.fs.list_dir("${root}.lifecycle"),
+          names,
+          "resume must complete the same CAS journal",
+        )
+      } else if mode == "interrupted-absence" {
+        assert_eq(census.remaining_entries, 0, "physical capacity reflects actual absence")
+        assert_eq(census.reclaimed_entries, 0, "absence after interruption is not proven deletion")
+        assert_eq(len(census.pending_intents), 1)
+        const pending = census.pending_intents[0]
+        require pending != nil
+        assert_eq(pending.reason, "entry absent after incomplete intent; removal is unconfirmed")
+        const next = reclaim_entries(caps, lock, runtime, readers)
+        assert_eq(next.reclaimed_entries, 0)
+        assert_eq(len(next.pending_intents), 1)
+      } else {
+        retained(harness.fs, root, mode, calls, census)
+      }
+    }
+  }
+  harness.stdio.println("lifecycle-${mode}-confirmed")
+}
