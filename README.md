@@ -28,6 +28,12 @@ current-check selection and owning-aggregate assessment for read-only adapters.
 Callers supply a complete check census for one stable head and retain observed,
 delegated measurement, pending, and failing counts.
 
+## Smart Ship recovery
+
+[Recovery storage](docs/smart-ship-recovery.md) explains repair capacity, worker
+retirement, source custody and interrupted cleanup. Unconfirmed work remains
+retained; a full store stops new repairs while green PRs can still merge.
+
 ## Selective Rust tests
 
 Capture exact path-filter and planner inputs with the

@@ -278,7 +278,11 @@ chmodSync(bin + '/pnpm', 0o755);
     const result = try {
       setup_main(harness, f.request.work, f.request.nonce)
     }
-    assert_eq(is_ok(result), scenario == "ready", scenario)
+    assert_eq(
+      is_ok(result),
+      scenario == "ready",
+      scenario + (is_err(result) ? ": " + to_string(unwrap_err(result)) : ""),
+    )
     const admitted = ["ready", "installer-failed", "install-failed"].contains(scenario)
     assert_eq(harness.fs.exists("${root}/installer-reached"), admitted, scenario)
     assert_eq(
@@ -567,9 +571,37 @@ pipeline test_main_repair_keeps_the_existing_credential_and_deadline_boundary(ha
   }
   assert_eq(
     launches(agent.run),
-    launches(previous.run),
-    "the same sandbox, grant and host deadline launch the existing agent",
+    [
+      [
+        "harn",
+        "run",
+        "--timeout",
+        "20m",
+        "--environment-policy",
+        "granted",
+        "--grant",
+        "openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,to=in_process",
+        "--write-root",
+        "$SHIP_WORK/pr",
+        "$SHIP_WORK/agent/repair.harn",
+      ],
+    ],
+    "main repair retains its sandbox, in-process model grant, write root and host deadline",
   )
+  const outer_shape = shell_command_shape(previous.run, "bash")
+  assert_eq(outer_shape.status, "measured")
+  const outer = outer_shape.segments.flat_map({ segment -> segment.stages }).filter(
+    { stage -> stage.words[0] == "$SHIP_HARN" },
+  )
+  assert_eq(len(outer), 1, "regular PR repair delegates process retirement to one trusted worker")
+  const selected = outer[0]
+  if selected == nil {
+    throw "the regular repair worker launch is missing"
+  }
+  const words = selected.words
+  assert_eq(words[0:6], ["$SHIP_HARN", "run", "--standalone", "--no-sandbox", "--timeout", "23m"])
+  assert(words.contains("openai=env:OPENAI_API_KEY,expose=OPENAI_API_KEY,for=harn"))
+  assert_eq(words[len(words) - 1], ".smart-ship/scripts/smart-ship/worker.harn")
   assert(
     agent["timeout-minutes"] < job["timeout-minutes"],
     "publication has time after the agent stops",

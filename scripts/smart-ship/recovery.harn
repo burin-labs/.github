@@ -1,0 +1,410 @@
+/** Confirmed remote custody and unchanged local source are both needed for recovery cleanup. */
+import { command_run } from "std/command"
+import { GithubClientOptions, api_call } from "harn-github-connector/default"
+
+type RecoveryStoreCapabilities = {fs: HarnessFs, tools: HarnessTools}
+
+type RecoveryEntryNames = list<string>
+
+type RecoveryProducer = {id: int, run_attempt: int, status: string, repository: {full_name: string}}
+
+type RecoveryGitReference = {ref: string, object: {sha: string, type: string}}
+
+type RecoveryGitCommit = {sha: string, tree: {sha: string}}
+
+type RecoveryGitReferences = list<RecoveryGitReference>
+
+pub type RecoveryStoreLock = {
+  root: string,
+  root_identity: string,
+  path: string,
+  identity: string,
+  nonce: string,
+  process_id: int,
+  descriptor: string,
+}
+
+pub type RecoveryIdentity = {
+  repository: string,
+  number: int,
+  run_id: int,
+  run_attempt: int,
+  nonce: string,
+  head: string,
+}
+
+pub type RecoverySnapshot = {tree: string, agent_index_sha256: string}
+
+pub type RecoveryReference = {reference: string, sha: string}
+
+pub type RecoveryCustody = {reference: string, sha: string, tree: string}
+
+pub type RecoveryRecord = {
+  schema: string,
+  identity: RecoveryIdentity,
+  snapshot: RecoverySnapshot,
+  custody: RecoveryCustody,
+  archives: list<RecoveryReference>,
+}
+
+pub type RecoveryObservation = {
+  repository: string,
+  run_id: int,
+  run_attempt: int,
+  run_status: string,
+  custody: RecoveryCustody,
+}
+
+pub type RecoveryCustodyDecision = {eligible: bool, reason: string}
+
+pub type RecoveryEntry = {
+  name: string,
+  record: RecoveryRecord?,
+  reason: string,
+  entry_identity?: string,
+  work_identity?: string,
+  receipt_sha256?: string,
+}
+
+pub const RECOVERY_SCHEMA = "smart-ship.recovery.v1"
+
+fn archive_reference(identity: RecoveryIdentity, sha: string) -> string {
+  return "refs/smart-ship/previous/${identity.number}/${sha}"
+}
+
+fn read(harness: Harness, options: GithubClientOptions, path: string) -> unknown {
+  const result = api_call(harness, {path: path, options: options})
+  require is_ok(result), "recovery remote observation is unavailable"
+  return unwrap(result)
+}
+
+/** A bounded whole archive census, bound to exact content-addressed names for this PR. */
+pub fn recovery_archives(
+  harness: Harness,
+  options: GithubClientOptions,
+  identity: RecoveryIdentity,
+) -> list<RecoveryReference> {
+  const references = schema_expect(
+    read(
+      harness,
+      options,
+      "/repos/${identity.repository}/git/matching-refs/smart-ship/previous/${identity.number}/",
+    ),
+    schema_of(RecoveryGitReferences),
+  )
+  require len(references) < 100, "recovery archive inventory may be incomplete"
+  let result: list<RecoveryReference> = []
+  let names: list<string> = []
+  for reference in references {
+    const expected = archive_reference(identity, reference.object.sha)
+    require reference.object.type == "commit" && oid(reference.object.sha)
+      && reference.ref == expected
+      && !names.contains(reference.ref),
+      "recovery archive identity is unconfirmed"
+    result.push({reference: reference.ref, sha: reference.object.sha})
+    names.push(reference.ref)
+  }
+  return result
+}
+
+/**
+ * Measure the exact producer attempt and a live durable Git reference, never SHA existence alone.
+ */
+pub fn recovery_observation(
+  harness: Harness,
+  options: GithubClientOptions,
+  record: RecoveryRecord,
+) -> RecoveryObservation {
+  const identity = record.identity
+  const prefix = "/repos/${identity.repository}"
+  const producer = schema_expect(
+    read(
+      harness,
+      options,
+      "${prefix}/actions/runs/${identity.run_id}/attempts/${identity.run_attempt}",
+    ),
+    schema_of(RecoveryProducer),
+  )
+  require producer.id == identity.run_id && producer.run_attempt == identity.run_attempt
+    && producer.repository.full_name == identity.repository,
+    "recovery producer identity is unconfirmed"
+  const suffix = join(split(record.custody.reference, "/")[1:], "/")
+  const primary = api_call(
+    harness,
+    {path: "${prefix}/git/ref/${url_encode(suffix)}", options: options},
+  )
+  let reference: RecoveryGitReference? = nil
+  if is_ok(primary) {
+    reference = schema_expect(unwrap(primary), schema_of(RecoveryGitReference))
+    require reference.ref == record.custody.reference && reference.object.type == "commit"
+      && oid(reference.object.sha),
+      "recovery custody does not name a measured commit"
+  } else {
+    require unwrap_err(primary).http_status == 404, "recovery custody read is unavailable"
+  }
+  if reference == nil || reference.object.sha != record.custody.sha {
+    const archived = archive_reference(identity, record.custody.sha)
+    const path = url_encode(join(split(archived, "/")[1:], "/"))
+    const backup = api_call(harness, {path: "${prefix}/git/ref/${path}", options: options})
+    if is_ok(backup) {
+      const measured = schema_expect(unwrap(backup), schema_of(RecoveryGitReference))
+      require measured.ref == archived && measured.object.type == "commit"
+        && measured.object.sha == record.custody.sha,
+        "archived recovery custody differs"
+      reference = measured
+    } else {
+      require unwrap_err(backup).http_status == 404, "archived recovery custody read is unavailable"
+    }
+  }
+  require reference != nil, "no live recovery custody was measured"
+  const commit = schema_expect(
+    read(harness, options, "${prefix}/git/commits/${reference.object.sha}"),
+    schema_of(RecoveryGitCommit),
+  )
+  require commit.sha == reference.object.sha && oid(commit.tree.sha),
+    "recovery custody tree is unconfirmed"
+  return {
+    repository: producer.repository.full_name,
+    run_id: producer.id,
+    run_attempt: producer.run_attempt,
+    run_status: producer.status,
+    custody: {reference: reference.ref, sha: commit.sha, tree: commit.tree.sha},
+  }
+}
+
+fn execute(tools: HarnessTools, argv: list<string>) -> string {
+  const result = command_run(tools, {argv: argv}, {timeout_ms: 30000, max_inline_bytes: 65536})
+  require result.success && !(result.stdout_truncated ?? false),
+    "recovery filesystem operation was not confirmed"
+  return trim(result.stdout)
+}
+
+fn self_pid(fs: HarnessFs) -> int {
+  const first = split(fs.read_text("/proc/self/stat"), " ")[0] ?? ""
+  require regex_match("^[1-9][0-9]*$", first) != nil, "recovery process identity is unmeasured"
+  return to_int(first)
+}
+
+fn lock_witness(
+  fs: HarnessFs,
+  path: string,
+  identity: string,
+  process_id: int,
+  descriptor: string,
+) {
+  require regex_match("^[0-9]+$", descriptor) != nil && process_id == self_pid(fs),
+    "recovery lock descriptor does not belong to this process"
+  const info = fs.stat(path, {follow_symlinks: false})
+  const held = fs.stat("/proc/self/fd/${descriptor}")
+  require info.is_file && !info.is_symlink && identity != "" && info.identity == identity
+    && held.is_file
+    && held.identity == identity,
+    "recovery store lock identity changed"
+  const inode = split(identity, ":")[2] ?? ""
+  require regex_match("^[1-9][0-9]*$", inode) != nil, "recovery store lock inode is unmeasured"
+  // Process pseudo-files have stable metadata; read_lines bypasses the text-file cache.
+  const lines = schema_expect(
+    fs.read_lines("/proc/self/fdinfo/${descriptor}"),
+    schema_of(RecoveryEntryNames),
+  )
+  const locks = lines.filter({ line -> starts_with(line, "lock:") })
+  require len(locks) == 1 && lines.any({ line -> regex_match("^ino:\\s+${inode}$", line) != nil })
+    && locks.all(
+      { line ->
+        regex_match(
+          "^lock:\\s+[0-9]+: FLOCK\\s+ADVISORY\\s+WRITE ${process_id} [0-9a-f]+:[0-9a-f]+:${inode} 0 EOF$",
+          line,
+        )
+          != nil
+      },
+    ),
+    "recovery process does not hold the exclusive kernel lock"
+}
+
+/** Recheck physical store custody and this process's live kernel lock before every mutation. */
+pub fn recovery_store_assert_owned(fs: HarnessFs, lock: RecoveryStoreLock) -> nil {
+  require lock.path == "${lock.root}.lock", "recovery lock is not bound to its store"
+  const store = fs.stat(lock.root, {follow_symlinks: false})
+  require store.is_dir && !store.is_symlink && store.identity == lock.root_identity,
+    "recovery store identity changed"
+  lock_witness(fs, lock.path, lock.identity, lock.process_id, lock.descriptor)
+  return nil
+}
+
+/**
+ * Admit a trusted transaction launched with flock --no-fork and /proc/self read scope.
+ * Never replace this persistent inode or run an untrusted child while holding its descriptor.
+ */
+pub fn recovery_store_lock(
+  caps: RecoveryStoreCapabilities,
+  root: string,
+  nonce: string,
+) -> RecoveryStoreLock {
+  require starts_with(root, "/") && !ends_with(root, "/"), "recovery store path is unmeasured"
+  require regex_match("^[0-9a-f]{32}$", nonce) != nil, "recovery store nonce is unmeasured"
+  const path = "${root}.lock"
+  const info = caps.fs.stat(path, {follow_symlinks: false})
+  const identity = info.identity ?? ""
+  require info.is_file && !info.is_symlink && identity != "",
+    "recovery store lock is not a measured persistent file"
+  const process_id = self_pid(caps.fs)
+  const descriptors = schema_expect(
+    caps.fs.list_dir("/proc/self/fd"),
+    schema_of(RecoveryEntryNames),
+  )
+  require len(descriptors) > 0 && len(descriptors) <= 256,
+    "recovery descriptor census is empty or exceeds its bound"
+  let descriptor = ""
+  for candidate in descriptors {
+    if regex_match("^[0-9]+$", candidate) != nil {
+      const measured = try {
+        lock_witness(caps.fs, path, identity, process_id, candidate)
+      }
+      if is_ok(measured) {
+        descriptor = candidate
+        break
+      }
+    }
+  }
+  require descriptor != "", "recovery process does not hold the exclusive kernel lock"
+  lock_witness(caps.fs, path, identity, process_id, descriptor)
+  caps.fs.mkdir(root, true)
+  const store = caps.fs.stat(root, {follow_symlinks: false})
+  const root_identity = store.identity ?? ""
+  require store.is_dir && !store.is_symlink && root_identity != "",
+    "recovery store is not a measured private directory"
+  const lock = {
+    root: root,
+    root_identity: root_identity,
+    path: path,
+    identity: identity,
+    nonce: nonce,
+    process_id: process_id,
+    descriptor: descriptor,
+  }
+  recovery_store_assert_owned(caps.fs, lock)
+  execute(caps.tools, ["chmod", "700", root])
+  recovery_store_assert_owned(caps.fs, lock)
+  return lock
+}
+
+/** Directory entry values preserve unusual filenames without inventing extra stored entries. */
+pub fn recovery_store_entries(fs: HarnessFs, lock: RecoveryStoreLock) -> list<string> {
+  recovery_store_assert_owned(fs, lock)
+  const store = fs.stat(lock.root, {follow_symlinks: false})
+  require store.is_dir && !store.is_symlink, "recovery store changed while locked"
+  return schema_expect(fs.list_dir(lock.root), schema_of(RecoveryEntryNames))
+}
+
+/** Read only a whole, owned controller record; a legacy or unreadable entry stays retained. */
+pub fn recovery_entry(fs: HarnessFs, lock: RecoveryStoreLock, name: string) -> RecoveryEntry {
+  recovery_store_assert_owned(fs, lock)
+  if regex_match("^[0-9]+-[0-9]+-[0-9]+(-[0-9a-f]{32})?$", name) == nil {
+    return {name: name, record: nil, reason: "legacy or unrecognized recovery entry"}
+  }
+  const measured = try {
+    const entry = "${lock.root}/${name}"
+    const work = "${entry}/work"
+    const entry_info = fs.stat(entry, {follow_symlinks: false})
+    const work_info = fs.stat(work, {follow_symlinks: false})
+    for info in [entry_info, work_info] {
+      require info.is_dir && !info.is_symlink && (info.identity ?? "") != "",
+        "unconfirmed recovery directory"
+    }
+    const receipt = "${work}/recovery.json"
+    const info = fs.stat(receipt, {follow_symlinks: false})
+    require info.is_file && !info.is_symlink && info.size > 0 && info.size <= 65536,
+      "unconfirmed recovery receipt"
+    const text = fs.read_text(receipt)
+    const record = recovery_record(json_parse(text))
+    const identity = record.identity
+    const expected = "${identity.run_id}-${identity.run_attempt}-${identity.number}"
+    require name == expected || name == "${expected}-${identity.nonce}",
+      "recovery entry does not match its producer"
+    const owner = "${work}/.owner"
+    const owner_info = fs.stat(owner, {follow_symlinks: false})
+    require owner_info.is_file && !owner_info.is_symlink && owner_info.size == 33
+      && fs.read_text(owner) == "${identity.nonce}\n",
+      "unconfirmed recovery owner"
+    {
+      name: name,
+      record: record,
+      reason: "controller record measured; custody still pending",
+      entry_identity: entry_info.identity ?? "",
+      work_identity: work_info.identity ?? "",
+      receipt_sha256: sha256(text),
+    }
+  }
+  return match measured {
+    Ok(entry) -> { entry }
+    Err(_) -> { {name: name, record: nil, reason: "recovery ownership or receipt is unconfirmed"} }
+  }
+}
+
+fn oid(value: string) -> bool {
+  return regex_match("^[0-9a-f]{40}$", value) != nil
+}
+
+fn digest(value: string) -> bool {
+  return regex_match("^[0-9a-f]{64}$", value) != nil
+}
+
+/** Decode the controller's receipt; legacy or malformed entries remain unconfirmed. */
+pub fn recovery_record(value: unknown) -> RecoveryRecord {
+  const record = schema_expect(value, schema_of(RecoveryRecord))
+  const identity = record.identity
+  require record.schema == RECOVERY_SCHEMA, "unrecognized recovery receipt"
+  require regex_match("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$", identity.repository) != nil
+    && ![".", ".."].contains(split(identity.repository, "/")[1]),
+    "unmeasured recovery repository"
+  require identity.number > 0 && identity.run_id > 0 && identity.run_attempt > 0,
+    "unmeasured recovery producer"
+  require regex_match("^[0-9a-f]{32}$", identity.nonce) != nil && oid(identity.head),
+    "unmeasured recovery ownership"
+  require oid(record.snapshot.tree) && digest(record.snapshot.agent_index_sha256),
+    "unmeasured recovery source"
+  require oid(record.custody.sha) && record.custody.tree == record.snapshot.tree,
+    "unconfirmed recovery custody"
+  const wip = "refs/smart-ship/wip/${identity.number}"
+  require record.custody.reference == wip
+    || regex_match("^refs/heads/[^\\x00-\\x20]+$", record.custody.reference) != nil,
+    "unrecognized recovery custody reference"
+  let references: list<string> = []
+  for archived in record.archives {
+    require oid(archived.sha)
+      && archived.reference == archive_reference(identity, archived.sha),
+      "unrecognized archived checkpoint"
+    require !references.contains(archived.reference), "duplicate archived checkpoint"
+    references = references + [archived.reference]
+  }
+  return record
+}
+
+/** A terminal run alone, or a historical Git object alone, never confirms cleanup. */
+pub fn recovery_custody_decision(
+  record: RecoveryRecord,
+  observed: RecoveryObservation,
+  current: RecoverySnapshot,
+) -> RecoveryCustodyDecision {
+  if observed.repository != record.identity.repository
+    || observed.run_id != record.identity.run_id
+    || observed.run_attempt != record.identity.run_attempt {
+    return {eligible: false, reason: "producer identity changed"}
+  }
+  if observed.run_status != "completed" {
+    return {eligible: false, reason: "producer is not terminal"}
+  }
+  if observed.custody.sha != record.custody.sha || observed.custody.tree != record.custody.tree
+    || ![record.custody.reference, archive_reference(record.identity, record.custody.sha)].contains(
+      observed.custody.reference,
+    ) {
+    return {eligible: false, reason: "live remote custody is unconfirmed"}
+  }
+  if current != record.snapshot {
+    return {eligible: false, reason: "local recovery source changed"}
+  }
+  return {
+    eligible: true,
+    reason: "terminal producer and unchanged source have confirmed live custody",
+  }
+}

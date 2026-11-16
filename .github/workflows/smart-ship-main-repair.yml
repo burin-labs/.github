@@ -67,7 +67,7 @@ jobs:
       - name: Install Harn
         uses: burin-labs/harn/.github/actions/setup-harn@2be559c93c3cab6b38bf720b1f671505769ade4b # supports compressed release archives
         with:
-          version: "0.10.197"
+          version: "0.10.200"
       - name: Prepare the controlled main repair
         id: prepare
         working-directory: .smart-ship/scripts/smart-ship

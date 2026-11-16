@@ -1,0 +1,516 @@
+/**
+ * Reserve and reclaim recovery entries within the caller's physical store lock.
+ * No model worker may run in this transaction. Source and GitHub observations
+ * remain with their existing owners; this module composes their receipts.
+ */
+import { command_run } from "std/command"
+import { replace_text } from "std/fs"
+import {
+  RecoveryCustody,
+  RecoveryIdentity,
+  RecoveryObservation,
+  RecoveryRecord,
+  RecoveryReference,
+  RecoverySnapshot,
+  RecoveryStoreLock,
+  recovery_custody_decision,
+  recovery_entry,
+  recovery_record,
+  recovery_store_assert_owned,
+  recovery_store_entries,
+} from "./recovery.harn"
+import { WorkerReceipt, WorkerRuntime, worker_retirement } from "./worker.harn"
+
+type LifecycleCapabilities = {fs: HarnessFs, tools: HarnessTools}
+
+type LifecycleNames = list<string>
+
+/**
+ * The adapter authenticates the repository and live custody before every archive read.
+ * A SHA with absent=true confirms removal; nil with absent=true means a measured GET404,
+ * never a failed/unreadable API response. Errors or absent=false remain unconfirmed.
+ */
+pub type ArchiveRemoval = {reference: string, observed_sha: string?, absent: bool}
+
+/** The PR serialized by the workflow's repository-wide concurrency group. */
+pub type ArchiveMutationScope = {repository: string, number: int}
+
+pub type LifecycleReaders = {
+  archive_scope: ArchiveMutationScope,
+  observe: fn(RecoveryRecord) -> RecoveryObservation,
+  source: fn(string, RecoveryIdentity) -> RecoverySnapshot,
+  archive_remove?: fn(RecoveryIdentity, RecoveryReference) -> ArchiveRemoval,
+}
+
+pub type ArchiveDisposition = {reference: string, sha: string, status: string, reason: string}
+
+pub type LifecycleEntry = {
+  name: string,
+  status: string,
+  reason: string,
+  archives: list<ArchiveDisposition>,
+}
+
+pub type PendingIntent = {name: string, entry: string?, reason: string}
+
+pub type LifecycleCensus = {
+  observed_entries: int,
+  remaining_entries: int,
+  reclaimed_entries: int,
+  pending_entries: int,
+  entries: list<LifecycleEntry>,
+  pending_intents: list<PendingIntent>,
+}
+
+pub type RecoveryReservation = {name: string, work: string, identity: RecoveryIdentity}
+
+pub type RecoveryAdmission = {
+  admitted: bool,
+  reason: string,
+  reservation: RecoveryReservation?,
+  census: LifecycleCensus,
+}
+
+type CleanupIntent = {
+  name: string,
+  entry_identity: string,
+  work_identity: string,
+  record_sha256: string,
+  worker_sha256: string,
+  record: RecoveryRecord,
+  custody: RecoveryCustody,
+  worker: WorkerReceipt,
+}
+
+type CleanupResult = {status: "removed", archives: list<ArchiveDisposition>}
+
+type CleanupJournal = {
+  schema: "smart-ship.lifecycle.v1",
+  intent: CleanupIntent,
+  archives?: list<ArchiveDisposition>,
+  result: CleanupResult?,
+}
+
+type Ledger = {path: string, identity: string}
+
+const FILE_LIMIT = 2097152
+
+fn directory(fs: HarnessFs, path: string) -> string {
+  const info = fs.stat(path, {follow_symlinks: false})
+  const identity = info.identity ?? ""
+  require info.is_dir && !info.is_symlink && identity != "",
+    "lifecycle directory identity is unconfirmed"
+  return identity
+}
+
+fn whole_file(fs: HarnessFs, path: string) -> string {
+  const info = fs.stat(path, {follow_symlinks: false})
+  require info.is_file && !info.is_symlink && info.size > 0 && info.size <= FILE_LIMIT
+    && (info.identity ?? "") != "",
+    "lifecycle file is unconfirmed"
+  return join(fs.read_lines(path), "\n")
+}
+
+fn ledger_owned(fs: HarnessFs, lock: RecoveryStoreLock, ledger: Ledger) {
+  recovery_store_assert_owned(fs, lock)
+  require directory(fs, ledger.path) == ledger.identity, "lifecycle ledger identity changed"
+}
+
+fn ledger_open(caps: LifecycleCapabilities, lock: RecoveryStoreLock) -> Ledger {
+  recovery_store_assert_owned(caps.fs, lock)
+  const path = "${lock.root}.lifecycle"
+  if !caps.fs.exists(path) {
+    recovery_store_assert_owned(caps.fs, lock)
+    caps.fs.mkdir(path, false)
+  }
+  const identity = directory(caps.fs, path)
+  recovery_store_assert_owned(caps.fs, lock)
+  const private = command_run(caps.tools, ["chmod", "700", path], {timeout_ms: 30000})
+  require private.success && directory(caps.fs, path) == identity,
+    "lifecycle ledger privacy is unconfirmed"
+  return {path: path, identity: identity}
+}
+
+fn journal_write(
+  caps: LifecycleCapabilities,
+  lock: RecoveryStoreLock,
+  ledger: Ledger,
+  name: string,
+  value: CleanupJournal,
+  expected: string = "",
+) -> string {
+  ledger_owned(caps.fs, lock, ledger)
+  const text = json_stringify(value)
+  const path = "${ledger.path}/${name}.json"
+  const written = expected == "" ? replace_text(
+    caps.fs,
+    path,
+    text,
+    {create: true, overwrite: false, durability: "flush"},
+  ) : replace_text(caps.fs, path, text, {expected_sha256: expected, durability: "flush"})
+  const digest = "sha256:${sha256(text)}"
+  require ["created", "replaced"].contains(written.status) && written.after_sha256 == digest
+    && written.file_synced
+    && written.namespace_synced
+    && sha256(caps.fs.read_bytes(path)) == sha256(text),
+    "lifecycle journal was not durably confirmed"
+  return digest
+}
+
+fn measured(
+  caps: LifecycleCapabilities,
+  lock: RecoveryStoreLock,
+  name: string,
+  runtime: WorkerRuntime,
+  readers: LifecycleReaders,
+) -> CleanupIntent {
+  recovery_store_assert_owned(caps.fs, lock)
+  const entry = recovery_entry(caps.fs, lock, name)
+  const record = entry.record
+  const entry_identity = entry.entry_identity ?? ""
+  const work_identity = entry.work_identity ?? ""
+  if record == nil {
+    throw entry.reason
+  }
+  require entry_identity != "" && work_identity != "", entry.reason
+  const work = "${lock.root}/${name}/work"
+  const observed = readers.observe(record)
+  // Do not ask the source owner to stage files for a producer still running.
+  require observed.run_status == "completed", "producer is not terminal"
+  const worker = worker_retirement(caps, work, record.identity, runtime)
+  require worker.retired && worker.receipt != nil, worker.reason
+  recovery_store_assert_owned(caps.fs, lock)
+  const snapshot = readers.source(work, record.identity)
+  const custody = recovery_custody_decision(record, observed, snapshot)
+  require custody.eligible, custody.reason
+  const record_path = "${work}/recovery.json"
+  const current_record = recovery_record(json_parse(whole_file(caps.fs, record_path)))
+  const record_sha = sha256(caps.fs.read_bytes(record_path))
+  require current_record == record && record_sha == entry.receipt_sha256,
+    "recovery receipt changed during measurement"
+  const worker_path = "${work}/worker.json"
+  const current_worker = schema_expect(
+    json_parse(whole_file(caps.fs, worker_path)),
+    schema_of(WorkerReceipt),
+  )
+  require current_worker == worker.receipt, "worker receipt changed during measurement"
+  const after = recovery_entry(caps.fs, lock, name)
+  require after == entry, "physical recovery entry changed during measurement"
+  return {
+    name: name,
+    entry_identity: entry_identity,
+    work_identity: work_identity,
+    record_sha256: record_sha,
+    worker_sha256: sha256(caps.fs.read_bytes(worker_path)),
+    record: record,
+    custody: observed.custody,
+    worker: current_worker,
+  }
+}
+
+fn intent_name(intent: CleanupIntent) -> string {
+  return sha256(json_stringify(intent))
+}
+
+fn pending_intents(fs: HarnessFs, lock: RecoveryStoreLock, ledger: Ledger) -> list<PendingIntent> {
+  ledger_owned(fs, lock, ledger)
+  const names = schema_expect(fs.list_dir(ledger.path), schema_of(LifecycleNames))
+  const physical = recovery_store_entries(fs, lock)
+  let pending: list<PendingIntent> = []
+  for name in names {
+    const read = try {
+      require regex_match("^[0-9a-f]{64}\\.json$", name) != nil, "unrecognized lifecycle record"
+      const journal = schema_expect(
+        json_parse(whole_file(fs, "${ledger.path}/${name}")),
+        schema_of(CleanupJournal),
+      )
+      require name == "${intent_name(journal.intent)}.json", "lifecycle intent identity changed"
+      journal
+    }
+    if is_err(read) {
+      pending.push({name: name, entry: nil, reason: "lifecycle record is unconfirmed"})
+    } else {
+      const journal = unwrap(read)
+      if journal.result == nil {
+        pending.push(
+          {
+            name: name,
+            entry: journal.intent.name,
+            reason:
+              physical.contains(journal.intent.name) ? "cleanup intent remains incomplete" : "entry absent after incomplete intent; removal is unconfirmed",
+          },
+        )
+      } else if physical.contains(journal.intent.name) {
+        pending.push(
+          {name: name, entry: journal.intent.name, reason: "completed cleanup entry reappeared"},
+        )
+      }
+    }
+  }
+  return pending
+}
+
+fn reclaim_one(
+  caps: LifecycleCapabilities,
+  lock: RecoveryStoreLock,
+  ledger: Ledger,
+  name: string,
+  runtime: WorkerRuntime,
+  readers: LifecycleReaders,
+) -> LifecycleEntry {
+  const examined = try {
+    measured(caps, lock, name, runtime, readers)
+  }
+  if is_err(examined) {
+    return {name: name, status: "retained", reason: to_string(unwrap_err(examined)), archives: []}
+  }
+  const intent = unwrap(examined)
+  const key = intent_name(intent)
+  const path = "${ledger.path}/${key}.json"
+  let journal: CleanupJournal = {
+    schema: "smart-ship.lifecycle.v1",
+    intent: intent,
+    archives: [],
+    result: nil,
+  }
+  let expected = ""
+  if caps.fs.exists(path) {
+    journal = schema_expect(json_parse(whole_file(caps.fs, path)), schema_of(CleanupJournal))
+    require journal.intent == intent && journal.result == nil,
+      "cleanup intent is already complete or does not match this entry"
+    expected = "sha256:${sha256(caps.fs.read_bytes(path))}"
+  } else {
+    expected = journal_write(caps, lock, ledger, key, journal)
+  }
+  let archives: list<ArchiveDisposition> = []
+  for archive in intent.record.archives {
+    if archive.sha != intent.record.custody.sha {
+      archives.push(
+        {
+          reference: archive.reference,
+          sha: archive.sha,
+          status: "retained",
+          reason: "archive differs from confirmed live custody",
+        },
+      )
+      continue
+    }
+    if intent.record.identity.repository != readers.archive_scope.repository
+      || intent.record.identity.number != readers.archive_scope.number {
+      archives.push(
+        {
+          reference: archive.reference,
+          sha: archive.sha,
+          status: "retained",
+          reason: "archive retirement requires its pull request's serialized look",
+        },
+      )
+      continue
+    }
+    const custody = readers.observe(intent.record)
+    const remote = recovery_custody_decision(intent.record, custody, intent.record.snapshot)
+    require remote.eligible, remote.reason
+    if archive.reference == custody.custody.reference {
+      archives.push(
+        {
+          reference: archive.reference,
+          sha: archive.sha,
+          status: "retained",
+          reason: "archive is the confirmed source custody reference",
+        },
+      )
+      continue
+    }
+    const remove = readers.archive_remove
+    if remove == nil {
+      archives.push(
+        {
+          reference: archive.reference,
+          sha: archive.sha,
+          status: "unconfirmed",
+          reason: "archive removal capability is unavailable",
+        },
+      )
+      continue
+    }
+    require measured(caps, lock, name, runtime, readers) == intent,
+      "recovery evidence changed before archive removal"
+    ledger_owned(caps.fs, lock, ledger)
+    const removed = try {
+      remove(intent.record.identity, archive)
+    }
+    const confirmed = is_ok(removed) && unwrap(removed).reference == archive.reference
+      && unwrap(removed).absent
+    const deleted = confirmed && unwrap(removed).observed_sha == archive.sha
+    const absent = confirmed && unwrap(removed).observed_sha == nil
+    archives.push(
+      {
+        reference: archive.reference,
+        sha: archive.sha,
+        status: deleted ? "removed" : absent ? "already_absent" : "unconfirmed",
+        reason:
+          deleted ? "exact archive removal and authenticated absence confirmed" : absent ? "authenticated archive absence confirmed; no deletion observed" : "archive removal is unconfirmed",
+      },
+    )
+  }
+  // Progress never authorizes a retry: every attempt remeasures the entry and archive.
+  journal = journal + {archives: archives}
+  expected = journal_write(caps, lock, ledger, key, journal, expected)
+  if archives.any({ archive -> archive.status == "unconfirmed" }) {
+    return {
+      name: name,
+      status: "retained",
+      reason: "eligible archive retirement remains unconfirmed",
+      archives: archives,
+    }
+  }
+  require measured(caps, lock, name, runtime, readers) == intent,
+    "recovery evidence changed before local removal"
+  ledger_owned(caps.fs, lock, ledger)
+  caps.fs.delete("${lock.root}/${name}")
+  const after = recovery_store_entries(caps.fs, lock)
+  require !after.contains(name), "local recovery entry removal is unconfirmed"
+  journal_write(
+    caps,
+    lock,
+    ledger,
+    key,
+    journal + {result: {status: "removed", archives: archives}},
+    expected,
+  )
+  return {
+    name: name,
+    status: "reclaimed",
+    reason: "owned local entry removal confirmed",
+    archives: archives,
+  }
+}
+
+/**
+ * Rechecks each candidate and records exact progress; an interrupted absence never becomes success.
+ */
+pub fn reclaim_entries(
+  caps: LifecycleCapabilities,
+  lock: RecoveryStoreLock,
+  runtime: WorkerRuntime,
+  readers: LifecycleReaders,
+) -> LifecycleCensus {
+  require readers.archive_scope.repository != "" && readers.archive_scope.number > 0,
+    "archive mutation scope is unmeasured"
+  recovery_store_assert_owned(caps.fs, lock)
+  const before = recovery_store_entries(caps.fs, lock)
+  const ledger = ledger_open(caps, lock)
+  let entries: list<LifecycleEntry> = []
+  for name in before {
+    const result = try {
+      reclaim_one(caps, lock, ledger, name, runtime, readers)
+    }
+    entries.push(
+      is_ok(result) ? unwrap(result) : {
+        name: name,
+        status: "unconfirmed",
+        reason: "cleanup interrupted or evidence changed; entry state requires fresh observation",
+        archives: [],
+      },
+    )
+  }
+  const after = recovery_store_entries(caps.fs, lock)
+  for name in after.filter({ entry -> !before.contains(entry) }) {
+    entries.push(
+      {
+        name: name,
+        status: "retained",
+        reason: "entry appeared during reconciliation",
+        archives: [],
+      },
+    )
+  }
+  return {
+    observed_entries: len(before),
+    remaining_entries: len(after),
+    reclaimed_entries: len(entries.filter({ entry -> entry.status == "reclaimed" })),
+    pending_entries: len(after),
+    entries: entries,
+    pending_intents: pending_intents(caps.fs, lock, ledger),
+  }
+}
+
+/** Reservation and capacity reclamation share the same held physical transaction. */
+pub fn reserve_attempt(
+  caps: LifecycleCapabilities,
+  lock: RecoveryStoreLock,
+  identity: RecoveryIdentity,
+  limit: int,
+  runtime: WorkerRuntime,
+  readers: LifecycleReaders,
+) -> RecoveryAdmission {
+  require limit > 0 && identity.run_id > 0 && identity.run_attempt > 0 && identity.number > 0
+    && identity.repository != ""
+    && regex_match("^[0-9a-f]{40}$", identity.head) != nil
+    && regex_match("^[0-9a-f]{32}$", identity.nonce) != nil,
+    "reservation identity or capacity is unconfirmed"
+  let census = reclaim_entries(caps, lock, runtime, readers)
+  const name = "${identity.run_id}-${identity.run_attempt}-${identity.number}-${identity.nonce}"
+  const current = recovery_store_entries(caps.fs, lock)
+  if len(current) >= limit || current.contains(name) {
+    return {
+      admitted: false,
+      reason: "recovery store has no unreserved capacity",
+      reservation: nil,
+      census: census,
+    }
+  }
+  const entry = "${lock.root}/${name}"
+  recovery_store_assert_owned(caps.fs, lock)
+  caps.fs.mkdir(entry, false)
+  recovery_store_assert_owned(caps.fs, lock)
+  caps.fs.mkdir("${entry}/work", false)
+  recovery_store_assert_owned(caps.fs, lock)
+  const owner = "${entry}/work/.owner"
+  const marker = "${identity.nonce}\n"
+  const written = replace_text(
+    caps.fs,
+    owner,
+    marker,
+    {create: true, overwrite: false, durability: "flush"},
+  )
+  require written.status == "created" && written.file_synced && written.namespace_synced
+    && written.after_sha256 == "sha256:${sha256(marker)}"
+    && sha256(caps.fs.read_bytes(owner)) == sha256(marker),
+    "recovery reservation ownership was not durably confirmed"
+  recovery_store_assert_owned(caps.fs, lock)
+  const reservation: RecoveryReservation = {name: name, work: "${entry}/work", identity: identity}
+  const text = json_stringify({schema: "smart-ship.reservation.v1", reservation: reservation})
+  const recorded = replace_text(
+    caps.fs,
+    "${entry}/reservation.json",
+    text,
+    {create: true, overwrite: false, durability: "flush"},
+  )
+  require recorded.status == "created" && recorded.file_synced && recorded.namespace_synced
+    && recorded.after_sha256 == "sha256:${sha256(text)}"
+    && sha256(caps.fs.read_bytes("${entry}/reservation.json")) == sha256(text),
+    "recovery reservation was not durably confirmed"
+  const final = recovery_store_entries(caps.fs, lock)
+  require final.contains(name) && len(final) <= limit, "recovery store changed during reservation"
+  census = census
+    + {
+      remaining_entries: len(final),
+      pending_entries: len(final),
+      entries: census.entries
+        + [
+          {
+            name: name,
+            status: "reserved",
+            reason: "work reserved before model launch",
+            archives: [],
+          },
+        ],
+    }
+  return {
+    admitted: true,
+    reason: "recovery work reserved under the physical store lock",
+    reservation: reservation,
+    census: census,
+  }
+}

@@ -153,7 +153,10 @@ pipeline test_real_cli_transport_reads_pages_and_enforces_private_execution(harn
       assert_eq(report.ok, 0)
       assert_eq(report.reopened, 0)
       assert(to_string(report.results[0]?.detail).contains("waiver names go:mistyped/package"))
-      assert_eq(report.failing_names, ["acme/project#2:pending"])
+      // Calendar age changes the unresolved verdict; audit tests pin the deadline boundary.
+      const verdict = to_string(report.results[0]?.verdict)
+      assert(["pending", "overdue"].contains(verdict))
+      assert_eq(report.failing_names, ["acme/project#2:${verdict}"])
       const output = trim(harness.fs.read_text(output_path)).split("\n")
       assert_eq(len(output), 3)
       const header = output[0] ?? ""
@@ -161,7 +164,7 @@ pipeline test_real_cli_transport_reads_pages_and_enforces_private_execution(harn
       assert_eq(output[2], header[8:len(header)])
       const report_path = output[1] ?? ""
       assert_eq(json_parse(harness.fs.read_text(report_path)), report)
-      assert(harness.fs.read_text(path_join(root, "summary-${scenario}")).contains("pending"))
+      assert(harness.fs.read_text(path_join(root, "summary-${scenario}")).contains(verdict))
     }
     if ["private", "unwaived"].contains(scenario) {
       const report = json_parse(result.stdout)
