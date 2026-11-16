@@ -2079,7 +2079,7 @@ fn main(harness: Harness) {
       harness,
       {installation_token: token},
       lock,
-      repo,
+      {repository: repo, number: number},
       { work, identity ->
         const prepared = schema_expect(
           json_parse(harness.fs.read_text("${work}/job.json")),

@@ -55,6 +55,7 @@ pipeline test_lifecycle_github_requires_unique_owned_record_and_content_addresse
     "foreign-identity",
     "mutable-wip",
     "different-sha",
+    "other-pr",
   ] {
     fixture_run(harness, mode)
   }
@@ -372,7 +373,7 @@ fn exercise(
     harness,
     options,
     lock,
-    "o/r",
+    {repository: "o/r", number: mode == "other-pr" ? 10 : 9},
     { path, identity ->
       source_calls += 1
       assert_eq(path, work)
@@ -406,7 +407,7 @@ fn exercise(
     calls.all({ call -> call.headers.authorization == "Bearer inert-token" }),
     "every observed GitHub request must carry the configured authority",
   )
-  if ["producer-running", "custody-changed", "archive-is-custody"].contains(mode) {
+  if ["producer-running", "custody-changed", "archive-is-custody", "other-pr"].contains(mode) {
     assert_eq(source_calls, 0, "unconfirmed producer or custody must not reach source staging")
   }
   if ["positive", "archive404"].contains(mode) {

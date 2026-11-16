@@ -74,6 +74,12 @@ then removes only that content-addressed reference. It preserves the caller's
 mutation authority and checks the physical lock immediately before the request.
 It never removes the mutable WIP reference through this cleanup path.
 
+Remote archive deletion is limited to the PR whose workflow holds the shared
+concurrency group for that repository and PR. A look may reclaim another PR's
+local entry after confirming its custody. It leaves that PR's remote archives
+for its own serialized look, so cleanup on another runner cannot race checkpoint
+publication.
+
 Deletion requires a fresh authenticated absence readback. An initially absent
 archive requires fresh repository and live-content authentication followed by a
 second absence read. Reports distinguish `removed` from `already_absent`.

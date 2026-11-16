@@ -32,7 +32,11 @@ type LifecycleNames = list<string>
  */
 pub type ArchiveRemoval = {reference: string, observed_sha: string?, absent: bool}
 
+/** The PR serialized by the workflow's repository-wide concurrency group. */
+pub type ArchiveMutationScope = {repository: string, number: int}
+
 pub type LifecycleReaders = {
+  archive_scope: ArchiveMutationScope,
   observe: fn(RecoveryRecord) -> RecoveryObservation,
   source: fn(string, RecoveryIdentity) -> RecoverySnapshot,
   archive_remove?: fn(RecoveryIdentity, RecoveryReference) -> ArchiveRemoval,
@@ -291,6 +295,18 @@ fn reclaim_one(
       )
       continue
     }
+    if intent.record.identity.repository != readers.archive_scope.repository
+      || intent.record.identity.number != readers.archive_scope.number {
+      archives.push(
+        {
+          reference: archive.reference,
+          sha: archive.sha,
+          status: "retained",
+          reason: "archive retirement requires its pull request's serialized look",
+        },
+      )
+      continue
+    }
     const custody = readers.observe(intent.record)
     const remote = recovery_custody_decision(intent.record, custody, intent.record.snapshot)
     require remote.eligible, remote.reason
@@ -379,6 +395,8 @@ pub fn reclaim_entries(
   runtime: WorkerRuntime,
   readers: LifecycleReaders,
 ) -> LifecycleCensus {
+  require readers.archive_scope.repository != "" && readers.archive_scope.number > 0,
+    "archive mutation scope is unmeasured"
   recovery_store_assert_owned(caps.fs, lock)
   const before = recovery_store_entries(caps.fs, lock)
   const ledger = ledger_open(caps, lock)

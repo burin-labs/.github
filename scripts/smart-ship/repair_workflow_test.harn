@@ -92,6 +92,9 @@ pipeline test_smart_ship_repair_has_a_host_deadline_before_actions_deadlines(har
 }
 
 pipeline test_smart_ship_trusted_transactions_hold_one_persistent_kernel_lock(harness: Harness) {
+  const concurrency = repair_workflow(harness.fs).jobs.ship.concurrency
+  assert_eq(concurrency.group, "smart-ship-\${{ github.repository }}-pr-\${{ matrix.pr }}")
+  assert_eq(concurrency["cancel-in-progress"], false)
   const retained = "\${{ runner.temp }}/../.smart-ship-retained"
   const runtime = "\${{ steps.harn.outputs.path }}"
   for name in ["Look at the pull request", "Publish the repair", "Finalize recovery custody"] {

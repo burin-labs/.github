@@ -3109,6 +3109,7 @@ pub fn full_storage_case(harness: Harness, root: string) -> nil {
   }
   assert(refused, "a symlinked retention root is refused")
   const readers: LifecycleReaders = {
+    archive_scope: {repository: "o/r", number: 9},
     observe: { _ ->
       throw "legacy entries must not reach the remote reader"
     },

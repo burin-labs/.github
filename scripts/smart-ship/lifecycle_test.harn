@@ -1,5 +1,6 @@
 /** Real locked lifecycle transactions, with inert source and archive readers. */
 import { CommandResult, command_run } from "std/command"
+import { lifecycle_github_readers } from "./lifecycle-github.harn"
 import {
   ArchiveDisposition,
   ArchiveRemoval,
@@ -16,6 +17,7 @@ import {
   RecoveryReference,
   RecoverySnapshot,
   RecoveryStoreLock,
+  recovery_custody_decision,
   recovery_store_lock,
 } from "./recovery.harn"
 import { WorkerReceipt, WorkerRuntime, worker_retirement, worker_runtime } from "./worker.harn"
@@ -29,7 +31,10 @@ type JournalProgress = {
 
 type LifecycleTestNames = list<string>
 
-type CompletedJournal = {intent: {custody: RecoveryCustody}, result: {status: string}}
+type CompletedJournal = {
+  intent: {custody: RecoveryCustody, record: RecoveryRecord},
+  result: {status: string},
+}
 
 pipeline test_lifecycle_counts_full_store_and_reserves_before_model(harness: Harness) {
   run_case(harness, "capacity")
@@ -75,6 +80,12 @@ pipeline test_lifecycle_only_removes_archives_matching_fresh_custody(harness: Ha
 
 pipeline test_lifecycle_reclaims_local_work_but_keeps_its_only_archive_custody(harness: Harness) {
   run_case(harness, "archive-is-custody")
+}
+
+pipeline test_lifecycle_keeps_other_pr_archives_during_concurrent_checkpoint_publication(
+  harness: Harness,
+) {
+  run_case(harness, "other-pr-race")
 }
 
 pipeline test_lifecycle_retains_unconfirmed_archive_for_fresh_retry(harness: Harness) {
@@ -415,9 +426,10 @@ fn reclaimed(
   mode: string,
   archive_calls: int,
 ) -> nil {
-  assert_eq(census.reclaimed_entries, 1)
+  assert_eq(census.reclaimed_entries, 1, json_stringify(census))
   assert_eq(census.remaining_entries, 0)
-  assert_eq(archive_calls, mode == "archive-is-custody" ? 0 : 1)
+  const kept = ["archive-is-custody", "other-pr-race"].contains(mode)
+  assert_eq(archive_calls, kept ? 0 : 1)
   const row = census.entries[0]
   require row != nil
   assert_eq(len(row.archives), 2)
@@ -426,9 +438,9 @@ fn reclaimed(
   require exact != nil && other != nil
   assert_eq(
     exact.status,
-    mode == "archive-is-custody" ? "retained" : mode == "archive-already-absent" ? "already_absent" : "removed",
+    kept ? "retained" : mode == "archive-already-absent" ? "already_absent" : "removed",
   )
-  if mode == "archive-is-custody" {
+  if kept {
     assert_eq(
       caps.fs.read_text("${dirname(lock.root)}/archive-sha"),
       "e" * 40,
@@ -443,6 +455,13 @@ fn reclaimed(
     schema_of(CompletedJournal),
   )
   assert_eq(journal.result.status, "removed")
+  if mode == "other-pr-race" {
+    assert_eq(caps.fs.read_text("${dirname(lock.root)}/wip-advanced"), "2")
+    const record = journal.intent.record
+    const observed = readers.observe(record)
+    assert_eq(observed.custody.reference, "refs/smart-ship/previous/9/${"e" * 40}")
+    assert(recovery_custody_decision(record, observed, record.snapshot).eligible)
+  }
   assert_eq(
     journal.intent.custody,
     {
@@ -459,6 +478,93 @@ fn reclaimed(
   assert_eq(caps.fs.list_dir("${lock.root}.lifecycle"), names)
 }
 
+fn other_pr_race_readers(
+  harness: Harness,
+  lock: RecoveryStoreLock,
+  work: string,
+) -> LifecycleReaders {
+  const record = schema_expect(
+    json_parse(harness.fs.read_text("${work}/recovery.json")),
+    schema_of(RecoveryRecord),
+  )
+  const api = "https://api.github.com/repos/o/r"
+  const wip = "${api}/git/ref/${url_encode("smart-ship/wip/9")}"
+  const archive = record.archives[0]
+  require archive != nil
+  harness.testing.http_mock(
+    "GET",
+    api,
+    {status: 200, body: json_stringify({id: 1, full_name: "o/r"})},
+  )
+  harness.testing.http_mock(
+    "GET",
+    "${api}/actions/runs/123/attempts/1",
+    {
+      status: 200,
+      body: json_stringify(
+        {id: 123, run_attempt: 1, status: "completed", repository: {full_name: "o/r"}},
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    wip,
+    {
+      status: 200,
+      body: json_stringify(
+        {ref: record.custody.reference, object: {sha: record.custody.sha, type: "commit"}},
+      ),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    "${api}/git/ref/${url_encode("smart-ship/previous/9/${archive.sha}")}",
+    {
+      status: 200,
+      body: json_stringify({ref: archive.reference, object: {sha: archive.sha, type: "commit"}}),
+    },
+  )
+  harness.testing.http_mock(
+    "GET",
+    "${api}/git/commits/${record.custody.sha}",
+    {
+      status: 200,
+      body: json_stringify({sha: record.custody.sha, tree: {sha: record.custody.tree}}),
+    },
+  )
+  let calls = 0
+  return lifecycle_github_readers(
+    harness,
+    {installation_token: "inert-token", budget: {state_dir: ""}, retry: {max_attempts: 1}},
+    lock,
+    {repository: "o/r", number: 10},
+    { path, id ->
+      assert_eq(path, work)
+      assert_eq(id, record.identity)
+      calls += 1
+      if calls == 2 {
+        // Another runner publishes after this transaction's final custody GET.
+        harness.testing.http_mock(
+          "GET",
+          wip,
+          {
+            status: 200,
+            body: json_stringify(
+              {ref: record.custody.reference, object: {sha: "f" * 40, type: "commit"}},
+            ),
+          },
+        )
+        harness.fs.write_text("${dirname(lock.root)}/wip-advanced", to_string(calls))
+      }
+      const writes = harness.testing.http_mock_calls({include_sensitive: false}).filter(
+        { call -> call.method == "DELETE" },
+      )
+      assert_eq(len(writes), 0, "another PR's archive must never reach DELETE")
+      return source(harness.fs, path)
+    },
+  )
+}
+
 pub fn lifecycle_fixture(harness: Harness) -> nil {
   require len(argv) == 2
   const root = argv[0] ?? ""
@@ -469,7 +575,12 @@ pub fn lifecycle_fixture(harness: Harness) -> nil {
   const work = "${root}/123-1-9/work"
   let calls = 0
   let archive_calls = 0
-  const readers: LifecycleReaders = {
+  const readers: LifecycleReaders = mode == "other-pr-race" ? other_pr_race_readers(
+    harness,
+    lock,
+    work,
+  ) : {
+    archive_scope: {repository: "o/r", number: 9},
     observe: { record ->
       if mode == "unlock-before-source" {
         assert(command_run(harness.tools, ["flock", "--unlock", lock.descriptor]).success)
@@ -610,9 +721,14 @@ pub fn lifecycle_fixture(harness: Harness) -> nil {
           mode == "archive-missing" ? 1 : 2,
           "retry must reobserve the archive",
         )
-      } else if ["archives", "archive-already-absent", "recover-intent", "archive-is-custody"].contains(
-        mode,
-      ) {
+      } else if [
+        "archives",
+        "archive-already-absent",
+        "recover-intent",
+        "archive-is-custody",
+        "other-pr-race",
+      ]
+        .contains(mode) {
         reclaimed(caps, lock, runtime, readers, census, mode, archive_calls)
       } else if mode == "resume" {
         assert_eq(census.reclaimed_entries, 0)

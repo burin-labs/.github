@@ -1,5 +1,5 @@
 /** Authenticated GitHub readers for the physically locked recovery lifecycle. */
-import { ArchiveRemoval, LifecycleReaders } from "./lifecycle.harn"
+import { ArchiveMutationScope, ArchiveRemoval, LifecycleReaders } from "./lifecycle.harn"
 import {
   RecoveryIdentity,
   RecoveryObservation,
@@ -101,12 +101,15 @@ fn remove_archive(
   harness: Harness,
   options: GithubClientOptions,
   lock: RecoveryStoreLock,
-  repository: string,
+  scope: ArchiveMutationScope,
   source: SourceReader,
   identity: RecoveryIdentity,
   archive: RecoveryReference,
 ) -> ArchiveRemoval {
+  const repository = scope.repository
   require identity.repository == repository, "recovery archive repository changed"
+  require identity.number == scope.number,
+    "archive retirement requires its pull request's serialized look"
   const selected = owned(harness.fs, lock, identity)
   const record = selected.record
   require record.archives.contains(archive) && archive.sha == record.custody.sha,
@@ -170,15 +173,17 @@ pub fn lifecycle_github_readers(
   harness: Harness,
   options: GithubClientOptions,
   lock: RecoveryStoreLock,
-  repository: string,
+  scope: ArchiveMutationScope,
   source: SourceReader,
 ) -> LifecycleReaders {
-  require repository != "", "trusted recovery repository is required"
+  const repository = scope.repository
+  require repository != "" && scope.number > 0, "trusted recovery pull request is required"
   return {
+    archive_scope: scope,
     observe: { record -> observation(harness, options, repository, record) },
     source: source,
     archive_remove: { identity, archive ->
-      remove_archive(harness, options, lock, repository, source, identity, archive)
+      remove_archive(harness, options, lock, scope, source, identity, archive)
     },
   }
 }
