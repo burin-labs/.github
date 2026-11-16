@@ -52,6 +52,12 @@ head of one open, same-repository consumer repair pull request. It proves the
 original producing attempt's required builds, smokes and artifact handoffs
 are complete, then requires a fresh reached product pass whose custody and
 terminal receipt bind the original manifest artifact ID and SHA-256 digest.
+Before accepting that pass, the reader reconstructs the original release's
+consumer requirements from its source commit and previous stable release tag.
+It checks that the tested consumer contains every required component's current
+head, then reads those heads again to detect changes during verification.
+The immutable reader checkout includes full history and tags; missing source
+history or an unmeasured tag inventory refuses publication.
 Source-only receipts cannot authorize this mode. A later consumer failure
 does not invalidate those completed archive stages; a missing or failed
 archive stage still refuses. The original release run remains unchanged.
