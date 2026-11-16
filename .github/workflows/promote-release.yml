@@ -164,8 +164,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: burin-labs/harn
-          ref: c4e6550c176ee06340cf58561612d05e622ecd05
+          ref: f5553f1edb98b53bc7fe433171c2a27cd077d6df
           path: .harn/promote-release/consumer-reader
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Set up the consumer reader runtime
